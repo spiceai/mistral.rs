@@ -1,12 +1,13 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, num::NonZeroUsize, sync::Arc};
 
 use candle_core::{Device, Result, Tensor};
 use image::{DynamicImage, GenericImageView};
 use indexmap::IndexMap;
 use mistralrs_vision::{ApplyTransforms, Normalize, Rescale, ToTensorNoNorm, Transforms};
 use tokenizers::Tokenizer;
+use tracing::warn;
 
 use crate::{
     pipeline::{
@@ -14,7 +15,7 @@ use crate::{
         text_models_inputs_processor::{
             self, get_completion_input, get_prompt_input, PagedAttentionMeta,
         },
-        InputsProcessor, InputsProcessorType, MessagesAction, Processor,
+        InputProcessorOutput, InputsProcessor, InputsProcessorType, MessagesAction, Processor,
     },
     sequence::Sequence,
     vision_models::ModelInputs,
@@ -55,7 +56,7 @@ impl Processor for Idefics2Processor {
         messages: Vec<IndexMap<String, MessageContent>>,
         add_generation_prompt: bool,
         tools: Vec<Tool>,
-    ) -> anyhow::Result<Vec<u32>> {
+    ) -> anyhow::Result<(Vec<u32>, String)> {
         let mut prompt = apply_chat_template(
             pipeline,
             messages,
@@ -67,7 +68,11 @@ impl Processor for Idefics2Processor {
         let mut image_str = format!(
             "{}{}{}",
             self.fake_image_token,
-            self.image_token.repeat(self.config.image_seq_len),
+            self.image_token.repeat(
+                self.config
+                    .image_seq_len
+                    .expect("Idefics 2 model needs `image_seq_len`")
+            ),
             self.fake_image_token
         );
         if self
@@ -86,11 +91,13 @@ impl Processor for Idefics2Processor {
             self.fake_image_token,
         );
 
-        let encoding = pipeline
-            .tokenizer()
-            .encode(prompt, true)
-            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
-        Ok(encoding.get_ids().to_vec())
+        let Some(tokenizer) = &pipeline.tokenizer() else {
+            anyhow::bail!("Idefics2InputProcessor requires a specified tokenizer.",);
+        };
+        let encoding = tokenizer
+            .encode(prompt.clone(), true)
+            .map_err(anyhow::Error::msg)?;
+        Ok((encoding.get_ids().to_vec(), prompt))
     }
 
     fn inputs_processor(&self) -> Arc<dyn InputsProcessor> {
@@ -112,7 +119,7 @@ impl InputsProcessor for Idefics2ImageProcessor {
     }
     fn process_inputs(
         &self,
-        _: Arc<Tokenizer>,
+        _: Option<Arc<Tokenizer>>,
         input_seqs: &mut [&mut Sequence],
         is_prompt: bool,
         is_xlora: bool,
@@ -121,20 +128,35 @@ impl InputsProcessor for Idefics2ImageProcessor {
         last_n_context_len: Option<(usize, usize)>,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta<'_>>,
-    ) -> anyhow::Result<Box<dyn std::any::Any>> {
+        prompt_batchsize: Option<NonZeroUsize>,
+    ) -> Box<dyn Iterator<Item = anyhow::Result<InputProcessorOutput>>> {
         if is_xlora {
-            anyhow::bail!("Cannot make inputs for X-LoRA vision model.");
+            return Box::new(std::iter::once(Err(anyhow::Error::msg(
+                "Cannot make inputs for X-LoRA vision model.",
+            ))));
         }
         if no_kv_cache {
-            anyhow::bail!("Vision model must have kv cache.");
+            return Box::new(std::iter::once(Err(anyhow::Error::msg(
+                "Vision model must have kv cache.",
+            ))));
         }
-        let text_models_inputs_processor::InputMetadata {
-            input,
-            positions,
-            positions_kernel,
-            context_lens,
-            position_ids,
-            paged_attn_meta,
+        // TODO(EricLBuehler): support this? Would require some handling of image tokens.
+        if prompt_batchsize.is_some() {
+            warn!("`prompt_batchsize` is set. Idefics 2 does not support prompt batching.");
+        }
+
+        let text_models_inputs_processor::InnerInputProcessorOutput {
+            inputs:
+                text_models_inputs_processor::InputMetadata {
+                    input,
+                    positions,
+                    positions_kernel,
+                    context_lens,
+                    position_ids,
+                    paged_attn_meta,
+                    flash_meta,
+                },
+            seq_indices,
         } = if is_prompt {
             get_prompt_input(
                 input_seqs
@@ -145,7 +167,11 @@ impl InputsProcessor for Idefics2ImageProcessor {
                 device,
                 last_n_context_len,
                 paged_attn_metadata.as_mut(),
-            )?
+                None, // TODO: evaluate if it is possible to batch this
+            )
+            .nth(0)
+            .unwrap()
+            .unwrap()
         } else {
             get_completion_input(
                 input_seqs
@@ -157,12 +183,20 @@ impl InputsProcessor for Idefics2ImageProcessor {
                 no_kv_cache,
                 last_n_context_len,
                 paged_attn_metadata.as_mut(),
-            )?
+                None, // TODO: evaluate if it is possible to batch this
+            )
+            .nth(0)
+            .unwrap()
+            .unwrap()
         };
         let config = other_config.expect("Need a PreProcessorConfig config.");
         let config: &PreProcessorConfig = config.downcast_ref().expect("Downcast failed.");
 
-        let (pixel_values, pixel_attention_mask) = if is_prompt {
+        let has_images = input_seqs
+            .iter()
+            .all(|seq| seq.images().is_some_and(|images| !images.is_empty()));
+
+        let (pixel_values, pixel_attention_mask) = if has_images {
             let mut pixel_values_accum = Vec::new();
             let mut pixel_attention_mask_accum = Vec::new();
             for seq in input_seqs.iter_mut() {
@@ -171,24 +205,31 @@ impl InputsProcessor for Idefics2ImageProcessor {
                     pixel_attention_mask,
                     image_sizes: _,
                     num_img_tokens: _,
-                } = self.preprocess(
-                    seq.take_images()
-                        .expect("Need to have images by this point."),
-                    config,
-                    device,
-                )?;
-                pixel_values_accum.push(pixel_values.unsqueeze(0)?);
-                pixel_attention_mask_accum.push(pixel_attention_mask.unwrap().unsqueeze(0)?);
+                    aspect_ratio_ids: _,
+                    aspect_ratio_mask: _,
+                    num_tiles: _,
+                } = self
+                    .preprocess(
+                        seq.take_images()
+                            .expect("Need to have images by this point."),
+                        config,
+                        device,
+                        (usize::MAX, usize::MAX), // Don't use it here...
+                    )
+                    .expect("Preprocessing failed");
+                pixel_values_accum.push(pixel_values.unsqueeze(0).unwrap());
+                pixel_attention_mask_accum
+                    .push(pixel_attention_mask.unwrap().unsqueeze(0).unwrap());
             }
             (
-                Some(Tensor::cat(&pixel_values_accum, 0)?),
-                Some(Tensor::cat(&pixel_attention_mask_accum, 0)?),
+                Some(Tensor::cat(&pixel_values_accum, 0).unwrap()),
+                Some(Tensor::cat(&pixel_attention_mask_accum, 0).unwrap()),
             )
         } else {
             (None, None)
         };
 
-        Ok(Box::new(ModelInputs {
+        let inputs: Box<dyn Any> = Box::new(ModelInputs {
             input_ids: input,
             seqlen_offsets: positions,
             seqlen_offsets_kernel: positions_kernel,
@@ -197,7 +238,12 @@ impl InputsProcessor for Idefics2ImageProcessor {
             pixel_values,
             model_specific_args: Box::new(pixel_attention_mask),
             paged_attn_meta,
-        }))
+            flash_meta,
+        });
+        Box::new(std::iter::once(Ok(InputProcessorOutput {
+            inputs,
+            seq_indices,
+        })))
     }
 }
 
@@ -212,6 +258,7 @@ impl ImagePreProcessor for Idefics2ImageProcessor {
         mut images: Vec<DynamicImage>,
         config: &PreProcessorConfig,
         device: &Device,
+        (_bs, _max_num_images): (usize, usize),
     ) -> Result<PreprocessedImages> {
         let mut patch_masks = Vec::new();
         let mut pixel_values = Vec::new();
@@ -314,6 +361,9 @@ impl ImagePreProcessor for Idefics2ImageProcessor {
             pixel_attention_mask: Some(Tensor::cat(&patch_masks, 0)?),
             image_sizes: None,
             num_img_tokens: None,
+            aspect_ratio_ids: None,
+            aspect_ratio_mask: None,
+            num_tiles: None,
         })
     }
 }

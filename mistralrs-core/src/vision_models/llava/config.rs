@@ -80,6 +80,8 @@ impl Config {
             rope_theta: self.text_config.rope_theta,
             max_position_embeddings: self.text_config.max_position_embeddings,
             rope_scaling: self.text_config.rope_scaling.clone(),
+            quantization_config: None,
+            tie_word_embeddings: false,
         }
     }
 
@@ -98,6 +100,8 @@ impl Config {
             sliding_window: self.text_config.sliding_window,
             use_flash_attn: self.use_flash_attn,
             head_dim: None,
+            quantization_config: None,
+            tie_word_embeddings: false,
         }
     }
 

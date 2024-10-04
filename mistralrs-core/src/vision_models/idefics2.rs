@@ -1,6 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use candle_core::{quantized::QMatMul, DType, Device, IndexOp, Result, Tensor, D};
+use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{
     conv2d, embedding, layer_norm, linear, linear_no_bias, Activation, Conv2d, Conv2dConfig,
     Embedding, LayerNorm, Module, VarBuilder,
@@ -15,8 +15,8 @@ use crate::{
     models::mistral::Model as Mistral,
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
-        text_models_inputs_processor::PagedAttentionInputMetadata, Cache, IsqModel,
-        NormalLoadingMetadata, NormalModel, VisionModel,
+        text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
+        Cache, IsqModel, NormalLoadingMetadata, NormalModel, VisionModel,
     },
     AnyMoeConfig, AnyMoeExpertType,
 };
@@ -151,7 +151,7 @@ pub(crate) struct TextConfig {
     #[serde(default = "default_14336")]
     intermediate_size: usize,
     #[serde(default = "default_32")]
-    num_hidden_layers: usize,
+    pub(crate) num_hidden_layers: usize,
     #[serde(default = "default_32")]
     num_attention_heads: usize,
     #[serde(default = "default_8")]
@@ -188,6 +188,8 @@ impl From<TextConfig> for mistral::Config {
             sliding_window: val.sliding_window,
             use_flash_attn: val.use_flash_attn,
             head_dim: None,
+            quantization_config: None,
+            tie_word_embeddings: false,
         }
     }
 }
@@ -954,6 +956,7 @@ impl Idefics2 {
         context_lens: Vec<(usize, usize)>,
         pixel_attention_mask: Option<Tensor>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let input_embeds = if let Some(pixel_values) = pixel_values {
             // == START VISUAL INPUTS INTEGRATION ==
@@ -1058,16 +1061,22 @@ impl Idefics2 {
             start_offsets_kernel,
             context_lens,
             metadata,
+            flash_params,
         )
     }
 }
 
 impl IsqModel for Idefics2 {
-    fn get_matmuls(&mut self) -> (Vec<(&mut QMatMul, Option<usize>)>, &dyn DeviceMapper) {
-        self.text_model.get_matmuls()
-    }
-    fn get_biases(&mut self) -> (Vec<(Option<&mut Tensor>, Option<usize>)>, &dyn DeviceMapper) {
-        self.text_model.get_biases()
+    fn get_layers(
+        &mut self,
+    ) -> (
+        Vec<(
+            &mut std::sync::Arc<dyn mistralrs_quant::QuantMethod>,
+            Option<usize>,
+        )>,
+        &dyn DeviceMapper,
+    ) {
+        self.text_model.get_layers()
     }
 }
 
@@ -1113,6 +1122,7 @@ impl VisionModel for Idefics2 {
         _: Vec<usize>, // Ignore, it is for phi3
         model_specific_args: Box<dyn Any>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        flash_params: &FlashParams,
     ) -> candle_core::Result<Tensor> {
         let pixel_attention_mask: Option<Tensor> = *model_specific_args
             .downcast()
@@ -1125,6 +1135,7 @@ impl VisionModel for Idefics2 {
             context_lens,
             pixel_attention_mask,
             metadata,
+            flash_params,
         )
     }
     fn cache(&self) -> &Cache {

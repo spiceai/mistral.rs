@@ -1,12 +1,12 @@
 use either::Either;
 use indexmap::IndexMap;
-use std::sync::Arc;
+use std::{fs::File, sync::Arc};
 use tokio::sync::mpsc::channel;
 
 use mistralrs::{
-    Constraint, DefaultSchedulerMethod, Device, DeviceMapMetadata, GGUFLoaderBuilder, MistralRs,
-    MistralRsBuilder, ModelDType, NormalRequest, Request, RequestMessage, Response, Result,
-    SamplingParams, SchedulerConfig, TokenSource,
+    Constraint, DefaultSchedulerMethod, Device, DeviceMapMetadata, MistralRs, MistralRsBuilder,
+    ModelDType, NormalLoaderBuilder, NormalRequest, NormalSpecificConfig, Request, RequestMessage,
+    ResponseOk, Result, SamplingParams, SchedulerConfig, TokenSource,
 };
 
 /// Gets the best device, cpu, cuda if compiled with CUDA
@@ -23,19 +23,34 @@ pub(crate) fn best_device() -> Result<Device> {
 
 fn setup() -> anyhow::Result<Arc<MistralRs>> {
     // Select a Mistral model
-    // This uses a model, tokenizer, and chat template, from HF hub.
-    let loader = GGUFLoaderBuilder::new(
-        None,
-        Some("mistralai/Mistral-7B-Instruct-v0.1".to_string()),
-        "TheBloke/Mistral-7B-Instruct-v0.1-GGUF".to_string(),
-        "mistral-7b-instruct-v0.1.Q4_K_M.gguf".to_string(),
-    )
-    .build();
+    let loader =
+        NormalLoaderBuilder::new(
+            NormalSpecificConfig {
+                use_flash_attn: false,
+                prompt_batchsize: None,
+                topology: None,
+                organization: Default::default(),
+                write_uqff: None,
+                from_uqff: None,
+            },
+            None,
+            None,
+            None, // Will detect from ordering file
+        )
+        .with_xlora(
+            "lamm-mit/x-lora".to_string(),
+            serde_json::from_reader(File::open("my-ordering-file.json").unwrap_or_else(|_| {
+                panic!("Could not load ordering file at my-ordering-file.json")
+            }))?,
+            false,
+            None,
+        )
+        .build(None)?;
     // Load, into a Pipeline
     let pipeline = loader.load_model_from_hf(
         None,
         TokenSource::CacheToken,
-        &ModelDType::default(),
+        &ModelDType::Auto,
         &best_device()?,
         false,
         DeviceMapMetadata::dummy(),
@@ -71,21 +86,14 @@ fn main() -> anyhow::Result<()> {
         adapters: None,
         tools: None,
         tool_choice: None,
+        logits_processors: None,
     });
     mistralrs.get_sender()?.blocking_send(request)?;
 
-    let response = rx.blocking_recv().unwrap();
+    let response = rx.blocking_recv().unwrap().as_result().unwrap();
     match response {
-        Response::Done(c) => println!(
+        ResponseOk::Done(c) => println!(
             "Text: {}, Prompt T/s: {}, Completion T/s: {}",
-            c.choices[0].message.content.as_ref().unwrap(),
-            c.usage.avg_prompt_tok_per_sec,
-            c.usage.avg_compl_tok_per_sec
-        ),
-        Response::InternalError(e) => panic!("Internal error: {e}"),
-        Response::ValidationError(e) => panic!("Validation error: {e}"),
-        Response::ModelError(e, c) => panic!(
-            "Model error: {e}. Response: Text: {}, Prompt T/s: {}, Completion T/s: {}",
             c.choices[0].message.content.as_ref().unwrap(),
             c.usage.avg_prompt_tok_per_sec,
             c.usage.avg_compl_tok_per_sec
