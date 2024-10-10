@@ -361,6 +361,9 @@ pub(crate) fn get_chat_template(
             .as_ref()
             .expect("A tokenizer config or chat template file path must be specified.");
         Some(fs::read_to_string(template_filename).expect("Loading chat template failed."))
+    } else if chat_template_fallback.is_some() {
+        // User specified a string literal
+        chat_template_fallback.clone()
     } else if chat_template_ovrd.is_some() {
         None
     } else {
