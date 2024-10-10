@@ -139,8 +139,12 @@ macro_rules! get_paths {
             None
         };
         let template_filename = if let Some(ref p) = $this.chat_template {
-            info!("Using chat template file at `{p}`");
-            Some(PathBuf::from_str(p)?)
+            if p.ends_with(".json") {
+                info!("Using chat template file at `{p}`");
+                Some(PathBuf::from_str(p)?)
+            } else {
+                None
+            }
         } else {
             info!("Loading `tokenizer_config.json` at `{}`", $this.model_id);
             Some($crate::api_get_file!(
