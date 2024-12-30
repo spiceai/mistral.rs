@@ -7,8 +7,8 @@ members = [
     "mistralrs-bench",
     "mistralrs-vision",
     "mistralrs-quant",
+    "mistralrs-paged-attn",
 ]
-exclude = ["mistralrs-paged_attn"]
 resolver = "2"
 
 [workspace.package]
@@ -24,8 +24,8 @@ rust-version = "1.82"
 
 [workspace.dependencies]
 anyhow = "1.0.80"
-candle-core = { git = "https://github.com/EricLBuehler/candle.git", version = "0.8.0", rev = "6800496" }
-candle-nn = { git = "https://github.com/EricLBuehler/candle.git", version = "0.8.0", rev = "6800496" }
+candle-core = { git = "https://github.com/EricLBuehler/candle.git", version = "0.8.0", rev = "521e33c" }
+candle-nn = { git = "https://github.com/EricLBuehler/candle.git", version = "0.8.0", rev = "521e33c" }
 serde = "1.0.197"
 serde_json = "1.0.114"
 indexmap = { version = "2.2.5", features = ["serde"] }
@@ -65,3 +65,4 @@ data-url = "0.3.1"
 buildstructor = "0.5.4"
 float8 = "0.1.1"
 regex = "1.10.6"
+metal = { version = "0.27.0", features = ["mps"] }
