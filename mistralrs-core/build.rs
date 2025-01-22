@@ -44,6 +44,8 @@ fn main() {
         builder.build_lib(out_file);
         println!("cargo:rustc-link-search={}", build_dir.display());
         println!("cargo:rustc-link-lib=mistralrscuda");
+
+        #[cfg(feature = "cuda-dynamic-linking")]
         println!("cargo:rustc-link-lib=dylib=cudart");
 
         if target.contains("msvc") {

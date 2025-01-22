@@ -63,6 +63,8 @@ pub use backend::{copy_blocks, paged_attention, reshape_and_cache, swap_blocks};
     );
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=mistralrspagedattention");
+
+    #[cfg(feature = "cuda-dynamic-linking")]
     println!("cargo:rustc-link-lib=dylib=cudart");
 
     let mut file = OpenOptions::new().write(true).open("src/lib.rs").unwrap();

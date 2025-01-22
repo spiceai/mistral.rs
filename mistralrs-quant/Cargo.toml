@@ -29,6 +29,7 @@ thiserror = "1"
 
 [features]
 cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:bindgen_cuda"]
+cuda-dynamic-linking = ["cuda"]
 metal = ["candle-core/metal", "candle-nn/metal", "dep:metal"]
 
 [build-dependencies]
