@@ -1,7 +1,6 @@
 mod request;
 mod response;
 
-use itertools::Itertools;
 pub use request::*;
 pub use response::*;
 use serde_json::Value;

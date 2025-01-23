@@ -50,7 +50,6 @@ impl CausalSelfAttention {
         x: &Tensor,
         attention_mask: &Option<Tensor>,
         seqlen_offsets: &[usize],
-        _start_offsets_kernel: Tensor,
         block_idx: usize,
         kv_cache: &mut crate::pipeline::LayerCaches,
         rope_parameter: (&Tensor, &Tensor),
@@ -100,12 +99,11 @@ impl CausalSelfAttention {
                     None,
                 )?,
                 None => {
-                    let mut input_metadata = PagedAttentionInputMetadata {
-                        block_tables: None,
-                        context_lens: None,
-                        max_context_len: None,
-                        slot_mappings: Tensor::new(&[0f32], q.device())?,
-                    };
+                    // If we don't have metadata, we are most likely generating an imatrix so we don't want to populate that.
+                    // Generating the dummy metadata with the assumption that we are not generating text (only processing prompts).
+                    let mut input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
+                    // Sanity check.
+                    assert!(attention_mask.is_some());
                     paged_attn.forward(
                         &q,
                         &k,
@@ -305,7 +303,6 @@ impl Block {
         x: &Tensor,
         attention_mask: &Option<Tensor>,
         seqlen_offsets: &[usize],
-        start_offsets_kernel: Tensor,
         block_idx: usize,
         kv_cache: &mut crate::pipeline::LayerCaches,
         rope_parameters: (&Tensor, &Tensor),
@@ -318,7 +315,6 @@ impl Block {
             &x,
             attention_mask,
             seqlen_offsets,
-            start_offsets_kernel,
             block_idx,
             kv_cache,
             rope_parameters,
@@ -380,7 +376,6 @@ impl Llama {
         &self,
         input_ids: &Tensor,
         seqlen_offsets: &[usize],
-        start_offsets_kernel: Tensor,
         context_lens: Vec<(usize, usize)>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
@@ -390,7 +385,6 @@ impl Llama {
             input_ids,
             x,
             seqlen_offsets,
-            start_offsets_kernel,
             context_lens,
             metadata,
             flash_params,
@@ -472,12 +466,14 @@ impl Llama {
             mapper,
             rope_parameters,
             cfg: ModelConfigMetadata {
+                max_seq_len: cfg.max_position_embeddings,
                 num_layers: cfg.num_hidden_layers,
                 hidden_size: cfg.hidden_size,
                 num_kv_heads: cfg.num_key_value_heads,
                 num_attn_heads: cfg.num_attention_heads,
                 sliding_window: None,
-                head_dim: None,
+                k_head_dim: None,
+                v_head_dim: None,
             },
         })
     }
@@ -523,7 +519,6 @@ impl LLaVALLM for Llama {
         input_ids: &Tensor,
         input_embed: Tensor,
         seqlen_offsets: &[usize],
-        start_offsets_kernel: Tensor,
         context_lens: Vec<(usize, usize)>,
         mut metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
@@ -545,7 +540,6 @@ impl LLaVALLM for Llama {
                 &x,
                 &mask.clone().map(|m| m.to_device(x.device()).unwrap()),
                 seqlen_offsets,
-                start_offsets_kernel.clone(),
                 block_idx,
                 &mut cache,
                 (&self.rope_parameters.0, &self.rope_parameters.1),
@@ -570,7 +564,6 @@ impl NormalModel for Llama {
         &self,
         input_ids: &Tensor,
         seqlen_offsets: &[usize],
-        start_offsets_kernel: Tensor,
         context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
@@ -579,7 +572,6 @@ impl NormalModel for Llama {
         self.forward_input(
             input_ids,
             seqlen_offsets,
-            start_offsets_kernel,
             context_lens,
             metadata,
             flash_params,
@@ -591,8 +583,6 @@ impl NormalModel for Llama {
         _input_ids_full: &Tensor,
         _seqlen_offsets: &[usize],
         _seqlen_offsets_full: &[usize],
-        _start_offsets_kernel: Tensor,
-        _start_offsets_kernel_full: Tensor,
         _no_kv_cache: bool,
         _non_granular_state: &Option<crate::xlora_models::NonGranularState>,
         _context_lens: Vec<(usize, usize)>,
