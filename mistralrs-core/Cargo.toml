@@ -17,7 +17,7 @@ candle-core.workspace = true
 candle-nn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-candle-flash-attn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "a84593f1951a4a9083e29257003a8112eb1450da", optional = true }
+candle-flash-attn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "d182e6f3a114a34c1dd56b6cbb36c89c111d2d45", optional = true }
 dirs = "5.0.1"
 hf-hub = { version = "0.3.3", package = "candle-hf-hub" }
 thiserror = "1.0.57"
@@ -86,7 +86,7 @@ toktrie_hf_tokenizers = { git = "https://github.com/microsoft/llguidance", rev =
 
 [features]
 pyo3_macros = ["pyo3"]
-cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:bindgen_cuda", "mistralrs-quant/cuda", "dep:mistralrs-paged-attn", "mistralrs-paged-attn/cuda", "float8/mistralrs_cudarc_fork"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:bindgen_cuda", "mistralrs-quant/cuda", "dep:mistralrs-paged-attn", "mistralrs-paged-attn/cuda"]
 cudnn = ["candle-core/cudnn"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]

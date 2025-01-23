@@ -395,12 +395,13 @@ checksum = "325918d6fe32f23b19878fe4b34794ae41fc19ddbe53b10571a4874d44ffd39b"
 [[package]]
 name = "candle-core"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/candle.git?rev=2056b181860620971fa3b43c69ad8d26321e9cda#2056b181860620971fa3b43c69ad8d26321e9cda"
+source = "git+https://github.com/spiceai/candle.git?rev=d182e6f3a114a34c1dd56b6cbb36c89c111d2d45#d182e6f3a114a34c1dd56b6cbb36c89c111d2d45"
 dependencies = [
  "accelerate-src",
  "byteorder",
  "candle-kernels",
  "candle-metal-kernels",
+ "cudarc",
  "float8",
  "gemm",
  "half",
@@ -408,7 +409,6 @@ dependencies = [
  "libc",
  "memmap2",
  "metal",
- "mistralrs_cudarc_fork",
  "num-traits",
  "num_cpus",
  "rand",
@@ -423,7 +423,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/candle.git?rev=2056b181860620971fa3b43c69ad8d26321e9cda#2056b181860620971fa3b43c69ad8d26321e9cda"
+source = "git+https://github.com/spiceai/candle.git?rev=d182e6f3a114a34c1dd56b6cbb36c89c111d2d45#d182e6f3a114a34c1dd56b6cbb36c89c111d2d45"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.5",
@@ -455,7 +455,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/candle.git?rev=2056b181860620971fa3b43c69ad8d26321e9cda#2056b181860620971fa3b43c69ad8d26321e9cda"
+source = "git+https://github.com/spiceai/candle.git?rev=d182e6f3a114a34c1dd56b6cbb36c89c111d2d45#d182e6f3a114a34c1dd56b6cbb36c89c111d2d45"
 dependencies = [
  "bindgen_cuda 0.1.5",
 ]
@@ -463,7 +463,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/candle.git?rev=2056b181860620971fa3b43c69ad8d26321e9cda#2056b181860620971fa3b43c69ad8d26321e9cda"
+source = "git+https://github.com/spiceai/candle.git?rev=d182e6f3a114a34c1dd56b6cbb36c89c111d2d45#d182e6f3a114a34c1dd56b6cbb36c89c111d2d45"
 dependencies = [
  "metal",
  "once_cell",
@@ -474,7 +474,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.8.0"
-source = "git+https://github.com/spiceai/candle.git?rev=2056b181860620971fa3b43c69ad8d26321e9cda#2056b181860620971fa3b43c69ad8d26321e9cda"
+source = "git+https://github.com/spiceai/candle.git?rev=d182e6f3a114a34c1dd56b6cbb36c89c111d2d45#d182e6f3a114a34c1dd56b6cbb36c89c111d2d45"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -808,6 +808,16 @@ checksum = "90eeab0aa92f3f9b4e87f258c72b139c207d251f9cbc1080a0086b86a8870dd3"
 dependencies = [
  "nix",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "cudarc"
+version = "0.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712390a76a83255b3d02760b8b3b3b7cb518f1f7cd83aafbbd65c382a7d6e8ef"
+dependencies = [
+ "half",
+ "libloading",
 ]
 
 [[package]]
@@ -1172,7 +1182,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea7c017f762b1198f03787816240bd8d07eb3dcea71262f6646b86d319b71460"
 dependencies = [
  "half",
- "mistralrs_cudarc_fork",
  "num-traits",
  "rand",
  "rand_distr",
@@ -2513,16 +2522,6 @@ version = "0.3.4"
 dependencies = [
  "candle-core",
  "image",
-]
-
-[[package]]
-name = "mistralrs_cudarc_fork"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c82ee900a0e7080a2ff91042d070b0112a3533b32ebc6d8faaba96ee4f598e8d"
-dependencies = [
- "half",
- "libloading",
 ]
 
 [[package]]
