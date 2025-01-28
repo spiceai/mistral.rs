@@ -20,8 +20,9 @@ mod vision;
 
 pub use super::diffusion_models::DiffusionGenerationParams;
 use crate::amoe::{AnyMoeConfig, AnyMoeExpertType, AnyMoeTrainingInputs, AnyMoeTrainingResult};
+use crate::device_map::DeviceMapper;
 use crate::paged_attention::{CacheConfig, CacheEngine, ModelConfigLike};
-use crate::prefix_cacher::PrefixCacheManager;
+use crate::prefix_cacher_v2::PrefixCacheManagerV2;
 pub use amoe::{AnyMoeLoader, AnyMoePipeline};
 use chat_template::ChatTemplate;
 pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder, DiffusionSpecificConfig};
@@ -31,13 +32,14 @@ use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
 pub use isq::{parse_isq_value, IsqModel, IsqOrganization};
 pub use loaders::{
-    AdapterKind, AutoLoader, DiffusionLoaderType, DiffusionModel, DiffusionModelLoader, FluxLoader,
+    AdapterKind, AutoDeviceMapParams, AutoLoader, DeepSeekV2Loader, DeepSeekV3Loader,
+    DeviceMappedModelLoader, DiffusionLoaderType, DiffusionModel, DiffusionModelLoader, FluxLoader,
     Gemma2Loader, GemmaLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader,
-    LlamaLoader, Loader, LocalModelPaths, MistralLoader, MixtralLoader, ModelKind, ModelPaths,
-    NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader, Phi2Loader,
-    Phi3Loader, Phi3VLoader, Phi3_5MoELoader, PrettyName, QuantizationKind, Qwen2Loader,
-    Qwen2VLLoader, Starcoder2Loader, TokenSource, VLlamaLoader, VisionLoaderType, VisionModel,
-    VisionModelLoader,
+    LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, MistralLoader, MixtralLoader, ModelKind,
+    ModelPaths, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
+    Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, PrettyName, QuantizationKind,
+    Qwen2Loader, Qwen2VLLoader, Starcoder2Loader, TokenSource, VLlamaLoader, VisionLoaderType,
+    VisionModel, VisionModelLoader,
 };
 use mistralrs_quant::IsqType;
 pub use normal::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
@@ -61,7 +63,7 @@ use candle_core::{DType, Device, IndexOp, Tensor, Var};
 use crate::sequence::Sequence;
 
 pub use self::cache_manager::{
-    Cache, CacheManager, EitherCache, KvCache, LayerCaches, NormalCache,
+    Cache, CacheManager, EitherCache, KvCache, LayerCaches, NormalCache, SingleCache,
 };
 pub use self::inputs_processor::{
     text_models_inputs_processor, InputsProcessor, InputsProcessorType,
@@ -72,7 +74,8 @@ pub struct GeneralMetadata {
     pub max_seq_len: usize,
     /// Only None if it doesnt make sense for the model
     pub tok_env: Option<llguidance::toktrie::TokEnv>,
-    pub has_no_kv_cache: bool,
+    pub no_kv_cache: bool,
+    pub no_prefix_cache: bool,
     pub num_hidden_layers: usize,
     pub eos_tok: Vec<u32>,
     pub kind: ModelKind,
@@ -149,6 +152,7 @@ pub trait MetadataMixin {
     fn name(&self) -> String;
     fn reset_non_granular_state(&self);
     fn get_metadata(&self) -> Arc<GeneralMetadata>;
+    fn device_mapper(&self) -> Option<&dyn DeviceMapper>;
 }
 
 /// Implemented by the base model of an AnyMoe.
@@ -308,7 +312,7 @@ pub trait Pipeline:
         input_seqs: &mut [&mut Sequence],
         is_prompt: bool,
         return_raw_logits: bool,
-        prefix_cacher: &mut PrefixCacheManager,
+        prefix_cacher: &mut PrefixCacheManagerV2,
         disable_eos_stop: bool,
         rng: Arc<std::sync::Mutex<Isaac64Rng>>,
         backend_metadata: CacheBackendMetadata<'_>,
@@ -321,12 +325,13 @@ pub trait Pipeline:
                     is_prompt,
                     self.get_metadata().is_xlora,
                     &self.device(),
-                    self.get_metadata().has_no_kv_cache,
+                    self.get_metadata().no_kv_cache,
                     None,
                     return_raw_logits,
                     self.get_input_processor_config(),
                     None,
                     self.get_metadata().prompt_batchsize,
+                    self.device_mapper(),
                 );
 
                 let mut logits = vec![None; input_seqs.len()];
@@ -533,12 +538,13 @@ pub trait Pipeline:
                     is_prompt,
                     self.get_metadata().is_xlora,
                     &self.device(),
-                    self.get_metadata().has_no_kv_cache,
+                    self.get_metadata().no_kv_cache,
                     None,
                     return_raw_logits,
                     self.get_input_processor_config(),
                     Some(metadata),
                     self.get_metadata().prompt_batchsize,
+                    self.device_mapper(),
                 );
 
                 let mut logits = vec![None; input_seqs.len()];
@@ -658,7 +664,7 @@ pub trait Pipeline:
         &self,
         seqs: &mut [&mut Sequence],
         logits: Vec<Tensor>,
-        prefix_cacher: &mut PrefixCacheManager,
+        prefix_cacher: &mut PrefixCacheManagerV2,
         disable_eos_stop: bool,
         rng: Arc<std::sync::Mutex<Isaac64Rng>>,
     ) -> Result<(), candle_core::Error>;

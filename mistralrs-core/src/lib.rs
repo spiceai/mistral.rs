@@ -1,5 +1,4 @@
 #![deny(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-
 use candle_core::Device;
 use cublaslt::setup_cublas_lt_wrapper;
 use engine::Engine;
@@ -32,29 +31,32 @@ mod engine;
 mod lora;
 mod model_loader;
 mod ops;
-pub use model_loader::{get_model_dtype, get_tgt_non_granular_index, LoaderBuilder};
+pub use model_loader::{
+    get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, LoaderBuilder,
+};
 
 mod model_selected;
 pub use model_selected::ModelSelected;
-pub use toml_selector::get_toml_selected_model_dtype;
+pub use toml_selector::{get_toml_selected_model_device_map_params, get_toml_selected_model_dtype};
 
 mod amoe;
 mod cublaslt;
-#[cfg(not(all(feature = "cuda", target_family = "unix")))]
+#[cfg(not(any(all(feature = "cuda", target_family = "unix"), feature = "metal")))]
 mod dummy_paged_attention;
 mod gguf;
 pub mod layers;
 mod layers_masker;
 mod layers_utils;
 mod models;
-#[cfg(all(feature = "cuda", target_family = "unix"))]
+#[cfg(any(all(feature = "cuda", target_family = "unix"), feature = "metal"))]
 mod paged_attention;
-#[cfg(not(all(feature = "cuda", target_family = "unix")))]
+#[cfg(not(any(all(feature = "cuda", target_family = "unix"), feature = "metal")))]
 use dummy_paged_attention as paged_attention;
 mod attention;
 mod diffusion_models;
 mod pipeline;
 mod prefix_cacher;
+mod prefix_cacher_v2;
 mod request;
 mod response;
 mod sampler;
@@ -68,20 +70,23 @@ mod vision_models;
 mod xlora_models;
 
 pub use amoe::{AnyMoeConfig, AnyMoeExpertType};
-pub use device_map::{DeviceLayerMapMetadata, DeviceMapMetadata, LayerDeviceMapper};
+pub use device_map::{
+    DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, LayerDeviceMapper,
+};
 pub use gguf::{GGUFArchitecture, GGUF_MULTI_FILE_DELIMITER};
 pub use mistralrs_quant::IsqType;
 pub use paged_attention::{MemoryGpuConfig, PagedAttentionConfig};
 pub use pipeline::{
     chat_template::ChatTemplate, parse_isq_value, AnyMoeLoader, AnyMoePipeline,
-    DiffusionGenerationParams, DiffusionLoader, DiffusionLoaderBuilder, DiffusionLoaderType,
-    DiffusionSpecificConfig, GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader,
-    GGUFLoaderBuilder, GGUFSpecificConfig, GemmaLoader, Idefics2Loader, IsqOrganization,
-    LLaVALoader, LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, MistralLoader,
-    MixtralLoader, ModelKind, ModelPaths, NormalLoader, NormalLoaderBuilder, NormalLoaderType,
-    NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig,
-    SpeculativeLoader, SpeculativePipeline, Starcoder2Loader, TokenSource, VisionLoader,
-    VisionLoaderBuilder, VisionLoaderType, VisionPromptPrefixer, VisionSpecificConfig,
+    AutoDeviceMapParams, DiffusionGenerationParams, DiffusionLoader, DiffusionLoaderBuilder,
+    DiffusionLoaderType, DiffusionSpecificConfig, GGMLLoader, GGMLLoaderBuilder,
+    GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig, GemmaLoader,
+    Idefics2Loader, IsqOrganization, LLaVALoader, LLaVANextLoader, LlamaLoader, Loader,
+    LocalModelPaths, MistralLoader, MixtralLoader, ModelKind, ModelPaths, NormalLoader,
+    NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, Phi2Loader, Phi3Loader,
+    Phi3VLoader, Qwen2Loader, SpeculativeConfig, SpeculativeLoader, SpeculativePipeline,
+    Starcoder2Loader, TokenSource, VisionLoader, VisionLoaderBuilder, VisionLoaderType,
+    VisionPromptPrefixer, VisionSpecificConfig,
 };
 pub use request::{
     Constraint, DetokenizationRequest, ImageGenerationResponseFormat, LlguidanceGrammar,
@@ -226,6 +231,7 @@ impl MistralRsBuilder {
         self.disable_eos_stop = Some(disable_eos_stop);
         self
     }
+    /// This setting is only applicable on CUDA. If set to false or not specified, this setting enables f16/bf16 reduced precision matmul for GPUs which support it. If set to true, this setting has no effect.
     pub fn with_gemm_full_precision_f16(mut self, gemm_full_precision: bool) -> Self {
         self.gemm_full_precision_f16 = Some(gemm_full_precision);
         self
@@ -240,10 +246,10 @@ impl MistralRsBuilder {
     }
 }
 
-pub(crate) static INHIBIT_GEMM_F16: AtomicBool = AtomicBool::new(false);
-
 #[cfg(feature = "cuda")]
 fn set_gemm_reduced_precision_f16() {
+    use mistralrs_quant::INHIBIT_GEMM_F16;
+
     use candle_core::{DType, Device, Tensor};
 
     // NOTE(EricLBuehler): When we support multi-GPU inference, we should check for each gpu here
@@ -363,52 +369,53 @@ impl MistralRs {
 
         let engine_id = ENGINE_ID.fetch_add(1, atomic::Ordering::SeqCst);
 
-        // Skip the dummy run in Single Threaded mode as blocking operations are not allowed
-        if tokio::runtime::Handle::try_current()
-            .is_ok_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread)
-        {
-            // Do a dummy run
-            if matches!(category, ModelCategory::Text | ModelCategory::Vision { .. }) {
-                let clone_sender = sender.read().unwrap().clone();
-                tokio::task::block_in_place(|| {
-                    let (tx, mut rx) = channel(1);
-                    let req = Request::Normal(NormalRequest {
-                        id: 0,
-                        messages: RequestMessage::Completion {
-                            text: "dummy".to_string(),
-                            echo_prompt: false,
-                            best_of: None,
-                        },
-                        sampling_params: SamplingParams {
-                            max_len: Some(1),
-                            ..SamplingParams::deterministic()
-                        },
-                        response: tx,
-                        return_logprobs: false,
-                        is_streaming: true,
-                        constraint: Constraint::None,
-                        suffix: None,
-                        adapters: None,
-                        tool_choice: None,
-                        tools: None,
-                        logits_processors: None,
-                        return_raw_logits: false,
-                    });
-                    info!("Beginning dummy run.");
-                    let start = Instant::now();
-                    clone_sender.blocking_send(req).unwrap();
+        // Determine if the current runtime is multi-threaded, as blocking operations are not allowed in single-threaded mode
+        let is_multi_threaded = tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread);
 
-                    if let Some(_resp) = rx.blocking_recv() {
-                        let end = Instant::now();
-                        info!(
-                            "Dummy run completed in {}s.",
-                            end.duration_since(start).as_secs_f64()
-                        );
-                    } else {
-                        warn!("Dummy run failed!");
-                    }
+        // Do a dummy run
+        if is_multi_threaded
+            && matches!(category, ModelCategory::Text | ModelCategory::Vision { .. })
+        {
+            let clone_sender = sender.read().unwrap().clone();
+            tokio::task::block_in_place(|| {
+                let (tx, mut rx) = channel(1);
+                let req = Request::Normal(NormalRequest {
+                    id: 0,
+                    messages: RequestMessage::Completion {
+                        text: "dummy".to_string(),
+                        echo_prompt: false,
+                        best_of: None,
+                    },
+                    sampling_params: SamplingParams {
+                        max_len: Some(1),
+                        ..SamplingParams::deterministic()
+                    },
+                    response: tx,
+                    return_logprobs: false,
+                    is_streaming: true,
+                    constraint: Constraint::None,
+                    suffix: None,
+                    adapters: None,
+                    tool_choice: None,
+                    tools: None,
+                    logits_processors: None,
+                    return_raw_logits: false,
                 });
-            }
+                info!("Beginning dummy run.");
+                let start = Instant::now();
+                clone_sender.blocking_send(req).unwrap();
+
+                if let Some(_resp) = rx.blocking_recv() {
+                    let end = Instant::now();
+                    info!(
+                        "Dummy run completed in {}s.",
+                        end.duration_since(start).as_secs_f64()
+                    );
+                } else {
+                    warn!("Dummy run failed!");
+                }
+            });
         };
 
         Arc::new(Self {
