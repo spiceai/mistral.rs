@@ -369,40 +369,42 @@ impl MistralRs {
 
         let engine_id = ENGINE_ID.fetch_add(1, atomic::Ordering::SeqCst);
 
-        // Skip the dummy run in Single Threaded mode as blocking operations are not allowed
-        if tokio::runtime::Handle::try_current()
-            .is_ok_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread)
+        // Determine if the current runtime is multi-threaded, as blocking operations are not allowed in single-threaded mode
+        let is_multi_threaded = tokio::runtime::Handle::try_current()
+            .is_ok_and(|h| h.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread);
+
+        // Do a dummy run
+        if is_multi_threaded
+            && matches!(category, ModelCategory::Text | ModelCategory::Vision { .. })
         {
-            // Do a dummy run
-            if matches!(category, ModelCategory::Text | ModelCategory::Vision { .. }) {
-                let clone_sender = sender.read().unwrap().clone();
-                tokio::task::block_in_place(|| {
-                    let (tx, mut rx) = channel(1);
-                    let req = Request::Normal(NormalRequest {
-                        id: 0,
-                        messages: RequestMessage::Completion {
-                            text: "dummy".to_string(),
-                            echo_prompt: false,
-                            best_of: None,
-                        },
-                        sampling_params: SamplingParams {
-                            max_len: Some(1),
-                            ..SamplingParams::deterministic()
-                        },
-                        response: tx,
-                        return_logprobs: false,
-                        is_streaming: true,
-                        constraint: Constraint::None,
-                        suffix: None,
-                        adapters: None,
-                        tool_choice: None,
-                        tools: None,
-                        logits_processors: None,
-                        return_raw_logits: false,
-                    });
-                    info!("Beginning dummy run.");
-                    let start = Instant::now();
-                    clone_sender.blocking_send(req).unwrap();
+            let clone_sender = sender.read().unwrap().clone();
+            tokio::task::block_in_place(|| {
+                let (tx, mut rx) = channel(1);
+                let req = Request::Normal(NormalRequest {
+                    id: 0,
+                    messages: RequestMessage::Completion {
+                        text: "dummy".to_string(),
+                        echo_prompt: false,
+                        best_of: None,
+                    },
+                    sampling_params: SamplingParams {
+                        max_len: Some(1),
+                        ..SamplingParams::deterministic()
+                    },
+                    response: tx,
+                    return_logprobs: false,
+                    is_streaming: true,
+                    constraint: Constraint::None,
+                    suffix: None,
+                    adapters: None,
+                    tool_choice: None,
+                    tools: None,
+                    logits_processors: None,
+                    return_raw_logits: false,
+                });
+                info!("Beginning dummy run.");
+                let start = Instant::now();
+                clone_sender.blocking_send(req).unwrap();
 
                     if let Some(_resp) = rx.blocking_recv() {
                         let end = Instant::now();
