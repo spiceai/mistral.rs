@@ -406,17 +406,16 @@ impl MistralRs {
                 let start = Instant::now();
                 clone_sender.blocking_send(req).unwrap();
 
-                    if let Some(_resp) = rx.blocking_recv() {
-                        let end = Instant::now();
-                        info!(
-                            "Dummy run completed in {}s.",
-                            end.duration_since(start).as_secs_f64()
-                        );
-                    } else {
-                        warn!("Dummy run failed!");
-                    }
-                });
-            }
+                if let Some(_resp) = rx.blocking_recv() {
+                    let end = Instant::now();
+                    info!(
+                        "Dummy run completed in {}s.",
+                        end.duration_since(start).as_secs_f64()
+                    );
+                } else {
+                    warn!("Dummy run failed!");
+                }
+            });
         };
 
         Arc::new(Self {

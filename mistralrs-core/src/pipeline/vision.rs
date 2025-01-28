@@ -31,7 +31,7 @@ use crate::{
 use crate::prefix_cacher_v2::PrefixCacheManagerV2;
 use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{Device, Tensor, Var};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::{GgufMatMul, HqqLayer, IsqType, QuantizedSerdeType};
