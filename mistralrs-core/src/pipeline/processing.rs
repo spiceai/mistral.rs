@@ -46,6 +46,7 @@ pub trait Processor {
             self.template_action(),
             tools,
         )?;
+
         let encoding = pipeline
             .tokenizer()
             .with_context(|| {
