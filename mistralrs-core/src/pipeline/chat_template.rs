@@ -4,11 +4,11 @@ use anyhow::Result;
 use either::Either;
 use indexmap::IndexMap;
 use itertools::Itertools;
-use minijinja::{context, value::Kwargs, Environment, Error, ErrorKind, Value};
+use minijinja::{context, value::Kwargs, Environment, Error, ErrorKind, Template, Value};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{MessageContent, Tool};
 
@@ -370,6 +370,7 @@ pub fn apply_chat_template_to(
     }
 
     env.add_template("chat_template", &template)?;
+
     env.add_function("raise_exception", raise_exception);
     env.add_filter("tojson", tojson);
     env.add_function("strftime_now", strftime_now);
@@ -416,6 +417,9 @@ pub fn apply_chat_template_to(
             reasoning_effort => reasoning_effort_str,
         })?)
     } else {
+        if !tools_are_supported(&tmpl) {
+            warn!("tools were provided to a 'chat_template' that does not support them. Tools will be ignored...");
+        }
         Ok(tmpl.render(context! {
             messages => new_messages,
             add_generation_prompt => add_generation_prompt,
@@ -430,4 +434,8 @@ pub fn apply_chat_template_to(
             reasoning_effort => reasoning_effort_str,
         })?)
     }
+}
+
+fn tools_are_supported(t: &Template) -> bool {
+    t.undeclared_variables(true).contains("tools")
 }
