@@ -1,6 +1,7 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     iter::zip,
     sync::{Arc, Mutex},
@@ -470,9 +471,15 @@ impl Sampler {
     ) -> Result<Logprobs> {
         let mut argsort_indices = (0..probs.len()).collect::<Vec<_>>();
         // Sort by descending probability.
-        argsort_indices
-            .sort_unstable_by(|&i, &j| probs[j].partial_cmp(&probs[i]).expect("No ordering."));
 
+        argsort_indices.sort_unstable_by(|&i, &j| match (probs[i].is_nan(), probs[j].is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            _ => probs[j].partial_cmp(&probs[i]).unwrap_or_else(|| {
+                panic!("Incomparable log probs at indices i={}, j={}. Cannot compare probs[i]={} & probs[j]={}", i, j, probs[i], probs[j])
+            })
+        });
         if top_k > 0 {
             // Clamp smaller probabilities to zero.
             for (index, val) in argsort_indices.iter().enumerate() {
