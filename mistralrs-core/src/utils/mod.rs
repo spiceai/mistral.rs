@@ -147,14 +147,13 @@ macro_rules! handle_pipeline_forward_error {
                             usage: group.get_usage(),
                         };
 
-                        if let Err(e) = seq.responder()
+                        seq.responder()
                             .send(Response::ModelError(
                                 e.to_string(),
                                 partial_completion_response
                             ))
-                            .await {
-                                error!("{} - Failed to send partial chat response after error: {:?}", $stage, &e);
-                            };
+                            .await
+                            .unwrap();
                     } else {
                         let partial_completion_response = CompletionResponse {
                             id: seq.id().to_string(),
@@ -166,14 +165,13 @@ macro_rules! handle_pipeline_forward_error {
                             usage: group.get_usage(),
                         };
 
-                        if let Err(e) = seq.responder()
+                        seq.responder()
                             .send(Response::CompletionModelError(
                                 e.to_string(),
                                 partial_completion_response
                             ))
-                            .await {
-                                error!("{} - Failed to send partial completion response after error: {:?}", $stage, &e);
-                            };
+                            .await
+                            .unwrap();
                     }
                 }
                 for seq in $seq_slice.iter_mut() {
@@ -186,9 +184,7 @@ macro_rules! handle_pipeline_forward_error {
                 // - The sequence is gone
                 // - We should reset the state then, including draft.
                 p.set_none_cache($seq_slice, true, true, false);
-                if let Err(e) = $prefix_cacher.evict_all_to_cpu() {
-                    error!("{} - Failed to evict prefix caches from CPU: {:?}", $stage, &e);
-                }
+                $prefix_cacher.evict_all_to_cpu().unwrap();
 
                 continue $label;
             }
