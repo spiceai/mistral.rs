@@ -476,13 +476,10 @@ impl Sampler {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Greater,
             (false, true) => Ordering::Less,
-            _ => probs[j]
-                .partial_cmp(&probs[i])
-                .expect(
-                    format!("Incomparable log probs at indices i={}, j={}. Cannot compare probs[i]={} & probs[j]={}", i, j, probs[0], probs[1]).as_str()
-                )
+            _ => probs[j].partial_cmp(&probs[i]).unwrap_or_else(|| {
+                panic!("Incomparable log probs at indices i={}, j={}. Cannot compare probs[i]={} & probs[j]={}", i, j, probs[i], probs[j])
+            })
         });
-
         if top_k > 0 {
             // Clamp smaller probabilities to zero.
             for (index, val) in argsort_indices.iter().enumerate() {
