@@ -470,8 +470,8 @@ impl Sampler {
         rng: Arc<Mutex<Isaac64Rng>>,
     ) -> Result<Logprobs> {
         let mut argsort_indices = (0..probs.len()).collect::<Vec<_>>();
-        // Sort by descending probability.
 
+        // Sort by descending probability with NaN handling.
         argsort_indices.sort_unstable_by(|&i, &j| match (probs[i].is_nan(), probs[j].is_nan()) {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Greater,
