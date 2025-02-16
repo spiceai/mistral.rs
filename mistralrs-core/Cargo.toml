@@ -14,6 +14,7 @@ homepage.workspace = true
 [dependencies]
 candle-flash-attn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "296f14fefc8166574d3270c524494c49d8f2c893", optional = true }
 dirs = "5.0.1"
+signal-hook = "0.3.17"
 anyhow.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true
