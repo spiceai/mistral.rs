@@ -45,7 +45,7 @@ use crate::{
 use anyhow::{bail, Result};
 use candle_core::{Device, Tensor};
 use either::Either;
-use hf_hub::{api::tokio::ApiBuilder, Repo, RepoType};
+use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
 use std::any::Any;
