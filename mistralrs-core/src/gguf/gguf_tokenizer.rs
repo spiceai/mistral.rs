@@ -376,7 +376,7 @@ impl TryFrom<Normalizer<'_>> for NormalizerWrapper {
 #[cfg(test)]
 mod tests {
     use anyhow::Result;
-    use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+    use hf_hub::{api::tokio::ApiBuilder, Repo, RepoType};
     use tokenizers::Tokenizer;
 
     #[allow(dead_code)]
@@ -389,7 +389,7 @@ mod tests {
         Rwkv,
     }
 
-    fn get_gguf_tokenizer(tokenizer: TokenizerType) -> Result<Tokenizer> {
+    async fn get_gguf_tokenizer(tokenizer: TokenizerType) -> Result<Tokenizer> {
         match tokenizer {
             TokenizerType::Llama => {
                 let api = ApiBuilder::new().with_progress(true).build().unwrap();
@@ -399,7 +399,7 @@ mod tests {
                     "main".to_string(),
                 ));
 
-                let filename = api.get("llama_gguf_tokenizer.json").unwrap();
+                let filename = api.get("llama_gguf_tokenizer.json").await.unwrap();
                 let tokenizer = Tokenizer::from_file(filename).expect("Valid tokenizer");
                 Ok(tokenizer)
             }
@@ -411,7 +411,7 @@ mod tests {
                     "main".to_string(),
                 ));
 
-                let filename = api.get("gpt2_gguf_tokenizer.json").unwrap();
+                let filename = api.get("gpt2_gguf_tokenizer.json").await.unwrap();
                 let tokenizer = Tokenizer::from_file(filename).expect("Valid tokenizer");
                 Ok(tokenizer)
             }
@@ -419,7 +419,7 @@ mod tests {
         }
     }
 
-    fn get_hf_tokenizer(tokenizer: TokenizerType) -> Result<Tokenizer> {
+    async fn get_hf_tokenizer(tokenizer: TokenizerType) -> Result<Tokenizer> {
         match tokenizer {
             TokenizerType::Llama => {
                 let api = ApiBuilder::new().with_progress(true).build().unwrap();
@@ -429,7 +429,7 @@ mod tests {
                     "main".to_string(),
                 ));
 
-                let tokenizer_filename = api.get("tokenizer.json").unwrap();
+                let tokenizer_filename = api.get("tokenizer.json").await.unwrap();
                 Ok(Tokenizer::from_file(tokenizer_filename).unwrap())
             }
             TokenizerType::Gpt2 => {
@@ -440,7 +440,7 @@ mod tests {
                     "main".to_string(),
                 ));
 
-                let tokenizer_filename = api.get("tokenizer_gpt2.json").unwrap();
+                let tokenizer_filename = api.get("tokenizer_gpt2.json").await.unwrap();
                 Ok(Tokenizer::from_file(tokenizer_filename).unwrap())
             }
             other => anyhow::bail!("Cannot get testing HF tokenizer for type {other:?}"),
@@ -478,14 +478,14 @@ mod tests {
             .map_err(anyhow::Error::msg)
     }
 
-    #[test]
-    fn test_encode_decode_llama() -> Result<()> {
+    #[tokio::test]
+    async fn test_encode_decode_llama() -> Result<()> {
         use rand::seq::SliceRandom;
         use rand::thread_rng;
 
         let passage = get_test_passage();
-        let hf_tokenizer = get_hf_tokenizer(TokenizerType::Llama)?;
-        let gguf_tokenizer = get_gguf_tokenizer(TokenizerType::Llama)?;
+        let hf_tokenizer = get_hf_tokenizer(TokenizerType::Llama).await?;
+        let gguf_tokenizer = get_gguf_tokenizer(TokenizerType::Llama).await?;
 
         // Without adding special tokens
         let hf_decoded = codec_roundtrip(&hf_tokenizer, passage.as_str(), false)?;
@@ -520,14 +520,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_encode_decode_gpt2() -> Result<()> {
+    #[tokio::test]
+    async fn test_encode_decode_gpt2() -> Result<()> {
         use rand::seq::SliceRandom;
         use rand::thread_rng;
 
         let passage = get_test_passage();
-        let hf_tokenizer = get_hf_tokenizer(TokenizerType::Gpt2)?;
-        let gguf_tokenizer = get_gguf_tokenizer(TokenizerType::Gpt2)?;
+        let hf_tokenizer = get_hf_tokenizer(TokenizerType::Gpt2).await?;
+        let gguf_tokenizer = get_gguf_tokenizer(TokenizerType::Gpt2).await?;
 
         // Without adding special tokens
         let hf_decoded = codec_roundtrip(&hf_tokenizer, passage.as_str(), false)?;

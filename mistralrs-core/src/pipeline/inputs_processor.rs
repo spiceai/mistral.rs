@@ -21,7 +21,7 @@ pub struct InputProcessorOutput {
 }
 
 /// Processor: Prepare inputs for the model (potentially preparing the images if applicable)
-pub trait InputsProcessor {
+pub trait InputsProcessor: Send + Sync {
     /// This should also enable matmul via f16 if prompt and the sequence length is greater than 32.
     /// Otherwise, matmul via f16 is disabled.
     ///

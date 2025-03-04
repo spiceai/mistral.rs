@@ -2,7 +2,7 @@ use std::{cmp::Ordering, fs::File, sync::Arc};
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Module, VarBuilder};
-use hf_hub::api::sync::{Api, ApiError};
+use hf_hub::api::tokio::{Api, ApiError};
 use tokenizers::Tokenizer;
 use tracing::info;
 
@@ -73,10 +73,11 @@ pub struct FluxStepper {
     offloaded: bool,
 }
 
-fn get_t5_tokenizer(api: &Api) -> anyhow::Result<Tokenizer> {
+async fn get_t5_tokenizer(api: &Api) -> anyhow::Result<Tokenizer> {
     let tokenizer_filename = api
         .model("EricB/t5_tokenizer".to_string())
-        .get("t5-v1_1-xxl.tokenizer.json")?;
+        .get("t5-v1_1-xxl.tokenizer.json")
+        .await?;
     let tokenizer = Tokenizer::from_file(tokenizer_filename).map_err(anyhow::Error::msg)?;
 
     Ok(tokenizer)
@@ -98,7 +99,7 @@ fn get_t5_model(
     let vb = from_mmaped_safetensors(
         T5_XXL_SAFETENSOR_FILES
             .iter()
-            .map(|f| repo.get(f))
+            .map(|f| repo.get(f).await)
             .collect::<std::result::Result<Vec<_>, ApiError>>()
             .map_err(candle_core::Error::msg)?,
         vec![],

@@ -5,13 +5,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result as anyhowResult;
-use candle_core::{Device, IndexOp, Result, Tensor};
-use mistralrs_quant::IsqType;
-use rand_isaac::Isaac64Rng;
-use tokenizers::Tokenizer;
-use tracing::warn;
-
 use crate::{
     device_map::DeviceMapper,
     get_mut_arcmutex,
@@ -25,6 +18,13 @@ use crate::{
     sequence::{Sequence, SequenceRecognizer},
     DeviceMapSetting, Loader, ModelKind, PagedAttentionConfig, Pipeline, TokenSource, TryIntoDType,
 };
+use anyhow::Result as anyhowResult;
+use async_trait::async_trait;
+use candle_core::{Device, IndexOp, Result, Tensor};
+use mistralrs_quant::IsqType;
+use rand_isaac::Isaac64Rng;
+use tokenizers::Tokenizer;
+use tracing::warn;
 
 use super::{
     cache_manager::FullCacheManager, chat_template::ChatTemplate, sampling::SpeculativeSample,
@@ -39,10 +39,10 @@ pub struct SpeculativeLoader {
     pub draft: Box<dyn Loader>,
     pub config: SpeculativeConfig,
 }
-
+#[async_trait]
 impl Loader for SpeculativeLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_hf(
+    async fn load_model_from_hf(
         &self,
         revision: Option<String>,
         token_source: TokenSource,
@@ -62,26 +62,32 @@ impl Loader for SpeculativeLoader {
             paged_attn_config
         };
 
-        let target = self.target.load_model_from_hf(
-            revision.clone(),
-            token_source.clone(),
-            dtype,
-            device,
-            silent,
-            mapper.clone(),
-            in_situ_quant,
-            paged_attn_config,
-        )?;
-        let draft = self.draft.load_model_from_hf(
-            revision,
-            token_source,
-            dtype,
-            device,
-            silent,
-            mapper,
-            in_situ_quant,
-            paged_attn_config,
-        )?;
+        let target = self
+            .target
+            .load_model_from_hf(
+                revision.clone(),
+                token_source.clone(),
+                dtype,
+                device,
+                silent,
+                mapper.clone(),
+                in_situ_quant,
+                paged_attn_config,
+            )
+            .await?;
+        let draft = self
+            .draft
+            .load_model_from_hf(
+                revision,
+                token_source,
+                dtype,
+                device,
+                silent,
+                mapper,
+                in_situ_quant,
+                paged_attn_config,
+            )
+            .await?;
         Ok(Arc::new(tokio::sync::Mutex::new(SpeculativePipeline::new(
             target,
             draft,
@@ -90,7 +96,7 @@ impl Loader for SpeculativeLoader {
     }
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_path(
+    async fn load_model_from_path(
         &self,
         paths: &Box<dyn ModelPaths>,
         dtype: &dyn TryIntoDType,
@@ -109,24 +115,30 @@ impl Loader for SpeculativeLoader {
             paged_attn_config
         };
 
-        let target = self.target.load_model_from_path(
-            paths,
-            dtype,
-            device,
-            silent,
-            mapper.clone(),
-            in_situ_quant,
-            paged_attn_config,
-        )?;
-        let draft = self.draft.load_model_from_path(
-            paths,
-            dtype,
-            device,
-            silent,
-            mapper.clone(),
-            in_situ_quant,
-            paged_attn_config,
-        )?;
+        let target = self
+            .target
+            .load_model_from_path(
+                paths,
+                dtype,
+                device,
+                silent,
+                mapper.clone(),
+                in_situ_quant,
+                paged_attn_config,
+            )
+            .await?;
+        let draft = self
+            .draft
+            .load_model_from_path(
+                paths,
+                dtype,
+                device,
+                silent,
+                mapper.clone(),
+                in_situ_quant,
+                paged_attn_config,
+            )
+            .await?;
         Ok(Arc::new(tokio::sync::Mutex::new(SpeculativePipeline::new(
             target,
             draft,

@@ -4,7 +4,7 @@ use std::{
 };
 
 use hf_hub::{
-    api::sync::{ApiBuilder, ApiError as HFHubApiError, ApiRepo},
+    api::tokio::{ApiBuilder, ApiError as HFHubApiError, ApiRepo},
     Repo, RepoType,
 };
 use thiserror::Error;
@@ -46,7 +46,7 @@ pub enum HFError {
 ///
 /// # Returns
 /// * `Result<PathBuf, String>` - The path to the file (if found, or downloaded), error message if not.
-pub(crate) fn api_get_file(
+pub(crate) async fn api_get_file(
     api: &ApiRepo,
     file: &str,
     model_id: impl AsRef<Path>,
@@ -64,8 +64,10 @@ pub(crate) fn api_get_file(
         info!("Loading `{file}` locally at `{}`", path.display());
         Ok(path)
     } else {
-        api.get(file).map_err(|e| match e {
-            HFHubApiError::RequestError(err) if matches!(*err, ureq::Error::Status(403, _)) => {
+        api.get(file).await.map_err(|e| match e {
+            HFHubApiError::RequestError(err)
+                if matches!(err.status(), Some(reqwest::StatusCode::FORBIDDEN)) =>
+            {
                 HFError::AuthorizationError {
                     model_id: model_id.display().to_string(),
                 }
@@ -76,7 +78,7 @@ pub(crate) fn api_get_file(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn get_paths(
+pub async fn get_paths(
     model_id: String,
     tokenizer_json: Option<&str>,
     xlora_model_id: Option<&str>,
@@ -111,12 +113,12 @@ pub fn get_paths(
         })?
     } else {
         info!("Loading `tokenizer.json` at `{:?}`", model_id);
-        api_get_file(&api, "tokenizer.json", &model_id)?
+        api_get_file(&api, "tokenizer.json", &model_id).await?
     };
 
     // Get config path
     info!("Loading `config.json` at `{:?}`", model_id);
-    let config_filename = api_get_file(&api, "config.json", &model_id)?;
+    let config_filename = api_get_file(&api, "config.json", &model_id).await?;
 
     // Get model paths
     let filenames = get_model_paths(
@@ -127,7 +129,8 @@ pub fn get_paths(
         &api,
         Path::new(&model_id),
         loading_uqff,
-    )?;
+    )
+    .await?;
 
     // Get XLora paths
     let XLoraPaths {
@@ -143,28 +146,29 @@ pub fn get_paths(
         token_source,
         revision.clone(),
         xlora_order,
-    )?;
+    )
+    .await?;
 
     // Get optional configs by checking directory contents
-    let dir_contents: Vec<String> = api_dir_list(&api, Path::new(&model_id))?;
+    let dir_contents: Vec<String> = api_dir_list(&api, Path::new(&model_id)).await?;
 
     let gen_conf = if dir_contents.contains(&"generation_config.json".to_string()) {
         info!("Loading `generation_config.json` at `{}`", model_id);
-        Some(api_get_file(&api, "generation_config.json", &model_id)?)
+        Some(api_get_file(&api, "generation_config.json", &model_id).await?)
     } else {
         None
     };
 
     let preprocessor_config = if dir_contents.contains(&"preprocessor_config.json".to_string()) {
         info!("Loading `preprocessor_config.json` at `{}`", model_id);
-        Some(api_get_file(&api, "preprocessor_config.json", &model_id)?)
+        Some(api_get_file(&api, "preprocessor_config.json", &model_id).await?)
     } else {
         None
     };
 
     let processor_config = if dir_contents.contains(&"processor_config.json".to_string()) {
         info!("Loading `processor_config.json` at `{}`", model_id);
-        Some(api_get_file(&api, "processor_config.json", &model_id)?)
+        Some(api_get_file(&api, "processor_config.json", &model_id).await?)
     } else {
         None
     };
@@ -177,7 +181,7 @@ pub fn get_paths(
         })?)
     } else {
         info!("Loading `tokenizer_config.json` at `{}`", model_id);
-        Some(api_get_file(&api, "tokenizer_config.json", &model_id)?)
+        Some(api_get_file(&api, "tokenizer_config.json", &model_id).await?)
     };
 
     Ok(Box::new(LocalModelPaths::new(
@@ -206,7 +210,10 @@ pub fn get_paths(
 ///
 /// # Returns
 /// * `Result<Vec<String>>` - List of filenames in the directory
-pub fn api_dir_list(api: &ApiRepo, model_id: impl AsRef<Path>) -> Result<Vec<String>, HFError> {
+pub async fn api_dir_list(
+    api: &ApiRepo,
+    model_id: impl AsRef<Path>,
+) -> Result<Vec<String>, HFError> {
     let model_id = model_id.as_ref();
 
     if model_id.exists() {
@@ -234,7 +241,7 @@ pub fn api_dir_list(api: &ApiRepo, model_id: impl AsRef<Path>) -> Result<Vec<Str
             .collect()
     } else {
         // Get listing from API
-        let repo = api.info()?;
+        let repo = api.info().await?;
         Ok(repo.siblings.iter().map(|x| x.rfilename.clone()).collect())
     }
 }

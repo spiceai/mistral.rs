@@ -9,18 +9,17 @@ use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 
-use hf_hub::api::sync::ApiRepo;
+use hf_hub::api::tokio::ApiRepo;
 #[cfg(feature = "pyo3_macros")]
 use pyo3::pyclass;
 
+use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
 
-use tracing::info;
-
 use super::{ModelPaths, NormalLoadingMetadata};
 use crate::{
-    api_dir_list, api_get_file,
+    api_dir_list,
     diffusion_models::{
         flux::{
             self,
@@ -30,6 +29,7 @@ use crate::{
     },
     lora::LoraConfig,
     paged_attention::AttentionImplementation,
+    pipeline::api_get_file,
     xlora_models::XLoraConfig,
     Ordering,
 };
@@ -45,11 +45,12 @@ pub trait DiffusionModel {
     fn max_seq_len(&self) -> usize;
 }
 
+#[async_trait]
 pub trait DiffusionModelLoader: Send + Sync {
     /// If the model is being loaded with `load_model_from_hf` (so manual paths not provided), this will be called.
-    fn get_model_paths(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>>;
+    async fn get_model_paths(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>>;
     /// If the model is being loaded with `load_model_from_hf` (so manual paths not provided), this will be called.
-    fn get_config_filenames(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>>;
+    async fn get_config_filenames(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>>;
     fn force_cpu_vb(&self) -> Vec<bool>;
     // `configs` and `vbs` should be corresponding. It is up to the implementer to maintain this invaraint.
     fn load(
@@ -149,22 +150,23 @@ pub struct FluxLoader {
     pub(crate) offload: bool,
 }
 
+#[async_trait]
 impl DiffusionModelLoader for FluxLoader {
-    fn get_model_paths(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>> {
+    async fn get_model_paths(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>> {
         let regex = Regex::new(r"^flux\d+-(schnell|dev)\.safetensors$")?;
         let flux_name = api_dir_list!(api, model_id)
             .filter(|x| regex.is_match(x))
             .nth(0)
             .with_context(|| "Expected at least 1 .safetensors file matching the FLUX regex, please raise an issue.")?;
-        let flux_file = api_get_file!(api, &flux_name, model_id);
-        let ae_file = api_get_file!(api, "ae.safetensors", model_id);
+        let flux_file = api_get_file(api, &flux_name, model_id).await;
+        let ae_file = api_get_file(api, Path::new("ae.safetensors"), model_id).await;
 
         // NOTE(EricLBuehler): disgusting way of doing this but the 0th path is the flux, 1 is ae
         Ok(vec![flux_file, ae_file])
     }
-    fn get_config_filenames(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>> {
-        let flux_file = api_get_file!(api, "transformer/config.json", model_id);
-        let ae_file = api_get_file!(api, "vae/config.json", model_id);
+    async fn get_config_filenames(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>> {
+        let flux_file = api_get_file(api, "transformer/config.json", model_id).await;
+        let ae_file = api_get_file(api, "vae/config.json", model_id).await;
 
         // NOTE(EricLBuehler): disgusting way of doing this but the 0th path is the flux, 1 is ae
         Ok(vec![flux_file, ae_file])

@@ -11,6 +11,7 @@ use super::{
 };
 use crate::device_map::{self, DeviceMapper};
 use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
+use crate::pipeline::api_get_file;
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::llg::build_tok_env;
 use crate::pipeline::sampling::sample_and_add_toks;
@@ -24,16 +25,17 @@ use crate::vision_models::{
     preprocessor_config::PreProcessorConfig, processor_config::ProcessorConfig, ModelInputs,
 };
 use crate::{
-    api_dir_list, api_get_file, get_uqff_paths, vision_normal_model_loader, AnyMoeExpertType,
-    DeviceMapSetting, Ordering, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
+    api_dir_list, get_uqff_paths, vision_normal_model_loader, AnyMoeExpertType, DeviceMapSetting,
+    Ordering, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
 };
+use async_trait::async_trait;
 
 use crate::prefix_cacher_v2::PrefixCacheManagerV2;
 use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 
 use anyhow::Result;
 use candle_core::{Device, Tensor, Var};
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use hf_hub::{api::tokio::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::{GgufMatMul, HqqLayer, IsqType, QuantizedSerdeType};
 use rand_isaac::Isaac64Rng;
 use regex_automata::meta::Regex;
@@ -148,10 +150,10 @@ impl VisionLoaderBuilder {
         })
     }
 }
-
+#[async_trait]
 impl Loader for VisionLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_hf(
+    async fn load_model_from_hf(
         &self,
         revision: Option<String>,
         token_source: TokenSource,
@@ -174,7 +176,8 @@ impl Loader for VisionLoader {
             None,
             silent,
             self.config.from_uqff.is_some(),
-        )?;
+        )
+        .await?;
         if let Some(from_uqff) = self.config.from_uqff.clone() {
             *self.from_uqff.write().unwrap() = Some(get_uqff_paths!(&from_uqff, self, silent));
         }
@@ -192,10 +195,11 @@ impl Loader for VisionLoader {
             in_situ_quant,
             paged_attn_config,
         )
+        .await
     }
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_path(
+    async fn load_model_from_path(
         &self,
         paths: &Box<dyn ModelPaths>,
         dtype: &dyn TryIntoDType,
@@ -791,7 +795,7 @@ impl AnyMoePipelineMixin for VisionPipeline {
     fn amoe_take_cached_gating_outputs(&mut self) -> Vec<Tensor> {
         self.model.take_cached_gating_outputs()
     }
-    fn amoe_create_layers(
+    async fn amoe_create_layers(
         &mut self,
         model_ids: Vec<String>,
         token: &TokenSource,
@@ -826,8 +830,11 @@ impl AnyMoePipelineMixin for VisionPipeline {
             ));
 
             let mut filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
-                filenames.push(api_get_file!(api, &rfilename, model_id));
+            for rfilename in api_dir_list!(api, model_id)
+                .await
+                .filter(|x| x.ends_with(".safetensors"))
+            {
+                filenames.push(api_get_file!(api, &rfilename, model_id).await);
             }
 
             let regex = regex.clone();

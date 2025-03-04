@@ -15,8 +15,9 @@ use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 use crate::utils::{tokens::get_token, varbuilder_utils::from_mmaped_safetensors};
 use crate::{DeviceMapSetting, PagedAttentionConfig, Pipeline, TryIntoDType};
 use anyhow::Result;
+use async_trait::async_trait;
 use candle_core::{DType, Device, Tensor};
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use hf_hub::{api::tokio::ApiBuilder, Repo, RepoType};
 use image::{DynamicImage, RgbImage};
 use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
@@ -78,10 +79,10 @@ impl DiffusionLoaderBuilder {
         })
     }
 }
-
+#[async_trait]
 impl Loader for DiffusionLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_hf(
+    async fn load_model_from_hf(
         &self,
         revision: Option<String>,
         token_source: TokenSource,
@@ -104,8 +105,8 @@ impl Loader for DiffusionLoader {
                 revision.clone(),
             ));
             let model_id = std::path::Path::new(&self.model_id);
-            let filenames = self.inner.get_model_paths(&api, model_id)?;
-            let config_filenames = self.inner.get_config_filenames(&api, model_id)?;
+            let filenames = self.inner.get_model_paths(&api, model_id).await?;
+            let config_filenames = self.inner.get_config_filenames(&api, model_id).await?;
             Ok(Box::new(DiffusionModelPaths(DiffusionModelPathsInner {
                 config_filenames,
                 filenames,
@@ -120,10 +121,11 @@ impl Loader for DiffusionLoader {
             in_situ_quant,
             paged_attn_config,
         )
+        .await
     }
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_path(
+    async fn load_model_from_path(
         &self,
         paths: &Box<dyn ModelPaths>,
         dtype: &dyn TryIntoDType,

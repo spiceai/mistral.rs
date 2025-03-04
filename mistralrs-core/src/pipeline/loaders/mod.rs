@@ -12,6 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use as_any::AsAny;
+use async_trait::async_trait;
 use candle_core::{DType, Device};
 use itertools::Itertools;
 use mistralrs_quant::IsqType;
@@ -47,7 +48,7 @@ use super::Pipeline;
 
 /// `ModelPaths` abstracts the mechanism to get all necessary files for running a model. For
 /// example `LocalModelPaths` implements `ModelPaths` when all files are in the local file system.
-pub trait ModelPaths: AsAny + Debug {
+pub trait ModelPaths: AsAny + Debug + Send + Sync {
     /// Model weights files (multiple files supported).
     fn get_weight_filenames(&self) -> &[PathBuf];
 
@@ -754,12 +755,13 @@ pub trait DeviceMappedModelLoader {
 ///     None,
 /// ).unwrap();
 /// ```
+#[async_trait]
 pub trait Loader: Send + Sync {
     /// If `revision` is None, then it defaults to `main`.
     /// If `dtype` is None, then it defaults to the model default (usually BF16).
     /// If model is not found on HF, will attempt to resolve locally.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_hf(
+    async fn load_model_from_hf(
         &self,
         revision: Option<String>,
         token_source: TokenSource,
@@ -778,7 +780,7 @@ pub trait Loader: Send + Sync {
         clippy::too_many_arguments,
         clippy::borrowed_box
     )]
-    fn load_model_from_path(
+    async fn load_model_from_path(
         &self,
         paths: &Box<dyn ModelPaths>,
         dtype: &dyn TryIntoDType,

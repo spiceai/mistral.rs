@@ -7,7 +7,7 @@ use std::{
 use anyhow::Result;
 use either::Either;
 use hf_hub::{
-    api::sync::{ApiBuilder, ApiRepo},
+    api::tokio::{ApiBuilder, ApiRepo},
     Repo, RepoType,
 };
 use regex_automata::meta::{BuildError, Regex};
@@ -42,7 +42,7 @@ pub(crate) struct XLoraPaths {
     pub lora_preload_adapter_info: Option<HashMap<String, (PathBuf, LoraConfig)>>,
 }
 
-pub fn get_xlora_paths(
+pub async fn get_xlora_paths(
     base_model_id: String,
     xlora_model_id: Option<&str>,
     token_source: &TokenSource,
@@ -63,7 +63,7 @@ pub fn get_xlora_paths(
         ));
 
     let model_id = Path::new(&xlora_id);
-    let api_dir = api_dir_list(&api, model_id)?;
+    let api_dir = api_dir_list(&api, model_id).await?;
 
     // Get the path for the xlora classifier
     let xlora_classifier = api_dir
@@ -76,9 +76,12 @@ pub fn get_xlora_paths(
     }
     let xlora_classifier = xlora_classifier.first();
 
-    let classifier_path = xlora_classifier
-        .map(|xlora_classifier| api_get_file(&api, xlora_classifier, model_id))
-        .transpose()?;
+    let classifier_path = if let Some(xlora_classifier) = xlora_classifier {
+        let c = api_get_file(&api, xlora_classifier, model_id).await?;
+        Some(c)
+    } else {
+        None
+    };
 
     // Get the path for the xlora config by checking all for valid versions.
     // NOTE(EricLBuehler): Remove this functionality because all configs should be deserializable
@@ -96,7 +99,7 @@ pub fn get_xlora_paths(
         if xlora_configs.len() != 1 {
             warn!("Selecting config: `{}`", config_path);
         }
-        let config_path = api_get_file(&api, config_path, model_id)?;
+        let config_path = api_get_file(&api, config_path, model_id).await?;
         let conf = fs::read_to_string(config_path)?;
         let deser: Result<XLoraConfig, serde_json::Error> = serde_json::from_str(&conf);
         match deser {
@@ -149,9 +152,9 @@ pub fn get_xlora_paths(
     let mut adapters_paths: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for (file, name) in adapter_files {
         if let Some(paths) = adapters_paths.get_mut(&name) {
-            paths.push(api_get_file(&api, file, model_id)?);
+            paths.push(api_get_file(&api, file, model_id).await?);
         } else {
-            adapters_paths.insert(name, vec![api_get_file(&api, file, model_id)?]);
+            adapters_paths.insert(name, vec![api_get_file(&api, file, model_id).await?]);
         }
     }
 
@@ -179,7 +182,7 @@ pub fn get_xlora_paths(
         )));
     };
 
-    let lora_preload_adapter_info = lora_preload_adapter_info(&api, model_id, xlora_order)?;
+    let lora_preload_adapter_info = lora_preload_adapter_info(&api, model_id, xlora_order).await?;
     Ok(XLoraPaths {
         adapter_configs: Some(adapters_configs),
         adapter_safetensors: Some(adapters_safetensors),
@@ -228,7 +231,7 @@ pub fn xlora_adapters_config_and_safetensors(
 
 pub type LoraAdapterInfo = HashMap<String, (PathBuf, LoraConfig)>;
 // If preload adapters are specified
-pub fn lora_preload_adapter_info(
+pub async fn lora_preload_adapter_info(
     api: &ApiRepo,
     model_id: &Path,
     xlora_order: Option<&Ordering>,
@@ -242,7 +245,7 @@ pub fn lora_preload_adapter_info(
     let mut output = HashMap::new();
     for adapter in preload_adapters {
         // Get the names and remote paths of the files associated with this adapter
-        let files = api_dir_list(api, &adapter.adapter_model_id)?;
+        let files = api_dir_list(api, &adapter.adapter_model_id).await?;
         let adapter_files = files
             .iter()
             .filter_map(|f| {
@@ -259,7 +262,7 @@ pub fn lora_preload_adapter_info(
         // Get local paths for this adapter
         let mut adapters_paths: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for (file, name) in adapter_files {
-            let path = api_get_file(api, file, model_id)?;
+            let path = api_get_file(api, file, model_id).await?;
             if let Some(paths) = adapters_paths.get_mut(&name) {
                 paths.push(path);
             } else {
@@ -302,7 +305,7 @@ fn compile_patterns() -> Result<(Regex, Regex, Regex), BuildError> {
     Ok((safetensor_match, quant_safetensor_match, pickle_match))
 }
 
-pub fn get_model_paths(
+pub async fn get_model_paths(
     revision: String,
     token_source: &TokenSource,
     quantized_model_id: Option<&str>,
@@ -327,7 +330,7 @@ pub fn get_model_paths(
                     revision.clone(),
                 ));
                 let model_id = Path::new(&id);
-                files.push(api_get_file(&qapi, name, model_id)?);
+                files.push(api_get_file(&qapi, name, model_id).await?);
             }
             Ok(files)
         }
@@ -339,7 +342,7 @@ pub fn get_model_paths(
                 })?;
 
             let mut filenames = vec![];
-            let all_listing = api_dir_list(api, model_id)?;
+            let all_listing = api_dir_list(api, model_id).await?;
             let listing = all_listing.iter().filter(|&x| {
                 safetensor_match.is_match(x)
                     || pickle_match.is_match(x)
@@ -380,7 +383,7 @@ pub fn get_model_paths(
                     .collect::<Vec<_>>()
             );
             for rfilename in files {
-                filenames.push(api_get_file(api, rfilename, model_id)?);
+                filenames.push(api_get_file(api, rfilename, model_id).await?);
             }
             Ok(filenames)
         }

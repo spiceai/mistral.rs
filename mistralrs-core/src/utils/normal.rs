@@ -50,7 +50,7 @@ impl FromStr for ModelDType {
 }
 
 /// Type which can be converted to a DType
-pub trait TryIntoDType {
+pub trait TryIntoDType: Send + Sync {
     fn try_into_dtype(&self, devices: &[&Device]) -> Result<DType>;
 }
 

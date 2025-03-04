@@ -29,7 +29,7 @@ pub enum MessagesAction {
 /// Processor for messages.
 /// Also includes method to retrieve the input processor for processing inputs for the
 /// model.
-pub trait Processor {
+pub trait Processor: Send + Sync {
     /// Get the tokens and the untokenized prompt. `add_special_tokens` should usually be true.
     fn process(
         &self,

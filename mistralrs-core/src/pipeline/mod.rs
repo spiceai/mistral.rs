@@ -28,6 +28,7 @@ use chat_template::ChatTemplate;
 pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder, DiffusionSpecificConfig};
 pub use ggml::{GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig};
 pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
+use hf_hub::api::tokio::ApiRepo;
 use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
 pub use isq::{parse_isq_value, IsqModel, IsqOrganization};
@@ -51,10 +52,13 @@ use rand_isaac::Isaac64Rng;
 pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline};
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
+use tracing::info;
 pub use vision::{VisionLoader, VisionLoaderBuilder, VisionSpecificConfig};
 
 use anyhow::Result;
@@ -156,6 +160,7 @@ pub trait MetadataMixin {
 }
 
 /// Implemented by the base model of an AnyMoe.
+#[async_trait::async_trait]
 pub trait AnyMoePipelineMixin {
     /// Get vars for each gating layer
     fn amoe_layer_vars(&self) -> Vec<Vec<Var>> {
@@ -176,7 +181,7 @@ pub trait AnyMoePipelineMixin {
     }
     /// Inject the MoE layers
     #[allow(clippy::too_many_arguments)]
-    fn amoe_create_layers(
+    async fn amoe_create_layers(
         &mut self,
         _model_ids: Vec<String>,
         _token: &TokenSource,
@@ -195,7 +200,7 @@ pub trait AnyMoePipelineMixin {
     }
     /// Pre-train the gating layers
     #[allow(clippy::too_many_arguments)]
-    fn amoe_pre_train(
+    async fn amoe_pre_train(
         &self,
         _inputs: AnyMoeTrainingInputs,
         (_prefix, _mlp): (String, String),
@@ -670,6 +675,38 @@ pub trait Pipeline:
     ) -> Result<(), candle_core::Error>;
 
     fn category(&self) -> ModelCategory;
+}
+
+pub async fn api_get_file<
+    S: AsRef<std::ffi::OsStr> + ?Sized,
+    T: AsRef<std::ffi::OsStr> + ?Sized,
+>(
+    api: &ApiRepo,
+    file: &S,
+    model_id: &T,
+) -> PathBuf {
+    let model_id = Path::new(model_id);
+    let file = Path::new(file);
+    if model_id.exists() {
+        let path = model_id.join(file);
+        if !path.exists() {
+            panic!(
+                "File \"{}\" not found at model id {}",
+                file.display(),
+                model_id.display(),
+            )
+        }
+        info!(
+            "Loading `{}` locally at `{}`",
+            file.display(),
+            path.display()
+        );
+        path
+    } else {
+        api.get(file.display().to_string().as_str())
+            .await
+            .unwrap_or_else(|e| panic!("Could not get file {:?} from API: {:?}", file.display(), e))
+    }
 }
 
 pub(crate) fn extract_logits(

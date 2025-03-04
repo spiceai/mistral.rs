@@ -1,3 +1,8 @@
+use std::path::PathBuf;
+
+use hf_hub::api::tokio::ApiRepo;
+use tracing::info;
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! api_dir_list {
@@ -23,6 +28,7 @@ macro_rules! api_dir_list {
                 .into_iter()
         } else {
             $api.info()
+                .await
                 .map(|repo| {
                     repo.siblings
                         .iter()
@@ -31,24 +37,6 @@ macro_rules! api_dir_list {
                 })
                 .unwrap_or_else(|e| panic!("Could not get directory listing from API: {:?}", e))
                 .into_iter()
-        }
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! api_get_file {
-    ($api:expr, $file:expr, $model_id:expr) => {
-        if std::path::Path::new($model_id).exists() {
-            let path = $model_id.join($file);
-            if !path.exists() {
-                panic!("File \"{}\" not found at model id {:?}", $file, $model_id)
-            }
-            info!("Loading `{}` locally at `{}`", &$file, path.display());
-            path
-        } else {
-            $api.get($file)
-                .unwrap_or_else(|e| panic!("Could not get file {:?} from API: {:?}", $file, e))
         }
     };
 }
@@ -82,10 +70,11 @@ macro_rules! get_paths {
             PathBuf::from_str(p)?
         } else {
             info!("Loading `tokenizer.json` at `{}`", $this.model_id);
-            $crate::api_get_file!(api, "tokenizer.json", model_id)
+            $crate::pipeline::api_get_file(&api, std::path::Path::new("tokenizer.json"), &model_id)
+                .await
         };
         info!("Loading `config.json` at `{}`", $this.model_id);
-        let config_filename = $crate::api_get_file!(api, "config.json", model_id);
+        let config_filename = $crate::pipeline::api_get_file(&api, "config.json", &model_id).await;
         let filenames = get_model_paths(
             revision.clone(),
             &$token_source,
@@ -94,7 +83,8 @@ macro_rules! get_paths {
             &api,
             &model_id,
             $loading_uqff,
-        )?;
+        )
+        .await?;
         let XLoraPaths {
             adapter_configs,
             adapter_safetensors,
@@ -108,17 +98,14 @@ macro_rules! get_paths {
             &$token_source,
             revision.clone(),
             $this.xlora_order.as_ref(),
-        )?;
+        )
+        .await?;
         let gen_conf = if $crate::api_dir_list!(api, model_id)
             .collect::<Vec<_>>()
             .contains(&"generation_config.json".to_string())
         {
             info!("Loading `generation_config.json` at `{}`", $this.model_id);
-            Some($crate::api_get_file!(
-                api,
-                "generation_config.json",
-                model_id
-            ))
+            Some($crate::pipeline::api_get_file(&api, "generation_config.json", model_id).await)
         } else {
             None
         };
@@ -127,11 +114,7 @@ macro_rules! get_paths {
             .contains(&"preprocessor_config.json".to_string())
         {
             info!("Loading `preprocessor_config.json` at `{}`", $this.model_id);
-            Some($crate::api_get_file!(
-                api,
-                "preprocessor_config.json",
-                model_id
-            ))
+            Some($crate::pipeline::api_get_file(&api, "preprocessor_config.json", model_id).await)
         } else {
             None
         };
@@ -140,11 +123,7 @@ macro_rules! get_paths {
             .contains(&"processor_config.json".to_string())
         {
             info!("Loading `processor_config.json` at `{}`", $this.model_id);
-            Some($crate::api_get_file!(
-                api,
-                "processor_config.json",
-                model_id
-            ))
+            Some($crate::pipeline::api_get_file(&api, "processor_config.json", model_id).await)
         } else {
             None
         };
@@ -153,18 +132,14 @@ macro_rules! get_paths {
             Some(PathBuf::from_str(p)?)
         } else {
             info!("Loading `tokenizer_config.json` at `{}`", $this.model_id);
-            Some($crate::api_get_file!(
-                api,
-                "tokenizer_config.json",
-                model_id
-            ))
+            Some($crate::pipeline::api_get_file(&api, "tokenizer_config.json", model_id).await)
         };
         let chat_template_json_filename = if $crate::api_dir_list!(api, model_id)
             .collect::<Vec<_>>()
             .contains(&"chat_template.json".to_string())
         {
             info!("Loading `chat_template.json` at `{}`", $this.model_id);
-            Some($crate::api_get_file!(api, "chat_template.json", model_id))
+            Some($crate::pipeline::api_get_file(&api, "chat_template.json", model_id).await)
         } else {
             None
         };
@@ -216,7 +191,7 @@ macro_rules! get_uqff_paths {
 
         let file = $from_uqff.display().to_string();
 
-        api_get_file!(api, &file, Path::new(&$this.model_id))
+        api_get_file(&api, &file, Path::new(&$this.model_id)).await
     }};
 }
 
@@ -257,11 +232,11 @@ macro_rules! get_paths_gguf {
                 None
             } else {
                 info!("Loading `tokenizer_config.json` at `{}` because no chat template file was specified.", this_model_id);
-                let res = $crate::api_get_file!(
-                    api,
+                let res = $crate::pipeline::api_get_file(
+                    &api,
                     "tokenizer_config.json",
-                    model_id
-                );
+                    model_id,
+                ).await;
                 Some(res)
             }
         };
@@ -274,7 +249,7 @@ macro_rules! get_paths_gguf {
             &api,
             &model_id,
             false, // Never loading UQFF
-        )?;
+        ).await?;
 
         let XLoraPaths {
             adapter_configs,
@@ -289,18 +264,18 @@ macro_rules! get_paths_gguf {
             &$token_source,
             revision.clone(),
             $this.xlora_order.as_ref(),
-        )?;
+        ).await?;
 
         let gen_conf = if $crate::api_dir_list!(api, model_id)
             .collect::<Vec<_>>()
             .contains(&"generation_config.json".to_string())
         {
             info!("Loading `generation_config.json` at `{}`", this_model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::api_get_file(
+                &api,
                 "generation_config.json",
                 model_id
-            ))
+            ).await)
         } else {
             None
         };
@@ -310,11 +285,11 @@ macro_rules! get_paths_gguf {
             .contains(&"preprocessor_config.json".to_string())
         {
             info!("Loading `preprocessor_config.json` at `{}`", this_model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::api_get_file(
+                &api,
                 "preprocessor_config.json",
                 model_id
-            ))
+            ).await)
         } else {
             None
         };
@@ -324,18 +299,18 @@ macro_rules! get_paths_gguf {
             .contains(&"processor_config.json".to_string())
         {
             info!("Loading `processor_config.json` at `{}`", this_model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::api_get_file(
+                &api,
                 "processor_config.json",
                 model_id
-            ))
+            ).await)
         } else {
             None
         };
 
         let tokenizer_filename = if $this.model_id.is_some() {
             info!("Loading `tokenizer.json` at `{}`", this_model_id);
-            $crate::api_get_file!(api, "tokenizer.json", model_id)
+            $crate::pipeline::api_get_file(&api, "tokenizer.json", model_id).await
         } else {
             PathBuf::from_str("")?
         };
@@ -345,11 +320,11 @@ macro_rules! get_paths_gguf {
             .contains(&"chat_template.json".to_string())
         {
             info!("Loading `chat_template.json` at `{}`", this_model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::api_get_file(
+                &api,
                 "chat_template.json",
                 model_id
-            ))
+            ).await)
         } else {
             None
         };

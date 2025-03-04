@@ -17,6 +17,10 @@ use rand::{seq::SliceRandom, thread_rng};
 use rand_isaac::Isaac64Rng;
 use tracing::{info, warn};
 
+use super::{
+    AdapterActivationMixin, AnyMoePipelineMixin, CacheManagerMixin, EitherCache,
+    ForwardInputsResult, IsqPipelineMixin, MetadataMixin, PreProcessingMixin,
+};
 use crate::{
     amoe::{AnyMoeConfig, AnyMoeTrainingInputRow, AnyMoeTrainingInputs, AnyMoeTrainingResult},
     device_map::DeviceMapper,
@@ -28,11 +32,7 @@ use crate::{
     DeviceMapSetting, Loader, ModelCategory, ModelKind, ModelPaths, PagedAttentionConfig, Pipeline,
     Response, TokenSource, TryIntoDType,
 };
-
-use super::{
-    AdapterActivationMixin, AnyMoePipelineMixin, CacheManagerMixin, EitherCache,
-    ForwardInputsResult, IsqPipelineMixin, MetadataMixin, PreProcessingMixin,
-};
+use async_trait::async_trait;
 
 pub struct AnyMoeLoader {
     pub target: Box<dyn Loader>,
@@ -48,10 +48,10 @@ pub struct AnyMoePipeline {
     target: Arc<tokio::sync::Mutex<dyn Pipeline>>,
     config: AnyMoeConfig,
 }
-
+#[async_trait]
 impl Loader for AnyMoeLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_hf(
+    async fn load_model_from_hf(
         &self,
         revision: Option<String>,
         token_source: TokenSource,
@@ -69,32 +69,38 @@ impl Loader for AnyMoeLoader {
             paged_attn_config
         };
 
-        let target = self.target.load_model_from_hf(
-            revision.clone(),
-            token_source.clone(),
-            dtype,
-            device,
-            silent,
-            mapper.clone(),
-            in_situ_quant,
-            paged_attn_config,
-        )?;
-        Ok(Arc::new(tokio::sync::Mutex::new(AnyMoePipeline::new(
-            target,
-            self.config.clone(),
-            AnyMoeTrainingInputs::from_json(&self.path)?,
-            self.prefix.clone(),
-            self.mlp.clone(),
-            self.model_ids.clone(),
-            token_source,
-            revision,
-            self.layers.clone(),
-            silent,
-        )?)))
+        let target = self
+            .target
+            .load_model_from_hf(
+                revision.clone(),
+                token_source.clone(),
+                dtype,
+                device,
+                silent,
+                mapper.clone(),
+                in_situ_quant,
+                paged_attn_config,
+            )
+            .await?;
+        Ok(Arc::new(tokio::sync::Mutex::new(
+            AnyMoePipeline::new(
+                target,
+                self.config.clone(),
+                AnyMoeTrainingInputs::from_json(&self.path)?,
+                self.prefix.clone(),
+                self.mlp.clone(),
+                self.model_ids.clone(),
+                token_source,
+                revision,
+                self.layers.clone(),
+                silent,
+            )
+            .await?,
+        )))
     }
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_path(
+    async fn load_model_from_path(
         &self,
         paths: &Box<dyn ModelPaths>,
         dtype: &dyn TryIntoDType,
@@ -111,27 +117,33 @@ impl Loader for AnyMoeLoader {
             paged_attn_config
         };
 
-        let target = self.target.load_model_from_path(
-            paths,
-            dtype,
-            device,
-            silent,
-            mapper.clone(),
-            in_situ_quant,
-            paged_attn_config,
-        )?;
-        Ok(Arc::new(tokio::sync::Mutex::new(AnyMoePipeline::new(
-            target,
-            self.config.clone(),
-            AnyMoeTrainingInputs::from_json(&self.path)?,
-            self.prefix.clone(),
-            self.mlp.clone(),
-            self.model_ids.clone(),
-            TokenSource::None,
-            None,
-            self.layers.clone(),
-            silent,
-        )?)))
+        let target = self
+            .target
+            .load_model_from_path(
+                paths,
+                dtype,
+                device,
+                silent,
+                mapper.clone(),
+                in_situ_quant,
+                paged_attn_config,
+            )
+            .await?;
+        Ok(Arc::new(tokio::sync::Mutex::new(
+            AnyMoePipeline::new(
+                target,
+                self.config.clone(),
+                AnyMoeTrainingInputs::from_json(&self.path)?,
+                self.prefix.clone(),
+                self.mlp.clone(),
+                self.model_ids.clone(),
+                TokenSource::None,
+                None,
+                self.layers.clone(),
+                silent,
+            )
+            .await?,
+        )))
     }
     fn get_id(&self) -> String {
         format!("AnyMoE: tgt = `{}`", self.target.get_id(),)
@@ -145,7 +157,7 @@ impl Loader for AnyMoeLoader {
 
 impl AnyMoePipeline {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub async fn new(
         target: Arc<tokio::sync::Mutex<dyn Pipeline>>,
         config: AnyMoeConfig,
         inputs: AnyMoeTrainingInputs,
@@ -159,15 +171,18 @@ impl AnyMoePipeline {
     ) -> anyhow::Result<Self> {
         let this = Self { target, config };
         info!("Loaded pretraining dataset of {} samples.", inputs.len());
-        match this.amoe_pre_train(
-            inputs,
-            (prefix, mlp),
-            model_ids,
-            token,
-            revision,
-            layers,
-            silent,
-        )? {
+        match this
+            .amoe_pre_train(
+                inputs,
+                (prefix, mlp),
+                model_ids,
+                token,
+                revision,
+                layers,
+                silent,
+            )
+            .await?
+        {
             Some(AnyMoeTrainingResult { steps, final_loss }) => {
                 info!("Finished training in {steps} steps. Final losses per layer: {final_loss:?}")
             }
@@ -278,9 +293,10 @@ impl Pipeline for AnyMoePipeline {
     }
 }
 
+#[async_trait]
 impl AnyMoePipelineMixin for AnyMoePipeline {
     // Training result is None if inference
-    fn amoe_pre_train(
+    async fn amoe_pre_train(
         &self,
         inputs: AnyMoeTrainingInputs,
         (prefix, mlp): (String, String),
@@ -318,24 +334,26 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
         info!("Expert model ids: {model_ids:?}");
 
         // Inject the AnyMoE layers
-        target.amoe_create_layers(
-            model_ids,
-            &token,
-            revision,
-            &mlp.clone(),
-            self.config.clone(),
-            metadata.activation_dtype,
-            &device,
-            (prefix, mlp),
-            layers,
-            expert_type,
-            silent,
-            if !training {
-                gate_model_id.clone()
-            } else {
-                None
-            },
-        )?;
+        target
+            .amoe_create_layers(
+                model_ids,
+                &token,
+                revision,
+                &mlp.clone(),
+                self.config.clone(),
+                metadata.activation_dtype,
+                &device,
+                (prefix, mlp),
+                layers,
+                expert_type,
+                silent,
+                if !training {
+                    gate_model_id.clone()
+                } else {
+                    None
+                },
+            )
+            .await?;
         let layer_vars = target.amoe_layer_vars();
 
         // If there are no trainable params, assume we got a gate model id so no training

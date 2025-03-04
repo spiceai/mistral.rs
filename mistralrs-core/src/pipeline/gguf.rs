@@ -43,9 +43,10 @@ use crate::{
     xlora_models::{XLoraQLlama, XLoraQPhi3},
 };
 use anyhow::{bail, Result};
+use async_trait::async_trait;
 use candle_core::{Device, Tensor};
 use either::Either;
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use hf_hub::{api::tokio::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
 use std::any::Any;
@@ -250,10 +251,10 @@ impl GGUFLoader {
         }
     }
 }
-
+#[async_trait]
 impl Loader for GGUFLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_hf(
+    async fn load_model_from_hf(
         &self,
         revision: Option<String>,
         token_source: TokenSource,
@@ -282,10 +283,11 @@ impl Loader for GGUFLoader {
             in_situ_quant,
             paged_attn_config,
         )
+        .await
     }
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_path(
+    async fn load_model_from_path(
         &self,
         paths: &Box<dyn ModelPaths>,
         dtype: &dyn TryIntoDType,

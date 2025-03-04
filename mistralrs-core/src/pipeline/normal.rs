@@ -3,13 +3,13 @@ use super::hf::get_paths;
 use super::isq::ImatrixDataSource;
 use super::llg::build_tok_env;
 use super::{
-    text_models_inputs_processor::ModelInputs, AdapterKind, CacheManager, GeneralMetadata, Loader,
-    ModelKind, ModelPaths, NormalModel, NormalModelLoader, TokenSource,
-};
-use super::{
-    AdapterActivationMixin, AnyMoePipelineMixin, CacheManagerMixin, EitherCache,
+    api_get_file, AdapterActivationMixin, AnyMoePipelineMixin, CacheManagerMixin, EitherCache,
     ForwardInputsResult, IsqOrganization, IsqPipelineMixin, MetadataMixin, ModelCategory,
     PreProcessingMixin,
+};
+use super::{
+    text_models_inputs_processor::ModelInputs, AdapterKind, CacheManager, GeneralMetadata, Loader,
+    ModelKind, ModelPaths, NormalModel, NormalModelLoader, TokenSource,
 };
 use super::{
     AutoLoader, DeepSeekV2Loader, DeepSeekV3Loader, Gemma2Loader, GemmaLoader, LlamaLoader,
@@ -32,13 +32,14 @@ use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 use crate::utils::{tokens::get_token, varbuilder_utils::from_mmaped_safetensors};
 use crate::xlora_models::NonGranularState;
 use crate::{
-    api_dir_list, api_get_file, get_mut_arcmutex, get_uqff_paths, lora_model_loader,
-    normal_model_loader, xlora_model_loader, DeviceMapSetting, PagedAttentionConfig, Pipeline,
-    Topology, TryIntoDType,
+    api_dir_list, get_mut_arcmutex, get_uqff_paths, lora_model_loader, normal_model_loader,
+    xlora_model_loader, DeviceMapSetting, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
 };
+
 use anyhow::Result;
+use async_trait::async_trait;
 use candle_core::{Device, Tensor, Var};
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use hf_hub::{api::tokio::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::{GgufMatMul, HqqLayer, IsqType, QuantizedSerdeType};
 use rand_isaac::Isaac64Rng;
 use regex_automata::meta::Regex;
@@ -224,9 +225,10 @@ impl NormalLoaderBuilder {
     }
 }
 
+#[async_trait]
 impl Loader for NormalLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_hf(
+    async fn load_model_from_hf(
         &self,
         revision: Option<String>,
         token_source: TokenSource,
@@ -249,7 +251,8 @@ impl Loader for NormalLoader {
             None,
             silent,
             self.config.from_uqff.is_some(),
-        )?;
+        )
+        .await?;
         if let Some(from_uqff) = self.config.from_uqff.clone() {
             *self.from_uqff.write().unwrap() = Some(get_uqff_paths!(&from_uqff, self, silent));
         }
@@ -267,10 +270,11 @@ impl Loader for NormalLoader {
             in_situ_quant,
             paged_attn_config,
         )
+        .await
     }
 
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
-    fn load_model_from_path(
+    async fn load_model_from_path(
         &self,
         paths: &Box<dyn ModelPaths>,
         dtype: &dyn TryIntoDType,
@@ -908,6 +912,7 @@ impl Pipeline for NormalPipeline {
     }
 }
 
+#[async_trait]
 impl AnyMoePipelineMixin for NormalPipeline {
     fn amoe_finish_training(&mut self, gate_model_id: Option<String>) -> candle_core::Result<()> {
         self.model.finish_training(gate_model_id)
@@ -921,7 +926,7 @@ impl AnyMoePipelineMixin for NormalPipeline {
     fn amoe_take_cached_gating_outputs(&mut self) -> Vec<Tensor> {
         self.model.take_cached_gating_outputs()
     }
-    fn amoe_create_layers(
+    async fn amoe_create_layers(
         &mut self,
         model_ids: Vec<String>,
         token: &TokenSource,
@@ -957,7 +962,7 @@ impl AnyMoePipelineMixin for NormalPipeline {
 
             let mut filenames = vec![];
             for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
-                filenames.push(api_get_file!(api, &rfilename, model_id));
+                filenames.push(api_get_file(&api, Path::new(&rfilename), model_id).await);
             }
 
             let regex = regex.clone();
@@ -1008,7 +1013,7 @@ impl AnyMoePipelineMixin for NormalPipeline {
 
             let mut gate_filenames = vec![];
             for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
-                gate_filenames.push(api_get_file!(api, &rfilename, model_id));
+                gate_filenames.push(api_get_file(&api, &Path::new(&rfilename), &model_id).await);
             }
             assert_eq!(
                 gate_filenames.len(),
