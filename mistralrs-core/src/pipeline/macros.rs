@@ -91,7 +91,7 @@ macro_rules! get_paths {
             &$token_source,
             $quantized_model_id.as_deref(),
             $quantized_filename,
-            &api,
+            api,
             &model_id,
             $loading_uqff,
         )?;
@@ -271,7 +271,7 @@ macro_rules! get_paths_gguf {
             &$token_source,
             Some($quantized_model_id.as_str()),
             Some($quantized_filenames),
-            &api,
+            api,
             &model_id,
             false, // Never loading UQFF
         )?;

@@ -1,6 +1,17 @@
+use signal_hook::consts::TERM_SIGNALS;
+use signal_hook::iterator::Signals;
 use std::{
     path::{Path, PathBuf},
+    process,
     str::FromStr,
+};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
 
 use hf_hub::{
@@ -42,12 +53,15 @@ pub enum HFError {
     InvalidRepoStructure(String),
 }
 
+/// Global atomic flag for SIGTERM handling
+static SHOULD_TERMINATE: AtomicBool = AtomicBool::new(false);
+
 /// Attempts to retrieve a file from a HF repo. Will check if the file exists locally first.
 ///
 /// # Returns
 /// * `Result<PathBuf, String>` - The path to the file (if found, or downloaded), error message if not.
 pub(crate) fn api_get_file(
-    api: &ApiRepo,
+    api: &Arc<ApiRepo>,
     file: &str,
     model_id: impl AsRef<Path>,
 ) -> Result<PathBuf, HFError> {
@@ -64,15 +78,56 @@ pub(crate) fn api_get_file(
         info!("Loading `{file}` locally at `{}`", path.display());
         Ok(path)
     } else {
-        api.get(file).map_err(|e| match e {
-            HFHubApiError::RequestError(err) if matches!(*err, ureq::Error::Status(403, _)) => {
-                HFError::AuthorizationError {
-                    model_id: model_id.display().to_string(),
+        // **Check for SIGTERM before starting the request**
+        if SHOULD_TERMINATE.load(AtomicOrdering::SeqCst) {
+            eprintln!("Download aborted due to SIGTERM.");
+            process::exit(1);
+        }
+
+        // **Start download but abort if SIGTERM is received**
+        let download_result = thread::spawn({
+            let api = Arc::clone(api);
+            let file = file.to_string();
+            move || api.get(&file)
+        });
+
+        while !SHOULD_TERMINATE.load(AtomicOrdering::SeqCst) {
+            if download_result.is_finished() {
+                if let Ok(result) = download_result.join() {
+                    return result.map_err(|e| match e {
+                        HFHubApiError::RequestError(err)
+                            if matches!(*err, ureq::Error::Status(403, _)) =>
+                        {
+                            HFError::AuthorizationError {
+                                model_id: model_id.display().to_string(),
+                            }
+                        }
+                        ee => HFError::HFHubApiError(ee),
+                    });
                 }
             }
-            ee => HFError::HFHubApiError(ee),
-        })
+            thread::sleep(Duration::from_millis(100)); // Polling loop to check SIGTERM
+        }
+
+        eprintln!("Download aborted due to SIGTERM.");
+        process::exit(1);
     }
+}
+
+fn setup_signal_handler() -> Arc<AtomicBool> {
+    let should_terminate = Arc::new(AtomicBool::new(false));
+    let mut signals = Signals::new(TERM_SIGNALS).expect("Failed to set signal handler");
+
+    let should_terminate_clone = Arc::clone(&should_terminate);
+    thread::spawn(move || {
+        for _ in signals.forever() {
+            eprintln!("Received termination signal. Aborting download...");
+            should_terminate_clone.store(true, AtomicOrdering::SeqCst);
+            process::exit(1);
+        }
+    });
+
+    should_terminate
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -96,11 +151,11 @@ pub fn get_paths(
         .build()?;
 
     let revision = revision.unwrap_or_else(|| "main".to_string());
-    let api = api.repo(Repo::with_revision(
+    let api = Arc::new(api.repo(Repo::with_revision(
         model_id.clone(),
         RepoType::Model,
         revision.clone(),
-    ));
+    )));
 
     // Get tokenizer path
     let tokenizer_filename = if let Some(p) = tokenizer_json {
@@ -124,7 +179,7 @@ pub fn get_paths(
         token_source,
         quantized_model_id,
         quantized_filenames,
-        &api,
+        api,
         Path::new(&model_id),
         loading_uqff,
     )?;
