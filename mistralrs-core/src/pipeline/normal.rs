@@ -34,9 +34,9 @@ use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 use crate::utils::{tokens::get_token, varbuilder_utils::from_mmaped_safetensors};
 use crate::xlora_models::NonGranularState;
 use crate::{
-    api_dir_list, api_get_file, get_mut_arcmutex, get_paths, get_uqff_paths, lora_model_loader,
-    normal_model_loader, normal_model_loader_sharded, xlora_model_loader, DeviceMapSetting, PagedAttentionConfig, Pipeline,
-    Topology, TryIntoDType,
+    api_dir_list, api_get_file, get_mut_arcmutex, get_uqff_paths, lora_model_loader,
+    normal_model_loader, normal_model_loader_sharded, xlora_model_loader, DeviceMapSetting,
+    PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
 };
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor, Var};

@@ -7,8 +7,7 @@ use crate::{
     prefix_cacher_v2::PrefixCacheManagerV2,
     sampler::Logprobs,
     sequence::{Sequence, SequenceRecognizer, StopReason},
-    tools::{parse_text_tools, ToolCallingMatcher},
-    ToolCallResponse,
+    tools::parse_text_tools,
 };
 
 use super::Pipeline;
@@ -37,14 +36,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
     );
     // Handle streaming requests
     if seq.get_mut_group().is_streaming {
-        let mut tool_use_still_possible = false;
-        let mut tool_use_is_done = false;
-        if let Some(ref t) = seq.tools {
-            if let Ok(Some(ref d)) = seq.peek_delta() {
-                (tool_use_still_possible, tool_use_is_done) = t.prefix_could_be_tool(d.as_str());
-            }
-        };
-
+        const STREAMING_RATE_LIMIT: usize = 3;
         let token_index = seq.get_toks().len();
         let rate_limit_allowed = is_done.is_some() || token_index % STREAMING_RATE_LIMIT == 0;
 
@@ -60,7 +52,8 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             if let Some(delta) = crate::handle_seq_error_ok!(seq.get_delta(), seq.responder()) {
                 if seq.get_mut_group().is_chat {
                     let (text_new, tool_calls) =
-                        parse_text_tools(delta.as_str(), seq.tools.clone()).map_err(candle_core::Error::msg)?;
+                        parse_text_tools(delta.as_str(), seq.tools.clone())
+                            .map_err(candle_core::Error::msg)?;
 
                     if !tool_calls.is_empty() && is_done.is_none() {
                         is_done = Some(StopReason::Eos);

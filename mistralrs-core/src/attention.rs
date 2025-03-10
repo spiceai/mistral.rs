@@ -4,7 +4,8 @@
 use std::sync::atomic::AtomicUsize;
 
 use crate::{
-    cublaslt::CUBLASLT_HANDLE, pipeline::text_models_inputs_processor::FlashParams, MemoryUsage,
+    cublaslt::CUBLASLT_HANDLE, cuda::SUPPORTS_ATTN_SOFTMAX,
+    pipeline::text_models_inputs_processor::FlashParams, MemoryUsage,
 };
 
 use candle_core::{Device, Result, Tensor};

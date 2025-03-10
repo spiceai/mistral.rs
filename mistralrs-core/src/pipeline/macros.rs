@@ -112,7 +112,7 @@ macro_rules! get_paths {
             $this.xlora_model_id.as_deref(),
             &$token_source,
             revision.clone(),
-            $this.xlora_order.as_ref(),
+            &$this.xlora_order.clone(),
         )?;
         let gen_conf = if $crate::api_dir_list!(api, model_id)
             .collect::<Vec<_>>()
@@ -303,7 +303,7 @@ macro_rules! get_paths_gguf {
             $this.xlora_model_id.as_deref(),
             &$token_source,
             revision.clone(),
-            $this.xlora_order.as_ref(),
+            &$this.xlora_order.clone(),
         )?;
 
         let gen_conf = if $crate::api_dir_list!(api, model_id)

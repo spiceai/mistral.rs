@@ -12,7 +12,9 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
-candle-flash-attn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "296f14fefc8166574d3270c524494c49d8f2c893", optional = true }
+candle-flash-attn-v3 = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "708efab695fd7b4aa138ff3f4c631e489e0e6865", optional = true }
+candle-flash-attn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "708efab695fd7b4aa138ff3f4c631e489e0e6865", optional = true }
+
 dirs = "5.0.1"
 anyhow.workspace = true
 candle-core.workspace = true
@@ -111,8 +113,8 @@ metal = [
 
 pyo3_macros = ["pyo3"]
 cudnn = ["candle-core/cudnn"]
-flash-attn = ["cuda", "dep:candle-flash-attn"]
 flash-attn-v3 = ["cuda", "dep:candle-flash-attn-v3"]
+flash-attn = ["cuda", "dep:candle-flash-attn"]
 accelerate = [
     "candle-core/accelerate",
     "candle-nn/accelerate",

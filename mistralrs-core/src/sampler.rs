@@ -469,14 +469,17 @@ impl Sampler {
         let mut argsort_indices: Vec<u32> = logits.arg_sort_last_dim(false)?.to_vec1()?;
 
         // Sort by descending probability with NaN handling.
-        argsort_indices.sort_unstable_by(|&i, &j| match (probs[i].is_nan(), probs[j].is_nan()) {
+        argsort_indices.sort_unstable_by(|&i, &j| {
+            let prob_j = probs[j as usize];
+            let prob_i = probs[i as usize];
+            match (prob_i.is_nan(), prob_j.is_nan()) {
             (true, true) => Ordering::Equal,
             (true, false) => Ordering::Greater,
             (false, true) => Ordering::Less,
-            _ => probs[j].partial_cmp(&probs[i]).unwrap_or_else(|| {
-                panic!("Incomparable log probs at indices i={}, j={}. Cannot compare probs[i]={} & probs[j]={}", i, j, probs[i], probs[j])
+            _ => prob_j.partial_cmp(&prob_j).unwrap_or_else(|| {
+                panic!("Incomparable log probs at indices i={}, j={}. Cannot compare probs[i]={} & probs[j]={}", i, j, prob_i, prob_j)
             })
-        });
+        }});
         if top_k > 0 {
             // Clamp smaller probabilities to zero.
             for (index, val) in argsort_indices.iter().enumerate() {

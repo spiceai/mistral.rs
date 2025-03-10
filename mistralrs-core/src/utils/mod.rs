@@ -5,7 +5,6 @@ pub(crate) mod memory_usage;
 pub(crate) mod model_config;
 pub(crate) mod normal;
 pub(crate) mod progress;
-pub(crate) mod safetensors;
 #[allow(dead_code)]
 pub(crate) mod supports_attn_softmax;
 pub(crate) mod tokenizer;

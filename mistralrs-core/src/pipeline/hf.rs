@@ -90,10 +90,15 @@ pub fn get_paths(
     loading_uqff: bool,
 ) -> Result<Box<dyn ModelPaths>, HFError> {
     let token = get_token(token_source).map_err(HFError::HFTokenError)?;
-    let api = ApiBuilder::new()
-        .with_progress(!silent)
-        .with_token(token)
-        .build()?;
+    let api = {
+        let mut api = ApiBuilder::new()
+            .with_progress(!silent)
+            .with_token(get_token(token_source)?);
+        if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+            api = api.with_cache_dir(x.into());
+        }
+        api.build()?
+    };
 
     let revision = revision.unwrap_or_else(|| "main".to_string());
     let api = api.repo(Repo::with_revision(
@@ -142,7 +147,7 @@ pub fn get_paths(
         xlora_model_id,
         token_source,
         revision.clone(),
-        xlora_order,
+        &xlora_order.cloned(),
     )?;
 
     // Get optional configs by checking directory contents
