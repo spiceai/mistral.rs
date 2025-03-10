@@ -47,17 +47,20 @@ pub fn get_xlora_paths(
     xlora_model_id: Option<&str>,
     token_source: &TokenSource,
     revision: String,
-    xlora_order: Option<&Ordering>,
-) -> Result<XLoraPaths, HFError> {
-    let Some(xlora_id) = xlora_model_id else {
-        return Ok(XLoraPaths::default());
-    };
-    let api = ApiBuilder::new()
-        .with_progress(true)
-        .with_token(get_token(token_source)?)
-        .build()?
-        .repo(Repo::with_revision(
-            xlora_id.to_string(),
+    xlora_order: &Option<Ordering>,
+) -> Result<XLoraPaths> {
+    Ok(if let Some(ref xlora_id) = xlora_model_id {
+        let api = {
+            let mut api = ApiBuilder::new()
+                .with_progress(true)
+                .with_token(get_token(token_source)?);
+            if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+                api = api.with_cache_dir(x.into());
+            }
+            api.build().map_err(candle_core::Error::msg)?
+        };
+        let api = api.repo(Repo::with_revision(
+            xlora_id.clone(),
             RepoType::Model,
             revision,
         ));
@@ -317,10 +320,15 @@ pub fn get_model_paths(
             let mut files = Vec::new();
 
             for name in names {
-                let qapi = ApiBuilder::new()
-                    .with_progress(true)
-                    .with_token(get_token(token_source)?)
-                    .build()?;
+                let qapi = {
+                    let mut api = ApiBuilder::new()
+                        .with_progress(true)
+                        .with_token(get_token(token_source)?);
+                    if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+                        api = api.with_cache_dir(x.into());
+                    }
+                    api.build().map_err(candle_core::Error::msg)?
+                };
                 let qapi = qapi.repo(Repo::with_revision(
                     id.to_string(),
                     RepoType::Model,

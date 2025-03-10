@@ -21,14 +21,14 @@ use tokenizers::Tokenizer;
 static DRY_SEQUENCE_BREAKERS: Lazy<Vec<String>> =
     Lazy::new(|| ["\n", ":", "\"", "*"].map(String::from).to_vec());
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 /// Stop sequences or ids.
 pub enum StopTokens {
     Seqs(Vec<String>),
     Ids(Vec<u32>),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 /// Sampling params are used to control sampling.
 pub struct SamplingParams {
     pub temperature: Option<f64>,
@@ -68,7 +68,7 @@ impl SamplingParams {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DrySamplingParams {
     pub sequence_breakers: Vec<String>,
     pub multiplier: f32,
@@ -229,7 +229,7 @@ impl Sampler {
         min_p: f64,
         logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
     ) -> anyhow::Result<Self> {
-        let temperature = if temperature.map_or(true, |v| v < 1e-7) {
+        let temperature = if temperature.is_none_or(|v| v < 1e-7) {
             None
         } else {
             temperature
@@ -257,21 +257,20 @@ impl Sampler {
         })
     }
 
-    fn get_top_logprobs(
-        &self,
-        probs: &[f32],
-        argsort_indices: &[usize],
-    ) -> Result<Vec<TopLogprob>> {
+    fn get_top_logprobs(&self, probs: &[f32], argsort_indices: &[u32]) -> Result<Vec<TopLogprob>> {
         let mut argsort_indices_sorted = argsort_indices.to_vec();
         // Sort by descending prob
-        argsort_indices_sorted
-            .sort_by(|a, b| probs[*b].partial_cmp(&probs[*a]).expect("No ordering."));
+        argsort_indices_sorted.sort_by(|a, b| {
+            probs[*b as usize]
+                .partial_cmp(&probs[*a as usize])
+                .expect("No ordering.")
+        });
         // These are where the top n are
         let top_n_toks_range = 0..self.top_n_logprobs;
         // The top n's values
         let top_n_logprobs = argsort_indices_sorted[top_n_toks_range.clone()]
             .iter()
-            .map(|x| probs[*x].log(10.0))
+            .map(|x| probs[*x as usize].log(10.0))
             .collect::<Vec<_>>();
         // Find where they actually are in the logits
         let mut top_n_toks = Vec::new();
@@ -284,14 +283,14 @@ impl Sampler {
             for tok in &top_n_toks {
                 bytes.push(
                     tokenizer
-                        .decode(&[*tok as u32], false)
+                        .decode(&[{ *tok }], false)
                         .map_err(|x| Error::Msg(x.to_string()))?,
                 );
             }
 
             Ok(zip(bytes, zip(top_n_toks, top_n_logprobs))
                 .map(|(bytes, (token, logprob))| TopLogprob {
-                    token: token as u32,
+                    token,
                     logprob,
                     bytes: Some(bytes),
                 })
@@ -299,7 +298,7 @@ impl Sampler {
         } else {
             Ok(zip(top_n_toks, top_n_logprobs)
                 .map(|(token, logprob)| TopLogprob {
-                    token: token as u32,
+                    token,
                     logprob,
                     bytes: None,
                 })
@@ -312,7 +311,7 @@ impl Sampler {
 
         let probs: Vec<f32> = logits.to_vec1()?;
 
-        let argsort_indices = (0..probs.len()).collect::<Vec<_>>();
+        let argsort_indices = (0..probs.len() as u32).collect::<Vec<_>>();
         let logprob = probs[next_token as usize].log(10.0);
 
         let top_logprobs = if return_logprobs {
@@ -348,17 +347,13 @@ impl Sampler {
         min_p: f32,
     ) -> Result<Logprobs> {
         let mut probs: Vec<f32> = logits.to_vec1()?;
-        let mut argsort_indices = (0..probs.len()).collect::<Vec<_>>();
-
-        // Sort by descending probability.
-        argsort_indices
-            .sort_unstable_by(|&i, &j| probs[j].partial_cmp(&probs[i]).expect("No ordering."));
+        let argsort_indices: Vec<u32> = logits.arg_sort_last_dim(false)?.to_vec1()?;
 
         if top_k > 0 {
             // Clamp smaller probabilities to zero.
             for (index, val) in argsort_indices.iter().enumerate() {
                 if index >= top_k as usize {
-                    probs[*val] = 0.0;
+                    probs[*val as usize] = 0.0;
                 }
             }
         }
@@ -373,13 +368,13 @@ impl Sampler {
         let mut cumsum = 0.;
         for index in &argsort_indices {
             if cumsum >= top_p {
-                probs[*index] = 0.0;
+                probs[*index as usize] = 0.0;
             } else {
-                cumsum += probs[*index];
+                cumsum += probs[*index as usize];
             }
         }
 
-        let max_p = probs[argsort_indices[0]];
+        let max_p = probs[argsort_indices[0] as usize];
 
         // MIN P
 
@@ -388,8 +383,8 @@ impl Sampler {
 
         // Clamp smaller probabilities to zero.
         for index in &argsort_indices {
-            if max_p * min_p >= probs[*index] {
-                probs[*index] = 0.0;
+            if max_p * min_p >= probs[*index as usize] {
+                probs[*index as usize] = 0.0;
             }
         }
 
@@ -426,7 +421,7 @@ impl Sampler {
     fn sample_multinomial(
         &self,
         probs: &mut Vec<f32>,
-        argsort_indices: Vec<usize>,
+        argsort_indices: Vec<u32>,
         return_logprobs: bool,
         rng: Arc<Mutex<Isaac64Rng>>,
     ) -> Result<Logprobs> {
@@ -460,16 +455,18 @@ impl Sampler {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn sample_top_kp_min_p(
         &self,
         probs: &mut Vec<f32>,
+        logits: &Tensor,
         top_k: i64,
         top_p: f32,
         min_p: f32,
         return_logprobs: bool,
         rng: Arc<Mutex<Isaac64Rng>>,
     ) -> Result<Logprobs> {
-        let mut argsort_indices = (0..probs.len()).collect::<Vec<_>>();
+        let mut argsort_indices: Vec<u32> = logits.arg_sort_last_dim(false)?.to_vec1()?;
 
         // Sort by descending probability with NaN handling.
         argsort_indices.sort_unstable_by(|&i, &j| match (probs[i].is_nan(), probs[j].is_nan()) {
@@ -484,7 +481,7 @@ impl Sampler {
             // Clamp smaller probabilities to zero.
             for (index, val) in argsort_indices.iter().enumerate() {
                 if index >= top_k as usize {
-                    probs[*val] = 0.0;
+                    probs[*val as usize] = 0.0;
                 }
             }
         }
@@ -503,9 +500,9 @@ impl Sampler {
         let mut cumsum = 0.;
         for index in &argsort_indices {
             if cumsum >= top_p {
-                probs[*index] = 0.0;
+                probs[*index as usize] = 0.0;
             } else {
-                cumsum += probs[*index];
+                cumsum += probs[*index as usize];
             }
         }
 
@@ -513,7 +510,7 @@ impl Sampler {
             return self.sample_multinomial(probs, argsort_indices, return_logprobs, rng);
         }
 
-        let max_p = probs[argsort_indices[0]];
+        let max_p = probs[argsort_indices[0] as usize];
 
         // MIN P
 
@@ -522,8 +519,8 @@ impl Sampler {
 
         // Clamp smaller probabilities to zero.
         for index in &argsort_indices {
-            if max_p * min_p >= probs[*index] {
-                probs[*index] = 0.0;
+            if max_p * min_p >= probs[*index as usize] {
+                probs[*index as usize] = 0.0;
             }
         }
 
@@ -574,6 +571,10 @@ impl Sampler {
 
     fn apply_dry_penalty(&self, logits: &mut [f32], context: &[u32]) -> Result<()> {
         if let Some(ref params) = self.dry_params {
+            if params.multiplier == 0. {
+                return Ok(());
+            }
+
             let match_indices = context
                 .par_iter()
                 .enumerate()
@@ -684,11 +685,12 @@ impl Sampler {
                 None => self.sample_argmax(logits, return_logprobs)?,
                 Some(temperature) => {
                     let logits = (&logits / temperature)?;
-                    let probs = candle_nn::ops::softmax_last_dim(&logits)?;
-                    let mut probs: Vec<f32> = probs.to_vec1()?;
+                    let logits = candle_nn::ops::softmax_last_dim(&logits)?;
+                    let mut probs: Vec<f32> = logits.to_vec1()?;
 
                     self.sample_top_kp_min_p(
                         &mut probs,
+                        &logits,
                         self.top_k,
                         self.top_p as f32,
                         self.min_p as f32,

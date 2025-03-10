@@ -7,31 +7,11 @@ use crate::{
     prefix_cacher_v2::PrefixCacheManagerV2,
     sampler::Logprobs,
     sequence::{Sequence, SequenceRecognizer, StopReason},
-    tools::ToolCallingMatcher,
+    tools::{parse_text_tools, ToolCallingMatcher},
     ToolCallResponse,
 };
 
 use super::Pipeline;
-
-/// Takes raw UTf8 text and parses any possible tool calls from it.
-fn parse_text_tools(
-    raw_text: &str,
-    matcher: Option<Arc<ToolCallingMatcher>>,
-) -> Result<(Option<&str>, Vec<ToolCallResponse>)> {
-    let mut tool_calls = Vec::new();
-    let mut text_new = Some(raw_text);
-
-    if let Some(ref matcher) = matcher {
-        let calls = matcher
-            .get_call(raw_text)
-            .map_err(candle_core::Error::msg)?;
-        if !calls.is_empty() {
-            text_new = None;
-            tool_calls = calls;
-        }
-    };
-    Ok((text_new, tool_calls))
-}
 
 pub(crate) async fn finish_or_add_toks_to_seq(
     this: &dyn Pipeline,
@@ -57,7 +37,13 @@ pub(crate) async fn finish_or_add_toks_to_seq(
     );
     // Handle streaming requests
     if seq.get_mut_group().is_streaming {
-        const STREAMING_RATE_LIMIT: usize = 3;
+        let mut tool_use_still_possible = false;
+        let mut tool_use_is_done = false;
+        if let Some(ref t) = seq.tools {
+            if let Ok(Some(ref d)) = seq.peek_delta() {
+                (tool_use_still_possible, tool_use_is_done) = t.prefix_could_be_tool(d.as_str());
+            }
+        };
 
         let token_index = seq.get_toks().len();
         let rate_limit_allowed = is_done.is_some() || token_index % STREAMING_RATE_LIMIT == 0;
@@ -74,12 +60,11 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             if let Some(delta) = crate::handle_seq_error_ok!(seq.get_delta(), seq.responder()) {
                 if seq.get_mut_group().is_chat {
                     let (text_new, tool_calls) =
-                        parse_text_tools(delta.as_str(), seq.tools.clone())?;
+                        parse_text_tools(delta.as_str(), seq.tools.clone()).map_err(candle_core::Error::msg)?;
 
                     if !tool_calls.is_empty() && is_done.is_none() {
                         is_done = Some(StopReason::Eos);
                     };
-
                     seq.add_streaming_chunk_choice_to_group(crate::ChunkChoice {
                         delta: crate::Delta {
                             content: text_new.map(ToString::to_string),
@@ -171,14 +156,14 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 for logprob in seq.logprobs() {
                     let resp_logprob = crate::ResponseLogprob {
                         token: crate::handle_seq_error_ok!(
-                            tokenizer
-                            .as_ref()
-                            .ok_or(candle_core::Error::Msg(
-                                "`finish_or_add_toks_to_seq` requires the pipeline to have a tokenizer"
-                                    .to_string(),
-                            ))?.decode(&[logprob.token], false),
-                            seq.responder()
-                        ),
+                        tokenizer
+                        .as_ref()
+                        .ok_or(candle_core::Error::Msg(
+                            "`finish_or_add_toks_to_seq` requires the pipeline to have a tokenizer"
+                                .to_string(),
+                        ))?.decode(&[logprob.token], false),
+                        seq.responder()
+                    ),
                         bytes: logprob.bytes.clone().map(|b| b.into_bytes()),
                         logprob: logprob.logprob,
                         top_logprobs: logprob.top_logprobs.clone().unwrap(),
@@ -213,7 +198,8 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             };
 
             if seq.get_mut_group().is_chat {
-                let (text_new, tool_calls) = parse_text_tools(text.as_str(), seq.tools.clone())?;
+                let (text_new, tool_calls) = parse_text_tools(text.as_str(), seq.tools.clone())
+                    .map_err(candle_core::Error::msg)?;
                 let choice = crate::Choice {
                     finish_reason: reason.to_string(),
                     index: seq.get_response_index(),

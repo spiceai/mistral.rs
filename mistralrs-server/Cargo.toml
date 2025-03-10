@@ -37,6 +37,7 @@ image.workspace = true
 url.workspace = true
 data-url.workspace = true
 regex.workspace = true
+toml.workspace = true
 
 [features]
 cuda = ["mistralrs-core/cuda"]
@@ -45,3 +46,4 @@ metal = ["mistralrs-core/metal"]
 flash-attn = ["cuda", "mistralrs-core/flash-attn"]
 accelerate = ["mistralrs-core/accelerate"]
 mkl = ["mistralrs-core/mkl"]
+nccl = ["mistralrs-core/nccl"]

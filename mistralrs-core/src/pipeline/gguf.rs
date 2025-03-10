@@ -20,6 +20,7 @@ use crate::paged_attention::{
 };
 use crate::pipeline::chat_template::{calculate_eos_tokens, BeginEndUnkPadTok, GenerationConfig};
 use crate::pipeline::get_chat_template;
+use crate::pipeline::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
 use crate::pipeline::loaders::DeviceMappedModelLoader;
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::ChatTemplate;
@@ -50,7 +51,7 @@ use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
 use std::any::Any;
 use std::fs;
-use std::num::NonZeroUsize;
+use std::num::{NonZero, NonZeroUsize};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -96,7 +97,7 @@ pub struct GGUFLoader {
 #[derive(Clone, Default)]
 /// Config for a GGUF loader.
 pub struct GGUFSpecificConfig {
-    pub prompt_batchsize: Option<NonZeroUsize>,
+    pub prompt_chunksize: Option<NonZeroUsize>,
     pub topology: Option<Topology>,
 }
 
@@ -301,6 +302,15 @@ impl Loader for GGUFLoader {
             );
         }
 
+        // Apply default prompt size here
+        let prompt_chunksize = self
+            .config
+            .prompt_chunksize
+            .unwrap_or(DEFAULT_PROMPT_CHUNK_SIZE.try_into().unwrap())
+            .get();
+
+        info!("Prompt chunk size is {prompt_chunksize}.",);
+
         let mut readers = Vec::new();
         for filename in paths.get_weight_filenames() {
             readers.push(std::fs::File::open(filename)?);
@@ -341,6 +351,7 @@ impl Loader for GGUFLoader {
                 &devices,
                 dtype,
                 &params,
+                prompt_chunksize,
                 paged_attn_config.as_ref(),
             )?;
             mapper = DeviceMapSetting::Map(new);
@@ -545,7 +556,7 @@ impl Loader for GGUFLoader {
                 sliding_window: None,
                 cache_config,
                 cache_engine,
-                prompt_batchsize: self.config.prompt_batchsize,
+                prompt_chunksize: Some(NonZero::new(prompt_chunksize).unwrap()),
                 model_metadata: Some(Arc::new(model_config_metadata)),
             }),
             mapper: pipeline_mapper,
@@ -582,18 +593,18 @@ impl IsqPipelineMixin for GGUFPipeline {
 }
 
 impl CacheManagerMixin for GGUFPipeline {
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
         if matches!(self.cache(), EitherCache::Full(_)) {
-            FullCacheManager.clone_in_cache(self, seqs, modify_draft_cache)
+            FullCacheManager.clone_in_cache(self, seqs, false)
         } else {
-            NormalCacheManager.clone_in_cache(self, seqs, modify_draft_cache)
+            NormalCacheManager.clone_in_cache(self, seqs, false)
         }
     }
-    fn clone_out_cache(&self, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
+    fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
         if matches!(self.cache(), EitherCache::Full(_)) {
-            FullCacheManager.clone_out_cache(self, seqs, modify_draft_cache)
+            FullCacheManager.clone_out_cache(self, seqs, false)
         } else {
-            NormalCacheManager.clone_out_cache(self, seqs, modify_draft_cache)
+            NormalCacheManager.clone_out_cache(self, seqs, false)
         }
     }
     fn set_none_cache(
@@ -695,14 +706,12 @@ impl Pipeline for GGUFPipeline {
             seqlen_offsets_full,
             context_lens,
             position_ids: _, // NOTE(EricLBuehler): ignore, it is for phi3
-            mut paged_attn_meta,
+            paged_attn_meta,
             flash_meta,
             flash_meta_full,
         } = *inputs.downcast().expect("Downcast failed.");
-        let paged_attn_meta = match (
-            self.get_metadata().cache_engine.as_ref(),
-            &mut paged_attn_meta,
-        ) {
+        let metadata = self.get_metadata();
+        let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
             (Some(engine), Some(meta)) => Some((engine.get_kv_cache().clone(), meta)),
             (Some(_), None) => {
                 // This can happen if Rust-side user code is wrong

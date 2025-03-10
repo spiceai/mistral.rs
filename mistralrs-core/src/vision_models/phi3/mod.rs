@@ -7,9 +7,8 @@ pub(crate) mod phi3_inputs_processor;
 use candle_core::{
     shape::ShapeWithOneHole, DType, Device, IndexOp, Module, Result, Shape, Tensor, D,
 };
-use candle_nn::VarBuilder;
 use either::Either;
-use mistralrs_quant::{QuantMethod, QuantMethodConfig, QuantizedConfig, UnquantLinear};
+use mistralrs_quant::{QuantMethod, QuantizedConfig, ReplicatedLayer, ShardedVarBuilder};
 use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
 
 use crate::{
@@ -18,8 +17,8 @@ use crate::{
     device_map::DeviceMapper,
     get_delta_from_lora_ab,
     layers::{
-        CausalMasker, MatMul, PhiRopeConfig, PhiRopeScalingConfig, PhiRotaryEmbedding, RmsNorm,
-        Sdpa,
+        self, Activation, CausalMasker, MatMul, PhiRopeConfig, PhiRopeScalingConfig,
+        PhiRotaryEmbedding, RmsNorm, Sdpa,
     },
     layers_masker::PastKvLenCache,
     ops::{BitWiseOp, NonZeroOp},
@@ -31,9 +30,11 @@ use crate::{
     },
     serde_default_fn,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
-    vision_models::clip::{Activation, ClipConfig, ClipVisionTransformer},
+    vision_models::clip::{ClipConfig, ClipVisionTransformer},
     AnyMoeConfig, AnyMoeExpertType,
 };
+
+use super::clip;
 
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct EmbedLayerConfig {
@@ -58,7 +59,7 @@ serde_default_fn!(bool, word_emb_default, false);
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 pub struct Config {
     pub vocab_size: usize,
-    pub hidden_act: candle_nn::Activation,
+    pub hidden_act: Activation,
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
@@ -170,7 +171,7 @@ impl Attention {
     fn new(
         rotary_emb: Arc<PhiRotaryEmbedding>,
         cfg: &Config,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         paged_attn: Option<PagedAttention>,
     ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
@@ -178,6 +179,7 @@ impl Attention {
         let head_dim = cfg.head_dim();
         let op_size = num_heads * head_dim + 2 * num_kv_heads * head_dim;
 
+        // No TP here.
         let qkv_proj = mistralrs_quant::linear_no_bias(
             cfg.hidden_size,
             op_size,
@@ -219,7 +221,7 @@ impl Attention {
         seqlen_offsets: &[usize],
         position_ids: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &mut PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
@@ -274,12 +276,13 @@ impl Attention {
                     Some(key_cache),
                     Some(value_cache),
                     input_metadata,
-                    None,
+                    &self.sdpa_params,
+                    Some(flash_params),
                 )?,
                 None => {
                     // If we don't have metadata, we are most likely generating an imatrix so we don't want to populate that.
                     // Generating the dummy metadata with the assumption that we are not generating text (only processing prompts).
-                    let mut input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
+                    let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
                     // Sanity check.
                     assert!(attention_mask.is_some());
                     paged_attn.forward(
@@ -289,8 +292,9 @@ impl Attention {
                         attention_mask,
                         None,
                         None,
-                        &mut input_metadata,
-                        None,
+                        &input_metadata,
+                        &self.sdpa_params,
+                        Some(flash_params),
                     )?
                 }
             },
@@ -329,16 +333,17 @@ impl Attention {
 struct Mlp {
     gate_up_proj: Arc<dyn QuantMethod>,
     down_proj: Arc<dyn QuantMethod>,
-    act_fn: candle_nn::Activation,
+    act_fn: Activation,
     i_size: usize,
     params: Vec<usize>,
 }
 
 impl Mlp {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Config, vb: ShardedVarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
 
+        // No TP here.
         let gate_up_proj = mistralrs_quant::linear_no_bias(
             hidden_size,
             2 * i_size,
@@ -391,6 +396,9 @@ impl MlpLayer for Mlp {
     fn get_params(&self) -> &[usize] {
         &self.params
     }
+    fn hidden_act(&self) -> Activation {
+        self.act_fn
+    }
     // gate_up, down
     fn new_added_delta(&self, deltas: Vec<Option<Tensor>>) -> Result<Box<dyn MlpLayer>> {
         let new_gate_up = if let Some(ref delta) = deltas[0] {
@@ -429,7 +437,7 @@ impl DecoderLayer {
     fn new(
         rotary_emb: Arc<PhiRotaryEmbedding>,
         cfg: &Config,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         mapper: &dyn DeviceMapper,
         layer_idx: usize,
         loading_isq: bool,
@@ -468,7 +476,7 @@ impl DecoderLayer {
         seqlen_offsets: &[usize],
         position_ids: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &mut PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let residual = xs;
@@ -531,7 +539,7 @@ pub struct ImageEmbedding {
 }
 
 pub(crate) const PHI3V_CLIP_CONFIG: ClipConfig = ClipConfig {
-    hidden_act: Activation::QuickGelu,
+    hidden_act: clip::Activation::QuickGelu,
     hidden_size: 1024,
     image_size: 336,
     intermediate_size: 4096,
@@ -546,7 +554,7 @@ impl ImageEmbedding {
         config: &Config,
         wte: candle_nn::Embedding,
         embed_config: &EmbedLayerConfig,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
     ) -> Result<Self> {
         let hidden_size = config.hidden_size;
         if config.img_processor.name != "clip_vision_model" {
@@ -954,7 +962,7 @@ pub struct Model {
 impl Model {
     pub fn new(
         cfg: &Config,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         _is_gptx: bool,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
@@ -962,7 +970,7 @@ impl Model {
         let mapper = normal_loading_metadata.mapper;
         let vb_m = vb.pp("model");
 
-        let embed_tokens = candle_nn::embedding(
+        let embed_tokens = layers::embedding(
             cfg.vocab_size,
             cfg.hidden_size,
             mapper.set_nm_device(vb_m.pp("embed_tokens"), false),
@@ -985,9 +993,11 @@ impl Model {
                 Arc::new(PhiRotaryEmbedding::new(vb.dtype(), cfg.clone(), device)?),
             );
         }
-        for layer_idx in
-            NiceProgressBar::<_, 'b'>(0..cfg.num_hidden_layers, "Loading repeating layers")
-        {
+        for layer_idx in NiceProgressBar::<_, 'b'>(
+            0..cfg.num_hidden_layers,
+            "Loading repeating layers",
+            &normal_loading_metadata.multi_progress,
+        ) {
             let device = mapper
                 .device_for(layer_idx, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
@@ -997,15 +1007,9 @@ impl Model {
                 .clone();
             let paged_attn = match &attention_mechanism {
                 AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => Some(PagedAttention::new(
-                    cfg.num_attention_heads,
-                    cfg.head_dim(),
-                    (1.0 / (cfg.head_dim() as f64).sqrt()) as f32,
-                    Some(cfg.num_key_value_heads),
-                    cfg.sliding_window,
-                    device,
-                    None,
-                )?),
+                AttentionImplementation::PagedAttention => {
+                    Some(PagedAttention::new(cfg.head_dim(), device, None)?)
+                }
             };
             let layer = DecoderLayer::new(
                 rotary_emb.clone(),
@@ -1024,23 +1028,23 @@ impl Model {
             mapper.set_nm_device(vb_m.pp("norm"), false),
         )?;
         let lm_head = if !cfg.tie_word_embeddings {
-            mistralrs_quant::linear_no_bias(
+            ReplicatedLayer::new(
                 cfg.hidden_size,
                 cfg.vocab_size,
                 &None,
+                false,
                 mapper.set_nm_device(vb.pp("lm_head"), normal_loading_metadata.loading_isq),
             )?
         } else {
-            Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(
-                candle_nn::Linear::new(
-                    mapper.cast_nm_device(
-                        embed_tokens.embeddings(),
-                        normal_loading_metadata.loading_isq,
-                    )?,
-                    None,
-                ),
-            ))?)
+            ReplicatedLayer::from_linear(candle_nn::Linear::new(
+                mapper.cast_nm_device(
+                    embed_tokens.embeddings(),
+                    normal_loading_metadata.loading_isq,
+                )?,
+                None,
+            ))?
         };
+
         Ok(Self {
             vision_embed_tokens,
             layers,
@@ -1052,19 +1056,20 @@ impl Model {
                 cfg.max_position_embeddings,
             )),
             max_seq_len: cfg.max_position_embeddings,
-            mapper,
             sliding_window: cfg.sliding_window,
             embed_tokens,
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,
                 num_layers: cfg.num_hidden_layers,
                 hidden_size: cfg.hidden_size,
-                num_kv_heads: cfg.num_key_value_heads,
-                num_attn_heads: cfg.num_attention_heads,
+                num_attn_heads: cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size(),
+                num_kv_heads: (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size())
+                    .max(1),
                 sliding_window: cfg.sliding_window,
-                k_head_dim: None,
-                v_head_dim: None,
+                k_head_dim: cfg.head_dim(),
+                v_head_dim: cfg.head_dim(),
             },
+            mapper,
         })
     }
 
@@ -1077,7 +1082,7 @@ impl Model {
         position_ids: &[usize],
         context_lens: Vec<(usize, usize)>,
         image_sizes: Option<Vec<(usize, usize)>>,
-        mut metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let mut xs = if let Some(ref pixel_values) = pixel_values {
@@ -1097,6 +1102,12 @@ impl Model {
             xs.dtype(),
             self.cfg.num_attn_heads,
         )?;
+        let attention_mask = attention_mask.filter(|_| {
+            metadata
+                .as_ref()
+                .map(|(_, meta)| meta.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
 
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
@@ -1110,8 +1121,8 @@ impl Model {
                 position_ids,
                 &mut cache[i],
                 metadata
-                    .as_mut()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), &mut **metadata)),
+                    .as_ref()
+                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                 flash_params,
             )?
         }
@@ -1184,7 +1195,7 @@ impl VisionModel for Model {
         context_lens: Vec<(usize, usize)>,
         position_ids: Vec<usize>,
         model_specific_args: Box<dyn Any>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let Phi3VisionSpecificArgs { image_sizes } = *model_specific_args
@@ -1241,12 +1252,12 @@ impl AnyMoeBaseModelMixin for Model {
     }
     fn create_anymoe_layers(
         &mut self,
-        additional_vbs: Vec<VarBuilder>,
+        additional_vbs: Vec<ShardedVarBuilder>,
         config: AnyMoeConfig,
         (prefix, mlp): (String, String),
         mut layers: Vec<usize>,
         expert_type: AnyMoeExpertType,
-        gate_vb: Option<VarBuilder>,
+        gate_vb: Option<ShardedVarBuilder>,
     ) -> Result<()> {
         let mut experts: Vec<Vec<Box<dyn MlpLayer>>> = Vec::new();
         if layers.is_empty() {

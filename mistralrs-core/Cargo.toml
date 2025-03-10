@@ -51,7 +51,7 @@ pyo3 = { workspace = true, optional = true }
 indicatif = { version = "0.17.8", features = ["rayon"] }
 async-trait = "0.1.80"
 once_cell.workspace = true
-toml = "0.8.12"
+toml.workspace = true
 strum = { version = "0.26", features = ["derive"] }
 image.workspace = true
 derive_more = { version = "0.99.17", default-features = false, features = [
@@ -75,7 +75,6 @@ ureq = "2.10"
 schemars = "0.8.21"
 serde_yaml = "0.9.34"
 regex.workspace = true
-safetensors = "0.4.5"
 serde_plain = "1.0.2"
 as-any = "0.3.1"
 float8.workspace = true
@@ -85,11 +84,11 @@ llguidance = { git = "https://github.com/microsoft/llguidance", rev = "cfef3df97
 toktrie_hf_tokenizers = { git = "https://github.com/microsoft/llguidance", rev = "cfef3df97372a7b84d74976ff41cc9cb78bca6cc" }
 objc = { version = "0.2.7", optional = true }
 metal = { workspace = true, optional = true }
-yoke = "0.7.5"
-memmap2 = "0.9.5"
+safetensors.workspace = true
+serde-big-array = "0.5.1"
+interprocess = "2.2.2"
 
 [features]
-pyo3_macros = ["pyo3"]
 cuda = [
     "candle-core/cuda",
     "candle-nn/cuda",
@@ -98,8 +97,8 @@ cuda = [
     "dep:mistralrs-paged-attn",
     "mistralrs-paged-attn/cuda",
     "float8/mistralrs_cudarc_fork",
+    "float8/cuda",
 ]
-cudnn = ["candle-core/cudnn"]
 metal = [
     "candle-core/metal",
     "candle-nn/metal",
@@ -109,13 +108,18 @@ metal = [
     "mistralrs-paged-attn/metal",
     "dep:metal",
 ]
+
+pyo3_macros = ["pyo3"]
+cudnn = ["candle-core/cudnn"]
 flash-attn = ["cuda", "dep:candle-flash-attn"]
+flash-attn-v3 = ["cuda", "dep:candle-flash-attn-v3"]
 accelerate = [
     "candle-core/accelerate",
     "candle-nn/accelerate",
     "mistralrs-quant/accelerate",
 ]
 mkl = ["candle-core/mkl", "candle-nn/mkl"]
+nccl = ["cuda", "mistralrs-quant/nccl"]
 
 [build-dependencies]
 bindgen_cuda = { version = "0.1.5", optional = true }

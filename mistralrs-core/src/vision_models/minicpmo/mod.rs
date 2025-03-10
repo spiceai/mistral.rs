@@ -1,10 +1,9 @@
-use std::{any::Any, collections::HashMap, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
-use candle_nn::VarBuilder;
 pub use config::MiniCpmOConfig;
 pub use inputs_processor::MiniCpmOProcessor;
-use mistralrs_quant::QuantMethod;
+use mistralrs_quant::{CollectedImatrixData, QuantMethod, ShardedVarBuilder};
 use resampler::Resampler;
 
 use crate::{
@@ -37,7 +36,7 @@ pub struct MiniCpmOModel {
 impl MiniCpmOModel {
     pub fn new(
         cfg: &MiniCpmOConfig,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         is_gptx: bool,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
@@ -217,7 +216,7 @@ impl MiniCpmOModel {
         image_bound: Option<Vec<Tensor>>,
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let vllm_embedding = self.get_vllm_embedding(
@@ -273,7 +272,7 @@ impl VisionModel for MiniCpmOModel {
         context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
         model_specific_args: Box<dyn Any>, // pixel attention mask, or image sizes, or anything else
-        metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let MiniCpmOSpecificArgs {
@@ -332,7 +331,7 @@ impl IsqModel for MiniCpmOModel {
     }
 
     /// End stats tracking and return the imatrix data
-    fn extract_imatrix_data(&mut self) -> candle_core::Result<HashMap<usize, Option<Vec<f32>>>> {
+    fn extract_imatrix_data(&mut self) -> candle_core::Result<CollectedImatrixData> {
         self.llm.extract_imatrix_data()
     }
 }
