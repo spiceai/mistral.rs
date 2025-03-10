@@ -6,11 +6,9 @@ use super::{
     AdapterActivationMixin, AnyMoePipelineMixin, CacheManager, CacheManagerMixin, EitherCache,
     ForwardInputsResult, GeneralMetadata, Idefics2Loader, Idefics3Loader, IsqPipelineMixin,
     LLaVALoader, LLaVANextLoader, Loader, MetadataMixin, MiniCpmOLoader, ModelCategory, ModelKind,
-    ModelPaths, Phi3VLoader, PreProcessingMixin, Processor, Qwen2VLLoader, TokenSource,
-    VLlamaLoader, VisionLoaderType, VisionModel, VisionModelLoader, VisionPromptPrefixer,
-    get_model_paths, get_xlora_paths,
-    Phi4MMLoader,
-     XLoraPaths,
+    ModelPaths, Phi3VLoader, Phi4MMLoader, PreProcessingMixin, Processor, Qwen2VLLoader,
+    TokenSource, VLlamaLoader, VisionLoaderType, VisionModel, VisionModelLoader,
+    VisionPromptPrefixer,
 };
 use crate::device_map::{self, DeviceMapper};
 use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};

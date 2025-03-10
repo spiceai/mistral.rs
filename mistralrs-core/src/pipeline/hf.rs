@@ -91,9 +91,7 @@ pub fn get_paths(
 ) -> Result<Box<dyn ModelPaths>, HFError> {
     let token = get_token(token_source).map_err(HFError::HFTokenError)?;
     let api = {
-        let mut api = ApiBuilder::new()
-            .with_progress(!silent)
-            .with_token(get_token(token_source)?);
+        let mut api = ApiBuilder::new().with_progress(!silent).with_token(token);
         if let Ok(x) = std::env::var("HF_HUB_CACHE") {
             api = api.with_cache_dir(x.into());
         }
