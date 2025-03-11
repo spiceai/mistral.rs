@@ -4,7 +4,7 @@ pub mod chat_template;
 mod diffusion;
 mod ggml;
 mod gguf;
-mod hf;
+pub(crate) mod hf;
 mod inputs_processor;
 mod isq;
 pub(crate) mod llg;

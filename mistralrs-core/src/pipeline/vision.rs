@@ -1,5 +1,5 @@
 use super::cache_manager::{FullCacheManager, NormalCacheManager};
-use super::hf::get_paths;
+use super::hf::{api_dir_list, api_get_file, get_paths, get_uqff_paths};
 use super::isq::ImatrixDataSource;
 use super::isq::UqffFullSer;
 use super::{
@@ -25,8 +25,8 @@ use crate::vision_models::{
     preprocessor_config::PreProcessorConfig, processor_config::ProcessorConfig, ModelInputs,
 };
 use crate::{
-    api_dir_list, api_get_file, get_uqff_paths, vision_normal_model_loader, AnyMoeExpertType,
-    DeviceMapSetting, Ordering, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
+    vision_normal_model_loader, AnyMoeExpertType, DeviceMapSetting, Ordering, PagedAttentionConfig,
+    Pipeline, Topology, TryIntoDType,
 };
 
 use crate::prefix_cacher_v2::PrefixCacheManagerV2;
@@ -181,7 +181,16 @@ impl Loader for VisionLoader {
             self.config.from_uqff.is_some(),
         )?;
         if let Some(from_uqff) = self.config.from_uqff.clone() {
-            *self.from_uqff.write().unwrap() = Some(get_uqff_paths!(&from_uqff, self, silent));
+            *self.from_uqff.write().unwrap() = Some(
+                get_uqff_paths(
+                    &from_uqff,
+                    &token_source,
+                    revision.clone().unwrap_or("main".to_string()),
+                    self.model_id.as_str(),
+                    silent,
+                )
+                .expect("Failed to get UQFF files"),
+            );
         }
         *self
             .token_source
@@ -851,8 +860,11 @@ impl AnyMoePipelineMixin for VisionPipeline {
             ));
 
             let mut filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
-                filenames.push(api_get_file!(api, &rfilename, model_id));
+            let dir_list = api_dir_list(&api, model_id).map_err(candle_core::Error::msg)?;
+            for rfilename in dir_list.iter().filter(|x| x.ends_with(".safetensors")) {
+                filenames.push(
+                    api_get_file(&api, rfilename, model_id).map_err(candle_core::Error::msg)?,
+                );
             }
 
             let regex = regex.clone();
@@ -906,8 +918,11 @@ impl AnyMoePipelineMixin for VisionPipeline {
             ));
 
             let mut gate_filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
-                gate_filenames.push(api_get_file!(api, &rfilename, model_id));
+            let dir_list = api_dir_list(&api, model_id).map_err(candle_core::Error::msg)?;
+            for rfilename in dir_list.iter().filter(|x| x.ends_with(".safetensors")) {
+                gate_filenames.push(
+                    api_get_file(&api, rfilename, model_id).map_err(candle_core::Error::msg)?,
+                );
             }
             assert_eq!(
                 gate_filenames.len(),

@@ -1,5 +1,6 @@
 use super::cache_manager::{FullCacheManager, NormalCacheManager};
-use super::hf::get_paths;
+use super::hf::{api_dir_list, api_get_file};
+use super::hf::{get_paths, get_uqff_paths};
 use super::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
 use super::isq::ImatrixDataSource;
 use super::llg::build_tok_env;
@@ -34,9 +35,8 @@ use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 use crate::utils::{tokens::get_token, varbuilder_utils::from_mmaped_safetensors};
 use crate::xlora_models::NonGranularState;
 use crate::{
-    api_dir_list, api_get_file, get_mut_arcmutex, get_uqff_paths, lora_model_loader,
-    normal_model_loader, normal_model_loader_sharded, xlora_model_loader, DeviceMapSetting,
-    PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
+    get_mut_arcmutex, lora_model_loader, normal_model_loader, normal_model_loader_sharded,
+    xlora_model_loader, DeviceMapSetting, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
 };
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor, Var};
@@ -259,7 +259,13 @@ impl Loader for NormalLoader {
             self.config.from_uqff.is_some(),
         )?;
         if let Some(from_uqff) = self.config.from_uqff.clone() {
-            *self.from_uqff.write().unwrap() = Some(get_uqff_paths!(&from_uqff, self, silent));
+            *self.from_uqff.write().unwrap() = Some(get_uqff_paths(
+                &from_uqff,
+                &token_source,
+                revision.clone().unwrap_or("main".to_string()),
+                self.model_id.as_str(),
+                silent,
+            )?);
         }
         *self
             .token_source
@@ -1260,8 +1266,11 @@ impl AnyMoePipelineMixin for NormalPipeline {
             ));
 
             let mut filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
-                filenames.push(api_get_file!(api, &rfilename, model_id));
+            let dir_list = api_dir_list(&api, model_id).map_err(candle_core::Error::msg)?;
+            for rfilename in dir_list.iter().filter(|x| x.ends_with(".safetensors")) {
+                filenames.push(
+                    api_get_file(&api, rfilename, model_id).map_err(candle_core::Error::msg)?,
+                );
             }
 
             let regex = regex.clone();
@@ -1315,8 +1324,11 @@ impl AnyMoePipelineMixin for NormalPipeline {
             ));
 
             let mut gate_filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
-                gate_filenames.push(api_get_file!(api, &rfilename, model_id));
+            let dir_list = api_dir_list(&api, model_id).map_err(candle_core::Error::msg)?;
+            for rfilename in dir_list.iter().filter(|x| x.ends_with(".safetensors")) {
+                gate_filenames.push(
+                    api_get_file(&api, rfilename, model_id).map_err(candle_core::Error::msg)?,
+                );
             }
             assert_eq!(
                 gate_filenames.len(),
