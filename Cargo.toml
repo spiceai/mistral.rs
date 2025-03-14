@@ -24,8 +24,8 @@ rust-version = "1.82"
 
 [workspace.dependencies]
 anyhow = "1.0.80"
-candle-core = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "708efab695fd7b4aa138ff3f4c631e489e0e6865" }
-candle-nn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "708efab695fd7b4aa138ff3f4c631e489e0e6865" }
+candle-core = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "e9db971395936b520439083f57ef28c86a04d92a" }
+candle-nn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "e9db971395936b520439083f57ef28c86a04d92a" }
 serde = "1.0.197"
 serde_json = "1.0.114"
 indexmap = { version = "2.2.5", features = ["serde"] }
