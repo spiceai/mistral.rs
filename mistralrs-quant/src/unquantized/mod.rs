@@ -36,7 +36,8 @@ impl QuantMethod for UnquantLinear {
             | QuantMethodConfig::Hqq { .. }
             | QuantMethodConfig::Dummy
             | QuantMethodConfig::FP8 { .. }
-            | QuantMethodConfig::Bnb { .. } => unreachable!(),
+            | QuantMethodConfig::Bnb { .. }
+            | QuantMethodConfig::BlockwiseFP8 { .. } => unreachable!(),
             QuantMethodConfig::Unquantized(l) => Ok(Self {
                 w: l.weight().clone(),
                 b: l.bias().cloned(),
@@ -92,11 +93,9 @@ impl QuantMethod for UnquantLinear {
                     }
                 }
                 DeviceLocation::Metal { .. } => {
-                    let mut out = b.contiguous()?.to_dtype(DType::F32)?;
-                    a.to_dtype(DType::F32)?
-                        .matmul_with_alpha_beta(&w.to_dtype(DType::F32)?.t()?, &mut out, None)
-                        .unwrap();
-                    out.to_dtype(a.dtype())
+                    let mut out = b.contiguous()?;
+                    a.matmul_with_alpha_beta(&w.t()?, &mut out, None)?;
+                    Ok(out)
                 }
                 DeviceLocation::Cpu => {
                     #[cfg(feature = "accelerate")]
@@ -137,10 +136,6 @@ impl QuantMethod for UnquantLinear {
 
     fn dtype_and_device(&self) -> (DType, candle_core::Device) {
         (self.w.dtype(), self.w.device().clone())
-    }
-
-    fn get_bias_mut(&mut self) -> Option<&mut Tensor> {
-        None
     }
 
     fn apply_isq(
@@ -286,10 +281,6 @@ impl QuantMethod for UnquantLinear {
         } else {
             candle_core::bail!("`{}` does not support tracking stats.", self.name())
         }
-    }
-
-    fn maybe_to_gguf_quant(self: Arc<Self>) -> Result<Arc<dyn QuantMethod>> {
-        Ok(self.clone())
     }
 }
 

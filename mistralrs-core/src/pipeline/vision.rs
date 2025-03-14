@@ -1,13 +1,14 @@
 use super::cache_manager::{FullCacheManager, NormalCacheManager};
-use super::hf::get_paths;
+use super::hf::{api_dir_list, api_get_file, get_paths, get_uqff_paths};
 use super::isq::ImatrixDataSource;
 use super::isq::UqffFullSer;
 use super::{
     AdapterActivationMixin, AnyMoePipelineMixin, CacheManager, CacheManagerMixin, EitherCache,
     ForwardInputsResult, GeneralMetadata, Idefics2Loader, Idefics3Loader, IsqPipelineMixin,
     LLaVALoader, LLaVANextLoader, Loader, MetadataMixin, MiniCpmOLoader, ModelCategory, ModelKind,
-    ModelPaths, Phi3VLoader, PreProcessingMixin, Processor, Qwen2VLLoader, TokenSource,
-    VLlamaLoader, VisionLoaderType, VisionModel, VisionModelLoader, VisionPromptPrefixer,
+    ModelPaths, Phi3VLoader, Phi4MMLoader, PreProcessingMixin, Processor, Qwen2VLLoader,
+    TokenSource, VLlamaLoader, VisionLoaderType, VisionModel, VisionModelLoader,
+    VisionPromptPrefixer,
 };
 use crate::device_map::{self, DeviceMapper};
 use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
@@ -24,8 +25,8 @@ use crate::vision_models::{
     preprocessor_config::PreProcessorConfig, processor_config::ProcessorConfig, ModelInputs,
 };
 use crate::{
-    api_dir_list, api_get_file, get_uqff_paths, vision_normal_model_loader, AnyMoeExpertType,
-    DeviceMapSetting, Ordering, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
+    vision_normal_model_loader, AnyMoeExpertType, DeviceMapSetting, Ordering, PagedAttentionConfig,
+    Pipeline, Topology, TryIntoDType,
 };
 
 use crate::prefix_cacher_v2::PrefixCacheManagerV2;
@@ -34,6 +35,7 @@ use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 use anyhow::Result;
 use candle_core::{Device, Tensor, Var};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use indicatif::MultiProgress;
 use mistralrs_quant::{GgufMatMul, HqqLayer, IsqType, QuantizedSerdeType};
 use rand_isaac::Isaac64Rng;
 use regex_automata::meta::Regex;
@@ -67,6 +69,7 @@ pub struct VisionPipeline {
     config: String,
     processor_filename: Option<PathBuf>,
     preprocessor_filename: Option<PathBuf>,
+    imatrix: Option<PathBuf>,
 }
 
 /// A loader for a vision (non-quantized) model.
@@ -98,11 +101,12 @@ pub struct VisionLoaderBuilder {
 /// Config specific to loading a vision model.
 pub struct VisionSpecificConfig {
     pub use_flash_attn: bool,
-    pub prompt_batchsize: Option<NonZeroUsize>,
+    pub prompt_chunksize: Option<NonZeroUsize>,
     pub topology: Option<Topology>,
     pub write_uqff: Option<PathBuf>,
     pub from_uqff: Option<PathBuf>,
     pub max_edge: Option<u32>,
+    pub imatrix: Option<PathBuf>,
     pub calibration_file: Option<PathBuf>,
 }
 
@@ -132,6 +136,7 @@ impl VisionLoaderBuilder {
             VisionLoaderType::Qwen2VL => Box::new(Qwen2VLLoader),
             VisionLoaderType::Idefics3 => Box::new(Idefics3Loader),
             VisionLoaderType::MiniCpmO => Box::new(MiniCpmOLoader),
+            VisionLoaderType::Phi4MM => Box::new(Phi4MMLoader),
         };
         Box::new(VisionLoader {
             inner: loader,
@@ -176,7 +181,16 @@ impl Loader for VisionLoader {
             self.config.from_uqff.is_some(),
         )?;
         if let Some(from_uqff) = self.config.from_uqff.clone() {
-            *self.from_uqff.write().unwrap() = Some(get_uqff_paths!(&from_uqff, self, silent));
+            *self.from_uqff.write().unwrap() = Some(
+                get_uqff_paths(
+                    &from_uqff,
+                    &token_source,
+                    revision.clone().unwrap_or("main".to_string()),
+                    self.model_id.as_str(),
+                    silent,
+                )
+                .expect("Failed to get UQFF files"),
+            );
         }
         *self
             .token_source
@@ -289,6 +303,7 @@ impl Loader for VisionLoader {
                     )
                 };
 
+            // NOTE: Vision models don't support prompt chunking yet, so just using max seq len
             let new = self.inner.get_device_layers(
                 &config,
                 self.inner.num_layers(&config)?,
@@ -298,6 +313,7 @@ impl Loader for VisionLoader {
                 &devices,
                 dtype,
                 &params,
+                params.max_seq_len(),
                 paged_attn_config.as_ref(),
             )?;
             mapper = DeviceMapSetting::Map(new);
@@ -342,6 +358,12 @@ impl Loader for VisionLoader {
                 .any(|layer| layer.as_ref().is_some_and(|layer| layer.isq.is_some()));
         }
 
+        if self.config.imatrix.is_some() && self.config.calibration_file.is_some() {
+            anyhow::bail!(
+                "`imatrix` and `calibration_file` were both specified, this is not allowed."
+            );
+        }
+
         // Load onto the regular device if not using isq or if the calibration file is specified
         let load_device = if !loading_isq || self.config.calibration_file.is_some() {
             loading_isq = false;
@@ -356,6 +378,7 @@ impl Loader for VisionLoader {
             AttentionImplementation::Eager
         };
 
+        let multi_progress = Arc::new(MultiProgress::new());
         let mut model = match self.kind {
             ModelKind::Normal => vision_normal_model_loader!(
                 paths,
@@ -370,7 +393,8 @@ impl Loader for VisionLoader {
                 loading_isq,
                 self.config.from_uqff.is_some(),
                 device.clone(),
-                attention_mechanism
+                attention_mechanism,
+                multi_progress,
             ),
             _ => unreachable!(),
         };
@@ -488,11 +512,15 @@ impl Loader for VisionLoader {
         if (in_situ_quant.is_some() || self.config.topology.is_some())
             && self.config.from_uqff.is_none()
         {
-            let imatrix_source = self
-                .config
-                .calibration_file
-                .as_ref()
-                .map(|_| ImatrixDataSource::Collected);
+            let imatrix_source = match (
+                self.config.imatrix.as_ref(),
+                self.config.calibration_file.is_some(),
+            ) {
+                (None, false) => None,
+                (Some(file), false) => Some(ImatrixDataSource::File(file)),
+                (None, true) => Some(ImatrixDataSource::Collected),
+                (Some(_), true) => unreachable!(),
+            };
             model.quantize(
                 in_situ_quant,
                 device.clone(),
@@ -509,6 +537,7 @@ impl Loader for VisionLoader {
                     processor_filename: paths.get_processor_config(),
                     preprocessor_filename: paths.get_preprocessor_config(),
                 },
+                Arc::new(MultiProgress::new()),
             )?;
         } else if let Some(from_uqff) = &*self.from_uqff.read().unwrap() {
             model.load_from_artifacts(
@@ -563,12 +592,12 @@ impl Loader for VisionLoader {
                 eos_tok: eos,
                 kind: self.kind.clone(),
                 no_kv_cache: false,
-                no_prefix_cache: true, // TODO: evaluate. Do vision models need to not have prefix caching?
+                no_prefix_cache: false,
                 activation_dtype: dtype,
                 sliding_window,
                 cache_config,
                 cache_engine,
-                prompt_batchsize: self.config.prompt_batchsize,
+                prompt_chunksize: self.config.prompt_chunksize,
                 model_metadata: Some(model_metadata),
             }),
             processor,
@@ -582,6 +611,7 @@ impl Loader for VisionLoader {
             processor_filename: paths.get_processor_config().clone(),
             preprocessor_filename: paths.get_preprocessor_config().clone(),
             mapper: pipeline_mapper,
+            imatrix: self.config.imatrix.clone(),
         })))
     }
 
@@ -615,7 +645,7 @@ impl IsqPipelineMixin for VisionPipeline {
                 device,
                 self.topology.as_ref(),
                 self.silent,
-                None,
+                self.imatrix.as_ref().map(ImatrixDataSource::File),
                 IsqOrganization::Default,
                 None,
                 UqffFullSer {
@@ -626,24 +656,25 @@ impl IsqPipelineMixin for VisionPipeline {
                     processor_filename: &self.processor_filename,
                     preprocessor_filename: &self.preprocessor_filename,
                 },
+                Arc::new(MultiProgress::new()),
             )
             .map_err(anyhow::Error::msg)
     }
 }
 
 impl CacheManagerMixin for VisionPipeline {
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
         if matches!(self.model.cache(), EitherCache::Full(_)) {
-            FullCacheManager.clone_in_cache(self, seqs, modify_draft_cache)
+            FullCacheManager.clone_in_cache(self, seqs, false)
         } else {
-            NormalCacheManager.clone_in_cache(self, seqs, modify_draft_cache)
+            NormalCacheManager.clone_in_cache(self, seqs, false)
         }
     }
-    fn clone_out_cache(&self, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
+    fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
         if matches!(self.model.cache(), EitherCache::Full(_)) {
-            FullCacheManager.clone_out_cache(self, seqs, modify_draft_cache)
+            FullCacheManager.clone_out_cache(self, seqs, false)
         } else {
-            NormalCacheManager.clone_out_cache(self, seqs, modify_draft_cache)
+            NormalCacheManager.clone_out_cache(self, seqs, false)
         }
     }
     fn set_none_cache(
@@ -651,6 +682,7 @@ impl CacheManagerMixin for VisionPipeline {
         seqs: &mut [&mut Sequence],
         reset_non_granular: bool,
         modify_draft_cache: bool,
+
         load_preallocated_cache: bool,
     ) {
         if matches!(self.model.cache(), EitherCache::Full(_)) {
@@ -711,13 +743,11 @@ impl Pipeline for VisionPipeline {
             position_ids,
             pixel_values,
             model_specific_args,
-            mut paged_attn_meta,
+            paged_attn_meta,
             flash_meta,
         } = *inputs.downcast::<ModelInputs>().expect("Downcast failed.");
-        let paged_attn_meta = match (
-            self.get_metadata().cache_engine.as_ref(),
-            &mut paged_attn_meta,
-        ) {
+        let metadata = self.get_metadata();
+        let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
             (Some(engine), Some(meta)) => Some((engine.get_kv_cache().clone(), meta)),
             (Some(_), None) => {
                 // This can happen if Rust-side user code is wrong
@@ -813,11 +843,15 @@ impl AnyMoePipelineMixin for VisionPipeline {
             let model_id_str = &model_id;
             let model_id = Path::new(&model_id);
 
-            let api = ApiBuilder::new()
-                .with_progress(!silent)
-                .with_token(get_token(token).map_err(candle_core::Error::msg)?)
-                .build()
-                .map_err(candle_core::Error::msg)?;
+            let api = {
+                let mut api = ApiBuilder::new()
+                    .with_progress(!silent)
+                    .with_token(get_token(token).map_err(candle_core::Error::msg)?);
+                if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+                    api = api.with_cache_dir(x.into());
+                }
+                api.build().map_err(candle_core::Error::msg)?
+            };
             let revision = revision.clone().unwrap_or("main".to_string());
             let api = api.repo(Repo::with_revision(
                 model_id_str.clone(),
@@ -826,8 +860,11 @@ impl AnyMoePipelineMixin for VisionPipeline {
             ));
 
             let mut filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
-                filenames.push(api_get_file!(api, &rfilename, model_id));
+            let dir_list = api_dir_list(&api, model_id).map_err(candle_core::Error::msg)?;
+            for rfilename in dir_list.iter().filter(|x| x.ends_with(".safetensors")) {
+                filenames.push(
+                    api_get_file(&api, rfilename, model_id).map_err(candle_core::Error::msg)?,
+                );
             }
 
             let regex = regex.clone();
@@ -864,11 +901,15 @@ impl AnyMoePipelineMixin for VisionPipeline {
             let model_id_str = &gate_model_id;
             let model_id = Path::new(&gate_model_id);
 
-            let api = ApiBuilder::new()
-                .with_progress(!silent)
-                .with_token(get_token(token).map_err(candle_core::Error::msg)?)
-                .build()
-                .map_err(candle_core::Error::msg)?;
+            let api = {
+                let mut api = ApiBuilder::new()
+                    .with_progress(!silent)
+                    .with_token(get_token(token).map_err(candle_core::Error::msg)?);
+                if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+                    api = api.with_cache_dir(x.into());
+                }
+                api.build().map_err(candle_core::Error::msg)?
+            };
             let revision = revision.clone().unwrap_or("main".to_string());
             let api = api.repo(Repo::with_revision(
                 model_id_str.clone(),
@@ -877,8 +918,11 @@ impl AnyMoePipelineMixin for VisionPipeline {
             ));
 
             let mut gate_filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
-                gate_filenames.push(api_get_file!(api, &rfilename, model_id));
+            let dir_list = api_dir_list(&api, model_id).map_err(candle_core::Error::msg)?;
+            for rfilename in dir_list.iter().filter(|x| x.ends_with(".safetensors")) {
+                gate_filenames.push(
+                    api_get_file(&api, rfilename, model_id).map_err(candle_core::Error::msg)?,
+                );
             }
             assert_eq!(
                 gate_filenames.len(),

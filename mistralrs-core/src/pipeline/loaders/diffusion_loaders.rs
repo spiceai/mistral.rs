@@ -7,20 +7,17 @@ use std::{
 
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};
-use candle_nn::VarBuilder;
 
 use hf_hub::api::sync::ApiRepo;
+use mistralrs_quant::ShardedVarBuilder;
 #[cfg(feature = "pyo3_macros")]
 use pyo3::pyclass;
 
 use regex::Regex;
 use serde::Deserialize;
 
-use tracing::info;
-
 use super::{ModelPaths, NormalLoadingMetadata};
 use crate::{
-    api_dir_list, api_get_file,
     diffusion_models::{
         flux::{
             self,
@@ -30,6 +27,7 @@ use crate::{
     },
     lora::LoraConfig,
     paged_attention::AttentionImplementation,
+    pipeline::hf::{api_dir_list, api_get_file},
     xlora_models::XLoraConfig,
     Ordering,
 };
@@ -56,7 +54,7 @@ pub trait DiffusionModelLoader: Send + Sync {
         &self,
         configs: Vec<String>,
         use_flash_attn: bool,
-        vbs: Vec<VarBuilder>,
+        vbs: Vec<ShardedVarBuilder>,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
         silent: bool,
@@ -152,19 +150,21 @@ pub struct FluxLoader {
 impl DiffusionModelLoader for FluxLoader {
     fn get_model_paths(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>> {
         let regex = Regex::new(r"^flux\d+-(schnell|dev)\.safetensors$")?;
-        let flux_name = api_dir_list!(api, model_id)
+        let dir_list = api_dir_list(api, model_id)?;
+        let flux_name = dir_list
+            .iter()
             .filter(|x| regex.is_match(x))
             .nth(0)
             .with_context(|| "Expected at least 1 .safetensors file matching the FLUX regex, please raise an issue.")?;
-        let flux_file = api_get_file!(api, &flux_name, model_id);
-        let ae_file = api_get_file!(api, "ae.safetensors", model_id);
+        let flux_file = api_get_file(api, flux_name, model_id)?;
+        let ae_file = api_get_file(api, "ae.safetensors", model_id)?;
 
         // NOTE(EricLBuehler): disgusting way of doing this but the 0th path is the flux, 1 is ae
         Ok(vec![flux_file, ae_file])
     }
     fn get_config_filenames(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>> {
-        let flux_file = api_get_file!(api, "transformer/config.json", model_id);
-        let ae_file = api_get_file!(api, "vae/config.json", model_id);
+        let flux_file = api_get_file(api, "transformer/config.json", model_id)?;
+        let ae_file = api_get_file(api, "vae/config.json", model_id)?;
 
         // NOTE(EricLBuehler): disgusting way of doing this but the 0th path is the flux, 1 is ae
         Ok(vec![flux_file, ae_file])
@@ -176,7 +176,7 @@ impl DiffusionModelLoader for FluxLoader {
         &self,
         mut configs: Vec<String>,
         _use_flash_attn: bool,
-        mut vbs: Vec<VarBuilder>,
+        mut vbs: Vec<ShardedVarBuilder>,
         normal_loading_metadata: NormalLoadingMetadata,
         _attention_mechanism: AttentionImplementation,
         silent: bool,

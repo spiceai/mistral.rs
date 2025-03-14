@@ -4,7 +4,7 @@ pub mod chat_template;
 mod diffusion;
 mod ggml;
 mod gguf;
-mod hf;
+pub(crate) mod hf;
 mod inputs_processor;
 mod isq;
 pub(crate) mod llg;
@@ -37,9 +37,9 @@ pub use loaders::{
     Gemma2Loader, GemmaLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader,
     LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, MistralLoader, MixtralLoader, ModelKind,
     ModelPaths, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
-    Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, PrettyName, QuantizationKind,
-    Qwen2Loader, Qwen2VLLoader, Starcoder2Loader, TokenSource, VLlamaLoader, VisionLoaderType,
-    VisionModel, VisionModelLoader,
+    Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader, PrettyName,
+    QuantizationKind, Qwen2Loader, Qwen2VLLoader, Starcoder2Loader, TokenSource, VLlamaLoader,
+    VisionLoaderType, VisionModel, VisionModelLoader,
 };
 use mistralrs_quant::IsqType;
 pub use normal::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
@@ -86,7 +86,7 @@ pub struct GeneralMetadata {
     // PagedAttention stuff
     pub cache_config: Option<CacheConfig>,
     pub cache_engine: Option<CacheEngine>,
-    pub prompt_batchsize: Option<NonZeroUsize>,
+    pub prompt_chunksize: Option<NonZeroUsize>,
     pub model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>>,
 }
 
@@ -123,10 +123,10 @@ pub trait IsqPipelineMixin {
 pub trait CacheManagerMixin {
     /// Clone the cache FROM the sequences' cache TO the model cache. Only called for completion seqs.
     /// It is not a guarantee that this will be called for each completion step.
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence], modify_draft_cache: bool);
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]);
     /// Clone the cache FROM the model cache TO the sequences. Called for prompt and completion seqs.
     /// It is not a guarantee that this will be called for each step.
-    fn clone_out_cache(&self, seqs: &mut [&mut Sequence], modify_draft_cache: bool);
+    fn clone_out_cache(&self, seqs: &mut [&mut Sequence]);
     /// Set the model cache to all None. Only called for prompt seqs.
     /// It is not a guarantee that this will be called for each prompt step.
     /// This may also reset the non granular state if applicable.
@@ -138,6 +138,9 @@ pub trait CacheManagerMixin {
         load_preallocated_cache: bool,
     );
     fn cache(&self) -> &EitherCache;
+    fn do_preallocated_cache(&self) -> bool {
+        matches!(self.cache(), EitherCache::Normal(_))
+    }
 }
 
 pub trait AdapterActivationMixin {
@@ -330,19 +333,19 @@ pub trait Pipeline:
                     return_raw_logits,
                     self.get_input_processor_config(),
                     None,
-                    self.get_metadata().prompt_batchsize,
+                    self.get_metadata().prompt_chunksize,
                     self.device_mapper(),
                 );
 
                 let mut logits = vec![None; input_seqs.len()];
-                let prompt_batchsize = self
+                let prompt_chunksize = self
                     .get_metadata()
-                    .prompt_batchsize
+                    .prompt_chunksize
                     .map(NonZeroUsize::get)
                     .unwrap_or(1);
                 let len_inputs = input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().len().div_ceil(prompt_batchsize))
+                    .map(|seq| seq.get_toks().len().div_ceil(prompt_chunksize))
                     .max()
                     .unwrap();
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
@@ -368,7 +371,7 @@ pub trait Pipeline:
                                     }
                                     AdapterInstruction::None => 0,
                                 };
-                                self.clone_in_cache(input_seqs, false)
+                                self.clone_in_cache(input_seqs)
                             }
                             CacheInstruction::Nothing(ref adapter_inst) => {
                                 match adapter_inst {
@@ -428,7 +431,7 @@ pub trait Pipeline:
                 }
 
                 match post_op {
-                    CacheInstruction::Out => self.clone_out_cache(input_seqs, false),
+                    CacheInstruction::Out => self.clone_out_cache(input_seqs),
                     CacheInstruction::Nothing(_) => (),
                     CacheInstruction::Reset {
                         load_preallocated_cache,
@@ -526,11 +529,16 @@ pub trait Pipeline:
                 blocks_to_swap_in,
                 blocks_to_swap_out,
             } => {
+                // Cloning might be bad?
                 self.get_metadata()
                     .cache_engine
                     .as_ref()
-                    .expect("PagedAttention must have cache engine.")
-                    .execute_scheduler_ops(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)?;
+                    .expect("PagedAttention must have cache engines.")
+                    .execute_scheduler_ops(
+                        blocks_to_swap_in.clone(),
+                        blocks_to_swap_out.clone(),
+                        blocks_to_copy.clone(),
+                    )?;
 
                 let inputs_iter = self.get_processor().inputs_processor().process_inputs(
                     self.tokenizer(),
@@ -543,19 +551,19 @@ pub trait Pipeline:
                     return_raw_logits,
                     self.get_input_processor_config(),
                     Some(metadata),
-                    self.get_metadata().prompt_batchsize,
+                    self.get_metadata().prompt_chunksize,
                     self.device_mapper(),
                 );
 
                 let mut logits = vec![None; input_seqs.len()];
-                let prompt_batchsize = self
+                let prompt_chunksize = self
                     .get_metadata()
-                    .prompt_batchsize
+                    .prompt_chunksize
                     .map(NonZeroUsize::get)
                     .unwrap_or(1);
                 let len_inputs = input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().len().div_ceil(prompt_batchsize))
+                    .map(|seq| seq.get_toks().len().div_ceil(prompt_chunksize))
                     .max()
                     .unwrap();
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];

@@ -22,9 +22,9 @@ use crate::{
 };
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
 
-use mistralrs_quant::QuantizedConfig;
+use indicatif::MultiProgress;
+use mistralrs_quant::{QuantizedConfig, ShardedVarBuilder};
 #[cfg(feature = "pyo3_macros")]
 use pyo3::pyclass;
 
@@ -46,7 +46,7 @@ pub trait NormalModel: IsqModel + AnyMoeBaseModelMixin {
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
         position_ids: Vec<usize>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> candle_core::Result<Tensor>;
     #[allow(clippy::too_many_arguments)]
@@ -85,6 +85,8 @@ pub struct NormalLoadingMetadata {
     pub loading_isq: bool,
     // Device mapping target device (the one that is not the cpu)
     pub real_device: Device,
+    // MultiProgress support for parallelized loading
+    pub multi_progress: Arc<MultiProgress>,
 }
 
 pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoader {
@@ -92,7 +94,7 @@ pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoa
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>>;
@@ -101,12 +103,12 @@ pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoa
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>>;
     fn is_gptx(&self, config: &str) -> Result<bool>;
     fn get_config_repr(&self, config: &str, use_flash_attn: bool) -> Result<Box<dyn Debug>>;
@@ -114,7 +116,7 @@ pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoa
     fn get_total_device_mapping_num_layers(&self, config: &str) -> Result<usize>;
     fn get_device_for_tensor(
         &self,
-        _config: &str,
+        config: &str,
         _mapper: &dyn DeviceMapper,
         loading_isq: bool,
     ) -> Result<Arc<dyn Fn(String) -> DeviceForLoadTensor + Send + Sync + 'static>> {
@@ -122,11 +124,13 @@ pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoa
             Ok(Arc::new(|_| DeviceForLoadTensor::Base))
         } else {
             let re = Regex::new(r"\.layers\.(\d+)\.").unwrap();
+            let num_layers = self.model_config(config)?.num_layers();
             let closure = move |name: String| {
                 if let Some(captures) = re.captures(&name) {
                     captures
                         .get(1)
                         .and_then(|m| m.as_str().parse::<usize>().ok())
+                        .map(|l| l.min(num_layers))
                         .map(DeviceForLoadTensor::Idx)
                         .unwrap_or(DeviceForLoadTensor::Base)
                 } else {
@@ -286,7 +290,7 @@ impl NormalModelLoader for AutoLoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -302,12 +306,12 @@ impl NormalModelLoader for AutoLoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         Self::get_loader(config)?.load_xlora(
             config,
@@ -361,8 +365,9 @@ impl DeviceMappedModelLoader for AutoLoader {
         &self,
         config: &str,
         params: &super::AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
-        Self::get_loader(config)?.mapped_max_act_size_elems(config, params)
+        Self::get_loader(config)?.mapped_max_act_size_elems(config, params, prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -429,7 +434,7 @@ impl NormalModelLoader for MistralLoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -445,12 +450,12 @@ impl NormalModelLoader for MistralLoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         Ok(Box::new(xlora_models::XLoraMistral::new(
             &MistralBasicConfig::deserialize(config, use_flash_attn)?,
@@ -499,9 +504,10 @@ impl DeviceMappedModelLoader for MistralLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -510,7 +516,7 @@ impl DeviceMappedModelLoader for MistralLoader {
 
         let cfg = MistralBasicConfig::deserialize(config, false)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -596,8 +602,8 @@ impl DeviceMappedModelLoader for MistralLoader {
             num_kv_heads: cfg.num_key_value_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: cfg.sliding_window,
-            k_head_dim: Some(cfg.head_dim()),
-            v_head_dim: Some(cfg.head_dim()),
+            k_head_dim: cfg.head_dim(),
+            v_head_dim: cfg.head_dim(),
         };
 
         Ok(Box::new(cfg))
@@ -667,7 +673,7 @@ impl NormalModelLoader for GemmaLoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -683,12 +689,12 @@ impl NormalModelLoader for GemmaLoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         Ok(Box::new(xlora_models::XLoraGemma::new(
             &GemmaBasicConfig::deserialize(config, use_flash_attn)?,
@@ -737,9 +743,10 @@ impl DeviceMappedModelLoader for GemmaLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -748,7 +755,7 @@ impl DeviceMappedModelLoader for GemmaLoader {
 
         let cfg = GemmaBasicConfig::deserialize(config, false)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -838,8 +845,8 @@ impl DeviceMappedModelLoader for GemmaLoader {
             num_kv_heads: cfg.num_key_value_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: None,
-            k_head_dim: Some(cfg.head_dim),
-            v_head_dim: Some(cfg.head_dim),
+            k_head_dim: cfg.head_dim,
+            v_head_dim: cfg.head_dim,
         };
 
         Ok(Box::new(cfg))
@@ -850,6 +857,7 @@ impl DeviceMappedModelLoader for GemmaLoader {
 
 #[derive(Deserialize)]
 struct LlamaBasicConfig {
+    hidden_act: Activation,
     hidden_size: usize,
     intermediate_size: usize,
     vocab_size: usize,
@@ -889,6 +897,7 @@ impl LlamaBasicConfig {
             rope_scaling: basic_config.rope_scaling,
             quantization_config: basic_config.quantization_config,
             tie_word_embeddings: basic_config.tie_word_embeddings,
+            hidden_act: basic_config.hidden_act,
         })
     }
 }
@@ -903,7 +912,7 @@ impl NormalModelLoader for LlamaLoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -919,12 +928,12 @@ impl NormalModelLoader for LlamaLoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         Ok(Box::new(xlora_models::XLoraLlama::new(
             &LlamaBasicConfig::deserialize(config, use_flash_attn)?,
@@ -973,9 +982,10 @@ impl DeviceMappedModelLoader for LlamaLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -984,7 +994,7 @@ impl DeviceMappedModelLoader for LlamaLoader {
 
         let cfg = LlamaBasicConfig::deserialize(config, false)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -1069,8 +1079,8 @@ impl DeviceMappedModelLoader for LlamaLoader {
             num_kv_heads: cfg.num_key_value_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: None,
-            k_head_dim: Some(cfg.hidden_size / cfg.num_attention_heads),
-            v_head_dim: Some(cfg.hidden_size / cfg.num_attention_heads),
+            k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
         };
 
         Ok(Box::new(cfg))
@@ -1130,7 +1140,7 @@ impl NormalModelLoader for MixtralLoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -1146,12 +1156,12 @@ impl NormalModelLoader for MixtralLoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         Ok(Box::new(xlora_models::XLoraMixtral::new(
             &MixtralBasicConfig::deserialize(config, use_flash_attn)?,
@@ -1201,9 +1211,10 @@ impl DeviceMappedModelLoader for MixtralLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -1212,7 +1223,7 @@ impl DeviceMappedModelLoader for MixtralLoader {
 
         let cfg = MixtralBasicConfig::deserialize(config, false)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -1301,8 +1312,8 @@ impl DeviceMappedModelLoader for MixtralLoader {
             num_kv_heads: cfg.num_key_value_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: cfg.sliding_window,
-            k_head_dim: Some(cfg.hidden_size / cfg.num_attention_heads),
-            v_head_dim: Some(cfg.hidden_size / cfg.num_attention_heads),
+            k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
         };
 
         Ok(Box::new(cfg))
@@ -1363,7 +1374,7 @@ impl NormalModelLoader for Phi2Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -1379,12 +1390,12 @@ impl NormalModelLoader for Phi2Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         Ok(Box::new(xlora_models::XLoraPhi2::new(
             &Phi2BasicConfig::deserialize(config, use_flash_attn)?,
@@ -1432,9 +1443,10 @@ impl DeviceMappedModelLoader for Phi2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -1443,7 +1455,7 @@ impl DeviceMappedModelLoader for Phi2Loader {
 
         let cfg = Phi2BasicConfig::deserialize(config, false)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -1524,8 +1536,8 @@ impl DeviceMappedModelLoader for Phi2Loader {
             num_kv_heads: cfg.num_key_value_heads(),
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: None,
-            k_head_dim: Some(cfg.head_dim()),
-            v_head_dim: Some(cfg.head_dim()),
+            k_head_dim: cfg.head_dim(),
+            v_head_dim: cfg.head_dim(),
         };
 
         Ok(Box::new(cfg))
@@ -1592,7 +1604,7 @@ impl NormalModelLoader for Phi3Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -1608,12 +1620,12 @@ impl NormalModelLoader for Phi3Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         Ok(Box::new(xlora_models::XLoraPhi3::new(
             &Phi3BasicConfig::deserialize(config, use_flash_attn)?,
@@ -1660,9 +1672,10 @@ impl DeviceMappedModelLoader for Phi3Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -1671,7 +1684,7 @@ impl DeviceMappedModelLoader for Phi3Loader {
 
         let cfg = Phi3BasicConfig::deserialize(config, false)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -1752,8 +1765,8 @@ impl DeviceMappedModelLoader for Phi3Loader {
             num_kv_heads: cfg.num_key_value_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: cfg.sliding_window,
-            k_head_dim: Some(cfg.head_dim()),
-            v_head_dim: Some(cfg.head_dim()),
+            k_head_dim: cfg.head_dim(),
+            v_head_dim: cfg.head_dim(),
         };
 
         Ok(Box::new(cfg))
@@ -1811,7 +1824,7 @@ impl NormalModelLoader for Qwen2Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -1827,12 +1840,12 @@ impl NormalModelLoader for Qwen2Loader {
         &self,
         _config: &str,
         _use_flash_attn: bool,
-        _vb: VarBuilder,
+        _vb: ShardedVarBuilder,
         _lora_config: &[((String, String), LoraConfig)],
         _xlora_config: Option<XLoraConfig>,
         _xlora_ordering: Ordering,
         _normal_loading_metadata: NormalLoadingMetadata,
-        _preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         todo!()
     }
@@ -1872,9 +1885,10 @@ impl DeviceMappedModelLoader for Qwen2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -1883,7 +1897,7 @@ impl DeviceMappedModelLoader for Qwen2Loader {
 
         let cfg = Qwen2BasicConfig::deserialize(config, false)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -1969,8 +1983,8 @@ impl DeviceMappedModelLoader for Qwen2Loader {
             num_kv_heads: cfg.num_key_value_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: Some(cfg.sliding_window),
-            k_head_dim: Some(cfg.hidden_size / cfg.num_attention_heads),
-            v_head_dim: Some(cfg.hidden_size / cfg.num_attention_heads),
+            k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
         };
 
         Ok(Box::new(cfg))
@@ -2044,7 +2058,7 @@ impl NormalModelLoader for Gemma2Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -2060,12 +2074,12 @@ impl NormalModelLoader for Gemma2Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         Ok(Box::new(xlora_models::XLoraGemma2::new(
             &Gemma2BasicConfig::deserialize(config, use_flash_attn)?,
@@ -2115,9 +2129,10 @@ impl DeviceMappedModelLoader for Gemma2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -2126,7 +2141,7 @@ impl DeviceMappedModelLoader for Gemma2Loader {
 
         let cfg = Gemma2BasicConfig::deserialize(config, false)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -2215,8 +2230,8 @@ impl DeviceMappedModelLoader for Gemma2Loader {
             num_kv_heads: cfg.num_key_value_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: Some(cfg.sliding_window),
-            k_head_dim: Some(cfg.hidden_size / cfg.num_attention_heads),
-            v_head_dim: Some(cfg.hidden_size / cfg.num_attention_heads),
+            k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
         };
 
         Ok(Box::new(cfg))
@@ -2277,7 +2292,7 @@ impl NormalModelLoader for Starcoder2Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -2293,12 +2308,12 @@ impl NormalModelLoader for Starcoder2Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         Ok(Box::new(xlora_models::XLoraStarcoder2::new(
             &Starcoder2BasicConfig::deserialize(config, use_flash_attn)?,
@@ -2345,9 +2360,10 @@ impl DeviceMappedModelLoader for Starcoder2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -2356,7 +2372,7 @@ impl DeviceMappedModelLoader for Starcoder2Loader {
 
         let cfg = Starcoder2BasicConfig::deserialize(config, false)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -2440,8 +2456,8 @@ impl DeviceMappedModelLoader for Starcoder2Loader {
             num_kv_heads: cfg.num_key_value_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: cfg.sliding_window,
-            k_head_dim: Some(cfg.hidden_size / cfg.num_attention_heads),
-            v_head_dim: Some(cfg.hidden_size / cfg.num_attention_heads),
+            k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
         };
 
         Ok(Box::new(cfg))
@@ -2512,7 +2528,7 @@ impl NormalModelLoader for Phi3_5MoELoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -2528,12 +2544,12 @@ impl NormalModelLoader for Phi3_5MoELoader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         lora_config: &[((String, String), LoraConfig)],
         xlora_config: Option<XLoraConfig>,
         xlora_ordering: Ordering,
         normal_loading_metadata: NormalLoadingMetadata,
-        preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         Ok(Box::new(xlora_models::XLoraPhi3::new(
             &Phi3BasicConfig::deserialize(config, use_flash_attn)?,
@@ -2592,9 +2608,10 @@ impl DeviceMappedModelLoader for Phi3_5MoELoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -2603,7 +2620,7 @@ impl DeviceMappedModelLoader for Phi3_5MoELoader {
 
         let cfg = Phi3_5MoEBasicConfig::deserialize(config, false)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -2696,8 +2713,8 @@ impl DeviceMappedModelLoader for Phi3_5MoELoader {
             num_kv_heads: cfg.num_key_value_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: cfg.sliding_window,
-            k_head_dim: Some(cfg.head_dim()),
-            v_head_dim: Some(cfg.head_dim()),
+            k_head_dim: cfg.head_dim(),
+            v_head_dim: cfg.head_dim(),
         };
 
         Ok(Box::new(cfg))
@@ -2714,7 +2731,7 @@ impl NormalModelLoader for DeepSeekV2Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -2732,12 +2749,12 @@ impl NormalModelLoader for DeepSeekV2Loader {
         &self,
         _config: &str,
         _use_flash_attn: bool,
-        _vb: VarBuilder,
+        _vb: ShardedVarBuilder,
         _lora_config: &[((String, String), LoraConfig)],
         _xlora_config: Option<XLoraConfig>,
         _xlora_ordering: Ordering,
         _normal_loading_metadata: NormalLoadingMetadata,
-        _preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         todo!()
     }
@@ -2878,9 +2895,10 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -2889,7 +2907,7 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
 
         let cfg: crate::models::deepseek2::DeepSeekV2Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -2926,7 +2944,9 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
         weight_pack_factor: usize,
     ) -> Result<Vec<usize>> {
         let cfg: crate::models::deepseek2::DeepSeekV2Config = serde_json::from_str(config)?;
-        let per_layer_elems = {
+        let mut per_layer_elems = Vec::new();
+
+        for layer_idx in 0..cfg.num_hidden_layers {
             let input_layernorm = cfg.hidden_size;
             let post_attention_layernorm = cfg.hidden_size;
 
@@ -2953,56 +2973,57 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
 
             let moe_block = {
                 let mut sum = 0;
-                for layer_idx in 0..cfg.num_hidden_layers {
-                    if cfg.n_routed_experts.is_some()
-                        && layer_idx >= cfg.first_k_dense_replace
-                        && layer_idx % cfg.moe_layer_freq == 0
-                    {
-                        let h_size = cfg.hidden_size;
-                        let gate_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
-                            * cfg.n_routed_experts.unwrap();
-                        let up_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
-                            * cfg.n_routed_experts.unwrap();
-                        let down_proj = cfg.moe_intermediate_size * h_size / weight_pack_factor
-                            * cfg.n_routed_experts.unwrap();
-                        let shared_experts = if let Some(n_shared_experts) = cfg.n_shared_experts {
-                            let gate_proj = h_size * (cfg.intermediate_size * n_shared_experts)
-                                / weight_pack_factor;
-                            let up_proj = h_size * (cfg.intermediate_size * n_shared_experts)
-                                / weight_pack_factor;
-                            let down_proj = (cfg.intermediate_size * n_shared_experts) * h_size
-                                / weight_pack_factor;
-                            gate_proj + up_proj + down_proj
-                        } else {
-                            0
-                        };
-                        let gate_weight = cfg.n_routed_experts.unwrap() * cfg.hidden_size;
-                        sum += gate_proj + up_proj + down_proj + shared_experts + gate_weight;
+                if cfg.n_routed_experts.is_some()
+                    && layer_idx >= cfg.first_k_dense_replace
+                    && layer_idx % cfg.moe_layer_freq == 0
+                {
+                    let h_size = cfg.hidden_size;
+                    let gate_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
+                        * cfg.n_routed_experts.unwrap();
+                    let up_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
+                        * cfg.n_routed_experts.unwrap();
+                    let down_proj = cfg.moe_intermediate_size * h_size / weight_pack_factor
+                        * cfg.n_routed_experts.unwrap();
+                    let shared_experts = if let Some(n_shared_experts) = cfg.n_shared_experts {
+                        let gate_proj = h_size * (cfg.intermediate_size * n_shared_experts)
+                            / weight_pack_factor;
+                        let up_proj = h_size * (cfg.intermediate_size * n_shared_experts)
+                            / weight_pack_factor;
+                        let down_proj = (cfg.intermediate_size * n_shared_experts) * h_size
+                            / weight_pack_factor;
+                        gate_proj + up_proj + down_proj
                     } else {
-                        let h_size = cfg.hidden_size;
-                        let i_size = cfg.intermediate_size;
-                        let gate_proj = h_size * i_size / weight_pack_factor;
-                        let up_proj = h_size * i_size / weight_pack_factor;
-                        let down_proj = i_size * h_size / weight_pack_factor;
-                        sum += gate_proj + up_proj + down_proj;
-                    }
+                        0
+                    };
+                    let gate_weight = cfg.n_routed_experts.unwrap() * cfg.hidden_size;
+                    sum += gate_proj + up_proj + down_proj + shared_experts + gate_weight;
+                } else {
+                    let h_size = cfg.hidden_size;
+                    let i_size = cfg.intermediate_size;
+                    let gate_proj = h_size * i_size / weight_pack_factor;
+                    let up_proj = h_size * i_size / weight_pack_factor;
+                    let down_proj = i_size * h_size / weight_pack_factor;
+                    sum += gate_proj + up_proj + down_proj;
                 }
                 sum
             };
 
-            input_layernorm
-                + post_attention_layernorm
-                + q_proj
-                + kv_a_layernorm
-                + kv_a_proj_with_mqa
-                + kv_b_proj
-                + o_proj
-                + moe_block
-        };
-        Ok(vec![
-            per_layer_elems * dtype.size_in_bytes();
-            cfg.num_hidden_layers
-        ])
+            per_layer_elems.push(
+                input_layernorm
+                    + post_attention_layernorm
+                    + q_proj
+                    + kv_a_layernorm
+                    + kv_a_proj_with_mqa
+                    + kv_b_proj
+                    + o_proj
+                    + moe_block,
+            );
+        }
+
+        Ok(per_layer_elems
+            .into_iter()
+            .map(|x| x * dtype.size_in_bytes())
+            .collect())
     }
 
     fn num_layers(&self, config: &str) -> Result<usize> {
@@ -3020,8 +3041,8 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
             num_kv_heads: cfg.num_attention_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: None,
-            k_head_dim: Some(cfg.qk_rope_head_dim + cfg.qk_nope_head_dim),
-            v_head_dim: Some(cfg.v_head_dim),
+            k_head_dim: cfg.qk_rope_head_dim + cfg.qk_nope_head_dim,
+            v_head_dim: cfg.v_head_dim,
         };
 
         Ok(Box::new(cfg))
@@ -3038,7 +3059,7 @@ impl NormalModelLoader for DeepSeekV3Loader {
         &self,
         config: &str,
         use_flash_attn: bool,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
@@ -3056,12 +3077,12 @@ impl NormalModelLoader for DeepSeekV3Loader {
         &self,
         _config: &str,
         _use_flash_attn: bool,
-        _vb: VarBuilder,
+        _vb: ShardedVarBuilder,
         _lora_config: &[((String, String), LoraConfig)],
         _xlora_config: Option<XLoraConfig>,
         _xlora_ordering: Ordering,
         _normal_loading_metadata: NormalLoadingMetadata,
-        _preload_adapters: &Option<HashMap<String, (VarBuilder, LoraConfig)>>,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
     ) -> Result<Box<dyn NormalModel + Send + Sync>> {
         todo!()
     }
@@ -3202,9 +3223,10 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -3213,7 +3235,7 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
 
         let cfg: crate::models::deepseek3::DeepSeekV3Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -3250,7 +3272,9 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
         weight_pack_factor: usize,
     ) -> Result<Vec<usize>> {
         let cfg: crate::models::deepseek3::DeepSeekV3Config = serde_json::from_str(config)?;
-        let per_layer_elems = {
+        let mut per_layer_elems = Vec::new();
+
+        for layer_idx in 0..cfg.num_hidden_layers {
             let input_layernorm = cfg.hidden_size;
             let post_attention_layernorm = cfg.hidden_size;
 
@@ -3277,56 +3301,57 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
 
             let moe_block = {
                 let mut sum = 0;
-                for layer_idx in 0..cfg.num_hidden_layers {
-                    if cfg.n_routed_experts.is_some()
-                        && layer_idx >= cfg.first_k_dense_replace
-                        && layer_idx % cfg.moe_layer_freq == 0
-                    {
-                        let h_size = cfg.hidden_size;
-                        let gate_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
-                            * cfg.n_routed_experts.unwrap();
-                        let up_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
-                            * cfg.n_routed_experts.unwrap();
-                        let down_proj = cfg.moe_intermediate_size * h_size / weight_pack_factor
-                            * cfg.n_routed_experts.unwrap();
-                        let shared_experts = if let Some(n_shared_experts) = cfg.n_shared_experts {
-                            let gate_proj = h_size * (cfg.intermediate_size * n_shared_experts)
-                                / weight_pack_factor;
-                            let up_proj = h_size * (cfg.intermediate_size * n_shared_experts)
-                                / weight_pack_factor;
-                            let down_proj = (cfg.intermediate_size * n_shared_experts) * h_size
-                                / weight_pack_factor;
-                            gate_proj + up_proj + down_proj
-                        } else {
-                            0
-                        };
-                        let gate_weight = cfg.n_routed_experts.unwrap() * cfg.hidden_size;
-                        sum += gate_proj + up_proj + down_proj + shared_experts + gate_weight;
+                if cfg.n_routed_experts.is_some()
+                    && layer_idx >= cfg.first_k_dense_replace
+                    && layer_idx % cfg.moe_layer_freq == 0
+                {
+                    let h_size = cfg.hidden_size;
+                    let gate_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
+                        * cfg.n_routed_experts.unwrap();
+                    let up_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
+                        * cfg.n_routed_experts.unwrap();
+                    let down_proj = cfg.moe_intermediate_size * h_size / weight_pack_factor
+                        * cfg.n_routed_experts.unwrap();
+                    let shared_experts = if let Some(n_shared_experts) = cfg.n_shared_experts {
+                        let gate_proj = h_size * (cfg.intermediate_size * n_shared_experts)
+                            / weight_pack_factor;
+                        let up_proj = h_size * (cfg.intermediate_size * n_shared_experts)
+                            / weight_pack_factor;
+                        let down_proj = (cfg.intermediate_size * n_shared_experts) * h_size
+                            / weight_pack_factor;
+                        gate_proj + up_proj + down_proj
                     } else {
-                        let h_size = cfg.hidden_size;
-                        let i_size = cfg.intermediate_size;
-                        let gate_proj = h_size * i_size / weight_pack_factor;
-                        let up_proj = h_size * i_size / weight_pack_factor;
-                        let down_proj = i_size * h_size / weight_pack_factor;
-                        sum += gate_proj + up_proj + down_proj;
-                    }
+                        0
+                    };
+                    let gate_weight = cfg.n_routed_experts.unwrap() * cfg.hidden_size;
+                    sum += gate_proj + up_proj + down_proj + shared_experts + gate_weight;
+                } else {
+                    let h_size = cfg.hidden_size;
+                    let i_size = cfg.intermediate_size;
+                    let gate_proj = h_size * i_size / weight_pack_factor;
+                    let up_proj = h_size * i_size / weight_pack_factor;
+                    let down_proj = i_size * h_size / weight_pack_factor;
+                    sum += gate_proj + up_proj + down_proj;
                 }
                 sum
             };
 
-            input_layernorm
-                + post_attention_layernorm
-                + q_proj
-                + kv_a_layernorm
-                + kv_a_proj_with_mqa
-                + kv_b_proj
-                + o_proj
-                + moe_block
-        };
-        Ok(vec![
-            per_layer_elems * dtype.size_in_bytes();
-            cfg.num_hidden_layers
-        ])
+            per_layer_elems.push(
+                input_layernorm
+                    + post_attention_layernorm
+                    + q_proj
+                    + kv_a_layernorm
+                    + kv_a_proj_with_mqa
+                    + kv_b_proj
+                    + o_proj
+                    + moe_block,
+            );
+        }
+
+        Ok(per_layer_elems
+            .into_iter()
+            .map(|x| x * dtype.size_in_bytes())
+            .collect())
     }
 
     fn num_layers(&self, config: &str) -> Result<usize> {
@@ -3344,8 +3369,8 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
             num_kv_heads: cfg.num_attention_heads,
             num_attn_heads: cfg.num_attention_heads,
             sliding_window: None,
-            k_head_dim: Some(cfg.qk_rope_head_dim + cfg.qk_nope_head_dim),
-            v_head_dim: Some(cfg.v_head_dim),
+            k_head_dim: cfg.qk_rope_head_dim + cfg.qk_nope_head_dim,
+            v_head_dim: cfg.v_head_dim,
         };
 
         Ok(Box::new(cfg))

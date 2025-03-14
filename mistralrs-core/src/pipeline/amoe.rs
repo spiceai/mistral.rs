@@ -12,6 +12,7 @@ use candle_nn::{AdamW, Optimizer, ParamsAdamW};
 use either::Either;
 use image::DynamicImage;
 use indexmap::IndexMap;
+use indicatif::MultiProgress;
 use mistralrs_quant::IsqType;
 use rand::{seq::SliceRandom, thread_rng};
 use rand_isaac::Isaac64Rng;
@@ -189,11 +190,11 @@ impl CacheManagerMixin for AnyMoePipeline {
     fn cache(&self) -> &EitherCache {
         unreachable!()
     }
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
-        get_mut_arcmutex!(self.target).clone_in_cache(seqs, modify_draft_cache)
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
+        get_mut_arcmutex!(self.target).clone_in_cache(seqs)
     }
-    fn clone_out_cache(&self, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
-        get_mut_arcmutex!(self.target).clone_out_cache(seqs, modify_draft_cache)
+    fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
+        get_mut_arcmutex!(self.target).clone_out_cache(seqs)
     }
     fn set_none_cache(
         &self,
@@ -391,7 +392,9 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
         let mut latest_loss = vec![0.0; optimizers.len()];
         let mut all_losses = Vec::new();
 
-        for _ in NiceProgressBar::<_, 'g'>(0..epochs, "Training gating layers") {
+        for _ in
+            NiceProgressBar::<_, 'g'>(0..epochs, "Training gating layers", &MultiProgress::new())
+        {
             samples.as_mut_slice().shuffle(&mut rng);
             for batch in samples.chunks(batch_size) {
                 steps += 1;

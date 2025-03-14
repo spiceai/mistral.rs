@@ -1,9 +1,9 @@
 use super::cache_manager::FullCacheManager;
+use super::hf::get_paths;
 use super::llg::build_tok_env;
 use super::{
-    get_model_paths, get_xlora_paths, text_models_inputs_processor::ModelInputs, AdapterKind,
-    CacheManager, GeneralMetadata, Loader, ModelKind, ModelPaths, QuantizationKind, TokenSource,
-    XLoraPaths,
+    text_models_inputs_processor::ModelInputs, AdapterKind, CacheManager, GeneralMetadata, Loader,
+    ModelKind, ModelPaths, QuantizationKind, TokenSource,
 };
 use super::{
     AdapterActivationMixin, AnyMoePipelineMixin, CacheManagerMixin, EitherCache,
@@ -13,8 +13,9 @@ use crate::device_map::DeviceMapper;
 use crate::lora::Ordering;
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::get_chat_template;
+use crate::pipeline::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
 use crate::pipeline::sampling::sample_and_add_toks;
-use crate::pipeline::{ChatTemplate, LocalModelPaths};
+use crate::pipeline::ChatTemplate;
 use crate::prefix_cacher_v2::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::debug::DeviceRepr;
@@ -22,24 +23,18 @@ use crate::utils::model_config as ModelConfig;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::xlora_models::NonGranularState;
 use crate::{
-    get_mut_arcmutex, get_paths, DeviceMapSetting, PagedAttentionConfig, Pipeline, Topology,
-    TryIntoDType, DEBUG,
+    get_mut_arcmutex, DeviceMapSetting, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
+    DEBUG,
 };
-use crate::{
-    models::quantized_llama::ModelWeights as QLlama, utils::tokens::get_token,
-    xlora_models::XLoraQLlama,
-};
+use crate::{models::quantized_llama::ModelWeights as QLlama, xlora_models::XLoraQLlama};
 use anyhow::Result;
 use candle_core::quantized::ggml_file;
 use candle_core::{Device, Tensor};
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
 use std::any::Any;
 use std::fs;
-use std::num::NonZeroUsize;
-use std::path::PathBuf;
-use std::str::FromStr;
+use std::num::{NonZero, NonZeroUsize};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
@@ -79,7 +74,7 @@ pub struct GGMLLoader {
 /// Config for a GGML loader.
 pub struct GGMLSpecificConfig {
     pub gqa: usize,
-    pub prompt_batchsize: Option<NonZeroUsize>,
+    pub prompt_chunksize: Option<NonZeroUsize>,
     pub topology: Option<Topology>,
 }
 
@@ -262,6 +257,15 @@ impl Loader for GGMLLoader {
             paged_attn_config = None;
         }
 
+        // Apply default prompt size here
+        let prompt_chunksize = self
+            .config
+            .prompt_chunksize
+            .unwrap_or(DEFAULT_PROMPT_CHUNK_SIZE.try_into().unwrap())
+            .get();
+
+        info!("Prompt chunk size is {prompt_chunksize}.",);
+
         info!(
             "Loading model `{}` on {}.",
             self.get_id(),
@@ -378,7 +382,7 @@ impl Loader for GGMLLoader {
                 sliding_window: None,
                 cache_config: None,
                 cache_engine: None,
-                prompt_batchsize: self.config.prompt_batchsize,
+                prompt_chunksize: Some(NonZero::new(prompt_chunksize).unwrap()),
                 model_metadata: None,
             }),
         })))
@@ -396,18 +400,21 @@ impl Loader for GGMLLoader {
         in_situ_quant: Option<IsqType>,
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
-        let paths: anyhow::Result<Box<dyn ModelPaths>> = get_paths!(
-            LocalModelPaths,
+        let paths: Box<dyn ModelPaths> = get_paths(
+            self.model_id.clone(),
+            self.tokenizer_json.as_deref(),
+            self.xlora_model_id.as_deref(),
+            self.xlora_order.as_ref(),
+            self.chat_template.as_deref(),
             &token_source,
             revision,
-            self,
-            self.quantized_model_id,
+            self.quantized_model_id.as_deref(),
             Some(vec![self.quantized_filename.as_ref().unwrap().clone()]),
+            false, // Never loading UQFF
             silent,
-            false // Never loading UQFF
-        );
+        )?;
         self.load_model_from_path(
-            &paths?,
+            &paths,
             dtype,
             device,
             silent,
@@ -447,17 +454,18 @@ impl IsqPipelineMixin for GGMLPipeline {
 }
 
 impl CacheManagerMixin for GGMLPipeline {
-    fn clone_in_cache(&self, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
-        FullCacheManager.clone_in_cache(self, seqs, modify_draft_cache)
+    fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) {
+        FullCacheManager.clone_in_cache(self, seqs, false)
     }
-    fn clone_out_cache(&self, seqs: &mut [&mut Sequence], modify_draft_cache: bool) {
-        FullCacheManager.clone_out_cache(self, seqs, modify_draft_cache)
+    fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
+        FullCacheManager.clone_out_cache(self, seqs, false)
     }
     fn set_none_cache(
         &self,
         seqs: &mut [&mut Sequence],
         reset_non_granular: bool,
         modify_draft_cache: bool,
+
         load_preallocated_cache: bool,
     ) {
         FullCacheManager.set_none_cache(self, seqs, modify_draft_cache, load_preallocated_cache);

@@ -13,12 +13,15 @@ use crate::pipeline::AutoDeviceMapParams;
 use crate::pipeline::DeviceMappedModelLoader;
 use crate::GGUFArchitecture;
 
+#[derive(Debug)]
 pub struct ContentConfig {
     max_seq_len: usize,
     hidden_size: usize,
     num_attn_heads: usize,
     num_kv_heads: usize,
     num_layers: usize,
+    key_length: Option<usize>,
+    value_length: Option<usize>,
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -40,6 +43,12 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
                 .to_u64()
                 .unwrap() as usize,
             num_layers: metadata[&format!("{arch}.block_count")].to_u64().unwrap() as usize,
+            key_length: metadata
+                .get(&format!("{arch}.attention.key_length"))
+                .map(|x| x.to_u64().unwrap() as usize),
+            value_length: metadata
+                .get(&format!("{arch}.attention.value_length"))
+                .map(|x| x.to_u64().unwrap() as usize),
         }
     }
 }
@@ -59,6 +68,14 @@ impl ModelConfigLike for ContentConfig {
     }
     fn num_layers(&self) -> usize {
         self.num_layers
+    }
+    fn k_head_dim(&self) -> usize {
+        self.key_length
+            .unwrap_or(self.hidden_size / self.num_attn_heads)
+    }
+    fn v_head_dim(&self) -> usize {
+        self.value_length
+            .unwrap_or(self.hidden_size / self.num_attn_heads)
     }
 }
 
@@ -218,9 +235,10 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         &self,
         _config: &str,
         params: &AutoDeviceMapParams,
+        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len,
+            max_seq_len: _,
             max_batch_size,
         } = params
         else {
@@ -228,7 +246,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         };
         let num_heads = self.model.get_metadata()[&format!("{}.attention.head_count", self.arch)]
             .to_u32()? as usize;
-        Ok(max_batch_size * num_heads * max_seq_len * max_seq_len)
+        Ok(max_batch_size * num_heads * prompt_chunksize * prompt_chunksize)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -482,10 +500,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     + tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_v.bias")?);
                 let attn_output = tensor_info_size_in_bytes!(self
                     .model
-                    .tensor_info("blk.0.attn_output.weight")?)
-                    + tensor_info_size_in_bytes!(self
-                        .model
-                        .tensor_info("blk.0.attn_output.bias")?);
+                    .tensor_info("blk.0.attn_output.weight")?);
 
                 let ffn_gate =
                     tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_gate.weight")?);

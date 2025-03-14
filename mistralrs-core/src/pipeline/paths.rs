@@ -47,20 +47,33 @@ pub fn get_xlora_paths(
     xlora_model_id: Option<&str>,
     token_source: &TokenSource,
     revision: String,
-    xlora_order: Option<&Ordering>,
+    xlora_order: &Option<Ordering>,
 ) -> Result<XLoraPaths, HFError> {
-    let Some(xlora_id) = xlora_model_id else {
-        return Ok(XLoraPaths::default());
+    let Some(ref xlora_id) = xlora_model_id else {
+        return Ok(XLoraPaths {
+            adapter_configs: None,
+            adapter_safetensors: None,
+            classifier_path: None,
+            xlora_order: None,
+            xlora_config: None,
+            lora_preload_adapter_info: None,
+        });
     };
-    let api = ApiBuilder::new()
-        .with_progress(true)
-        .with_token(get_token(token_source)?)
-        .build()?
-        .repo(Repo::with_revision(
-            xlora_id.to_string(),
-            RepoType::Model,
-            revision,
-        ));
+
+    let api = {
+        let mut api = ApiBuilder::new()
+            .with_progress(true)
+            .with_token(get_token(token_source)?);
+        if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+            api = api.with_cache_dir(x.into());
+        }
+        api.build().map_err(HFError::HFHubApiError)
+    }?;
+    let api = api.repo(Repo::with_revision(
+        xlora_id.to_string(),
+        RepoType::Model,
+        revision,
+    ));
 
     let model_id = Path::new(&xlora_id);
     let api_dir = api_dir_list(&api, model_id)?;
@@ -124,20 +137,22 @@ pub fn get_xlora_paths(
     });
 
     // If there are adapters in the ordering file, get their names and remote paths
-    let adapter_files = api_dir
+    let api_files = api_dir_list(&api, model_id)?;
+    let adapter_files = api_files
         .iter()
         .filter_map(|name| {
-            let adapters = xlora_order?.adapters.as_deref()?;
-            for adapter_name in adapters {
-                if name.contains(adapter_name) {
-                    return Some((name, adapter_name.clone()));
+            if let Some(ref adapters) = xlora_order.as_ref().unwrap().adapters {
+                for adapter_name in adapters {
+                    if name.contains(adapter_name) {
+                        return Some((name, adapter_name.clone()));
+                    }
                 }
             }
             None
         })
         .collect::<Vec<_>>();
 
-    if adapter_files.is_empty() && xlora_order.is_some_and(|x| x.adapters.is_some()) {
+    if adapter_files.is_empty() && xlora_order.as_ref().is_some_and(|x| x.adapters.is_some()) {
         return Err(
             HFError::InvalidRepoStructure(
                 "Adapter files are empty. Perhaps the ordering file adapters does not match the actual adapters?".to_string()
@@ -157,7 +172,7 @@ pub fn get_xlora_paths(
 
     // Sort local paths for the adapter configs and safetensors files
     let (adapters_configs, adapters_safetensors) =
-        xlora_adapters_config_and_safetensors(xlora_order, adapters_paths)?;
+        xlora_adapters_config_and_safetensors(xlora_order.into(), adapters_paths)?;
 
     // Make sure they all match
     if xlora_order.as_ref().is_some_and(|order| {
@@ -179,12 +194,13 @@ pub fn get_xlora_paths(
         )));
     };
 
-    let lora_preload_adapter_info = lora_preload_adapter_info(&api, model_id, xlora_order)?;
+    let lora_preload_adapter_info =
+        lora_preload_adapter_info(&api, model_id, xlora_order.as_ref())?;
     Ok(XLoraPaths {
         adapter_configs: Some(adapters_configs),
         adapter_safetensors: Some(adapters_safetensors),
         classifier_path,
-        xlora_order: xlora_order.cloned(),
+        xlora_order: xlora_order.clone(),
         xlora_config,
         lora_preload_adapter_info,
     })
@@ -317,10 +333,15 @@ pub fn get_model_paths(
             let mut files = Vec::new();
 
             for name in names {
-                let qapi = ApiBuilder::new()
-                    .with_progress(true)
-                    .with_token(get_token(token_source)?)
-                    .build()?;
+                let qapi = {
+                    let mut api = ApiBuilder::new()
+                        .with_progress(true)
+                        .with_token(get_token(token_source)?);
+                    if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+                        api = api.with_cache_dir(x.into());
+                    }
+                    api.build().map_err(HFError::HFHubApiError)?
+                };
                 let qapi = qapi.repo(Repo::with_revision(
                     id.to_string(),
                     RepoType::Model,

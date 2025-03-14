@@ -3,6 +3,7 @@ use std::{num::NonZeroUsize, path::PathBuf};
 
 use crate::{best_device, Model};
 
+#[derive(Clone)]
 /// Configure a vision model with the various parameters for loading, running, and other inference behaviors.
 pub struct VisionModelBuilder {
     // Loading model
@@ -12,6 +13,7 @@ pub struct VisionModelBuilder {
     pub(crate) write_uqff: Option<PathBuf>,
     pub(crate) from_uqff: Option<PathBuf>,
     pub(crate) calibration_file: Option<PathBuf>,
+    pub(crate) imatrix: Option<PathBuf>,
     pub(crate) chat_template: Option<String>,
     pub(crate) tokenizer_json: Option<String>,
     pub(crate) device_mapping: Option<DeviceMapSetting>,
@@ -19,7 +21,7 @@ pub struct VisionModelBuilder {
 
     // Model running
     pub(crate) use_flash_attn: bool,
-    pub(crate) prompt_batchsize: Option<NonZeroUsize>,
+    pub(crate) prompt_chunksize: Option<NonZeroUsize>,
     pub(crate) topology: Option<Topology>,
     pub(crate) loader_type: VisionLoaderType,
     pub(crate) dtype: ModelDType,
@@ -43,7 +45,7 @@ impl VisionModelBuilder {
             topology: None,
             write_uqff: None,
             from_uqff: None,
-            prompt_batchsize: None,
+            prompt_chunksize: None,
             chat_template: None,
             tokenizer_json: None,
             max_edge: None,
@@ -57,12 +59,13 @@ impl VisionModelBuilder {
             with_logging: false,
             device_mapping: None,
             calibration_file: None,
+            imatrix: None,
         }
     }
 
     /// Set the prompt batchsize to use for inference.
-    pub fn with_prompt_batchsize(mut self, prompt_batchsize: NonZeroUsize) -> Self {
-        self.prompt_batchsize = Some(prompt_batchsize);
+    pub fn with_prompt_chunksize(mut self, prompt_chunksize: NonZeroUsize) -> Self {
+        self.prompt_chunksize = Some(prompt_chunksize);
         self
     }
 
@@ -167,12 +170,13 @@ impl VisionModelBuilder {
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = VisionSpecificConfig {
             use_flash_attn: self.use_flash_attn,
-            prompt_batchsize: self.prompt_batchsize,
+            prompt_chunksize: self.prompt_chunksize,
             topology: self.topology,
             write_uqff: self.write_uqff,
             from_uqff: self.from_uqff,
             max_edge: self.max_edge,
             calibration_file: self.calibration_file,
+            imatrix: self.imatrix,
         };
 
         if self.with_logging {

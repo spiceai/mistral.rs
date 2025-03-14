@@ -7,8 +7,11 @@ use std::{collections::HashMap, sync::Arc};
 /// This corresponds to the model update made with the following commit:
 /// https://huggingface.co/microsoft/phi-2/commit/cb2f4533604d8b67de604e7df03bfe6f3ca22869
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{embedding, layer_norm, Embedding, LayerNorm, VarBuilder};
-use mistralrs_quant::{QuantMethod, QuantizedConfig};
+use candle_nn::{Embedding, LayerNorm};
+use mistralrs_quant::{
+    ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
+    ShardedVarBuilder,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -19,7 +22,7 @@ use crate::{
     attention::SdpaParams,
     device_map::DeviceMapper,
     get_delta_from_lora_ab,
-    layers::{Activation, CausalMasker, MatMul, RotaryEmbedding, Sdpa},
+    layers::{embedding, layer_norm, Activation, CausalMasker, MatMul, RotaryEmbedding, Sdpa},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -74,17 +77,21 @@ struct MLP {
 }
 
 impl MLP {
-    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let fc1 = mistralrs_quant::linear(
+    fn new(cfg: &Config, vb: ShardedVarBuilder, comm: &Arc<mistralrs_quant::Comm>) -> Result<Self> {
+        let fc1 = ColumnParallelLayer::new(
             cfg.hidden_size,
             cfg.intermediate_size,
             &cfg.quantization_config,
+            true,
+            comm,
             vb.pp("fc1"),
         )?;
-        let fc2 = mistralrs_quant::linear(
+        let fc2 = RowParallelLayer::new(
             cfg.intermediate_size,
             cfg.hidden_size,
             &cfg.quantization_config,
+            true,
+            comm,
             vb.pp("fc2"),
         )?;
         Ok(Self {
@@ -124,6 +131,9 @@ impl MlpLayer for MLP {
     }
     fn get_params(&self) -> &[usize] {
         &self.params
+    }
+    fn hidden_act(&self) -> Activation {
+        self.act
     }
     // fc1, fc2
     fn new_added_delta(&self, deltas: Vec<Option<Tensor>>) -> Result<Box<dyn MlpLayer>> {
@@ -169,35 +179,51 @@ struct Attention {
 impl Attention {
     fn new(
         cfg: &Config,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         rope: Arc<RotaryEmbedding>,
         paged_attn: Option<PagedAttention>,
+        comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads();
         let head_dim = cfg.head_dim();
-        let q_proj = mistralrs_quant::linear(
+        let q_proj = ColumnParallelLayer::new(
             cfg.hidden_size,
             num_heads * head_dim,
             &cfg.quantization_config,
+            true,
+            comm,
             vb.pp("q_proj"),
         )?;
-        let k_proj = mistralrs_quant::linear(
+        let kv_shard = mistralrs_quant::compute_kv_shard(
+            cfg.num_attention_heads,
+            cfg.hidden_size / cfg.num_attention_heads,
+            comm,
+        );
+        let k_proj = ColumnParallelLayer::new_with_shard(
             cfg.hidden_size,
             num_kv_heads * head_dim,
             &cfg.quantization_config,
+            true,
+            comm,
+            kv_shard,
             vb.pp("k_proj"),
         )?;
-        let v_proj = mistralrs_quant::linear(
+        let v_proj = ColumnParallelLayer::new_with_shard(
             cfg.hidden_size,
             num_kv_heads * head_dim,
             &cfg.quantization_config,
+            true,
+            comm,
+            kv_shard,
             vb.pp("v_proj"),
         )?;
-        let dense = mistralrs_quant::linear(
+        let dense = RowParallelLayer::new(
             num_heads * head_dim,
             cfg.hidden_size,
             &cfg.quantization_config,
+            true,
+            comm,
             vb.pp("dense"),
         )?;
         let (q_layernorm, k_layernorm) = if cfg.qk_layernorm {
@@ -215,12 +241,16 @@ impl Attention {
             q_layernorm,
             k_layernorm,
             rotary_emb: rope,
-            num_heads,
-            num_kv_heads,
+            num_heads: num_heads / comm.world_size(),
+            num_kv_heads: (num_kv_heads / comm.world_size()).max(1),
             head_dim,
             paged_attn,
             sdpa_params: SdpaParams {
-                n_kv_groups: num_heads / num_kv_heads,
+                n_kv_groups: mistralrs_quant::compute_n_kv_groups(
+                    cfg.num_attention_heads,
+                    cfg.num_attention_heads,
+                    comm,
+                ),
                 use_flash_attn: cfg.use_flash_attn,
                 softcap: None,
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
@@ -236,7 +266,7 @@ impl Attention {
         mask: Option<&Tensor>,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &mut PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_size, seq_len, _n_embd) = xs.dims3()?;
@@ -294,15 +324,26 @@ impl Attention {
                     Some(key_cache),
                     Some(value_cache),
                     input_metadata,
-                    None,
+                    &self.sdpa_params,
+                    Some(flash_params),
                 )?,
                 None => {
                     // If we don't have metadata, we are most likely generating an imatrix so we don't want to populate that.
                     // Generating the dummy metadata with the assumption that we are not generating text (only processing prompts).
-                    let mut input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
+                    let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
                     // Sanity check.
                     assert!(mask.is_some());
-                    paged_attn.forward(&q, &k, &v, mask, None, None, &mut input_metadata, None)?
+                    paged_attn.forward(
+                        &q,
+                        &k,
+                        &v,
+                        mask,
+                        None,
+                        None,
+                        &input_metadata,
+                        &self.sdpa_params,
+                        Some(flash_params),
+                    )?
                 }
             },
             None => {
@@ -337,22 +378,29 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cfg: &Config,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         mapper: &dyn DeviceMapper,
         layer_idx: usize,
         loading_isq: bool,
         rotary_emb: Arc<RotaryEmbedding>,
         paged_attn: Option<PagedAttention>,
+        comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
         let self_attn = Attention::new(
             cfg,
             mapper.set_device(layer_idx, vb.pp("self_attn"), loading_isq),
             rotary_emb,
             paged_attn,
+            comm,
         )?;
-        let mlp = MLP::new(cfg, mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq))?;
+        let mlp = MLP::new(
+            cfg,
+            mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq),
+            comm,
+        )?;
         let input_layernorm = layer_norm(
             cfg.hidden_size,
             cfg.layer_norm_eps,
@@ -372,7 +420,7 @@ impl DecoderLayer {
         mask: Option<&Tensor>,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &mut PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let residual = xs;
@@ -400,7 +448,7 @@ pub struct Model {
 impl Model {
     pub fn new(
         cfg: &Config,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         is_gptx: bool,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
@@ -445,9 +493,11 @@ impl Model {
         }
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_m = vb_m.pp("layers");
-        for layer_idx in
-            NiceProgressBar::<_, 'b'>(0..cfg.num_hidden_layers, "Loading repeating layers")
-        {
+        for layer_idx in NiceProgressBar::<_, 'b'>(
+            0..cfg.num_hidden_layers,
+            "Loading repeating layers",
+            &normal_loading_metadata.multi_progress,
+        ) {
             let device = mapper
                 .device_for(layer_idx, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
@@ -457,16 +507,11 @@ impl Model {
                 .clone();
             let paged_attn = match &attention_mechanism {
                 AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => Some(PagedAttention::new(
-                    cfg.num_attention_heads,
-                    cfg.head_dim(),
-                    (1.0 / (cfg.head_dim() as f64).sqrt()) as f32,
-                    Some(cfg.num_key_value_heads()),
-                    None,
-                    device,
-                    None,
-                )?),
+                AttentionImplementation::PagedAttention => {
+                    Some(PagedAttention::new(cfg.head_dim(), device, None)?)
+                }
             };
+            let comm = mapper.get_comm_for(layer_idx)?;
             let layer = DecoderLayer::new(
                 cfg,
                 vb_m.pp(layer_idx),
@@ -475,14 +520,16 @@ impl Model {
                 normal_loading_metadata.loading_isq,
                 rotary_emb,
                 paged_attn,
+                &comm,
             )?;
             layers.push(layer)
         }
         let lm_head = if !cfg.tie_word_embeddings {
-            mistralrs_quant::linear(
+            ReplicatedLayer::new(
                 cfg.hidden_size,
                 cfg.vocab_size,
                 &None,
+                false,
                 mapper.set_nm_device(vb.pp("lm_head"), normal_loading_metadata.loading_isq),
             )?
         } else {
@@ -499,17 +546,18 @@ impl Model {
             )),
             device: normal_loading_metadata.real_device,
             max_seq_len: cfg.max_position_embeddings,
-            mapper,
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,
                 num_layers: cfg.num_hidden_layers,
                 hidden_size: cfg.hidden_size,
-                num_kv_heads: cfg.num_key_value_heads(),
-                num_attn_heads: cfg.num_attention_heads,
+                num_kv_heads: (cfg.num_key_value_heads() / mapper.get_comm_for(0)?.world_size())
+                    .max(1),
+                num_attn_heads: cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size(),
                 sliding_window: None,
-                k_head_dim: None,
-                v_head_dim: None,
+                k_head_dim: cfg.head_dim(),
+                v_head_dim: cfg.head_dim(),
             },
+            mapper,
         })
     }
 
@@ -518,7 +566,7 @@ impl Model {
         input_ids: &Tensor,
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        mut metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let mut xs = input_ids.apply(&self.embed_tokens)?;
@@ -532,6 +580,13 @@ impl Model {
             xs.dtype(),
             self.cfg.num_attn_heads,
         )?;
+        // PagedAttention prompt chunking
+        let mask = mask.filter(|_| {
+            metadata
+                .as_ref()
+                .map(|(_, meta)| meta.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(
@@ -542,8 +597,8 @@ impl Model {
                 seqlen_offsets,
                 &mut cache[i],
                 metadata
-                    .as_mut()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), &mut **metadata)),
+                    .as_ref()
+                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
                 flash_params,
             )?;
         }
@@ -605,7 +660,7 @@ impl NormalModel for Model {
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         self.forward(
@@ -668,12 +723,12 @@ impl AnyMoeBaseModelMixin for Model {
     }
     fn create_anymoe_layers(
         &mut self,
-        additional_vbs: Vec<VarBuilder>,
+        additional_vbs: Vec<ShardedVarBuilder>,
         config: AnyMoeConfig,
         (prefix, mlp): (String, String),
         mut layers: Vec<usize>,
         expert_type: AnyMoeExpertType,
-        gate_vb: Option<VarBuilder>,
+        gate_vb: Option<ShardedVarBuilder>,
     ) -> Result<()> {
         let mut experts: Vec<Vec<Box<dyn MlpLayer>>> = Vec::new();
         if layers.is_empty() {
@@ -701,6 +756,7 @@ impl AnyMoeBaseModelMixin for Model {
                                 ..Default::default()
                             },
                             vb.pp(layer).pp(&mlp).set_dtype(dtype).set_device(device),
+                            &self.mapper.get_comm_for(layer)?,
                         )?));
                     }
                     AnyMoeExpertType::LoraAdapter {

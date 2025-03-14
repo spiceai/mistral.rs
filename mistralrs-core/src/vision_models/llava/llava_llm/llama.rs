@@ -8,15 +8,20 @@
 use std::sync::Arc;
 
 use candle_core::{DType, Device, Result, Tensor};
-use candle_nn::{embedding, linear_no_bias as linear, Embedding, Module, VarBuilder};
-use mistralrs_quant::{QuantMethod, QuantMethodConfig, UnquantLinear};
+use candle_nn::{Embedding, Module};
+use mistralrs_quant::{
+    ColumnParallelLayer, QuantMethod, QuantMethodConfig, RowParallelLayer, ShardedVarBuilder,
+    UnquantLinear,
+};
 
 use crate::{
     amoe::{AnyMoeBaseModelMixin, AnyMoeTrainableLayer, MlpLayer, MoeMlp},
     attention::SdpaParams,
     device_map::DeviceMapper,
     get_delta_from_lora_ab,
-    layers::{CausalMasker, MatMul, RmsNorm, Sdpa},
+    layers::{
+        embedding, linear_no_bias as linear, Activation, CausalMasker, MatMul, RmsNorm, Sdpa,
+    },
     layers_masker::PastKvLenCache,
     models::llama::Config,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -53,7 +58,7 @@ impl CausalSelfAttention {
         block_idx: usize,
         kv_cache: &mut crate::pipeline::LayerCaches,
         rope_parameter: (&Tensor, &Tensor),
-        metadata: Option<((Tensor, Tensor), &mut PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
@@ -96,12 +101,13 @@ impl CausalSelfAttention {
                     Some(key_cache),
                     Some(value_cache),
                     input_metadata,
-                    None,
+                    &self.sdpa_params,
+                    Some(flash_params),
                 )?,
                 None => {
                     // If we don't have metadata, we are most likely generating an imatrix so we don't want to populate that.
                     // Generating the dummy metadata with the assumption that we are not generating text (only processing prompts).
-                    let mut input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
+                    let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
                     // Sanity check.
                     assert!(attention_mask.is_some());
                     paged_attn.forward(
@@ -111,8 +117,9 @@ impl CausalSelfAttention {
                         attention_mask.clone().as_ref(),
                         None,
                         None,
-                        &mut input_metadata,
-                        None,
+                        &input_metadata,
+                        &self.sdpa_params,
+                        Some(flash_params),
                     )?
                 }
             },
@@ -146,32 +153,52 @@ impl CausalSelfAttention {
         Ok(res)
     }
 
-    fn load(vb: VarBuilder, cfg: &Config, paged_attn: Option<PagedAttention>) -> Result<Self> {
+    fn load(
+        vb: ShardedVarBuilder,
+        cfg: &Config,
+        paged_attn: Option<PagedAttention>,
+        comm: &Arc<mistralrs_quant::Comm>,
+    ) -> Result<Self> {
         let size_in = cfg.hidden_size;
         let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
         let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
-        let q_proj = mistralrs_quant::linear_no_bias(
+        let q_proj = ColumnParallelLayer::new(
             size_in,
             size_q,
             &cfg.quantization_config,
+            false,
+            comm,
             vb.pp("q_proj"),
         )?;
-        let k_proj = mistralrs_quant::linear_no_bias(
+        let kv_shard = mistralrs_quant::compute_kv_shard(
+            cfg.num_key_value_heads,
+            cfg.hidden_size / cfg.num_attention_heads,
+            comm,
+        );
+        let k_proj = ColumnParallelLayer::new_with_shard(
             size_in,
             size_kv,
             &cfg.quantization_config,
+            false,
+            comm,
+            kv_shard,
             vb.pp("k_proj"),
         )?;
-        let v_proj = mistralrs_quant::linear_no_bias(
+        let v_proj = ColumnParallelLayer::new_with_shard(
             size_in,
             size_kv,
             &cfg.quantization_config,
+            false,
+            comm,
+            kv_shard,
             vb.pp("v_proj"),
         )?;
-        let o_proj = mistralrs_quant::linear_no_bias(
+        let o_proj = RowParallelLayer::new(
             size_q,
             size_in,
             &cfg.quantization_config,
+            false,
+            comm,
             vb.pp("o_proj"),
         )?;
         Ok(Self {
@@ -179,13 +206,17 @@ impl CausalSelfAttention {
             k_proj,
             v_proj,
             o_proj,
-            num_attention_heads: cfg.num_attention_heads,
-            num_key_value_heads: cfg.num_key_value_heads,
+            num_attention_heads: cfg.num_attention_heads / comm.world_size(),
+            num_key_value_heads: (cfg.num_key_value_heads / comm.world_size()).max(1),
             head_dim: cfg.hidden_size / cfg.num_attention_heads,
             max_seq_len: cfg.max_position_embeddings,
             paged_attn,
             sdpa_params: SdpaParams {
-                n_kv_groups: cfg.num_attention_heads / cfg.num_key_value_heads,
+                n_kv_groups: mistralrs_quant::compute_n_kv_groups(
+                    cfg.num_key_value_heads,
+                    cfg.num_attention_heads,
+                    comm,
+                ),
                 use_flash_attn: cfg.use_flash_attn,
                 softcap: None,
                 softmax_scale: 1.0 / ((cfg.hidden_size / cfg.num_attention_heads) as f32).sqrt(),
@@ -203,25 +234,35 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    fn load(
+        vb: ShardedVarBuilder,
+        cfg: &Config,
+        comm: &Arc<mistralrs_quant::Comm>,
+    ) -> Result<Self> {
         let h_size = cfg.hidden_size;
         let i_size = cfg.intermediate_size;
-        let c_fc1 = mistralrs_quant::linear_no_bias(
+        let c_fc1 = ColumnParallelLayer::new(
             h_size,
             i_size,
             &cfg.quantization_config,
+            false,
+            comm,
             vb.pp("gate_proj"),
         )?;
-        let c_fc2 = mistralrs_quant::linear_no_bias(
+        let c_fc2 = ColumnParallelLayer::new(
             h_size,
             i_size,
             &cfg.quantization_config,
+            false,
+            comm,
             vb.pp("up_proj"),
         )?;
-        let c_proj = mistralrs_quant::linear_no_bias(
+        let c_proj = RowParallelLayer::new(
             i_size,
             h_size,
             &cfg.quantization_config,
+            false,
+            comm,
             vb.pp("down_proj"),
         )?;
         Ok(Self {
@@ -259,6 +300,9 @@ impl MlpLayer for Mlp {
     fn get_params(&self) -> &[usize] {
         &self.params
     }
+    fn hidden_act(&self) -> Activation {
+        Activation::Silu
+    }
     // c_fc1, c_fc2, c_proj
     fn new_added_delta(&self, deltas: Vec<Option<Tensor>>) -> Result<Box<dyn MlpLayer>> {
         let new_c_fc1 = if let Some(ref delta) = deltas[0] {
@@ -295,6 +339,7 @@ struct Block {
     attn: CausalSelfAttention,
     rms_2: RmsNorm,
     mlp: Box<dyn MlpLayer>,
+    rope_parameter: (Tensor, Tensor),
 }
 
 impl Block {
@@ -305,8 +350,7 @@ impl Block {
         seqlen_offsets: &[usize],
         block_idx: usize,
         kv_cache: &mut crate::pipeline::LayerCaches,
-        rope_parameters: (&Tensor, &Tensor),
-        metadata: Option<((Tensor, Tensor), &mut PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let residual = x;
@@ -317,7 +361,7 @@ impl Block {
             seqlen_offsets,
             block_idx,
             kv_cache,
-            rope_parameters,
+            (&self.rope_parameter.0, &self.rope_parameter.1),
             metadata,
             flash_params,
         )? + residual)?;
@@ -327,19 +371,26 @@ impl Block {
     }
 
     fn load(
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         cfg: &Config,
         mapper: &dyn DeviceMapper,
         layer_idx: usize,
         loading_isq: bool,
         paged_attn: Option<PagedAttention>,
+        rope_parameter: (Tensor, Tensor),
+        comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
         let attn = CausalSelfAttention::load(
             mapper.set_device(layer_idx, vb.pp("self_attn"), loading_isq),
             cfg,
             paged_attn,
+            comm,
         )?;
-        let mlp = Mlp::load(mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq), cfg)?;
+        let mlp = Mlp::load(
+            mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq),
+            cfg,
+            comm,
+        )?;
         let rms_1 = RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -355,6 +406,7 @@ impl Block {
             attn,
             rms_2,
             mlp: Box::new(mlp),
+            rope_parameter,
         })
     }
 }
@@ -367,7 +419,6 @@ pub struct Llama {
     kv_cache: crate::pipeline::EitherCache,
     device: Device,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
-    rope_parameters: (Tensor, Tensor),
     cfg: ModelConfigMetadata,
 }
 
@@ -377,7 +428,7 @@ impl Llama {
         input_ids: &Tensor,
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let x = self.wte.forward(input_ids)?;
@@ -393,7 +444,7 @@ impl Llama {
 
     pub fn new(
         cfg: &Config,
-        vb: VarBuilder,
+        vb: ShardedVarBuilder,
         _is_gptx: bool,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
@@ -416,43 +467,47 @@ impl Llama {
         )?;
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
 
-        let blocks: Vec<_> =
-            NiceProgressBar::<_, 'b'>(0..cfg.num_hidden_layers, "Loading repeating layers")
-                .into_iter()
-                .map(|i| {
-                    let paged_attn = match &attention_mechanism {
-                        AttentionImplementation::Eager => None,
-                        AttentionImplementation::PagedAttention => Some(
-                            PagedAttention::new(
-                                cfg.num_attention_heads,
-                                head_dim,
-                                (1.0 / (head_dim as f64).sqrt()) as f32,
-                                Some(cfg.num_key_value_heads),
-                                None,
-                                &normal_loading_metadata.real_device,
-                                None,
-                            )
-                            .expect("Failed to create PagedAttention"),
-                        ),
-                    };
-                    Block::load(
-                        vb.pp(format!("model.layers.{i}")),
-                        cfg,
-                        &*mapper,
-                        i,
-                        normal_loading_metadata.loading_isq,
-                        paged_attn,
-                    )
-                    .expect("Failed to load block.")
-                })
-                .collect();
-        let rope_parameters = OrdinaryRoPE::create_parameters(
-            head_dim,
-            cfg.max_position_embeddings,
-            cfg.rope_theta,
-            vb.dtype(),
-            &normal_loading_metadata.real_device,
-        )?;
+        let blocks: Vec<_> = NiceProgressBar::<_, 'b'>(
+            0..cfg.num_hidden_layers,
+            "Loading repeating layers",
+            &normal_loading_metadata.multi_progress,
+        )
+        .into_iter()
+        .map(|i| {
+            let vb_m = vb.pp(format!("model.layers.{i}"));
+            let device = mapper
+                .device_for(i, false)
+                .unwrap_or(&normal_loading_metadata.real_device);
+            let rope_parameters = OrdinaryRoPE::create_parameters(
+                head_dim,
+                cfg.max_position_embeddings,
+                cfg.rope_theta,
+                vb_m.dtype(),
+                device,
+            )
+            .unwrap();
+            let paged_attn = match &attention_mechanism {
+                AttentionImplementation::Eager => None,
+                AttentionImplementation::PagedAttention => Some(
+                    PagedAttention::new(head_dim, device, None)
+                        .expect("Failed to create PagedAttention"),
+                ),
+            };
+            let comm = mapper.get_comm_for(i).unwrap();
+            Block::load(
+                vb_m,
+                cfg,
+                &*mapper,
+                i,
+                normal_loading_metadata.loading_isq,
+                paged_attn,
+                rope_parameters,
+                &comm,
+            )
+            .expect("Failed to load block.")
+        })
+        .collect();
+
         Ok(Self {
             wte,
             blocks,
@@ -463,18 +518,18 @@ impl Llama {
                 false,
             )),
             device: normal_loading_metadata.real_device,
-            mapper,
-            rope_parameters,
             cfg: ModelConfigMetadata {
                 max_seq_len: cfg.max_position_embeddings,
                 num_layers: cfg.num_hidden_layers,
                 hidden_size: cfg.hidden_size,
-                num_kv_heads: cfg.num_key_value_heads,
-                num_attn_heads: cfg.num_attention_heads,
+                num_attn_heads: cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size(),
+                num_kv_heads: (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size())
+                    .max(1),
                 sliding_window: None,
-                k_head_dim: None,
-                v_head_dim: None,
+                k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+                v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             },
+            mapper,
         })
     }
 }
@@ -520,7 +575,7 @@ impl LLaVALLM for Llama {
         input_embed: Tensor,
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        mut metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let mut x = input_embed;
@@ -534,6 +589,12 @@ impl LLaVALLM for Llama {
             x.dtype(),
             self.blocks[0].attn.num_attention_heads,
         )?;
+        let mask = mask.filter(|_| {
+            metadata
+                .as_ref()
+                .map(|(_, meta)| meta.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
         for (block_idx, block) in self.blocks.iter().enumerate() {
             x = self.mapper.map(x, block_idx)?;
             x = block.forward(
@@ -542,10 +603,9 @@ impl LLaVALLM for Llama {
                 seqlen_offsets,
                 block_idx,
                 &mut cache,
-                (&self.rope_parameters.0, &self.rope_parameters.1),
                 metadata
-                    .as_mut()
-                    .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone(), &mut **metadata)),
+                    .as_ref()
+                    .map(|(kv_cache, metadata)| (kv_cache[block_idx].clone(), *metadata)),
                 flash_params,
             )?;
         }
@@ -566,7 +626,7 @@ impl NormalModel for Llama {
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
         _position_ids: Vec<usize>,
-        metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         self.forward_input(
@@ -629,12 +689,12 @@ impl AnyMoeBaseModelMixin for Llama {
     }
     fn create_anymoe_layers(
         &mut self,
-        additional_vbs: Vec<VarBuilder>,
+        additional_vbs: Vec<ShardedVarBuilder>,
         config: AnyMoeConfig,
         (prefix, mlp): (String, String),
         mut layers: Vec<usize>,
         expert_type: AnyMoeExpertType,
-        gate_vb: Option<VarBuilder>,
+        gate_vb: Option<ShardedVarBuilder>,
     ) -> Result<()> {
         let mut experts: Vec<Vec<Box<dyn MlpLayer>>> = Vec::new();
         if layers.is_empty() {
@@ -662,6 +722,7 @@ impl AnyMoeBaseModelMixin for Llama {
                                 hidden_size: self.blocks[layer].mlp.get_params()[0],
                                 ..Default::default()
                             },
+                            &self.mapper.get_comm_for(layer)?,
                         )?));
                     }
                     AnyMoeExpertType::LoraAdapter {
