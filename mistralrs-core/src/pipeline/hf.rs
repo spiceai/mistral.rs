@@ -122,7 +122,6 @@ fn setup_signal_handler() -> Arc<AtomicBool> {
     let should_terminate_clone = Arc::clone(&should_terminate);
     thread::spawn(move || {
         if let Some(_) = signals.forever().next() {
-            eprintln!("Received termination signal. Aborting download...");
             should_terminate_clone.store(true, AtomicOrdering::SeqCst);
             process::exit(1);
         }
