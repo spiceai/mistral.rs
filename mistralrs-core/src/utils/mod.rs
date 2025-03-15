@@ -5,7 +5,6 @@ pub(crate) mod memory_usage;
 pub(crate) mod model_config;
 pub(crate) mod normal;
 pub(crate) mod progress;
-pub(crate) mod safetensors;
 #[allow(dead_code)]
 pub(crate) mod supports_attn_softmax;
 pub(crate) mod tokenizer;
@@ -218,12 +217,26 @@ macro_rules! serde_default_fn {
     };
 }
 
+/// `true` if built with CUDA (requires Unix) /Metal
 #[cfg(any(all(feature = "cuda", target_family = "unix"), feature = "metal"))]
 pub const fn paged_attn_supported() -> bool {
     true
 }
 
+/// `true` if built with CUDA (requires Unix) /Metal
 #[cfg(not(any(all(feature = "cuda", target_family = "unix"), feature = "metal")))]
 pub const fn paged_attn_supported() -> bool {
     false
+}
+
+/// `true` if built with the `flash-attn` or `flash-attn-v3` features, false otherwise.
+#[cfg(not(any(feature = "flash-attn", feature = "flash-attn-v3")))]
+pub const fn using_flash_attn() -> bool {
+    false
+}
+
+/// `true` if built with the `flash-attn` or `flash-attn-v3` features, false otherwise.
+#[cfg(any(feature = "flash-attn", feature = "flash-attn-v3"))]
+pub const fn using_flash_attn() -> bool {
+    true
 }

@@ -118,20 +118,21 @@ struct Args {
 
     /// GPU memory to allocate for KV cache with PagedAttention in MBs.
     /// PagedAttention is supported on CUDA and Metal. It is automatically activated on CUDA but not on Metal.
-    /// The priority is as follows: `pa-gpu-mem-usage` (default = 0.9) > `pa-ctxt-len` > `pa-gpu-mem`.
+    /// The priority is as follows: `pa-ctxt-len` > `pa-gpu-mem-usage` > `pa-gpu-mem`.
     #[arg(long = "pa-gpu-mem")]
     paged_attn_gpu_mem: Option<usize>,
 
     /// Percentage of GPU memory to utilize after allocation of KV cache with PagedAttention, from 0 to 1.
     /// If this is not set and the device is CUDA, it will default to `0.9`.
     /// PagedAttention is supported on CUDA and Metal. It is automatically activated on CUDA but not on Metal.
-    /// The priority is as follows: `pa-gpu-mem-usage` (default = 0.9) > `pa-ctxt-len` > `pa-gpu-mem`.
+    /// The priority is as follows: `pa-ctxt-len` > `pa-gpu-mem-usage` > `pa-gpu-mem`.
     #[arg(long = "pa-gpu-mem-usage")]
     paged_attn_gpu_mem_usage: Option<f32>,
 
     /// Total context length to allocate the KV cache for (total number of tokens which the KV cache can hold).
     /// PagedAttention is supported on CUDA and Metal. It is automatically activated on CUDA but not on Metal.
-    /// The priority is as follows: `pa-gpu-mem-usage` (default = 0.9) > `pa-ctxt-len` > `pa-gpu-mem`.
+    /// The priority is as follows: `pa-ctxt-len` > `pa-gpu-mem-usage` > `pa-gpu-mem`.
+    /// This is the default setting, and it defaults to the `max-seq-len` specified in after the model type.
     #[arg(long = "pa-ctxt-len")]
     paged_ctxt_len: Option<usize>,
 
@@ -154,7 +155,7 @@ struct Args {
 
     /// Number of tokens to batch the prompt step into. This can help with OOM errors when in the prompt step, but reduces performance.
     #[arg(long = "prompt-batchsize")]
-    prompt_batchsize: Option<usize>,
+    prompt_chunksize: Option<usize>,
 
     /// Use CPU only
     #[arg(long)]
@@ -283,21 +284,7 @@ async fn main() -> Result<()> {
     let mut args = Args::parse();
     initialize_logging();
 
-    let setting_server = if !args.interactive_mode {
-        let port = args.port.expect("Interactive mode was not specified, so expected port to be specified. Perhaps you forgot `-i` or `--port`?");
-        let ip = args.serve_ip.unwrap_or_else(|| "0.0.0.0".to_string());
-
-        // Create listener early to validate address before model loading
-        let listener = tokio::net::TcpListener::bind(format!("{ip}:{port}")).await?;
-        Some((listener, ip, port))
-    } else {
-        None
-    };
-
-    #[cfg(not(feature = "flash-attn"))]
-    let use_flash_attn = false;
-    #[cfg(feature = "flash-attn")]
-    let use_flash_attn = true;
+    let use_flash_attn = mistralrs_core::using_flash_attn();
 
     let tgt_non_granular_index = get_tgt_non_granular_index(&args.model);
     let dtype = get_model_dtype(&args.model)?;
@@ -307,19 +294,21 @@ async fn main() -> Result<()> {
         args.max_seqs = 1;
     }
 
-    let prompt_batchsize = match args.prompt_batchsize {
+    let prompt_chunksize = match args.prompt_chunksize {
         Some(0) => {
-            anyhow::bail!("`prompt_batchsize` must be a strictly positive integer, got 0.",)
+            anyhow::bail!("`prompt_chunksize` must be a strictly positive integer, got 0.",)
         }
         Some(x) => Some(NonZeroUsize::new(x).unwrap()),
         None => None,
     };
 
+    let max_seq_len = auto_device_map_params.max_seq_len();
+
     let loader: Box<dyn Loader> = LoaderBuilder::new(args.model)
         .with_no_kv_cache(args.no_kv_cache)
         .with_chat_template(args.chat_template)
         .with_use_flash_attn(use_flash_attn)
-        .with_prompt_batchsize(prompt_batchsize)
+        .with_prompt_chunksize(prompt_chunksize)
         .build()?;
 
     #[cfg(feature = "metal")]
@@ -409,7 +398,7 @@ async fn main() -> Result<()> {
         (block_size, None, None, None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
             512,
-            MemoryGpuConfig::Utilization(0.9), // NOTE(EricLBuehler): default is to use 90% of memory
+            MemoryGpuConfig::ContextSize(max_seq_len),
         )?),
         (block_size, None, None, Some(ctxt), true, false) => Some(PagedAttentionConfig::new(
             block_size,
@@ -502,6 +491,18 @@ async fn main() -> Result<()> {
         builder
     };
     let mistralrs = builder.build();
+
+    // Needs to be after the .build call as that is where the daemon waits.
+    let setting_server = if !args.interactive_mode {
+        let port = args.port.expect("Interactive mode was not specified, so expected port to be specified. Perhaps you forgot `-i` or `--port`?");
+        let ip = args.serve_ip.unwrap_or_else(|| "0.0.0.0".to_string());
+
+        // Create listener early to validate address before model loading
+        let listener = tokio::net::TcpListener::bind(format!("{ip}:{port}")).await?;
+        Some((listener, ip, port))
+    } else {
+        None
+    };
 
     let app = get_router(mistralrs);
     if let Some((listener, ip, port)) = setting_server {

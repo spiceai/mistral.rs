@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Module};
+use indicatif::MultiProgress;
 use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 
 use crate::attention::SdpaParams;
@@ -59,9 +60,9 @@ impl LayerWeights {
         mask: Option<&Tensor>,
         start_offsets: &[usize],
         kv_cache: &mut KvCache,
-        metadata: Option<((Tensor, Tensor), &mut PagedAttentionInputMetadata)>,
+        metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        let (b_sz, seq_len, n_embd) = x.dims3()?;
+        let (b_sz, seq_len, _) = x.dims3()?;
 
         let q = MatMul
             .qmethod_matmul(x, &*self.attention_wq)?
@@ -104,6 +105,7 @@ impl LayerWeights {
                     Some(key_cache),
                     Some(value_cache),
                     input_metadata,
+                    &self.sdpa_params,
                     None,
                 )?
             }
@@ -115,9 +117,9 @@ impl LayerWeights {
         };
 
         let y = if mask.is_some() {
-            y.transpose(1, 2)?.reshape(&[b_sz, seq_len, n_embd])?
+            y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
         } else {
-            y.reshape(&[b_sz, seq_len, n_embd])?
+            y.reshape((b_sz, seq_len, ()))?
         };
 
         let y = MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.attention_wo)?;
@@ -252,13 +254,17 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     head_dim,
                     max_seq_len,
                     device,
-                    false,
+                    true,
                     dtype,
                 )?),
             );
         }
 
-        for layer_idx in NiceProgressBar::<_, 'b'>(0..block_count, "Loading repeating layers") {
+        for layer_idx in NiceProgressBar::<_, 'b'>(
+            0..block_count,
+            "Loading repeating layers",
+            &MultiProgress::new(),
+        ) {
             let prefix = format!("blk.{layer_idx}");
             let device = mapper.device_for(layer_idx, false).unwrap_or(device);
             let rotary = ropes
@@ -302,15 +308,9 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let ffn_norm = ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?;
             let paged_attn = match &attention_mechanism {
                 AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => Some(PagedAttention::new(
-                    head_count,
-                    head_dim,
-                    (1.0 / (head_dim as f64).sqrt()) as f32,
-                    Some(head_count_kv),
-                    None,
-                    device,
-                    None,
-                )?),
+                AttentionImplementation::PagedAttention => {
+                    Some(PagedAttention::new(head_dim, device, None)?)
+                }
             };
             layers.push(LayerWeights {
                 attention_wq: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
@@ -370,7 +370,7 @@ impl ModelWeights {
         x: &Tensor,
         start_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        mut metadata: Option<(Vec<(Tensor, Tensor)>, &mut PagedAttentionInputMetadata)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         let mut layer_in = self.tok_embeddings.forward(x)?;
         let cache = &mut self.cache.normal().0;
@@ -383,6 +383,12 @@ impl ModelWeights {
             self.dtype,
             self.layers[0].n_head,
         )?;
+        let mask = mask.filter(|_| {
+            metadata
+                .as_ref()
+                .map(|(_, meta)| meta.is_first_prompt_chunk)
+                .unwrap_or(true)
+        });
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(ref mapper) = self.mapper {
                 layer_in = mapper.map(layer_in, i)?;
@@ -398,8 +404,8 @@ impl ModelWeights {
                 start_offsets,
                 &mut cache[i],
                 metadata
-                    .as_mut()
-                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), &mut **metadata)),
+                    .as_ref()
+                    .map(|(kv_cache, metadata)| (kv_cache[i].clone(), *metadata)),
             )?;
             let x = (attn + residual)?;
 

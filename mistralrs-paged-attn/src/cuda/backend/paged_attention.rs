@@ -121,9 +121,10 @@ impl PagedAttention {
             || head_size == 96
             || head_size == 112
             || head_size == 128
+            || head_size == 192
             || head_size == 256)
         {
-            candle::bail!("`head_size` must be one of 64, 80, 96, 112, 128 or 256");
+            candle_core::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 192 or 256");
         }
 
         let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
@@ -166,7 +167,7 @@ impl PagedAttention {
         let kv_head_stride = kc_l.stride()[1];
 
         let partition_size = 512;
-        let max_num_partitions = (self.max_context_len + partition_size - 1) / partition_size;
+        let max_num_partitions = self.max_context_len.div_ceil(partition_size);
         let use_v1 = (max_num_partitions == 1 || num_seqs * num_heads > 512)
             && partition_size % block_size == 0;
 

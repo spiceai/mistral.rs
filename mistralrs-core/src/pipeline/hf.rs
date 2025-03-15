@@ -129,6 +129,33 @@ fn setup_signal_handler() -> Arc<AtomicBool> {
 
     should_terminate
 }
+  
+pub fn get_uqff_paths(
+    from_uqff: impl AsRef<Path>,
+    token_source: &TokenSource,
+    revision: String,
+    model_id: &str,
+    silent: bool,
+) -> Result<PathBuf, HFError> {
+    let api = {
+        let mut api = ApiBuilder::new()
+            .with_progress(!silent)
+            .with_token(get_token(token_source).map_err(HFError::HFTokenError)?);
+        if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+            api = api.with_cache_dir(x.into());
+        }
+        api.build().map_err(HFError::HFHubApiError)?
+    };
+
+    let api = api.repo(Repo::with_revision(
+        model_id.to_string(),
+        RepoType::Model,
+        revision,
+    ));
+
+    let uqff_str = from_uqff.as_ref().display().to_string();
+    api_get_file(&api, uqff_str.as_str(), Path::new(model_id))
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn get_paths(
@@ -145,10 +172,13 @@ pub fn get_paths(
     loading_uqff: bool,
 ) -> Result<Box<dyn ModelPaths>, HFError> {
     let token = get_token(token_source).map_err(HFError::HFTokenError)?;
-    let api = ApiBuilder::new()
-        .with_progress(!silent)
-        .with_token(token)
-        .build()?;
+    let api = {
+        let mut api = ApiBuilder::new().with_progress(!silent).with_token(token);
+        if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+            api = api.with_cache_dir(x.into());
+        }
+        api.build()?
+    };
 
     let revision = revision.unwrap_or_else(|| "main".to_string());
     let api = Arc::new(api.repo(Repo::with_revision(
@@ -197,7 +227,7 @@ pub fn get_paths(
         xlora_model_id,
         token_source,
         revision.clone(),
-        xlora_order,
+        &xlora_order.cloned(),
     )?;
 
     // Get optional configs by checking directory contents

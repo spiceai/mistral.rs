@@ -112,7 +112,7 @@ impl InputsProcessor for Idefics3ImageProcessor {
         return_raw_logits: bool,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta<'_>>,
-        prompt_batchsize: Option<NonZeroUsize>,
+        prompt_chunksize: Option<NonZeroUsize>,
         mapper: Option<&dyn DeviceMapper>,
     ) -> Box<dyn Iterator<Item = anyhow::Result<InputProcessorOutput>>> {
         if is_xlora {
@@ -126,8 +126,8 @@ impl InputsProcessor for Idefics3ImageProcessor {
             ))));
         }
         // TODO(EricLBuehler): support this? Would require some handling of image tokens.
-        if prompt_batchsize.is_some() {
-            warn!("`prompt_batchsize` is set. Idefics 3 does not support prompt batching.");
+        if prompt_chunksize.is_some() {
+            warn!("`prompt_chunksize` is set. Idefics 3 does not support prompt batching.");
         }
         let Some(tokenizer) = tokenizer else {
             return Box::new(std::iter::once(Err(anyhow::Error::msg(
@@ -251,6 +251,12 @@ impl InputsProcessor for Idefics3ImageProcessor {
                 let ids = toks.get_ids().to_vec();
                 all_ids.push(ids.clone());
                 seq.set_toks(ids);
+
+                if let Some(ref mut metadata) = paged_attn_metadata {
+                    // Free and then reallocate as appropriate
+                    metadata.block_engine.free_sequence(*seq.id());
+                    metadata.block_engine.allocate(*seq);
+                }
             }
 
             let mut all_ids_new = Vec::new();

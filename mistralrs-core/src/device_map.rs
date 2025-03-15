@@ -1,14 +1,35 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use crate::{
     pipeline::AutoDeviceMapParams,
     utils::{debug::DeviceRepr, log::once_log_info},
-    Topology, TryIntoDType,
+    MemoryUsage, Topology, TryIntoDType,
 };
 use candle_core::{DType, Device, DeviceLocation, Result, Tensor};
-use candle_nn::VarBuilder;
+use mistralrs_quant::ShardedVarBuilder;
 use serde::Deserialize;
 use tracing::info;
+
+fn split_range(range: std::ops::Range<usize>, n: usize) -> Vec<std::ops::Range<usize>> {
+    assert!(n > 0, "n must be non-zero");
+
+    let total = range.end - range.start;
+    let chunk_size = total / n;
+    let remainder = total % n;
+
+    let mut chunks = Vec::with_capacity(n);
+    let mut start = range.start;
+
+    // Create each chunk. The first `remainder` chunks get an extra element.
+    for i in 0..n {
+        let extra = if i < remainder { 1 } else { 0 };
+        let end = start + chunk_size + extra;
+        chunks.push(start..end);
+        start = end;
+    }
+
+    chunks
+}
 
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DeviceLayerMapMetadata {
@@ -22,6 +43,13 @@ pub enum DeviceMapSetting {
     Map(DeviceMapMetadata),
     /// Automatic device mapping (recommended).
     Auto(AutoDeviceMapParams),
+    /// Dummy device mapping for a NCCL pipeline
+    Nccl { devices: Vec<Device> },
+    /// Device mapping when using PP (agnostic of TP)
+    NcclPipelineParallel {
+        devices_and_comms: Vec<(Arc<mistralrs_quant::Comm>, Device)>,
+        nm_device: Device,
+    },
 }
 
 #[derive(Debug, Default, Deserialize, Clone)]
@@ -59,6 +87,30 @@ impl DeviceMapSetting {
         topology: Option<&Topology>,
     ) -> Result<Box<dyn DeviceMapper + Send + Sync>> {
         match self {
+            Self::Nccl { devices } => {
+                once_log_info("Loading model using a NCCL-parallelized pipeline.");
+                Ok(Box::new(NcclDeviceMapper {
+                    nm_device: devices[0].clone(),
+                    devices: devices.clone(),
+                }))
+            }
+            Self::NcclPipelineParallel {
+                devices_and_comms,
+                nm_device,
+            } => {
+                let splits = split_range(0..model_layers, devices_and_comms.len());
+
+                let mut mappings = Vec::new();
+                for (split, device) in splits.into_iter().zip(devices_and_comms) {
+                    mappings.extend(vec![device.clone(); split.len()]);
+                }
+
+                Ok(Box::new(NcclPipelineParallelMapper {
+                    mappings,
+                    nm_device: nm_device.clone(),
+                }))
+            }
+
             Self::Map(DeviceMapMetadata {
                 device_layers,
                 host_layers,
@@ -161,10 +213,13 @@ impl DeviceMapSetting {
                         // If the variant changes, print the previous continuous block
                         if !variant.same_device(current_dev) {
                             once_log_info(format!(
-                                "Layers {}-{}: {}",
+                                "Layers {}-{}: {} ({} GB)",
                                 start_index,
                                 i - 1,
-                                current_dev.device_pretty_repr()
+                                current_dev.device_pretty_repr(),
+                                MemoryUsage
+                                    .get_total_memory(current_dev)?
+                                    .div_ceil(1024 * 1024 * 1024),
                             ));
                             start_index = i; // start a new range
                             current_dev = variant;
@@ -172,10 +227,13 @@ impl DeviceMapSetting {
                     }
 
                     once_log_info(format!(
-                        "Layers {}-{}: {}",
+                        "Layers {}-{}: {} ({} GB)",
                         start_index,
                         combined.len() - 1,
-                        current_dev.device_pretty_repr()
+                        current_dev.device_pretty_repr(),
+                        MemoryUsage
+                            .get_total_memory(current_dev)?
+                            .div_ceil(1024 * 1024 * 1024),
                     ));
                 }
 
@@ -201,9 +259,9 @@ pub trait DeviceMapper: Debug {
     fn set_device<'a>(
         &self,
         layer: usize,
-        varbuilder: VarBuilder<'a>,
+        varbuilder: ShardedVarBuilder<'a>,
         loading_isq: bool,
-    ) -> VarBuilder<'a>;
+    ) -> ShardedVarBuilder<'a>;
     /// If ISQ layer, then do not change the device (return None). *They will do it later in NormalModel::quantize*
     fn device_for(&self, layer: usize, loading_isq: bool) -> Option<&Device>;
     fn get_unique_devices(&self) -> Vec<Device>;
@@ -211,8 +269,13 @@ pub trait DeviceMapper: Debug {
     fn cast_nm_device(&self, x: &Tensor, loading_isq: bool) -> Result<Tensor>;
     /// Set non mapped layer device. This is for ISQ + device mapping support
     /// If ISQ layer, then do not change the device. *They will do it later in NormalModel::quantize*
-    fn set_nm_device<'a>(&self, varbuilder: VarBuilder<'a>, loading_isq: bool) -> VarBuilder<'a>;
+    fn set_nm_device<'a>(
+        &self,
+        varbuilder: ShardedVarBuilder<'a>,
+        loading_isq: bool,
+    ) -> ShardedVarBuilder<'a>;
     fn num_device_mapping_layers(&self) -> usize;
+    fn get_comm_for(&self, layer_idx: usize) -> Result<Arc<mistralrs_quant::Comm>>;
 
     // === IMMEDIATELY AFTER INIT ===
     fn get_min_dtype(&self, dtype: &dyn TryIntoDType) -> Result<DType>;
@@ -232,9 +295,9 @@ impl DeviceMapper for LayerDeviceMapper {
     fn set_device<'a>(
         &self,
         layer: usize,
-        varbuilder: VarBuilder<'a>,
+        varbuilder: ShardedVarBuilder<'a>,
         loading_isq: bool,
-    ) -> VarBuilder<'a> {
+    ) -> ShardedVarBuilder<'a> {
         if loading_isq {
             return varbuilder;
         }
@@ -261,7 +324,11 @@ impl DeviceMapper for LayerDeviceMapper {
             x.to_device(&self.nm_device)
         }
     }
-    fn set_nm_device<'a>(&self, varbuilder: VarBuilder<'a>, loading_isq: bool) -> VarBuilder<'a> {
+    fn set_nm_device<'a>(
+        &self,
+        varbuilder: ShardedVarBuilder<'a>,
+        loading_isq: bool,
+    ) -> ShardedVarBuilder<'a> {
         if loading_isq {
             varbuilder
         } else {
@@ -275,6 +342,15 @@ impl DeviceMapper for LayerDeviceMapper {
     }
     fn num_device_mapping_layers(&self) -> usize {
         self.mappings.len()
+    }
+    fn get_comm_for(&self, layer_idx: usize) -> Result<Arc<mistralrs_quant::Comm>> {
+        let id = mistralrs_quant::Id::new();
+        Ok(Arc::new(mistralrs_quant::Comm::from_device(
+            id,
+            self.device_for(layer_idx, false).unwrap_or(&self.nm_device),
+            0,
+            1,
+        )?))
     }
 }
 
@@ -290,9 +366,9 @@ impl DeviceMapper for DummyDeviceMapper {
     fn set_device<'a>(
         &self,
         _: usize,
-        varbuilder: VarBuilder<'a>,
+        varbuilder: ShardedVarBuilder<'a>,
         loading_isq: bool,
-    ) -> VarBuilder<'a> {
+    ) -> ShardedVarBuilder<'a> {
         if loading_isq {
             varbuilder.set_device(Device::Cpu)
         } else {
@@ -312,7 +388,11 @@ impl DeviceMapper for DummyDeviceMapper {
             x.to_device(&self.nm_device)
         }
     }
-    fn set_nm_device<'a>(&self, varbuilder: VarBuilder<'a>, loading_isq: bool) -> VarBuilder<'a> {
+    fn set_nm_device<'a>(
+        &self,
+        varbuilder: ShardedVarBuilder<'a>,
+        loading_isq: bool,
+    ) -> ShardedVarBuilder<'a> {
         if loading_isq {
             varbuilder.set_device(Device::Cpu)
         } else {
@@ -327,6 +407,150 @@ impl DeviceMapper for DummyDeviceMapper {
     fn num_device_mapping_layers(&self) -> usize {
         // Effectively one layer
         1
+    }
+    fn get_comm_for(&self, layer_idx: usize) -> Result<Arc<mistralrs_quant::Comm>> {
+        let id = mistralrs_quant::Id::new();
+        Ok(Arc::new(mistralrs_quant::Comm::from_device(
+            id,
+            self.device_for(layer_idx, false).unwrap_or(&self.nm_device),
+            0,
+            1,
+        )?))
+    }
+}
+
+#[derive(Debug)]
+pub struct NcclDeviceMapper {
+    nm_device: Device,
+    devices: Vec<Device>,
+}
+
+impl DeviceMapper for NcclDeviceMapper {
+    fn map(&self, input: Tensor, _: usize) -> Result<Tensor> {
+        Ok(input)
+    }
+    fn set_device<'a>(
+        &self,
+        _: usize,
+        varbuilder: ShardedVarBuilder<'a>,
+        loading_isq: bool,
+    ) -> ShardedVarBuilder<'a> {
+        if loading_isq {
+            varbuilder.set_device(Device::Cpu)
+        } else {
+            varbuilder.set_device(self.nm_device.clone())
+        }
+    }
+    fn device_for(&self, _: usize, _loading_isq: bool) -> Option<&Device> {
+        Some(&self.nm_device)
+    }
+    fn get_unique_devices(&self) -> Vec<Device> {
+        self.devices.clone()
+    }
+    fn cast_nm_device(&self, x: &Tensor, loading_isq: bool) -> Result<Tensor> {
+        if loading_isq {
+            x.to_device(&Device::Cpu)
+        } else {
+            x.to_device(&self.nm_device)
+        }
+    }
+    fn set_nm_device<'a>(
+        &self,
+        varbuilder: ShardedVarBuilder<'a>,
+        loading_isq: bool,
+    ) -> ShardedVarBuilder<'a> {
+        if loading_isq {
+            varbuilder.set_device(Device::Cpu)
+        } else {
+            varbuilder.set_device(self.nm_device.clone())
+        }
+    }
+    fn get_min_dtype(&self, dtype: &dyn TryIntoDType) -> Result<DType> {
+        dtype
+            .try_into_dtype(&self.devices.iter().collect::<Vec<_>>())
+            .map_err(candle_core::Error::msg)
+    }
+    fn num_device_mapping_layers(&self) -> usize {
+        // Effectively one layer
+        1
+    }
+    fn get_comm_for(&self, layer_idx: usize) -> Result<Arc<mistralrs_quant::Comm>> {
+        let id = mistralrs_quant::Id::new();
+        Ok(Arc::new(mistralrs_quant::Comm::from_device(
+            id,
+            self.device_for(layer_idx, false).unwrap_or(&self.nm_device),
+            0,
+            1,
+        )?))
+    }
+}
+
+#[derive(Debug)]
+/// A device mapper which does device mapping per hidden layer.
+pub struct NcclPipelineParallelMapper {
+    mappings: Vec<(Arc<mistralrs_quant::Comm>, Device)>,
+    nm_device: Device,
+}
+
+impl DeviceMapper for NcclPipelineParallelMapper {
+    fn map(&self, input: Tensor, layer: usize) -> Result<Tensor> {
+        input.to_device(&self.mappings[layer].1)
+    }
+    fn set_device<'a>(
+        &self,
+        layer: usize,
+        varbuilder: ShardedVarBuilder<'a>,
+        loading_isq: bool,
+    ) -> ShardedVarBuilder<'a> {
+        if loading_isq {
+            return varbuilder;
+        }
+        varbuilder.set_device(self.mappings[layer].1.clone())
+    }
+    fn device_for(&self, layer: usize, loading_isq: bool) -> Option<&Device> {
+        if loading_isq {
+            return Some(&self.nm_device);
+        }
+        self.mappings.get(layer).map(|(_, x)| x)
+    }
+    fn get_unique_devices(&self) -> Vec<Device> {
+        self.mappings
+            .iter()
+            .fold(Vec::new(), |mut acc, (_, device)| {
+                if !acc.iter().any(|d| d.same_device(device)) {
+                    acc.push(device.clone());
+                }
+                acc
+            })
+    }
+    fn cast_nm_device(&self, x: &Tensor, loading_isq: bool) -> Result<Tensor> {
+        if loading_isq {
+            x.to_device(&Device::Cpu)
+        } else {
+            x.to_device(&self.nm_device)
+        }
+    }
+    fn set_nm_device<'a>(
+        &self,
+        varbuilder: ShardedVarBuilder<'a>,
+        loading_isq: bool,
+    ) -> ShardedVarBuilder<'a> {
+        if loading_isq {
+            varbuilder
+        } else {
+            varbuilder.set_device(self.nm_device.clone())
+        }
+    }
+    fn get_min_dtype(&self, dtype: &dyn TryIntoDType) -> Result<DType> {
+        dtype
+            .try_into_dtype(&self.mappings.iter().map(|(_, x)| x).collect::<Vec<_>>())
+            .map_err(candle_core::Error::msg)
+    }
+    fn num_device_mapping_layers(&self) -> usize {
+        self.mappings.len()
+    }
+    fn get_comm_for(&self, layer_idx: usize) -> Result<Arc<mistralrs_quant::Comm>> {
+        Ok(self.mappings[layer_idx].0.clone())
     }
 }
 
@@ -346,6 +570,7 @@ pub fn get_all_similar_devices(base: &Device) -> Result<Vec<Device>> {
                     ord += 1;
                     continue;
                 }
+                // Needs to be without a stream as PagedAttention doesn't like it otherwise.
                 if let Ok(dev) = Device::new_cuda(ord) {
                     devices.push(dev);
                     ord += 1;

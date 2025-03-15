@@ -18,6 +18,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use image::{DynamicImage, RgbImage};
+use indicatif::MultiProgress;
 use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
 use std::any::Any;
@@ -199,6 +200,7 @@ impl Loader for DiffusionLoader {
                         mapper,
                         loading_isq: false,
                         real_device: device.clone(),
+                        multi_progress: Arc::new(MultiProgress::new()),
                     },
                     attention_mechanism,
                     silent,
@@ -224,7 +226,7 @@ impl Loader for DiffusionLoader {
                 sliding_window: None,
                 cache_config: None,
                 cache_engine: None,
-                prompt_batchsize: None,
+                prompt_chunksize: None,
                 model_metadata: None,
             }),
             dummy_cache: EitherCache::Full(Cache::new(0, false)),
@@ -259,8 +261,8 @@ impl IsqPipelineMixin for DiffusionPipeline {
 }
 
 impl CacheManagerMixin for DiffusionPipeline {
-    fn clone_in_cache(&self, _seqs: &mut [&mut Sequence], _modify_draft_cache: bool) {}
-    fn clone_out_cache(&self, _seqs: &mut [&mut Sequence], _modify_draft_cache: bool) {}
+    fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) {}
+    fn clone_out_cache(&self, _seqs: &mut [&mut Sequence]) {}
     fn set_none_cache(
         &self,
         _seqs: &mut [&mut Sequence],

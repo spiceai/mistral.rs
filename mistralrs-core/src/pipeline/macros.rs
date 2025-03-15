@@ -37,24 +37,6 @@ macro_rules! api_dir_list {
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! api_get_file {
-    ($api:expr, $file:expr, $model_id:expr) => {
-        if std::path::Path::new($model_id).exists() {
-            let path = $model_id.join($file);
-            if !path.exists() {
-                panic!("File \"{}\" not found at model id {:?}", $file, $model_id)
-            }
-            info!("Loading `{}` locally at `{}`", &$file, path.display());
-            path
-        } else {
-            $api.get($file)
-                .unwrap_or_else(|e| panic!("Could not get file {:?} from API: {:?}", $file, e))
-        }
-    };
-}
-
-#[doc(hidden)]
-#[macro_export]
 macro_rules! get_paths {
     (
         $path_name:ident,
@@ -66,10 +48,15 @@ macro_rules! get_paths {
         $silent:expr,
         $loading_uqff:expr
     ) => {{
-        let api = ApiBuilder::new()
-            .with_progress(!$silent)
-            .with_token(get_token($token_source)?)
-            .build()?;
+        let api = {
+            let mut api = ApiBuilder::new()
+                .with_progress(!$silent)
+                .with_token(get_token($token_source)?);
+            if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+                api = api.with_cache_dir(x.into());
+            }
+            api.build()?
+        };
         let revision = $revision.unwrap_or("main".to_string());
         let api = api.repo(Repo::with_revision(
             $this.model_id.clone(),
@@ -82,10 +69,10 @@ macro_rules! get_paths {
             PathBuf::from_str(p)?
         } else {
             info!("Loading `tokenizer.json` at `{}`", $this.model_id);
-            $crate::api_get_file!(api, "tokenizer.json", model_id)
+            $crate::pipeline::hf::api_get_file(&api, "tokenizer.json", model_id)
         };
         info!("Loading `config.json` at `{}`", $this.model_id);
-        let config_filename = $crate::api_get_file!(api, "config.json", model_id);
+        let config_filename = $crate::pipeline::hf::api_get_file(&api, "config.json", model_id);
         let filenames = get_model_paths(
             revision.clone(),
             &$token_source,
@@ -107,17 +94,17 @@ macro_rules! get_paths {
             $this.xlora_model_id.as_deref(),
             &$token_source,
             revision.clone(),
-            $this.xlora_order.as_ref(),
+            &$this.xlora_order.clone(),
         )?;
         let gen_conf = if $crate::api_dir_list!(api, model_id)
             .collect::<Vec<_>>()
             .contains(&"generation_config.json".to_string())
         {
             info!("Loading `generation_config.json` at `{}`", $this.model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::hf::api_get_file(
+                &api,
                 "generation_config.json",
-                model_id
+                model_id,
             ))
         } else {
             None
@@ -127,10 +114,10 @@ macro_rules! get_paths {
             .contains(&"preprocessor_config.json".to_string())
         {
             info!("Loading `preprocessor_config.json` at `{}`", $this.model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::hf::api_get_file(
+                &api,
                 "preprocessor_config.json",
-                model_id
+                model_id,
             ))
         } else {
             None
@@ -140,10 +127,10 @@ macro_rules! get_paths {
             .contains(&"processor_config.json".to_string())
         {
             info!("Loading `processor_config.json` at `{}`", $this.model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::hf::api_get_file(
+                &api,
                 "processor_config.json",
-                model_id
+                model_id,
             ))
         } else {
             None
@@ -153,10 +140,10 @@ macro_rules! get_paths {
             Some(PathBuf::from_str(p)?)
         } else {
             info!("Loading `tokenizer_config.json` at `{}`", $this.model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::hf::api_get_file(
+                &api,
                 "tokenizer_config.json",
-                model_id
+                model_id,
             ))
         };
         let chat_template_json_filename = if $crate::api_dir_list!(api, model_id)
@@ -164,7 +151,11 @@ macro_rules! get_paths {
             .contains(&"chat_template.json".to_string())
         {
             info!("Loading `chat_template.json` at `{}`", $this.model_id);
-            Some($crate::api_get_file!(api, "chat_template.json", model_id))
+            Some($crate::pipeline::hf::api_get_file(
+                &api,
+                "chat_template.json",
+                model_id,
+            ))
         } else {
             None
         };
@@ -189,39 +180,6 @@ macro_rules! get_paths {
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! get_uqff_paths {
-    ($from_uqff:expr, $this:expr, $silent:expr) => {{
-        let api = ApiBuilder::new()
-            .with_progress(!$silent)
-            .with_token(get_token(
-                &$this
-                    .token_source
-                    .read()
-                    .expect("Failed to read token source")
-                    .clone()
-                    .unwrap_or(TokenSource::None),
-            )?)
-            .build()?;
-        let revision = $this
-            .revision
-            .read()
-            .expect("Failed to read revision")
-            .clone()
-            .unwrap_or("main".to_string());
-        let api = api.repo(Repo::with_revision(
-            $this.model_id.to_string(),
-            RepoType::Model,
-            revision.clone(),
-        ));
-
-        let file = $from_uqff.display().to_string();
-
-        api_get_file!(api, &file, Path::new(&$this.model_id))
-    }};
-}
-
-#[doc(hidden)]
-#[macro_export]
 macro_rules! get_paths_gguf {
     (
         $path_name:ident,
@@ -232,10 +190,15 @@ macro_rules! get_paths_gguf {
         $quantized_filenames:expr,
         $silent:expr
     ) => {{
-        let api = ApiBuilder::new()
-            .with_progress(!$silent)
-            .with_token(get_token($token_source)?)
-            .build()?;
+        let api = {
+            let mut api = ApiBuilder::new()
+                .with_progress(!$silent)
+                .with_token(get_token($token_source)?);
+            if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+                api = api.with_cache_dir(x.into());
+            }
+            api.build()?
+        };
         let revision = $revision.unwrap_or("main".to_string());
         let this_model_id = $this.model_id.clone().unwrap_or($this.quantized_model_id.clone());
         let api = api.repo(Repo::with_revision(
@@ -257,11 +220,11 @@ macro_rules! get_paths_gguf {
                 None
             } else {
                 info!("Loading `tokenizer_config.json` at `{}` because no chat template file was specified.", this_model_id);
-                let res = $crate::api_get_file!(
-                    api,
+                let res = $crate::pipeline::hf::api_get_file(
+                    &api,
                     "tokenizer_config.json",
                     model_id
-                );
+                )?;
                 Some(res)
             }
         };
@@ -288,7 +251,7 @@ macro_rules! get_paths_gguf {
             $this.xlora_model_id.as_deref(),
             &$token_source,
             revision.clone(),
-            $this.xlora_order.as_ref(),
+            &$this.xlora_order.clone(),
         )?;
 
         let gen_conf = if $crate::api_dir_list!(api, model_id)
@@ -296,11 +259,11 @@ macro_rules! get_paths_gguf {
             .contains(&"generation_config.json".to_string())
         {
             info!("Loading `generation_config.json` at `{}`", this_model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::hf::api_get_file(
+                &api,
                 "generation_config.json",
                 model_id
-            ))
+            )?)
         } else {
             None
         };
@@ -310,11 +273,11 @@ macro_rules! get_paths_gguf {
             .contains(&"preprocessor_config.json".to_string())
         {
             info!("Loading `preprocessor_config.json` at `{}`", this_model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::hf::api_get_file(
+                &api,
                 "preprocessor_config.json",
                 model_id
-            ))
+            )?)
         } else {
             None
         };
@@ -324,18 +287,18 @@ macro_rules! get_paths_gguf {
             .contains(&"processor_config.json".to_string())
         {
             info!("Loading `processor_config.json` at `{}`", this_model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::hf::api_get_file(
+                &api,
                 "processor_config.json",
                 model_id
-            ))
+            )?)
         } else {
             None
         };
 
         let tokenizer_filename = if $this.model_id.is_some() {
             info!("Loading `tokenizer.json` at `{}`", this_model_id);
-            $crate::api_get_file!(api, "tokenizer.json", model_id)
+            $crate::pipeline::hf::api_get_file(&api, "tokenizer.json", model_id)?
         } else {
             PathBuf::from_str("")?
         };
@@ -345,11 +308,11 @@ macro_rules! get_paths_gguf {
             .contains(&"chat_template.json".to_string())
         {
             info!("Loading `chat_template.json` at `{}`", this_model_id);
-            Some($crate::api_get_file!(
-                api,
+            Some($crate::pipeline::hf::api_get_file(
+                &api,
                 "chat_template.json",
                 model_id
-            ))
+            )?)
         } else {
             None
         };
@@ -390,7 +353,8 @@ macro_rules! normal_model_loader {
         $loading_uqff:expr,
         $real_device:expr,
         $attention_mechanism:expr,
-        $is_moqe:expr
+        $is_moqe:expr,
+        $multi_progress:expr,
     ) => {{
         let regexes = if $loading_isq && $loading_uqff {
             // Dummy weights for the layers which will be overwritten...
@@ -425,6 +389,36 @@ macro_rules! normal_model_loader {
                 mapper: $mapper,
                 loading_isq: $loading_isq,
                 real_device: $real_device,
+                multi_progress: $multi_progress,
+            },
+            $attention_mechanism,
+        )?
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! normal_model_loader_sharded {
+    (
+        $vb:expr,
+        $config:expr,
+        $loader:expr,
+        $use_flash_attn:expr,
+        $mapper:expr,
+        $loading_isq:expr,
+        $real_device:expr,
+        $attention_mechanism:expr,
+        $multi_progress:expr,
+    ) => {{
+        $loader.load(
+            &$config,
+            $use_flash_attn,
+            $vb,
+            $crate::pipeline::NormalLoadingMetadata {
+                mapper: $mapper,
+                loading_isq: $loading_isq,
+                real_device: $real_device,
+                multi_progress: $multi_progress,
             },
             $attention_mechanism,
         )?
@@ -447,7 +441,8 @@ macro_rules! vision_normal_model_loader {
         $loading_isq:expr,
         $loading_uqff:expr,
         $real_device:expr,
-        $attention_mechanism:expr
+        $attention_mechanism:expr,
+        $multi_progress:expr,
     ) => {{
         let regexes = if $loading_isq && $loading_uqff {
             // Dummy weights for the layers which will be overwritten...
@@ -478,6 +473,7 @@ macro_rules! vision_normal_model_loader {
                 mapper: $mapper,
                 loading_isq: $loading_isq,
                 real_device: $real_device,
+                multi_progress: $multi_progress,
             },
             $attention_mechanism,
         )?
@@ -498,7 +494,8 @@ macro_rules! xlora_model_loader {
         $silent:expr,
         $mapper:expr,
         $loading_isq:expr,
-        $real_device:expr
+        $real_device:expr,
+        $multi_progress:expr,
     ) => {{
         let mut safetensors_paths = $paths.get_weight_filenames().iter().collect::<Vec<_>>();
         safetensors_paths.push($paths.get_classifier_path().as_ref().unwrap());
@@ -537,6 +534,7 @@ macro_rules! xlora_model_loader {
                 mapper: $mapper,
                 loading_isq: $loading_isq,
                 real_device: $real_device,
+                multi_progress: $multi_progress,
             },
             &None,
         )?
@@ -557,7 +555,8 @@ macro_rules! lora_model_loader {
         $silent:expr,
         $mapper:expr,
         $loading_isq:expr,
-        $real_device:expr
+        $real_device:expr,
+        $multi_progress:expr,
     ) => {{
         let safetensors_paths = $paths.get_weight_filenames().iter().collect::<Vec<_>>();
         let get_device_for_tensor =
@@ -595,6 +594,7 @@ macro_rules! lora_model_loader {
                 mapper: $mapper,
                 loading_isq: $loading_isq,
                 real_device: $real_device,
+                multi_progress: $multi_progress,
             },
             &$crate::utils::varbuilder_utils::load_preload_adapters(
                 $paths.get_lora_preload_adapter_info(),

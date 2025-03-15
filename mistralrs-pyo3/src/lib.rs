@@ -75,12 +75,9 @@ fn parse_which(
     which: Which,
     no_kv_cache: bool,
     chat_template: Option<String>,
-    prompt_batchsize: Option<NonZeroUsize>,
+    prompt_chunksize: Option<NonZeroUsize>,
 ) -> PyApiResult<Box<dyn Loader>> {
-    #[cfg(not(feature = "flash-attn"))]
-    let use_flash_attn = false;
-    #[cfg(feature = "flash-attn")]
-    let use_flash_attn = true;
+    let use_flash_attn = mistralrs_core::using_flash_attn();
 
     Ok(match which {
         Which::Plain {
@@ -98,7 +95,7 @@ fn parse_which(
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
                 use_flash_attn,
-                prompt_batchsize,
+                prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: organization.map(Into::into).unwrap_or(Default::default()),
                 write_uqff,
@@ -127,7 +124,7 @@ fn parse_which(
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
                 use_flash_attn,
-                prompt_batchsize,
+                prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
                 write_uqff,
@@ -164,7 +161,7 @@ fn parse_which(
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
                 use_flash_attn,
-                prompt_batchsize,
+                prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
                 write_uqff,
@@ -198,7 +195,7 @@ fn parse_which(
             quantized_model_id,
             quantized_filename.map_left(|f| vec![f]).into_inner(),
             GGUFSpecificConfig {
-                prompt_batchsize,
+                prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
         )
@@ -220,7 +217,7 @@ fn parse_which(
             quantized_model_id,
             quantized_filename.map_left(|f| vec![f]).into_inner(),
             GGUFSpecificConfig {
-                prompt_batchsize,
+                prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
         )
@@ -250,7 +247,7 @@ fn parse_which(
             quantized_model_id,
             quantized_filename.map_left(|f| vec![f]).into_inner(),
             GGUFSpecificConfig {
-                prompt_batchsize,
+                prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
         )
@@ -275,7 +272,7 @@ fn parse_which(
         } => GGMLLoaderBuilder::new(
             GGMLSpecificConfig {
                 gqa,
-                prompt_batchsize,
+                prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             chat_template,
@@ -301,7 +298,7 @@ fn parse_which(
         } => GGMLLoaderBuilder::new(
             GGMLSpecificConfig {
                 gqa,
-                prompt_batchsize,
+                prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             chat_template,
@@ -335,7 +332,7 @@ fn parse_which(
         } => GGMLLoaderBuilder::new(
             GGMLSpecificConfig {
                 gqa,
-                prompt_batchsize,
+                prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             chat_template,
@@ -363,16 +360,18 @@ fn parse_which(
             dtype: _,
             max_edge,
             calibration_file,
+            imatrix,
             auto_map_params: _,
         } => VisionLoaderBuilder::new(
             VisionSpecificConfig {
                 use_flash_attn,
-                prompt_batchsize,
+                prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 write_uqff,
                 from_uqff,
                 max_edge,
                 calibration_file,
+                imatrix,
             },
             chat_template,
             tokenizer_json,
@@ -445,7 +444,7 @@ impl Runner {
         pa_blk_size = None,
         no_paged_attn = false,
         paged_attn = false,
-        prompt_batchsize = None,
+        prompt_chunksize = None,
         seed = None,
     ))]
     fn new(
@@ -466,7 +465,7 @@ impl Runner {
         pa_blk_size: Option<usize>,
         no_paged_attn: bool,
         paged_attn: bool,
-        prompt_batchsize: Option<usize>,
+        prompt_chunksize: Option<usize>,
         seed: Option<u64>,
     ) -> PyApiResult<Self> {
         let tgt_non_granular_index = match which {
@@ -549,31 +548,30 @@ impl Runner {
                     max_num_images: p.max_num_images,
                 })
                 .unwrap_or(AutoDeviceMapParams::default_vision()),
-            Which::DiffusionPlain { .. } => {
-                return Err(PyApiErr::from(
-                    "diffusion model doesn't support max_seq_len",
-                ))
-            }
+            Which::DiffusionPlain { .. } => AutoDeviceMapParams::default_text(),
         };
+
+        let max_seq_len = auto_map_params.max_seq_len();
+
         let max_seqs = if tgt_non_granular_index.is_some() {
             1
         } else {
             max_seqs
         };
 
-        let prompt_batchsize = match prompt_batchsize {
+        let prompt_chunksize = match prompt_chunksize {
             Some(0) => {
                 return Err(PyApiErr::from(
-                    "`prompt_batchsize` must be a strictly positive integer, got 0.",
+                    "`prompt_chunksize` must be a strictly positive integer, got 0.",
                 ))
             }
             Some(x) => Some(NonZeroUsize::new(x).unwrap()),
             None => None,
         };
 
-        let loader = parse_which(which, no_kv_cache, chat_template.clone(), prompt_batchsize)?;
+        let loader = parse_which(which, no_kv_cache, chat_template.clone(), prompt_chunksize)?;
         let loader = if let Some(draft_which) = which_draft {
-            let draft = parse_which(draft_which, no_kv_cache, chat_template, prompt_batchsize)?;
+            let draft = parse_which(draft_which, no_kv_cache, chat_template, prompt_chunksize)?;
             Box::new(SpeculativeLoader {
                 target: loader,
                 draft,
@@ -672,7 +670,7 @@ impl Runner {
                 (block_size, None, None, None, true, false) => Some(PagedAttentionConfig::new(
                     block_size,
                     512,
-                    MemoryGpuConfig::Utilization(0.9), // NOTE(EricLBuehler): default is to use 90% of memory
+                    MemoryGpuConfig::ContextSize(max_seq_len),
                 )?),
                 (block_size, None, None, Some(ctxt), true, false) => Some(
                     PagedAttentionConfig::new(block_size, 512, MemoryGpuConfig::ContextSize(ctxt))?,

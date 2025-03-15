@@ -24,6 +24,8 @@ pub use scheduler::{
 use crate::MemoryUsage;
 use tracing::info;
 
+pub const DEFAULT_PAGED_ATTENTION_BLOCK_SIZE: usize = 32;
+
 /// All memory counts in MB. Default for block size is 32.
 #[derive(Clone, Copy)]
 pub struct PagedAttentionConfig {
@@ -46,6 +48,7 @@ impl PagedAttentionConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum AttentionImplementation {
     Eager,
     PagedAttention,
@@ -70,7 +73,7 @@ macro_rules! mb_to_blocks {
             / $dtype_size
             / $block_size
             / $config.num_kv_heads()
-            / ($config.hidden_size() / $config.num_attn_heads())
+            / ($config.k_head_dim().max($config.v_head_dim()))
             / $config.num_layers()
             / 2
     };
@@ -81,7 +84,7 @@ macro_rules! ctxt_to_blocks {
         $context_len
             * $dtype_size
             * $config.num_kv_heads()
-            * ($config.hidden_size() / $config.num_attn_heads())
+            * ($config.k_head_dim().max($config.v_head_dim()))
             * $config.num_layers()
             * 2
     };
@@ -99,7 +102,7 @@ pub fn calculate_cache_config(
     layer_devices: &[Option<Device>],
     silent: bool,
 ) -> anyhow::Result<CacheConfig> {
-    let block_size = block_size.unwrap_or(32);
+    let block_size = block_size.unwrap_or(DEFAULT_PAGED_ATTENTION_BLOCK_SIZE);
     if !SUPPORTED_BLOCK_SIZE.contains(&block_size) {
         anyhow::bail!("Block size must be in {SUPPORTED_BLOCK_SIZE:?}, got {block_size}");
     }
@@ -137,7 +140,7 @@ pub fn calculate_cache_config(
     }
 
     if !silent {
-        info!("Allocating {mem_gpu} MB for PagedAttention KV cache",);
+        info!("Allocating {mem_gpu} MB for PagedAttention KV cache per GPU");
         info!("Using PagedAttention with block size {block_size} and {num_gpu_blocks} GPU blocks: available context length is {} tokens", num_gpu_blocks*block_size);
     }
     Ok(CacheConfig {
