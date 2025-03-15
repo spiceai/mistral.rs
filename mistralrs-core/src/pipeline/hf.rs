@@ -84,16 +84,17 @@ pub(crate) fn api_get_file(
             process::exit(1);
         }
 
+        setup_signal_handler();
         // **Start download but abort if SIGTERM is received**
-        let download_result = thread::spawn({
+        let mut download_result = Some(thread::spawn({
             let api = Arc::clone(api);
             let file = file.to_string();
             move || api.get(&file)
-        });
+        }));
 
         while !SHOULD_TERMINATE.load(AtomicOrdering::SeqCst) {
-            if download_result.is_finished() {
-                if let Ok(result) = download_result.join() {
+            if download_result.as_ref().is_some_and(|r| r.is_finished()) {
+                if let Some(Ok(result)) = download_result.take().map(|r| r.join()) {
                     return result.map_err(|e| match e {
                         HFHubApiError::RequestError(err)
                             if matches!(*err, ureq::Error::Status(403, _)) =>
@@ -120,7 +121,7 @@ fn setup_signal_handler() -> Arc<AtomicBool> {
 
     let should_terminate_clone = Arc::clone(&should_terminate);
     thread::spawn(move || {
-        for _ in signals.forever() {
+        if let Some(_) = signals.forever().next() {
             eprintln!("Received termination signal. Aborting download...");
             should_terminate_clone.store(true, AtomicOrdering::SeqCst);
             process::exit(1);
@@ -129,7 +130,7 @@ fn setup_signal_handler() -> Arc<AtomicBool> {
 
     should_terminate
 }
-  
+
 pub fn get_uqff_paths(
     from_uqff: impl AsRef<Path>,
     token_source: &TokenSource,
@@ -154,7 +155,7 @@ pub fn get_uqff_paths(
     ));
 
     let uqff_str = from_uqff.as_ref().display().to_string();
-    api_get_file(&api, uqff_str.as_str(), Path::new(model_id))
+    api_get_file(&Arc::new(api), uqff_str.as_str(), Path::new(model_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -209,7 +210,7 @@ pub fn get_paths(
         token_source,
         quantized_model_id,
         quantized_filenames,
-        api,
+        Arc::clone(&api),
         Path::new(&model_id),
         loading_uqff,
     )?;
@@ -291,7 +292,10 @@ pub fn get_paths(
 ///
 /// # Returns
 /// * `Result<Vec<String>>` - List of filenames in the directory
-pub fn api_dir_list(api: &ApiRepo, model_id: impl AsRef<Path>) -> Result<Vec<String>, HFError> {
+pub fn api_dir_list(
+    api: &Arc<ApiRepo>,
+    model_id: impl AsRef<Path>,
+) -> Result<Vec<String>, HFError> {
     let model_id = model_id.as_ref();
 
     if model_id.exists() {
