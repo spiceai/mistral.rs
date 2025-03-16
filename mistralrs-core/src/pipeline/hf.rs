@@ -40,6 +40,9 @@ pub enum HFError {
     #[error("HF API error occurred: {0:?}")]
     HFHubApiError(#[from] HFHubApiError),
 
+    #[error("HF API download cancelled.")]
+    HFDownloadFileCancelled {},
+
     #[error("Could not retrieve HF API token: {0:?}")]
     HFTokenError(#[from] TokenRetrievalError),
 
@@ -80,8 +83,7 @@ pub(crate) fn api_get_file(
     } else {
         // **Check for SIGTERM before starting the request**
         if SHOULD_TERMINATE.load(AtomicOrdering::SeqCst) {
-            eprintln!("Download aborted due to SIGTERM.");
-            process::exit(1);
+            return Err(HFError::HFDownloadFileCancelled {});
         }
 
         setup_signal_handler();
@@ -109,9 +111,7 @@ pub(crate) fn api_get_file(
             }
             thread::sleep(Duration::from_millis(100)); // Polling loop to check SIGTERM
         }
-
-        eprintln!("Download aborted due to SIGTERM.");
-        process::exit(1);
+        Err(HFError::HFDownloadFileCancelled {})
     }
 }
 
