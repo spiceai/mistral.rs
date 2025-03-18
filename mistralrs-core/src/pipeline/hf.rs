@@ -1,11 +1,8 @@
 use signal_hook::consts::TERM_SIGNALS;
-use signal_hook::iterator::Signals;
+
 use std::{
     path::{Path, PathBuf},
-    process,
     str::FromStr,
-};
-use std::{
     sync::{
         atomic::{AtomicBool, Ordering as AtomicOrdering},
         Arc,
@@ -56,9 +53,6 @@ pub enum HFError {
     InvalidRepoStructure(String),
 }
 
-/// Global atomic flag for SIGTERM handling
-static SHOULD_TERMINATE: AtomicBool = AtomicBool::new(false);
-
 /// Attempts to retrieve a file from a HF repo. Will check if the file exists locally first.
 ///
 /// # Returns
@@ -81,12 +75,12 @@ pub(crate) fn api_get_file(
         info!("Loading `{file}` locally at `{}`", path.display());
         Ok(path)
     } else {
-        // **Check for SIGTERM before starting the request**
-        if SHOULD_TERMINATE.load(AtomicOrdering::SeqCst) {
-            return Err(HFError::HFDownloadFileCancelled {});
+        let should_terminate = Arc::new(AtomicBool::new(false));
+        for sig in TERM_SIGNALS {
+            let _ = signal_hook::flag::register(*sig, Arc::clone(&should_terminate))
+                .expect("Failed to set signal handler");
         }
 
-        setup_signal_handler();
         // **Start download but abort if SIGTERM is received**
         let mut download_result = Some(thread::spawn({
             let api = Arc::clone(api);
@@ -94,7 +88,7 @@ pub(crate) fn api_get_file(
             move || api.get(&file)
         }));
 
-        while !SHOULD_TERMINATE.load(AtomicOrdering::SeqCst) {
+        while !should_terminate.load(AtomicOrdering::SeqCst) {
             if download_result.as_ref().is_some_and(|r| r.is_finished()) {
                 if let Some(Ok(result)) = download_result.take().map(|r| r.join()) {
                     return result.map_err(|e| match e {
@@ -113,21 +107,6 @@ pub(crate) fn api_get_file(
         }
         Err(HFError::HFDownloadFileCancelled {})
     }
-}
-
-fn setup_signal_handler() -> Arc<AtomicBool> {
-    let should_terminate = Arc::new(AtomicBool::new(false));
-    let mut signals = Signals::new(TERM_SIGNALS).expect("Failed to set signal handler");
-
-    let should_terminate_clone = Arc::clone(&should_terminate);
-    thread::spawn(move || {
-        if let Some(_) = signals.forever().next() {
-            should_terminate_clone.store(true, AtomicOrdering::SeqCst);
-            process::exit(1);
-        }
-    });
-
-    should_terminate
 }
 
 pub fn get_uqff_paths(
