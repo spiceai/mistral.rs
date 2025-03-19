@@ -1,6 +1,14 @@
+use signal_hook::consts::TERM_SIGNALS;
+
 use std::{
     path::{Path, PathBuf},
     str::FromStr,
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
 
 use hf_hub::{
@@ -29,6 +37,9 @@ pub enum HFError {
     #[error("HF API error occurred: {0:?}")]
     HFHubApiError(#[from] HFHubApiError),
 
+    #[error("HF API download cancelled.")]
+    HFDownloadFileCancelled {},
+
     #[error("Could not retrieve HF API token: {0:?}")]
     HFTokenError(#[from] TokenRetrievalError),
 
@@ -47,7 +58,7 @@ pub enum HFError {
 /// # Returns
 /// * `Result<PathBuf, String>` - The path to the file (if found, or downloaded), error message if not.
 pub(crate) fn api_get_file(
-    api: &ApiRepo,
+    api: &Arc<ApiRepo>,
     file: &str,
     model_id: impl AsRef<Path>,
 ) -> Result<PathBuf, HFError> {
@@ -64,14 +75,37 @@ pub(crate) fn api_get_file(
         info!("Loading `{file}` locally at `{}`", path.display());
         Ok(path)
     } else {
-        api.get(file).map_err(|e| match e {
-            HFHubApiError::RequestError(err) if matches!(*err, ureq::Error::Status(403, _)) => {
-                HFError::AuthorizationError {
-                    model_id: model_id.display().to_string(),
+        let should_terminate = Arc::new(AtomicBool::new(false));
+        for sig in TERM_SIGNALS {
+            let _ = signal_hook::flag::register(*sig, Arc::clone(&should_terminate))
+                .expect("Failed to set signal handler");
+        }
+
+        // **Start download but abort if SIGTERM is received**
+        let mut download_result = Some(thread::spawn({
+            let api = Arc::clone(api);
+            let file = file.to_string();
+            move || api.get(&file)
+        }));
+
+        while !should_terminate.load(AtomicOrdering::SeqCst) {
+            if download_result.as_ref().is_some_and(|r| r.is_finished()) {
+                if let Some(Ok(result)) = download_result.take().map(|r| r.join()) {
+                    return result.map_err(|e| match e {
+                        HFHubApiError::RequestError(err)
+                            if matches!(*err, ureq::Error::Status(403, _)) =>
+                        {
+                            HFError::AuthorizationError {
+                                model_id: model_id.display().to_string(),
+                            }
+                        }
+                        ee => HFError::HFHubApiError(ee),
+                    });
                 }
             }
-            ee => HFError::HFHubApiError(ee),
-        })
+            thread::sleep(Duration::from_millis(100)); // Polling loop to check SIGTERM
+        }
+        Err(HFError::HFDownloadFileCancelled {})
     }
 }
 
@@ -99,7 +133,7 @@ pub fn get_uqff_paths(
     ));
 
     let uqff_str = from_uqff.as_ref().display().to_string();
-    api_get_file(&api, uqff_str.as_str(), Path::new(model_id))
+    api_get_file(&Arc::new(api), uqff_str.as_str(), Path::new(model_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -126,11 +160,11 @@ pub fn get_paths(
     };
 
     let revision = revision.unwrap_or_else(|| "main".to_string());
-    let api = api.repo(Repo::with_revision(
+    let api = Arc::new(api.repo(Repo::with_revision(
         model_id.clone(),
         RepoType::Model,
         revision.clone(),
-    ));
+    )));
 
     // Get tokenizer path
     let tokenizer_filename = if let Some(p) = tokenizer_json {
@@ -154,7 +188,7 @@ pub fn get_paths(
         token_source,
         quantized_model_id,
         quantized_filenames,
-        &api,
+        Arc::clone(&api),
         Path::new(&model_id),
         loading_uqff,
     )?;
@@ -236,7 +270,10 @@ pub fn get_paths(
 ///
 /// # Returns
 /// * `Result<Vec<String>>` - List of filenames in the directory
-pub fn api_dir_list(api: &ApiRepo, model_id: impl AsRef<Path>) -> Result<Vec<String>, HFError> {
+pub fn api_dir_list(
+    api: &Arc<ApiRepo>,
+    model_id: impl AsRef<Path>,
+) -> Result<Vec<String>, HFError> {
     let model_id = model_id.as_ref();
 
     if model_id.exists() {

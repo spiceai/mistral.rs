@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::Result;
@@ -69,11 +70,11 @@ pub fn get_xlora_paths(
         }
         api.build().map_err(HFError::HFHubApiError)
     }?;
-    let api = api.repo(Repo::with_revision(
+    let api = Arc::new(api.repo(Repo::with_revision(
         xlora_id.to_string(),
         RepoType::Model,
         revision,
-    ));
+    )));
 
     let model_id = Path::new(&xlora_id);
     let api_dir = api_dir_list(&api, model_id)?;
@@ -195,7 +196,7 @@ pub fn get_xlora_paths(
     };
 
     let lora_preload_adapter_info =
-        lora_preload_adapter_info(&api, model_id, xlora_order.as_ref())?;
+        lora_preload_adapter_info(Arc::clone(&api), model_id, xlora_order.as_ref())?;
     Ok(XLoraPaths {
         adapter_configs: Some(adapters_configs),
         adapter_safetensors: Some(adapters_safetensors),
@@ -245,7 +246,7 @@ pub fn xlora_adapters_config_and_safetensors(
 pub type LoraAdapterInfo = HashMap<String, (PathBuf, LoraConfig)>;
 // If preload adapters are specified
 pub fn lora_preload_adapter_info(
-    api: &ApiRepo,
+    api: Arc<ApiRepo>,
     model_id: &Path,
     xlora_order: Option<&Ordering>,
 ) -> Result<Option<LoraAdapterInfo>, HFError> {
@@ -258,7 +259,7 @@ pub fn lora_preload_adapter_info(
     let mut output = HashMap::new();
     for adapter in preload_adapters {
         // Get the names and remote paths of the files associated with this adapter
-        let files = api_dir_list(api, &adapter.adapter_model_id)?;
+        let files = api_dir_list(&api, &adapter.adapter_model_id)?;
         let adapter_files = files
             .iter()
             .filter_map(|f| {
@@ -275,7 +276,7 @@ pub fn lora_preload_adapter_info(
         // Get local paths for this adapter
         let mut adapters_paths: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for (file, name) in adapter_files {
-            let path = api_get_file(api, file, model_id)?;
+            let path = api_get_file(&api, file, model_id)?;
             if let Some(paths) = adapters_paths.get_mut(&name) {
                 paths.push(path);
             } else {
@@ -323,7 +324,7 @@ pub fn get_model_paths(
     token_source: &TokenSource,
     quantized_model_id: Option<&str>,
     quantized_filename: Option<Vec<String>>,
-    api: &ApiRepo,
+    api: Arc<ApiRepo>,
     model_id: &Path,
     loading_from_uqff: bool,
 ) -> Result<Vec<PathBuf>, HFError> {
@@ -348,7 +349,7 @@ pub fn get_model_paths(
                     revision.clone(),
                 ));
                 let model_id = Path::new(&id);
-                files.push(api_get_file(&qapi, name, model_id)?);
+                files.push(api_get_file(&Arc::new(qapi), name, model_id)?);
             }
             Ok(files)
         }
@@ -360,7 +361,7 @@ pub fn get_model_paths(
                 })?;
 
             let mut filenames = vec![];
-            let all_listing = api_dir_list(api, model_id)?;
+            let all_listing = api_dir_list(&api, model_id)?;
             let listing = all_listing.iter().filter(|&x| {
                 safetensor_match.is_match(x)
                     || pickle_match.is_match(x)
@@ -401,7 +402,7 @@ pub fn get_model_paths(
                     .collect::<Vec<_>>()
             );
             for rfilename in files {
-                filenames.push(api_get_file(api, rfilename, model_id)?);
+                filenames.push(api_get_file(&api, rfilename, model_id)?);
             }
             Ok(filenames)
         }

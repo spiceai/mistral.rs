@@ -1259,11 +1259,11 @@ impl AnyMoePipelineMixin for NormalPipeline {
                 api.build().map_err(candle_core::Error::msg)?
             };
             let revision = revision.clone().unwrap_or("main".to_string());
-            let api = api.repo(Repo::with_revision(
+            let api = Arc::new(api.repo(Repo::with_revision(
                 model_id_str.clone(),
                 RepoType::Model,
                 revision.clone(),
-            ));
+            )));
 
             let mut filenames = vec![];
             let dir_list = api_dir_list(&api, model_id).map_err(candle_core::Error::msg)?;
@@ -1317,11 +1317,11 @@ impl AnyMoePipelineMixin for NormalPipeline {
                 api.build().map_err(candle_core::Error::msg)?
             };
             let revision = revision.clone().unwrap_or("main".to_string());
-            let api = api.repo(Repo::with_revision(
+            let api = Arc::new(api.repo(Repo::with_revision(
                 model_id_str.clone(),
                 RepoType::Model,
                 revision.clone(),
-            ));
+            )));
 
             let mut gate_filenames = vec![];
             let dir_list = api_dir_list(&api, model_id).map_err(candle_core::Error::msg)?;

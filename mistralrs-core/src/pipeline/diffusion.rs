@@ -99,14 +99,16 @@ impl Loader for DiffusionLoader {
                 .with_token(get_token(&token_source)?)
                 .build()?;
             let revision = revision.unwrap_or("main".to_string());
-            let api = api.repo(Repo::with_revision(
+            let api = Arc::new(api.repo(Repo::with_revision(
                 self.model_id.clone(),
                 RepoType::Model,
                 revision.clone(),
-            ));
+            )));
             let model_id = std::path::Path::new(&self.model_id);
-            let filenames = self.inner.get_model_paths(&api, model_id)?;
-            let config_filenames = self.inner.get_config_filenames(&api, model_id)?;
+            let filenames = self.inner.get_model_paths(Arc::clone(&api), model_id)?;
+            let config_filenames = self
+                .inner
+                .get_config_filenames(Arc::clone(&api), model_id)?;
             Ok(Box::new(DiffusionModelPaths(DiffusionModelPathsInner {
                 config_filenames,
                 filenames,

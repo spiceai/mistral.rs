@@ -78,7 +78,7 @@ macro_rules! get_paths {
             &$token_source,
             $quantized_model_id.as_deref(),
             $quantized_filename,
-            &api,
+            api,
             &model_id,
             $loading_uqff,
         )?;
@@ -201,11 +201,11 @@ macro_rules! get_paths_gguf {
         };
         let revision = $revision.unwrap_or("main".to_string());
         let this_model_id = $this.model_id.clone().unwrap_or($this.quantized_model_id.clone());
-        let api = api.repo(Repo::with_revision(
+        let api = Arc::new(api.repo(Repo::with_revision(
             this_model_id.clone(),
             RepoType::Model,
             revision.clone(),
-        ));
+        )));
         let model_id = std::path::Path::new(&this_model_id);
 
         let chat_template = if let Some(ref p) = $this.chat_template {
@@ -234,7 +234,7 @@ macro_rules! get_paths_gguf {
             &$token_source,
             Some($quantized_model_id.as_str()),
             Some($quantized_filenames),
-            &api,
+            Arc::clone(&api),
             &model_id,
             false, // Never loading UQFF
         )?;
@@ -254,7 +254,7 @@ macro_rules! get_paths_gguf {
             &$this.xlora_order.clone(),
         )?;
 
-        let gen_conf = if $crate::api_dir_list!(api, model_id)
+        let gen_conf = if $crate::api_dir_list!(&api, model_id)
             .collect::<Vec<_>>()
             .contains(&"generation_config.json".to_string())
         {
@@ -268,7 +268,7 @@ macro_rules! get_paths_gguf {
             None
         };
 
-        let preprocessor_config = if $crate::api_dir_list!(api, model_id)
+        let preprocessor_config = if $crate::pipeline::hf::api_dir_list(&api, model_id)?.into_iter()
             .collect::<Vec<_>>()
             .contains(&"preprocessor_config.json".to_string())
         {

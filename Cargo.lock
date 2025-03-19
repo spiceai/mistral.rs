@@ -2448,6 +2448,7 @@ dependencies = [
  "serde_json",
  "serde_plain",
  "serde_yaml",
+ "signal-hook",
  "strum",
  "sysinfo",
  "thiserror 1.0.69",
