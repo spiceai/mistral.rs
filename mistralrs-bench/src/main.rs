@@ -79,11 +79,11 @@ fn run_bench(
         is_streaming: false,
         constraint: Constraint::None,
         suffix: None,
-        adapters: None,
         tools: None,
         tool_choice: None,
         logits_processors: None,
         return_raw_logits: false,
+        web_search_options: None,
     });
 
     let mut usages = Vec::new();
@@ -250,11 +250,11 @@ fn warmup_run(mistralrs: Arc<MistralRs>) {
         is_streaming: false,
         constraint: Constraint::None,
         suffix: None,
-        adapters: None,
         tools: None,
         tool_choice: None,
         logits_processors: None,
         return_raw_logits: false,
+        web_search_options: None,
     });
 
     sender
@@ -370,7 +370,11 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "metal")]
     let device = Device::new_metal(0)?;
     #[cfg(not(feature = "metal"))]
-    let device = Device::cuda_if_available(0)?;
+    let device = if mistralrs_core::distributed::use_nccl() {
+        Device::Cpu
+    } else {
+        Device::cuda_if_available(0)?
+    };
 
     if let Some(seed) = args.seed {
         device.set_seed(seed)?;
@@ -429,7 +433,7 @@ fn main() -> anyhow::Result<()> {
         DeviceMapSetting::Auto(auto_device_map_params)
     };
 
-    let no_paged_attn = if device.is_cuda() {
+    let no_paged_attn = if device.is_cuda() || mistralrs_core::distributed::use_nccl() {
         args.no_paged_attn
     } else if device.is_metal() {
         !args.paged_attn
@@ -531,7 +535,7 @@ fn main() -> anyhow::Result<()> {
             ),
         }
     };
-    let mistralrs = MistralRsBuilder::new(pipeline, scheduler_config)
+    let mistralrs = MistralRsBuilder::new(pipeline, scheduler_config, false, None)
         .with_no_prefix_cache(true)
         .with_disable_eos_stop(true)
         .build();

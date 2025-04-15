@@ -12,7 +12,7 @@ use candle_nn::{
 use float8::F8E4M3;
 use half::{bf16, f16};
 use mistralrs_quant::{
-    get_use_matmul_via_f16, ColumnParallelLayer, QuantMethod, QuantizedConfig, RowParallelLayer,
+    AfqLayer, ColumnParallelLayer, QuantMethod, QuantizedConfig, RowParallelLayer,
     ShardedVarBuilder,
 };
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,8 @@ use crate::{
     models::llama,
     ops::SplitOp,
     vision_models::{
+        gemma3::config::Gemma3TextConfig,
+        llama4,
         mllama::{MLlamaRopeScaling, MLlamaRopeType, MLlamaTextConfig},
         phi4::Phi4MMConfig,
     },
@@ -33,8 +35,20 @@ use crate::{
 
 pub use mistralrs_quant::MatMul;
 
-pub fn embedding(in_size: usize, out_size: usize, vb: ShardedVarBuilder) -> Result<Embedding> {
-    let embeddings = vb.get_with_hints((in_size, out_size), "weight", Default::default())?;
+pub fn embedding(
+    in_size: usize,
+    out_size: usize,
+    vb: ShardedVarBuilder,
+    config: &Option<QuantizedConfig>,
+) -> Result<Embedding> {
+    // AFQ quantized applies quantization to the embeddings.
+    let embeddings = if let Some(QuantizedConfig::Afq { .. }) = config {
+        let afq_layer =
+            AfqLayer::afq_linear_b(out_size, in_size, config.as_ref().unwrap(), false, vb)?;
+        afq_layer.dequantize_w()?
+    } else {
+        vb.get_with_hints((in_size, out_size), "weight", Default::default())?
+    };
     Ok(Embedding::new(embeddings, out_size))
 }
 
@@ -282,6 +296,7 @@ pub struct PhiRopeConfig {
     pub original_max_position_embeddings: usize,
     pub rope_theta: f64,
     pub head_dim: usize,
+    pub partial_rotary_factor: Option<f64>,
 }
 
 impl PhiRotaryEmbedding {
@@ -294,7 +309,7 @@ impl PhiRotaryEmbedding {
         dev: &Device,
     ) -> Result<Self> {
         let max_seq_len = cfg.max_position_embeddings;
-        let dim = cfg.head_dim;
+        let dim = (cfg.head_dim as f64 * cfg.partial_rotary_factor.unwrap_or(1.)) as usize;
 
         // Calculate scale
         let scale =
@@ -356,7 +371,7 @@ impl PhiRotaryEmbedding {
 
     fn new_unscaled(cfg: &PhiRopeConfig, dtype: DType, dev: &Device) -> Result<Self> {
         let max_seq_len = cfg.max_position_embeddings;
-        let dim = cfg.head_dim;
+        let dim = (cfg.head_dim as f64 * cfg.partial_rotary_factor.unwrap_or(1.)) as usize;
 
         let inv_freq: Vec<_> = (0..dim)
             .step_by(2)
@@ -391,7 +406,7 @@ impl PhiRotaryEmbedding {
         dev: &Device,
     ) -> Result<Self> {
         let max_seq_len = cfg.max_position_embeddings;
-        let dim = cfg.head_dim;
+        let dim = (cfg.head_dim as f64 * cfg.partial_rotary_factor.unwrap_or(1.)) as usize;
 
         if !matches!(scaling_type, ScaledRopeType::Su) {
             candle_core::bail!("Scaled Phi3 RoPE (non-classic scaled, with mscales) must have type `su`/`longrope`.");
@@ -512,8 +527,52 @@ impl PhiRotaryEmbedding {
     ) -> Result<(Tensor, Tensor)> {
         let (sin, cos) = self.get_long_or_short_sin_cos(position_ids);
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        let all_same = seqlen_offsets.iter().all(|&x| x == seqlen_offsets[0]);
-        if all_same {
+
+        let rot_dim = cos.dim(D::Minus1)? * 2;
+
+        // Case for Phi 3 / Phi 4 mini
+        if rot_dim != q.dim(D::Minus1)? {
+            let rot_dim = cos.dim(D::Minus1)? * 2;
+            let q_rot = q.narrow(D::Minus1, 0, rot_dim)?;
+            let q_pass = q.narrow(D::Minus1, rot_dim, q.dim(D::Minus1)? - rot_dim)?;
+            let k_rot = k.narrow(D::Minus1, 0, rot_dim)?;
+            let k_pass = k.narrow(D::Minus1, rot_dim, k.dim(D::Minus1)? - rot_dim)?;
+
+            let (q_rot, k_rot) = if seqlen_offsets.len() == 1 {
+                let cos = cos.narrow(0, seqlen_offsets[0], seq_len)?;
+                let sin = sin.narrow(0, seqlen_offsets[0], seq_len)?;
+                let q_embed = candle_nn::rotary_emb::rope(&q_rot.contiguous()?, &cos, &sin)?;
+                let k_embed = candle_nn::rotary_emb::rope(&k_rot.contiguous()?, &cos, &sin)?;
+                (q_embed, k_embed)
+            } else {
+                let mut q_embeds = Vec::new();
+                let mut k_embeds = Vec::new();
+                for (i, offset) in seqlen_offsets.iter().enumerate() {
+                    let cos = cos.narrow(0, *offset, seq_len)?;
+                    let sin = sin.narrow(0, *offset, seq_len)?;
+                    let q_embed = candle_nn::rotary_emb::rope(
+                        &q_rot.i(i)?.unsqueeze(0)?.contiguous()?,
+                        &cos,
+                        &sin,
+                    )?;
+                    let k_embed = candle_nn::rotary_emb::rope(
+                        &k_rot.i(i)?.unsqueeze(0)?.contiguous()?,
+                        &cos,
+                        &sin,
+                    )?;
+                    q_embeds.push(q_embed);
+                    k_embeds.push(k_embed);
+                }
+                let q_rot = Tensor::cat(&q_embeds, 0)?;
+                let k_rot = Tensor::cat(&k_embeds, 0)?;
+                (q_rot, k_rot)
+            };
+
+            Ok((
+                Tensor::cat(&[q_rot, q_pass], D::Minus1)?.contiguous()?,
+                Tensor::cat(&[k_rot, k_pass], D::Minus1)?.contiguous()?,
+            ))
+        } else if seqlen_offsets.len() == 1 {
             let cos = cos.narrow(0, seqlen_offsets[0], seq_len)?;
             let sin = sin.narrow(0, seqlen_offsets[0], seq_len)?;
             let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
@@ -567,6 +626,14 @@ fn calculate_default_inv_freq(cfg: &llama::Config) -> Vec<f32> {
         .collect()
 }
 
+fn calculate_default_inv_freq_llama4(cfg: &llama4::TextConfig) -> Vec<f32> {
+    let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+    (0..head_dim)
+        .step_by(2)
+        .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / head_dim as f32))
+        .collect()
+}
+
 // https://github.com/huggingface/transformers/blob/1392a6867f40a55dfabaf306745c67627598b1af/src/transformers/modeling_rope_utils.py#L298
 impl Llama3RotaryEmbedding {
     pub fn new_llama3(
@@ -595,6 +662,66 @@ impl Llama3RotaryEmbedding {
                     / rope_scaling.high_freq_factor;
 
                 let inv_freq = calculate_default_inv_freq(cfg)
+                    .into_iter()
+                    .map(|freq| {
+                        let wavelen = 2. * PI / freq;
+                        if wavelen < high_freq_wavelen {
+                            freq
+                        } else if wavelen > low_freq_wavelen {
+                            freq / rope_scaling.factor
+                        } else {
+                            let smooth = (rope_scaling.original_max_position_embeddings as f32
+                                / wavelen
+                                - rope_scaling.low_freq_factor)
+                                / (rope_scaling.high_freq_factor - rope_scaling.low_freq_factor);
+                            (1. - smooth) * freq / rope_scaling.factor + smooth * freq
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let inv_freq_len = inv_freq.len();
+                let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
+
+                let t = Tensor::arange(0u32, cfg.max_position_embeddings as u32, dev)?
+                    .to_dtype(DType::F32)?
+                    .reshape((cfg.max_position_embeddings, 1))?;
+                let freqs = t.matmul(&inv_freq)?;
+                let sin = freqs.sin()?.to_dtype(dtype)?;
+                let cos = freqs.cos()?.to_dtype(dtype)?;
+                Ok(Self(RotaryEmbedding {
+                    sin,
+                    cos,
+                    is_gpt_neox,
+                }))
+            }
+        }
+    }
+
+    pub fn new_llama4(
+        dtype: DType,
+        cfg: &llama4::TextConfig,
+        dev: &Device,
+        is_gpt_neox: bool,
+    ) -> Result<Self> {
+        match &cfg.rope_scaling {
+            None
+            | Some(Llama3RopeConfig {
+                rope_type: Llama3RopeType::Default,
+                ..
+            }) => Ok(Self(RotaryEmbedding::new(
+                cfg.rope_theta,
+                cfg.hidden_size / cfg.num_attention_heads,
+                cfg.max_position_embeddings,
+                dev,
+                is_gpt_neox,
+                dtype,
+            )?)),
+            Some(rope_scaling) => {
+                let low_freq_wavelen = rope_scaling.original_max_position_embeddings as f32
+                    / rope_scaling.low_freq_factor;
+                let high_freq_wavelen = rope_scaling.original_max_position_embeddings as f32
+                    / rope_scaling.high_freq_factor;
+
+                let inv_freq = calculate_default_inv_freq_llama4(cfg)
                     .into_iter()
                     .map(|freq| {
                         let wavelen = 2. * PI / freq;
@@ -802,6 +929,82 @@ impl Qwen2VLRotaryEmbedding {
 }
 
 #[derive(Debug, Clone)]
+pub struct Qwen2_5VLRotaryEmbedding {
+    inv_freq: Tensor,
+    mrope_section: Vec<usize>,
+}
+
+impl Qwen2_5VLRotaryEmbedding {
+    pub fn new(
+        base: f32,
+        head_dim: usize,
+        device: &Device,
+        mrope_section: Vec<usize>,
+    ) -> Result<Self> {
+        let inv_freq: Vec<_> = (0..head_dim)
+            .step_by(2)
+            .map(|i| 1f32 / base.powf(i as f32 / head_dim as f32))
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (inv_freq_len,), device)?.to_dtype(DType::F32)?;
+        Ok(Self {
+            inv_freq,
+            mrope_section,
+        })
+    }
+
+    /// (cos, sin)
+    pub fn compute_cos_sin(&self, position_ids: &Tensor, dtype: DType) -> Result<(Tensor, Tensor)> {
+        let inv_freq_expanded =
+            self.inv_freq
+                .reshape((1, 1, (), 1))?
+                .repeat((3, position_ids.dim(1)?, 1, 1))?;
+        let position_ids_expanded = position_ids.unsqueeze(2)?;
+        let freqs = inv_freq_expanded
+            .matmul(&position_ids_expanded.to_dtype(inv_freq_expanded.dtype())?)?
+            .transpose(2, 3)?;
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
+
+        let cos = Tensor::cat(
+            &cos.split(&self.mrope_section, D::Minus1)?
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| m.i(i % 3))
+                .collect::<Result<Vec<_>>>()?,
+            D::Minus1,
+        )?
+        .squeeze(0)?
+        .to_dtype(dtype)?
+        .contiguous()?;
+        let sin = Tensor::cat(
+            &sin.split(&self.mrope_section, D::Minus1)?
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| m.i(i % 3))
+                .collect::<Result<Vec<_>>>()?,
+            D::Minus1,
+        )?
+        .squeeze(0)?
+        .to_dtype(dtype)?
+        .contiguous()?;
+
+        Ok((cos, sin))
+    }
+
+    pub fn forward(
+        &self,
+        (cos, sin): &(Tensor, Tensor),
+        q: &mut Tensor,
+        k: &mut Tensor,
+    ) -> Result<()> {
+        *q = candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?;
+        *k = candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct DeepSeekV2RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
@@ -984,8 +1187,8 @@ impl DeepSeekV2RotaryEmbedding {
         seqlen_offsets: &[usize],
     ) -> Result<(Tensor, Tensor)> {
         let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
-        let all_same = seqlen_offsets.iter().all(|&x| x == seqlen_offsets[0]);
-        if all_same {
+
+        if seqlen_offsets.len() == 1 {
             let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
             let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?;
             let q_embed = candle_nn::rotary_emb::rope_i(&q.contiguous()?, &cos, &sin)?;
@@ -1174,8 +1377,7 @@ impl Phi4MMRotaryEmbedding {
         let k_rot = k.narrow(D::Minus1, 0, rot_dim)?;
         let k_pass = k.narrow(D::Minus1, rot_dim, k.dim(D::Minus1)? - rot_dim)?;
 
-        let all_same = seqlen_offsets.iter().all(|&x| x == seqlen_offsets[0]);
-        let (q_rot, k_rot) = if all_same {
+        let (q_rot, k_rot) = if seqlen_offsets.len() == 1 {
             let cos = cos.narrow(0, seqlen_offsets[0], seq_len)?;
             let sin = sin.narrow(0, seqlen_offsets[0], seq_len)?;
             let q_embed = candle_nn::rotary_emb::rope(&q_rot.contiguous()?, &cos, &sin)?;
@@ -1209,6 +1411,80 @@ impl Phi4MMRotaryEmbedding {
             Tensor::cat(&[q_rot, q_pass], D::Minus1)?.contiguous()?,
             Tensor::cat(&[k_rot, k_pass], D::Minus1)?.contiguous()?,
         ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Gemma3RotaryEmbedding(RotaryEmbedding);
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gemmma3ScaledRopeType {
+    #[serde(alias = "linear")]
+    Linear,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Gemma3RopeScalingConfig {
+    factor: f64,
+    rope_type: Gemmma3ScaledRopeType,
+}
+
+impl Gemma3RotaryEmbedding {
+    fn new_linear(
+        cfg: &Gemma3TextConfig,
+        factor: f64,
+        is_gpt_neox: bool,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Self> {
+        let max_seq_len = cfg.max_position_embeddings;
+        let dim = cfg.head_dim;
+
+        let inv_freq: Vec<_> = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
+        let inv_freq = (inv_freq / factor)?;
+
+        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let cos = freqs.cos()?.to_dtype(dtype)?;
+        Ok(Self(RotaryEmbedding {
+            cos,
+            sin,
+            is_gpt_neox,
+        }))
+    }
+
+    pub fn new(
+        is_gpt_neox: bool,
+        dtype: DType,
+        cfg: &Gemma3TextConfig,
+        dev: &Device,
+    ) -> Result<Self> {
+        match &cfg.rope_scaling {
+            Some(Gemma3RopeScalingConfig {
+                rope_type: Gemmma3ScaledRopeType::Linear,
+                factor,
+            }) => Self::new_linear(cfg, *factor, is_gpt_neox, dtype, dev),
+
+            _ => Self::new_linear(cfg, 1.0, is_gpt_neox, dtype, dev),
+        }
+    }
+
+    pub fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        self.0.forward(q, k, seqlen_offsets)
     }
 }
 
@@ -1300,17 +1576,13 @@ impl Module for QLinear {
         } else {
             xs.clone()
         };
-        let forward_fn = if !get_use_matmul_via_f16() {
-            QMatMul::forward
-        } else {
-            QMatMul::forward_via_f16
-        };
         if let Some(bias) = &self.bias {
-            forward_fn(&self.inner, &xs)?
+            self.inner
+                .forward(&xs)?
                 .broadcast_add(bias)?
                 .to_dtype(self.dtype)
         } else {
-            forward_fn(&self.inner, &xs)?.to_dtype(self.dtype)
+            self.inner.forward(&xs)?.to_dtype(self.dtype)
         }
     }
 }
@@ -1385,7 +1657,8 @@ impl RotaryEmbedding {
         k: &Tensor,
         seqlen_offsets: &[usize],
     ) -> Result<(Tensor, Tensor)> {
-        let (_b_sz, _h, seq_len, _n_embd) = q.dims4()?;
+        let (b_sz, qh, seq_len, n_embd) = q.dims4()?;
+        let (_b_sz, kh, _seq_len, __n_embd) = k.dims4()?;
 
         let rope = if self.is_gpt_neox {
             candle_nn::rotary_emb::rope
@@ -1393,8 +1666,43 @@ impl RotaryEmbedding {
             candle_nn::rotary_emb::rope_i
         };
 
-        let all_same = seqlen_offsets.iter().all(|&x| x == seqlen_offsets[0]);
-        if all_same {
+        if cfg!(feature = "cuda") && qh == kh {
+            let (cos, sin) = if seqlen_offsets.len() == 1 {
+                (
+                    self.cos.narrow(0, seqlen_offsets[0], seq_len)?,
+                    self.sin.narrow(0, seqlen_offsets[0], seq_len)?,
+                )
+            } else {
+                let mut cos_s = Vec::new();
+                let mut sin_s = Vec::new();
+                for offset in seqlen_offsets {
+                    cos_s.push(self.cos.narrow(0, *offset, seq_len)?);
+                    sin_s.push(self.sin.narrow(0, *offset, seq_len)?);
+                }
+                (Tensor::cat(&cos_s, 0)?, Tensor::cat(&sin_s, 0)?)
+            };
+
+            let q_embed = q.transpose(1, 2)?.flatten(0, 1)?;
+            let k_embed = k.transpose(1, 2)?.flatten(0, 1)?;
+            mistralrs_quant::rotary::apply_rotary_inplace(
+                &q_embed,
+                &k_embed,
+                &cos,
+                &sin,
+                self.is_gpt_neox,
+            )?;
+            let mut q = q_embed
+                .reshape((b_sz, seq_len, qh, n_embd))?
+                .transpose(1, 2)?;
+            let mut k = k_embed
+                .reshape((b_sz, seq_len, kh, n_embd))?
+                .transpose(1, 2)?;
+            if !(cfg!(feature = "flash-attn") || cfg!(feature = "flash-attn-v3")) {
+                q = q.contiguous()?;
+                k = k.contiguous()?;
+            }
+            Ok((q, k))
+        } else if seqlen_offsets.len() == 1 {
             let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
             let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?;
             let q_embed = rope(&q.contiguous()?, &cos, &sin)?;
@@ -1750,10 +2058,17 @@ impl MlpLayer for Mlp {
         }
         let lhs = MatMul.qmethod_matmul(&xs, &*self.gate)?;
         let rhs = MatMul.qmethod_matmul(&xs, &*self.up)?;
-        let mut res = MatMul.qmethod_matmul(
-            &candle_nn::ops::mul_and_act(&lhs, &rhs, self.act.try_into()?)?,
-            &*self.down,
-        )?;
+        let mut res = if matches!(
+            self.act,
+            Activation::Gelu | Activation::Silu | Activation::Relu
+        ) {
+            MatMul.qmethod_matmul(
+                &candle_nn::ops::mul_and_act(&lhs, &rhs, self.act.try_into()?)?,
+                &*self.down,
+            )?
+        } else {
+            MatMul.qmethod_matmul(&(&lhs.apply(&self.act)? * &rhs)?, &*self.down)?
+        };
         if self.gate.quantized_act_type().is_some() {
             res = res.to_dtype(original_dtype)?;
         }
@@ -1898,5 +2213,26 @@ impl Module for ReflectionPad2d {
         };
 
         Ok(x_padded)
+    }
+}
+
+pub struct ScaledEmbedding {
+    scale: f64,
+    embedding: Embedding,
+}
+
+impl ScaledEmbedding {
+    pub fn new(scale: f64, embedding: Embedding) -> Self {
+        Self { scale, embedding }
+    }
+
+    pub fn embeddings(&self) -> &Tensor {
+        self.embedding.embeddings()
+    }
+}
+
+impl Module for ScaledEmbedding {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        xs.apply(&self.embedding)? * self.scale
     }
 }

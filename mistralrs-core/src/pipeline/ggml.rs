@@ -2,12 +2,12 @@ use super::cache_manager::FullCacheManager;
 use super::hf::get_paths;
 use super::llg::build_tok_env;
 use super::{
-    text_models_inputs_processor::ModelInputs, AdapterKind, CacheManager, GeneralMetadata, Loader,
-    ModelKind, ModelPaths, QuantizationKind, TokenSource,
+    get_model_paths, get_xlora_paths, text_models_inputs_processor::ModelInputs, AdapterKind,
+    CacheManager, GeneralMetadata, Loader, ModelKind, ModelPaths, QuantizationKind, TokenSource,
 };
 use super::{
-    AdapterActivationMixin, AnyMoePipelineMixin, CacheManagerMixin, EitherCache,
-    ForwardInputsResult, IsqPipelineMixin, MetadataMixin, ModelCategory, PreProcessingMixin,
+    AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
+    MetadataMixin, ModelCategory, PreProcessingMixin,
 };
 use crate::device_map::DeviceMapper;
 use crate::lora::Ordering;
@@ -15,8 +15,8 @@ use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::get_chat_template;
 use crate::pipeline::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
 use crate::pipeline::sampling::sample_and_add_toks;
-use crate::pipeline::ChatTemplate;
-use crate::prefix_cacher_v2::PrefixCacheManagerV2;
+use crate::pipeline::{ChatTemplate, LocalModelPaths};
+use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::debug::DeviceRepr;
 use crate::utils::model_config as ModelConfig;
@@ -68,6 +68,8 @@ pub struct GGMLLoader {
     tokenizer_json: Option<String>,
     kind: ModelKind,
     tgt_non_granular_index: Option<usize>,
+    jinja_explicit: Option<String>,
+    lora_adapter_ids: Option<Vec<String>>,
 }
 
 #[derive(Clone, Default)]
@@ -92,10 +94,11 @@ pub struct GGMLLoaderBuilder {
     chat_template: Option<String>,
     tokenizer_json: Option<String>,
     tgt_non_granular_index: Option<usize>,
+    jinja_explicit: Option<String>,
 }
 
 impl GGMLLoaderBuilder {
-    /// NOTE: Until v0.4.0, you should make sure to call `.with_no_kv_cache` if applicable.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: GGMLSpecificConfig,
         chat_template: Option<String>,
@@ -103,6 +106,8 @@ impl GGMLLoaderBuilder {
         model_id: Option<String>,
         quantized_model_id: String,
         quantized_filename: String,
+        no_kv_cache: bool,
+        jinja_explicit: Option<String>,
     ) -> Self {
         let kind = ModelKind::GgufQuantized {
             quant: QuantizationKind::Ggml,
@@ -116,14 +121,10 @@ impl GGMLLoaderBuilder {
             kind,
             quantized_filename,
             quantized_model_id,
+            no_kv_cache,
+            jinja_explicit,
             ..Default::default()
         }
-    }
-
-    // TODO(EricLBuehler): in 0.4.0 we can move this into the config
-    pub fn with_no_kv_cache(mut self, no_kv_cache: bool) -> Self {
-        self.no_kv_cache = no_kv_cache;
-        self
     }
 
     fn with_adapter(
@@ -185,6 +186,8 @@ impl GGMLLoaderBuilder {
             tgt_non_granular_index: self.tgt_non_granular_index,
             quantized_filename: Some(self.quantized_filename),
             quantized_model_id: Some(self.quantized_model_id),
+            jinja_explicit: self.jinja_explicit,
+            lora_adapter_ids: None,
         })
     }
 }
@@ -203,6 +206,7 @@ impl GGMLLoader {
         chat_template: Option<String>,
         tokenizer_json: Option<String>,
         tgt_non_granular_index: Option<usize>,
+        jinja_explicit: Option<String>,
     ) -> Self {
         let model_id = if let Some(id) = model_id {
             id
@@ -225,6 +229,8 @@ impl GGMLLoader {
             tokenizer_json,
             kind,
             tgt_non_granular_index,
+            jinja_explicit,
+            lora_adapter_ids: None,
         }
     }
 }
@@ -338,8 +344,9 @@ impl Loader for GGMLLoader {
         });
         let chat_template = get_chat_template(
             paths,
+            &self.jinja_explicit,
             &paths
-                .get_chat_template_json()
+                .get_chat_template_explicit()
                 .as_ref()
                 .map(|x| x.to_string_lossy().to_string())
                 .clone(),
@@ -477,22 +484,6 @@ impl CacheManagerMixin for GGMLPipeline {
         match self.model {
             Model::Llama(ref model) => &model.cache,
             Model::XLoraLlama(ref model) => &model.cache,
-        }
-    }
-}
-
-impl AdapterActivationMixin for GGMLPipeline {
-    fn activate_adapters(&mut self, adapter_names: Vec<String>) -> anyhow::Result<usize> {
-        let is_lora = self.metadata.kind.is_adapted_and(|a| a.is_lora());
-        if !is_lora {
-            anyhow::bail!("Activating adapters is only supported for models fine-tuned with LoRA.")
-        }
-
-        match self.model {
-            Model::XLoraLlama(ref mut model) => model
-                .activate_adapters(adapter_names)
-                .map_err(anyhow::Error::msg),
-            _ => unreachable!(),
         }
     }
 }

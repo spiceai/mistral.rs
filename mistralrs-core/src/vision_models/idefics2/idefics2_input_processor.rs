@@ -105,7 +105,7 @@ impl Processor for Idefics2Processor {
             anyhow::bail!("Idefics2InputProcessor requires a specified tokenizer.",);
         };
         let encoding = tokenizer
-            .encode(prompt.clone(), add_special_tokens)
+            .encode_fast(prompt.clone(), add_special_tokens)
             .map_err(anyhow::Error::msg)?;
         Ok((encoding.get_ids().to_vec(), prompt))
     }
@@ -209,9 +209,7 @@ impl InputsProcessor for Idefics2ImageProcessor {
         let config = other_config.expect("Need a PreProcessorConfig config.");
         let config: &PreProcessorConfig = config.downcast_ref().expect("Downcast failed.");
 
-        let has_images = input_seqs
-            .iter()
-            .all(|seq| seq.images().is_some_and(|images| !images.is_empty()));
+        let has_images = input_seqs.iter().all(|seq| seq.has_images());
 
         let (pixel_values, pixel_attention_mask) = if has_images {
             let mut pixel_values_accum = Vec::new();
@@ -232,6 +230,7 @@ impl InputsProcessor for Idefics2ImageProcessor {
                     pixel_values_list: _,
                     tgt_sizes: _,
                     image_sizes_all: _,
+                    num_crops: _,
                 } = self
                     .preprocess(
                         seq.take_images()
@@ -402,6 +401,7 @@ impl ImagePreProcessor for Idefics2ImageProcessor {
             pixel_values_list: None,
             tgt_sizes: None,
             image_sizes_all: None,
+            num_crops: None,
         })
     }
 }

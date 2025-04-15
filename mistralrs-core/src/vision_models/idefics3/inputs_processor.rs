@@ -135,6 +135,82 @@ impl InputsProcessor for Idefics3ImageProcessor {
             ))));
         };
 
+        let config = other_config.expect("Need a PreProcessorConfig config.");
+        let config: &PreProcessorConfig = config.downcast_ref().expect("Downcast failed.");
+
+        let has_images = input_seqs.iter().all(|seq| seq.has_images());
+
+        let (pixel_values, pixel_attention_mask) = if has_images {
+            let mut pixel_values_accum = Vec::new();
+            let mut pixel_attention_mask_accum = Vec::new();
+            for seq in input_seqs.iter_mut() {
+                let PreprocessedImages {
+                    pixel_values,
+                    pixel_attention_mask,
+                    image_sizes: _,
+                    num_img_tokens: _,
+                    aspect_ratio_ids: _,
+                    aspect_ratio_mask: _,
+                    num_tiles: _,
+                    image_grid_thw: _,
+                    video_grid_thw: _,
+                    rows,
+                    cols,
+                    pixel_values_list: _,
+                    tgt_sizes: _,
+                    image_sizes_all: _,
+                    num_crops: _,
+                } = self
+                    .preprocess(
+                        seq.take_images()
+                            .expect("Need to have images by this point."),
+                        vec![],
+                        config,
+                        device,
+                        (usize::MAX, usize::MAX), // Don't use it here...
+                    )
+                    .expect("Preprocessing failed");
+                pixel_values_accum.push(pixel_values.unsqueeze(0).unwrap());
+                pixel_attention_mask_accum
+                    .push(pixel_attention_mask.unwrap().unsqueeze(0).unwrap());
+
+                let detok = tokenizer
+                    .decode(seq.get_toks(), false)
+                    .expect("Detokenization failed!");
+
+                let mut image_prompt_strings = Vec::new();
+                for (n_rows, n_cols) in rows.unwrap().into_iter().zip(cols.unwrap().into_iter()) {
+                    let image_prompt_string =
+                        get_image_prompt_string(n_rows, n_cols, self.image_seq_len);
+                    image_prompt_strings.push(image_prompt_string);
+                }
+
+                let split_sample = detok.split(IMAGE_TOKEN).collect::<Vec<_>>();
+                let mut sample = split_sample
+                    .first()
+                    .expect("The image token <image> should be present in the text.")
+                    .to_string();
+                for (i, image_prompt_string) in image_prompt_strings.into_iter().enumerate() {
+                    sample.push_str(&format!("{image_prompt_string}{}", split_sample[i]));
+                }
+
+                seq.set_initial_prompt(sample.clone());
+                let toks = tokenizer
+                    .encode_fast(sample, false)
+                    .expect("Detokenization failed!");
+
+                let ids = toks.get_ids().to_vec();
+                seq.set_toks_and_reallocate(ids, paged_attn_metadata.as_mut());
+            }
+
+            (
+                Some(Tensor::cat(&pixel_values_accum, 0).unwrap()),
+                Some(Tensor::cat(&pixel_attention_mask_accum, 0).unwrap()),
+            )
+        } else {
+            (None, None)
+        };
+
         let text_models_inputs_processor::InnerInputProcessorOutput {
             inputs:
                 text_models_inputs_processor::InputMetadata {
@@ -181,104 +257,6 @@ impl InputsProcessor for Idefics3ImageProcessor {
             .nth(0)
             .unwrap()
             .unwrap()
-        };
-        let config = other_config.expect("Need a PreProcessorConfig config.");
-        let config: &PreProcessorConfig = config.downcast_ref().expect("Downcast failed.");
-
-        let has_images = input_seqs
-            .iter()
-            .all(|seq| seq.images().is_some_and(|images| !images.is_empty()));
-
-        let (new_input, pixel_values, pixel_attention_mask) = if has_images {
-            let mut pixel_values_accum = Vec::new();
-            let mut pixel_attention_mask_accum = Vec::new();
-            let mut all_ids = Vec::new();
-            for seq in input_seqs.iter_mut() {
-                let PreprocessedImages {
-                    pixel_values,
-                    pixel_attention_mask,
-                    image_sizes: _,
-                    num_img_tokens: _,
-                    aspect_ratio_ids: _,
-                    aspect_ratio_mask: _,
-                    num_tiles: _,
-                    image_grid_thw: _,
-                    video_grid_thw: _,
-                    rows,
-                    cols,
-                    pixel_values_list: _,
-                    tgt_sizes: _,
-                    image_sizes_all: _,
-                } = self
-                    .preprocess(
-                        seq.take_images()
-                            .expect("Need to have images by this point."),
-                        vec![],
-                        config,
-                        device,
-                        (usize::MAX, usize::MAX), // Don't use it here...
-                    )
-                    .expect("Preprocessing failed");
-                pixel_values_accum.push(pixel_values.unsqueeze(0).unwrap());
-                pixel_attention_mask_accum
-                    .push(pixel_attention_mask.unwrap().unsqueeze(0).unwrap());
-
-                let detok = tokenizer
-                    .decode(seq.get_toks(), false)
-                    .expect("Detokenization failed!");
-
-                let mut image_prompt_strings = Vec::new();
-                for (n_rows, n_cols) in rows.unwrap().into_iter().zip(cols.unwrap().into_iter()) {
-                    let image_prompt_string =
-                        get_image_prompt_string(n_rows, n_cols, self.image_seq_len);
-                    image_prompt_strings.push(image_prompt_string);
-                }
-
-                let split_sample = detok.split(IMAGE_TOKEN).collect::<Vec<_>>();
-                let mut sample = split_sample
-                    .first()
-                    .expect("The image token <image> should be present in the text.")
-                    .to_string();
-                for (i, image_prompt_string) in image_prompt_strings.into_iter().enumerate() {
-                    sample.push_str(&format!("{image_prompt_string}{}", split_sample[i]));
-                }
-
-                seq.set_initial_prompt(sample.clone());
-                let toks = tokenizer
-                    .encode(sample, true)
-                    .expect("Detokenization failed!");
-
-                let ids = toks.get_ids().to_vec();
-                all_ids.push(ids.clone());
-                seq.set_toks(ids);
-
-                if let Some(ref mut metadata) = paged_attn_metadata {
-                    // Free and then reallocate as appropriate
-                    metadata.block_engine.free_sequence(*seq.id());
-                    metadata.block_engine.allocate(*seq);
-                }
-            }
-
-            let mut all_ids_new = Vec::new();
-            let max_len = all_ids.iter().map(|ids| ids.len()).max().unwrap();
-            for ids in all_ids {
-                let pad = max_len - ids.len();
-                all_ids_new
-                    .push(Tensor::new([ids, vec![0; pad]].concat(), input.device()).unwrap());
-            }
-
-            (
-                Some(Tensor::stack(&all_ids_new, 0).unwrap()),
-                Some(Tensor::cat(&pixel_values_accum, 0).unwrap()),
-                Some(Tensor::cat(&pixel_attention_mask_accum, 0).unwrap()),
-            )
-        } else {
-            (None, None, None)
-        };
-
-        let input = match new_input {
-            Some(new_input) => new_input,
-            None => input,
         };
 
         let inputs: Box<dyn Any> = Box::new(ModelInputs {
@@ -604,6 +582,7 @@ impl ImagePreProcessor for Idefics3ImageProcessor {
             pixel_values_list: None,
             tgt_sizes: None,
             image_sizes_all: None,
+            num_crops: None,
         })
     }
 }

@@ -1,6 +1,6 @@
 use crate::{
     get_mut_group,
-    pipeline::LayerCaches,
+    pipeline::{text_models_inputs_processor::PagedAttentionMeta, LayerCaches},
     response::{ChatCompletionChunkResponse, Choice, ChunkChoice, Response, SYSTEM_FINGERPRINT},
     sampler::{Logprobs, Sampler},
     ChatCompletionResponse, Usage,
@@ -166,6 +166,7 @@ pub struct Sequence {
     sequence_stepping_type: SeqStepType,
     pub(crate) return_raw_logits: bool,
     token_offset: usize,
+    eos_tokens: Vec<u32>,
 
     // Image generation
     image_gen_response_format: Option<ImageGenerationResponseFormat>,
@@ -180,9 +181,6 @@ pub struct Sequence {
 
     // Prefix caching
     prefill_prompt_toks: Option<Vec<u32>>,
-
-    // Adapter dynamic config
-    adapters: Option<Vec<String>>,
 
     // Cache
     normal_cache: Vec<Option<KvCache>>,
@@ -273,7 +271,6 @@ impl Sequence {
         recognizer: SequenceRecognizer,
         suffix: Option<String>,
         prefix: Option<String>,
-        adapters: Option<Vec<String>>,
         input_images: Option<Vec<image::DynamicImage>>,
         // Paged attention
         block_size: Option<usize>,
@@ -286,6 +283,7 @@ impl Sequence {
         seq_preallocated_cache: Option<(Tensor, Tensor)>,
         //
         return_raw_logits: bool,
+        eos_tokens: Vec<u32>,
     ) -> Self {
         let prompt_len = tokens.len();
         let mut custom_metadata = if let Some(block_size) = block_size {
@@ -340,7 +338,6 @@ impl Sequence {
             last_is_done: None,
             is_tmp: false,
             scheduling_urgency: 0,
-            adapters,
             input_images,
             custom_metadata,
             tools,
@@ -352,6 +349,7 @@ impl Sequence {
             cached_vid_thw: None,
             return_raw_logits,
             token_offset: 0,
+            eos_tokens,
         }
     }
 
@@ -480,7 +478,11 @@ impl Sequence {
     }
 
     /// This will also set prompt_len
-    pub(crate) fn set_toks(&mut self, toks: Vec<u32>) {
+    pub(crate) fn set_toks_and_reallocate(
+        &mut self,
+        toks: Vec<u32>,
+        paged_attn_metadata: Option<&mut PagedAttentionMeta<'_>>,
+    ) {
         self.tokens.clone_from(&toks);
         self.prompt_len = self.tokens.len();
         // Handle possible block engine
@@ -495,6 +497,12 @@ impl Sequence {
         }
         self.custom_metadata
             .append_tokens_to_blocks(toks.iter().map(|x| *x as usize).collect::<Vec<_>>());
+
+        if let Some(metadata) = paged_attn_metadata {
+            // Free and then reallocate as appropriate
+            metadata.block_engine.free_sequence(*self.id());
+            metadata.block_engine.allocate(self);
+        }
     }
 
     pub fn completion_bytes(&self) -> &[u8] {
@@ -713,11 +721,11 @@ impl Sequence {
             .as_millis();
 
         if let Some(ts) = self.prompt_timestamp {
-            get_mut_group!(self).total_completion_time += now - ts;
-            get_mut_group!(self).total_prompt_time += ts - self.timestamp;
+            get_mut_group!(self).total_completion_time = now - ts;
+            get_mut_group!(self).total_prompt_time = ts - self.timestamp;
         }
 
-        get_mut_group!(self).total_time += now - self.timestamp;
+        get_mut_group!(self).total_time = now - self.timestamp;
 
         get_mut_group!(self).total_prompt_toks = self.prompt_len;
         get_mut_group!(self).total_toks = self.len();
@@ -768,10 +776,7 @@ impl Sequence {
 
     pub fn add_streaming_completion_chunk_choice_to_group(&self, chunk: CompletionChunkChoice) {
         get_mut_group!(self).completion_streaming_chunks.push(chunk);
-    }
-
-    pub fn get_adapters(&self) -> Option<Vec<String>> {
-        self.adapters.clone()
+        self.update_time_info();
     }
 
     pub fn take_images(&mut self) -> Option<Vec<image::DynamicImage>> {
@@ -786,6 +791,12 @@ impl Sequence {
         self.input_images.as_deref()
     }
 
+    pub fn has_images(&self) -> bool {
+        self.input_images
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+    }
+
     pub fn image_gen_response_format(&self) -> Option<ImageGenerationResponseFormat> {
         self.image_gen_response_format
     }
@@ -796,6 +807,10 @@ impl Sequence {
 
     pub fn get_diffusion_diffusion_params(&self) -> Option<DiffusionGenerationParams> {
         self.diffusion_params.clone()
+    }
+
+    pub fn eos_tokens(&self) -> &[u32] {
+        &self.eos_tokens
     }
 }
 

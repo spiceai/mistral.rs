@@ -19,7 +19,7 @@ use crate::{
         DeepSeekV2RotaryEmbedding, Mlp, RmsNorm, Sdpa,
     },
     layers_masker::{masked_fill, PastKvLenCache},
-    ops::{BincountOp, NonZeroOp, SplitOp, TopKLastDimOp, TopKOutput},
+    ops::{NonZeroOp, SplitOp, TopKLastDimOp, TopKOutput},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
         extract_logits,
@@ -29,12 +29,12 @@ use crate::{
     serde_default_fn,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
-
+use std::collections::HashSet;
+use std::iter::FromIterator;
 serde_default_fn!(f64, routed_scaling_factor, 1.0);
 serde_default_fn!(TopkMethod, topk_method, TopkMethod::Greedy);
 serde_default_fn!(usize, moe_layer_freq, 1);
 serde_default_fn!(usize, first_k_dense_replace, 0);
-serde_default_fn!(bool, norm_topk_prob, false);
 serde_default_fn!(ScoringFunc, scoring_func, ScoringFunc::Softmax);
 serde_default_fn!(Activation, hidden_act, Activation::Silu);
 serde_default_fn!(bool, tie_word_embeddings, false);
@@ -77,9 +77,6 @@ pub struct DeepSeekV3Config {
     pub(crate) moe_layer_freq: usize,
     #[serde(default = "first_k_dense_replace")]
     pub(crate) first_k_dense_replace: usize,
-    // k dense layers
-    #[serde(default = "norm_topk_prob")]
-    pub(crate) norm_topk_prob: bool,
     #[serde(default = "scoring_func")]
     scoring_func: ScoringFunc,
     #[serde(default = "hidden_act")]
@@ -305,22 +302,12 @@ impl Attention {
 
         (q_pe, k_pe) = self.rotary_emb.forward(&q_pe, &k_pe, seqlen_offsets)?;
 
-        let mut q = Tensor::zeros(
-            (bs, self.num_attention_heads, seq_len, self.q_head_dim),
-            q_pe.dtype(),
-            q_pe.device(),
-        )?;
-        q = q.slice_assign(&[&.., &.., &.., &(..self.cfg.qk_nope_head_dim)], &q_nope)?;
-        q = q.slice_assign(&[&.., &.., &.., &(self.cfg.qk_nope_head_dim..)], &q_pe)?;
-
-        let mut k = Tensor::zeros(
-            (bs, self.num_attention_heads, seq_len, self.q_head_dim),
-            k_pe.dtype(),
-            k_pe.device(),
-        )?;
-        k = k.slice_assign(&[&.., &.., &.., &(..self.cfg.qk_nope_head_dim)], &k_nope)?;
-        let k_pe = k_pe.repeat((1, k.dim(1)?, 1, 1))?;
-        k = k.slice_assign(&[&.., &.., &.., &(self.cfg.qk_nope_head_dim..)], &k_pe)?;
+        let q = Tensor::cat(&[&q_nope, &q_pe], D::Minus1)?.contiguous()?;
+        let mut k = Tensor::cat(
+            &[&k_nope, &k_pe.repeat((1, self.num_attention_heads, 1, 1))?],
+            D::Minus1,
+        )?
+        .contiguous()?;
 
         let mut attn_out = match &self.paged_attn {
             Some(paged_attn) => match metadata {
@@ -546,7 +533,7 @@ impl MoeGate {
                     .reshape((bs * seq_len, self.cfg.n_group, ()))?
                     .max(D::Minus1)?;
                 // (n, topk_group)
-                let group_idx = scores.topk_unsorted(self.cfg.topk_group)?.indices;
+                let group_idx = group_scores.topk_unsorted(self.cfg.topk_group)?.indices;
                 // (n, n_group)
                 let mut group_mask = group_scores.zeros_like()?;
                 // (n, n_group)
@@ -563,7 +550,7 @@ impl MoeGate {
                         self.cfg.n_group,
                         self.n_routed_experts / self.cfg.n_group,
                     ))?
-                    .reshape((bs, seq_len, ()))?;
+                    .reshape((bs * seq_len, ()))?;
                 // (n, e)
                 // Invert the mask
                 let tmp_scores = masked_fill(&score_mask, &(1. - &score_mask.ne(0.)?)?, 0.)?;
@@ -572,7 +559,7 @@ impl MoeGate {
             }
         };
 
-        if self.top_k > 1 && self.cfg.norm_topk_prob {
+        if matches!(self.cfg.scoring_func, ScoringFunc::Sigmoid) {
             let denmoninator = (topk_weight.sum_keepdim(D::Minus1)? + 1e-20)?;
             topk_weight = topk_weight.broadcast_div(&denmoninator)?;
         }
@@ -654,16 +641,15 @@ impl Moe {
 
     fn moe_infer(&self, xs: &Tensor, topk_ids: &Tensor, topk_weight: &Tensor) -> Result<Tensor> {
         let mut y = xs.zeros_like()?;
-        let counts = topk_ids
-            .flatten_all()?
-            .bincount(self.experts.len() as u32)?;
-        for (i, count) in counts
-            .iter()
-            .enumerate()
-            .take(self.experts_end_idx)
-            .skip(self.experts_start_idx)
-        {
-            if *count == 0 {
+        let topk_weight = if topk_weight.dtype() != xs.dtype() {
+            topk_weight.to_dtype(xs.dtype())?
+        } else {
+            topk_weight.to_owned()
+        };
+        let unique_ids: HashSet<u32> =
+            HashSet::from_iter(topk_ids.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?);
+        for i in self.experts_start_idx..self.experts_end_idx {
+            if !unique_ids.contains(&(i as u32)) {
                 continue;
             }
             let idx_top = topk_ids.eq(i as f64)?.nonzero()?.t()?;
@@ -681,15 +667,14 @@ impl Moe {
                         .index_select(idx, 0)?
                         .gather(&top.unsqueeze(1)?, 1)?
                         .squeeze(1)?
-                        .unsqueeze(D::Minus1)?
-                        .to_dtype(xs.dtype())?,
+                        .unsqueeze(D::Minus1)?,
                 )?,
                 0,
             )?;
         }
 
         if self.world_size > 1 {
-            y = self.all_reduce.apply(&y)?;
+            y = self.all_reduce.sum_all_reduce(&y)?;
         }
 
         Ok(y)
@@ -853,6 +838,7 @@ impl DeepSeekV3 {
             cfg.vocab_size,
             cfg.hidden_size,
             mapper.set_nm_device(vb_m.pp("embed_tokens"), false),
+            &cfg.quantization_config,
         )?;
         let lm_head = if !cfg.tie_word_embeddings {
             ReplicatedLayer::new(

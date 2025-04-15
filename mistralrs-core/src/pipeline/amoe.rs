@@ -14,7 +14,7 @@ use image::DynamicImage;
 use indexmap::IndexMap;
 use indicatif::MultiProgress;
 use mistralrs_quant::IsqType;
-use rand::{seq::SliceRandom, thread_rng};
+use rand::{rng, seq::SliceRandom};
 use rand_isaac::Isaac64Rng;
 use tracing::{info, warn};
 
@@ -22,7 +22,7 @@ use crate::{
     amoe::{AnyMoeConfig, AnyMoeTrainingInputRow, AnyMoeTrainingInputs, AnyMoeTrainingResult},
     device_map::DeviceMapper,
     get_mut_arcmutex,
-    prefix_cacher_v2::PrefixCacheManagerV2,
+    prefix_cacher::PrefixCacheManagerV2,
     sampler::Sampler,
     sequence::{SeqStepType, Sequence, SequenceGroup, SequenceRecognizer},
     utils::progress::NiceProgressBar,
@@ -31,8 +31,8 @@ use crate::{
 };
 
 use super::{
-    AdapterActivationMixin, AnyMoePipelineMixin, CacheManagerMixin, EitherCache,
-    ForwardInputsResult, IsqPipelineMixin, MetadataMixin, PreProcessingMixin,
+    AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
+    MetadataMixin, PreProcessingMixin,
 };
 
 pub struct AnyMoeLoader {
@@ -177,12 +177,6 @@ impl AnyMoePipeline {
             }
         }
         Ok(this)
-    }
-}
-
-impl AdapterActivationMixin for AnyMoePipeline {
-    fn activate_adapters(&mut self, adapters: Vec<String>) -> anyhow::Result<usize> {
-        get_mut_arcmutex!(self.target).activate_adapters(adapters)
     }
 }
 
@@ -366,7 +360,7 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
             })
             .collect::<candle_core::Result<Vec<_>>>()?;
 
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let mut samples = inputs.into_inner();
 
         // Create several dummy objects for the sequences. No custom logits processors.
@@ -456,6 +450,7 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
                         dummy_sampler.clone(),
                         dummy_group.clone(),
                         images,
+                        target.get_metadata().eos_tok.clone(),
                     ));
                 }
                 let mut input_seqs = seqs.iter_mut().collect::<Vec<_>>();
@@ -566,6 +561,7 @@ fn new_dummy_seq(
     dummy_sampler: Sampler,
     dummy_group: Arc<tokio::sync::Mutex<SequenceGroup>>,
     images: Option<Vec<DynamicImage>>,
+    eos_toks: Vec<u32>,
 ) -> Sequence {
     Sequence::new_waiting(
         tokens,
@@ -586,7 +582,6 @@ fn new_dummy_seq(
         SequenceRecognizer::None,
         None,
         None,
-        None,
         images,
         None, // TODO incorrect for PagedAttention
         None,
@@ -595,5 +590,6 @@ fn new_dummy_seq(
         None,
         None,
         false,
+        eos_toks,
     )
 }

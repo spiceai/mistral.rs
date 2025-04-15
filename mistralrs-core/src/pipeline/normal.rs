@@ -5,13 +5,13 @@ use super::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
 use super::isq::ImatrixDataSource;
 use super::llg::build_tok_env;
 use super::{
-    text_models_inputs_processor::ModelInputs, AdapterKind, CacheManager, GeneralMetadata, Loader,
-    ModelKind, ModelPaths, NormalModel, NormalModelLoader, TokenSource,
+    get_model_paths, get_xlora_paths, text_models_inputs_processor::ModelInputs, AdapterKind,
+    CacheManager, GeneralMetadata, Loader, ModelKind, ModelPaths, NormalModel, NormalModelLoader,
+    TokenSource,
 };
 use super::{
-    AdapterActivationMixin, AnyMoePipelineMixin, CacheManagerMixin, EitherCache,
-    ForwardInputsResult, IsqOrganization, IsqPipelineMixin, MetadataMixin, ModelCategory,
-    PreProcessingMixin,
+    AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqOrganization,
+    IsqPipelineMixin, MetadataMixin, ModelCategory, PreProcessingMixin,
 };
 use super::{
     AutoLoader, DeepSeekV2Loader, DeepSeekV3Loader, Gemma2Loader, GemmaLoader, LlamaLoader,
@@ -19,40 +19,38 @@ use super::{
     Qwen2Loader, Starcoder2Loader,
 };
 use crate::amoe::AnyMoeExpertType;
-use crate::daemon::{self, BigCCharArray, WorkerTransferData};
 use crate::device_map::{self, DeviceMapper};
+use crate::distributed::{self, WorkerTransferData};
 use crate::lora::Ordering;
 use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::isq::UqffFullSer;
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::text_models_inputs_processor::make_prompt_chunk;
-use crate::pipeline::{get_chat_template, ChatTemplate};
-use crate::prefix_cacher_v2::PrefixCacheManagerV2;
+use crate::pipeline::{get_chat_template, ChatTemplate, LocalModelPaths};
+use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 use crate::utils::{tokens::get_token, varbuilder_utils::from_mmaped_safetensors};
 use crate::xlora_models::NonGranularState;
 use crate::{
-    get_mut_arcmutex, lora_model_loader, normal_model_loader, normal_model_loader_sharded,
-    xlora_model_loader, DeviceMapSetting, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
+    api_dir_list, api_get_file, get_mut_arcmutex, get_paths, get_uqff_paths, lora_model_loader,
+    normal_model_loader, normal_model_loader_sharded, xlora_model_loader, DeviceMapSetting,
+    PagedAttentionConfig, Pipeline, Topology, TryIntoDType, GLOBAL_HF_CACHE,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{Device, Tensor, Var};
+use hf_hub::Cache;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use indicatif::MultiProgress;
-use interprocess::local_socket::traits::{Listener, Stream};
-use interprocess::local_socket::{ListenerOptions, Stream as LocalStream};
-use mistralrs_quant::{GgufMatMul, HqqLayer, IsqType, QuantizedSerdeType, ShardedSafeTensors};
+use mistralrs_quant::{AfqLayer, GgufMatMul, HqqLayer, IsqType, QuantizedSerdeType};
 use rand_isaac::Isaac64Rng;
 use regex_automata::meta::Regex;
 use std::any::Any;
 use std::borrow::Cow;
-use std::io::{BufRead, BufReader, Write};
 use std::num::{NonZero, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -86,6 +84,7 @@ pub struct NormalLoader {
     model_id: String,
     config: NormalSpecificConfig,
     xlora_model_id: Option<String>,
+    lora_adapter_ids: Option<Vec<String>>,
     kind: ModelKind,
     xlora_order: Option<Ordering>,
     no_kv_cache: bool,
@@ -94,7 +93,9 @@ pub struct NormalLoader {
     tgt_non_granular_index: Option<usize>,
     token_source: RwLock<Option<TokenSource>>,
     revision: RwLock<Option<String>>,
-    from_uqff: RwLock<Option<PathBuf>>,
+    from_uqff: RwLock<Option<Vec<PathBuf>>>,
+    jinja_explicit: Option<String>,
+    hf_cache_path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -103,12 +104,15 @@ pub struct NormalLoaderBuilder {
     model_id: Option<String>,
     config: NormalSpecificConfig,
     xlora_model_id: Option<String>,
+    lora_adapter_ids: Option<Vec<String>>,
     kind: ModelKind,
     xlora_order: Option<Ordering>,
     no_kv_cache: bool,
     chat_template: Option<String>,
     tokenizer_json: Option<String>,
     tgt_non_granular_index: Option<usize>,
+    jinja_explicit: Option<String>,
+    hf_cache_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Default)]
@@ -119,18 +123,20 @@ pub struct NormalSpecificConfig {
     pub topology: Option<Topology>,
     pub organization: IsqOrganization,
     pub write_uqff: Option<PathBuf>,
-    pub from_uqff: Option<PathBuf>,
+    pub from_uqff: Option<Vec<PathBuf>>,
     pub imatrix: Option<PathBuf>,
     pub calibration_file: Option<PathBuf>,
+    pub hf_cache_path: Option<PathBuf>,
 }
 
 impl NormalLoaderBuilder {
-    /// NOTE: Until v0.4.0, you should make sure to call `.with_no_kv_cache` if applicable.
     pub fn new(
         config: NormalSpecificConfig,
         chat_template: Option<String>,
         tokenizer_json: Option<String>,
         model_id: Option<String>,
+        no_kv_cache: bool,
+        jinja_explicit: Option<String>,
     ) -> Self {
         Self {
             config,
@@ -138,14 +144,10 @@ impl NormalLoaderBuilder {
             tokenizer_json,
             model_id,
             kind: ModelKind::Normal,
+            jinja_explicit,
+            no_kv_cache,
             ..Default::default()
         }
-    }
-
-    // TODO(EricLBuehler): in 0.4.0 we can move this into the config
-    pub fn with_no_kv_cache(mut self, no_kv_cache: bool) -> Self {
-        self.no_kv_cache = no_kv_cache;
-        self
     }
 
     fn with_adapter(
@@ -189,11 +191,17 @@ impl NormalLoaderBuilder {
         )
     }
 
-    pub fn with_lora(mut self, lora_model_id: String, lora_order: Ordering) -> Self {
+    pub fn with_lora(mut self, lora_adapter_ids: Vec<String>) -> Self {
         self.kind = ModelKind::Adapter {
             adapter: AdapterKind::Lora,
         };
-        self.with_adapter(lora_model_id, lora_order, false, None)
+        self.lora_adapter_ids = Some(lora_adapter_ids);
+        self
+    }
+
+    pub fn hf_cache_path(mut self, hf_cache_path: PathBuf) -> Self {
+        self.hf_cache_path = Some(hf_cache_path);
+        self
     }
 
     /// If the loader type is not specified, loader type is automatically determined from the
@@ -219,15 +227,18 @@ impl NormalLoaderBuilder {
             model_id: self.model_id.unwrap(),
             config: self.config,
             xlora_model_id: self.xlora_model_id,
+            lora_adapter_ids: self.lora_adapter_ids,
             kind: self.kind,
             xlora_order: self.xlora_order,
             no_kv_cache: self.no_kv_cache,
             chat_template: self.chat_template,
             tokenizer_json: self.tokenizer_json,
             tgt_non_granular_index: self.tgt_non_granular_index,
+            jinja_explicit: self.jinja_explicit,
             token_source: RwLock::new(None),
             revision: RwLock::new(None),
             from_uqff: RwLock::new(None),
+            hf_cache_path: self.hf_cache_path,
         }))
     }
 }
@@ -245,6 +256,13 @@ impl Loader for NormalLoader {
         in_situ_quant: Option<IsqType>,
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
+        let cache = self
+            .hf_cache_path
+            .clone()
+            .map(Cache::new)
+            .unwrap_or_default();
+        GLOBAL_HF_CACHE.get_or_init(|| cache);
+
         let paths: Box<dyn ModelPaths> = get_paths(
             self.model_id.clone(),
             self.tokenizer_json.as_deref(),
@@ -296,6 +314,10 @@ impl Loader for NormalLoader {
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
         let config = std::fs::read_to_string(paths.get_config_filename())?;
 
+        if !self.inner.supports_paged_attention(&config)? {
+            paged_attn_config = None;
+        }
+
         // Apply default prompt size here
         let prompt_chunksize = self
             .config
@@ -307,7 +329,7 @@ impl Loader for NormalLoader {
 
         let use_nccl = mistralrs_quant::distributed::use_nccl();
 
-        let available_devices = if let Ok(payload) = env::var(daemon::IS_DAEMON_FLAG) {
+        let available_devices = if let Ok(payload) = env::var(distributed::IS_DAEMON_FLAG) {
             let payload: WorkerTransferData = serde_json::from_str(&payload)?;
             let WorkerTransferData::Init { id: _, worker_rank } = payload;
             vec![candle_core::Device::new_cuda(worker_rank + 1)?]
@@ -316,11 +338,16 @@ impl Loader for NormalLoader {
         } else {
             device_map::get_all_similar_devices(device)?
         };
+        let device = if use_nccl {
+            available_devices[0].clone()
+        } else {
+            device.clone()
+        };
 
         // If auto, convert to Map if not using nccl
         if use_nccl {
-            mapper = DeviceMapSetting::Nccl {
-                devices: available_devices.clone(),
+            mapper = DeviceMapSetting::DummyNccl {
+                nm_device: available_devices[0].clone(),
             };
         } else if let DeviceMapSetting::Auto(params) = mapper.clone() {
             // Initial dtype
@@ -332,7 +359,7 @@ impl Loader for NormalLoader {
                 if let Some(serialized) = &*self.from_uqff.read().unwrap() {
                     let weight_pack_factor = {
                         let ser_artifacts = unsafe {
-                            candle_core::safetensors::MmapedSafetensors::new(serialized)?
+                            candle_core::safetensors::MmapedSafetensors::multi(serialized)?
                         };
                         let mut total_pack_factors = 0;
                         let total_tensors = ser_artifacts.tensors().len();
@@ -352,6 +379,10 @@ impl Loader for NormalLoader {
                                 }
                                 QuantizedSerdeType::Fp8 => IsqType::F8E4M3.pack_factor(dtype),
                                 QuantizedSerdeType::Unquant => 1,
+                                QuantizedSerdeType::Afq => {
+                                    AfqLayer::get_isq_type_from_uqff(Cow::Borrowed(artifact))?
+                                        .pack_factor(dtype)
+                                }
                             };
                             total_pack_factors += pack_factor;
                         }
@@ -414,17 +445,17 @@ impl Loader for NormalLoader {
         }
 
         let pipeline_mapper = mapper.into_mapper(
-            self.inner.get_total_device_mapping_num_layers(&config)?,
-            device,
+            self.inner.num_layers(&config)?,
+            &device,
             self.config.topology.as_ref(),
         )?;
         let mapper = mapper.into_mapper(
-            self.inner.get_total_device_mapping_num_layers(&config)?,
-            device,
+            self.inner.num_layers(&config)?,
+            &device,
             self.config.topology.as_ref(),
         )?;
         let mut layer_devices = Vec::new();
-        for layer in 0..self.inner.get_total_device_mapping_num_layers(&config)? {
+        for layer in 0..self.inner.num_layers(&config)? {
             let device = mapper.device_for(layer, false).cloned();
             layer_devices.push(device);
         }
@@ -477,180 +508,20 @@ impl Loader for NormalLoader {
         let multi_progress = Arc::new(MultiProgress::new());
 
         let mut model = if use_nccl {
-            #[cfg(not(feature = "nccl"))]
-            warn!(
-                "NCCL support was included in the build, be sure to build with `--features nccl`."
-            );
-
-            // NCCL case!
-
-            let local_world_size = available_devices.len();
-            let global_world_size = if let Ok(x) = std::env::var("MISTRALRS_MN_GLOBAL_WORLD_SIZE") {
-                usize::from_str(&x).context("MISTRALRS_MN_GLOBAL_WORLD_SIZE")?
-            } else {
-                mistralrs_quant::distributed::get_global_tp_size_from_devices()?
-            };
-
-            let use_multi_node = std::env::var("MISTRALRS_MN_GLOBAL_WORLD_SIZE").is_ok();
-            if use_multi_node {
-                info!("MISTRALRS_MN_GLOBAL_WORLD_SIZE is set, entering multi-node.");
-            }
-
-            if global_world_size < local_world_size || global_world_size % local_world_size != 0 {
-                anyhow::bail!("Global world size {global_world_size} must both be at least and divide the local world size {local_world_size}");
-            }
-
-            info!("Local tensor parallel world size is {local_world_size}");
-            info!("Global tensor parallel world size is {global_world_size}");
-
-            let mut id = mistralrs_quant::Id::new();
-
-            // TP uses parallel pipelines.
-            let name = daemon::ipc_name()?;
-            let local_rank = if let Ok(payload) = env::var(daemon::IS_DAEMON_FLAG) {
-                let payload: WorkerTransferData = serde_json::from_str(&payload)?;
-                let WorkerTransferData::Init {
-                    id: new_id,
-                    worker_rank,
-                } = payload;
-                id = mistralrs_quant::Id::uninit(new_id.0);
-
-                let mut stream = LocalStream::connect(name)?;
-                stream.write_all(b"ready\n")?;
-                worker_rank + 1
-            } else {
-                let num_workers =
-                    mistralrs_quant::distributed::get_global_tp_size_from_devices()? - 1;
-                let mut children = Vec::new();
-                for worker_rank in 0..num_workers {
-                    let exe_path = env::current_exe().expect("Failed to get current exe");
-
-                    let args: Vec<String> = env::args().collect();
-
-                    let mut cmd = Command::new(exe_path);
-                    cmd.args(&args[1..]);
-
-                    let data = WorkerTransferData::Init {
-                        id: BigCCharArray(*id.internal()),
-                        worker_rank,
-                    };
-
-                    cmd.env(daemon::IS_DAEMON_FLAG, serde_json::to_string(&data)?);
-
-                    cmd.stdout(std::process::Stdio::null());
-                    cmd.stderr(std::process::Stdio::null());
-                    cmd.stdin(std::process::Stdio::null());
-
-                    children.push(cmd.spawn().expect("Failed to spawn process"));
-                }
-
-                let listener = ListenerOptions::new().name(name).create_sync()?;
-                let mut ready_count = 0;
-
-                while ready_count < num_workers {
-                    let stream = listener.accept()?;
-                    let mut reader = BufReader::new(stream);
-                    let mut message = String::new();
-                    reader.read_line(&mut message)?;
-                    if message.trim() == "ready" {
-                        ready_count += 1;
-                    }
-                }
-                info!("All workers have received the ids!");
-
-                0
-            };
-
-            if use_multi_node {
-                if let Ok(n_nodes) = env::var("MISTRALRS_MN_HEAD_NUM_WORKERS") {
-                    let n_nodes =
-                        usize::from_str(&n_nodes).context("MISTRALRS_MN_HEAD_NUM_WORKERS")?;
-                    info!("Head node managing {n_nodes} workers.");
-                    let Ok(port) = env::var("MISTRALRS_MN_HEAD_PORT") else {
-                        anyhow::bail!(
-                            "Got MISTRALRS_MN_HEAD_NUM_WORKERS, expected MISTRALRS_MN_HEAD_PORT"
-                        );
-                    };
-                    info!("Head node initializing connection on {port}.");
-                    let server = mistralrs_quant::Server::new(
-                        &format!("0.0.0.0:{port}"),
-                        n_nodes,
-                        local_world_size,
-                    )?;
-
-                    server.broadcast_id(&id)?;
-                } else if let Ok(addr) = env::var("MISTRALRS_MN_WORKER_SERVER_ADDR") {
-                    info!("Worker node connecting to {addr}.");
-                    let client = mistralrs_quant::Client::new(addr.parse()?, local_world_size)?;
-
-                    id = client.receive_id()?;
-                }
-            }
-
-            let rank_offset = if env::var("MISTRALRS_MN_WORKER_SERVER_ADDR").is_ok() {
-                let Ok(node_id) = env::var("MISTRALRS_MN_WORKER_ID") else {
-                    anyhow::bail!(
-                        "Got MISTRALRS_MN_WORKER_SERVER_ADDR, expected MISTRALRS_MN_WORKER_ID"
-                    );
-                };
-                let node_id = usize::from_str(&node_id).context("MISTRALRS_MN_WORKER_ID")?;
-                info!("Worker ID is {node_id}.");
-                (node_id + 1) * local_world_size
-            } else {
-                0
-            };
-
-            // They each block on each other
-            // https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/comms.html?ncclcomminitrank#ncclcomminitrank
-            let comm = mistralrs_quant::Comm::from_device(
-                id,
-                device,
-                local_rank + rank_offset,
-                global_world_size,
-            )?;
-
-            let make_dummy_regexes = if loading_isq && self.config.from_uqff.is_some() {
-                // Dummy weights for the layers which will be overwritten...
-                Some(std::sync::Arc::new(
-                    if matches!(self.config.organization, IsqOrganization::MoeExpertsOnly) {
-                        self.inner.isq_layer_regexes_moqe(&config)?
-                    } else {
-                        self.inner.isq_layer_regexes(&config)?
-                    },
-                ))
-            } else {
-                None
-            };
-
-            let sharded_vb = unsafe {
-                ShardedSafeTensors::sharded(
-                    paths.get_weight_filenames(),
-                    dtype,
-                    &load_device,
-                    make_dummy_regexes,
-                )?
-            };
-
-            info!("Loading all ranks.");
-            let device = available_devices[0].clone();
-            // The mapper is specific to this pipeline
-            let mapper = DeviceMapSetting::NcclPipelineParallel {
-                devices_and_comms: vec![(Arc::new(comm), device.clone())],
-                nm_device: device.clone(),
-            }
-            .into_mapper(
-                self.inner.get_total_device_mapping_num_layers(&config)?,
+            let (mapper, sharded_vb) = distributed::prepare_distributed_mapper(
+                dtype,
                 &device,
-                None,
+                &available_devices,
+                silent,
+                &config,
+                loading_isq,
+                self.config.from_uqff.is_some(),
+                self.config.organization,
+                &*self.inner,
+                paths.as_ref(),
             )?;
 
-            let sharded_vb = if !loading_isq {
-                sharded_vb.clone().set_device(device.clone())
-            } else {
-                sharded_vb.clone()
-            };
-
-            // Special case for normal models which support nccl so should be more optimially loaded.
+            // Special case for where things can be more optimially loaded.
             match self.kind {
                 ModelKind::Normal => normal_model_loader_sharded!(
                     sharded_vb,
@@ -659,7 +530,7 @@ impl Loader for NormalLoader {
                     self.config.use_flash_attn,
                     mapper,
                     loading_isq,
-                    device,
+                    device.clone(),
                     attention_mechanism,
                     multi_progress.clone(),
                 ),
@@ -676,14 +547,14 @@ impl Loader for NormalLoader {
                     silent,
                     mapper,
                     loading_isq,
-                    device,
+                    device.clone(),
                     multi_progress.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::Lora,
                 } => lora_model_loader!(
                     paths,
-                    dtype,
+                    Some(dtype),
                     &load_device,
                     layer_devices.clone(),
                     config,
@@ -692,7 +563,10 @@ impl Loader for NormalLoader {
                     silent,
                     mapper,
                     loading_isq,
-                    device,
+                    self.config.from_uqff.is_some(),
+                    device.clone(),
+                    attention_mechanism,
+                    matches!(self.config.organization, IsqOrganization::MoeExpertsOnly),
                     multi_progress.clone(),
                 ),
                 _ => unreachable!(),
@@ -736,7 +610,7 @@ impl Loader for NormalLoader {
                     adapter: AdapterKind::Lora,
                 } => lora_model_loader!(
                     paths,
-                    dtype,
+                    Some(dtype),
                     &load_device,
                     layer_devices.clone(),
                     config,
@@ -745,7 +619,10 @@ impl Loader for NormalLoader {
                     silent,
                     mapper,
                     loading_isq,
+                    self.config.from_uqff.is_some(),
                     device.clone(),
+                    attention_mechanism,
+                    matches!(self.config.organization, IsqOrganization::MoeExpertsOnly),
                     multi_progress.clone(),
                 ),
                 _ => unreachable!(),
@@ -760,8 +637,9 @@ impl Loader for NormalLoader {
 
         let chat_template = get_chat_template(
             paths,
+            &self.jinja_explicit,
             &paths
-                .get_chat_template_json()
+                .get_chat_template_explicit()
                 .as_ref()
                 .map(|x| x.to_string_lossy().to_string())
                 .clone(),
@@ -773,7 +651,7 @@ impl Loader for NormalLoader {
             let calibration_data = std::fs::read_to_string(calibration_file)?;
             // Tokenize, don't add bos yet
             let tokens = tokenizer
-                .encode(calibration_data, false)
+                .encode_fast(calibration_data, false)
                 .map_err(anyhow::Error::msg)?
                 .get_ids()
                 .to_vec();
@@ -828,7 +706,7 @@ impl Loader for NormalLoader {
                     }
                     EitherCache::Normal(normal) => {
                         for layer in &mut *normal.lock().unwrap().0 {
-                            layer.set_len(0);
+                            layer.reset();
                         }
                     }
                 }
@@ -892,7 +770,12 @@ impl Loader for NormalLoader {
             )?;
         }
 
-        let paged_attn_config = if matches!(self.kind, ModelKind::Adapter { .. }) {
+        let paged_attn_config = if matches!(
+            self.kind,
+            ModelKind::Adapter {
+                adapter: AdapterKind::XLora
+            }
+        ) {
             warn!(
                 "Adapter parallel_models do not currently support PagedAttention, running without"
             );
@@ -908,7 +791,7 @@ impl Loader for NormalLoader {
                 paged_attn_config.block_size,
                 dtype,
                 model.config(),
-                device,
+                &device,
                 &pipeline_mapper
                     .get_unique_devices()
                     .into_iter()
@@ -918,7 +801,7 @@ impl Loader for NormalLoader {
             )?;
 
             let mut layer_devices = Vec::new();
-            for layer in 0..self.inner.get_total_device_mapping_num_layers(&config)? {
+            for layer in 0..self.inner.num_layers(&config)? {
                 let device = model.get_layers().1.device_for(layer, false).cloned();
                 layer_devices.push(device);
             }
@@ -985,10 +868,7 @@ impl Loader for NormalLoader {
     }
 
     fn get_id(&self) -> String {
-        self.xlora_model_id
-            .as_deref()
-            .unwrap_or(&self.model_id)
-            .to_string()
+        self.model_id.clone()
     }
 
     fn get_kind(&self) -> ModelKind {
@@ -1069,12 +949,6 @@ impl CacheManagerMixin for NormalPipeline {
     }
     fn cache(&self) -> &EitherCache {
         self.model.cache()
-    }
-}
-
-impl AdapterActivationMixin for NormalPipeline {
-    fn activate_adapters(&mut self, adapter_names: Vec<String>) -> anyhow::Result<usize> {
-        Ok(self.model.activate_adapters(adapter_names)?)
     }
 }
 
@@ -1250,7 +1124,8 @@ impl AnyMoePipelineMixin for NormalPipeline {
             let model_id = Path::new(&model_id);
 
             let api = {
-                let mut api = ApiBuilder::new()
+                let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
+                let mut api = ApiBuilder::from_cache(cache)
                     .with_progress(!silent)
                     .with_token(get_token(token).map_err(candle_core::Error::msg)?);
                 if let Ok(x) = std::env::var("HF_HUB_CACHE") {
@@ -1308,7 +1183,8 @@ impl AnyMoePipelineMixin for NormalPipeline {
             let model_id = Path::new(&gate_model_id);
 
             let api = {
-                let mut api = ApiBuilder::new()
+                let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
+                let mut api = ApiBuilder::from_cache(cache)
                     .with_progress(!silent)
                     .with_token(get_token(token).map_err(candle_core::Error::msg)?);
                 if let Ok(x) = std::env::var("HF_HUB_CACHE") {

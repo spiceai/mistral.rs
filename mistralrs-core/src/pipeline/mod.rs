@@ -22,7 +22,7 @@ pub use super::diffusion_models::DiffusionGenerationParams;
 use crate::amoe::{AnyMoeConfig, AnyMoeExpertType, AnyMoeTrainingInputs, AnyMoeTrainingResult};
 use crate::device_map::DeviceMapper;
 use crate::paged_attention::{CacheConfig, CacheEngine, ModelConfigLike};
-use crate::prefix_cacher_v2::PrefixCacheManagerV2;
+use crate::prefix_cacher::PrefixCacheManagerV2;
 pub use amoe::{AnyMoeLoader, AnyMoePipeline};
 use chat_template::ChatTemplate;
 pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder, DiffusionSpecificConfig};
@@ -30,20 +30,24 @@ pub use ggml::{GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig};
 pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
 use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
-pub use isq::{parse_isq_value, IsqModel, IsqOrganization};
+pub(crate) use isq::IsqModelLoader;
+pub use isq::{parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER};
 pub use loaders::{
     AdapterKind, AutoDeviceMapParams, AutoLoader, DeepSeekV2Loader, DeepSeekV3Loader,
     DeviceMappedModelLoader, DiffusionLoaderType, DiffusionModel, DiffusionModelLoader, FluxLoader,
-    Gemma2Loader, GemmaLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader,
-    LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, MistralLoader, MixtralLoader, ModelKind,
-    ModelPaths, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
-    Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader, PrettyName,
-    QuantizationKind, Qwen2Loader, Qwen2VLLoader, Starcoder2Loader, TokenSource, VLlamaLoader,
-    VisionLoaderType, VisionModel, VisionModelLoader,
+    Gemma2Loader, Gemma3Loader, GemmaLoader, Idefics2Loader, Idefics3Loader, LLaVALoader,
+    LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader,
+    MistralLoader, MixtralLoader, ModelKind, ModelPaths, NormalLoaderType, NormalLoadingMetadata,
+    NormalModel, NormalModelLoader, Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader,
+    Phi4MMLoader, PrettyName, QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader,
+    Starcoder2Loader, TokenSource, VLlama4Loader, VLlamaLoader, VisionLoaderType, VisionModel,
+    VisionModelLoader,
 };
 use mistralrs_quant::IsqType;
 pub use normal::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
-pub(crate) use paths::{get_chat_template, get_model_paths, get_xlora_paths, XLoraPaths};
+pub(crate) use paths::{
+    get_chat_template, get_model_paths, get_xlora_paths, AdapterPaths, LoraAdapterPaths,
+};
 pub(crate) use processing::{
     apply_chat_template, BasicProcessor, MessagesAction, Processor, ProcessorCreator,
 };
@@ -63,7 +67,8 @@ use candle_core::{DType, Device, IndexOp, Tensor, Var};
 use crate::sequence::Sequence;
 
 pub use self::cache_manager::{
-    Cache, CacheManager, EitherCache, KvCache, LayerCaches, NormalCache, SingleCache,
+    Cache, CacheManager, EitherCache, KvCache, LayerCaches, NormalCache, NormalCacheType,
+    RotatingCache, SingleCache,
 };
 pub use self::inputs_processor::{
     text_models_inputs_processor, InputsProcessor, InputsProcessorType,
@@ -90,21 +95,15 @@ pub struct GeneralMetadata {
     pub model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>>,
 }
 
-pub enum AdapterInstruction {
-    Activate(Vec<String>),
-    None,
-}
-
 pub enum CacheInstruction {
-    In(AdapterInstruction),
+    In,
     Out,
     /// load_preallocated_cache means to load the preallocated cache, if applicable.
     Reset {
         load_preallocated_cache: bool,
         reset_non_granular: bool,
-        adapter_inst: AdapterInstruction,
     },
-    Nothing(AdapterInstruction),
+    Nothing,
 }
 
 pub trait PreProcessingMixin: MetadataMixin {
@@ -141,11 +140,6 @@ pub trait CacheManagerMixin {
     fn do_preallocated_cache(&self) -> bool {
         matches!(self.cache(), EitherCache::Normal(_))
     }
-}
-
-pub trait AdapterActivationMixin {
-    /// Returns the number of activated adapters.
-    fn activate_adapters(&mut self, adapters: Vec<String>) -> Result<usize>;
 }
 
 pub trait MetadataMixin {
@@ -298,7 +292,6 @@ pub trait Pipeline:
     + PreProcessingMixin
     + IsqPipelineMixin
     + CacheManagerMixin
-    + AdapterActivationMixin
     + MetadataMixin
     + AnyMoePipelineMixin
 {
@@ -358,59 +351,17 @@ pub trait Pipeline:
                     } = inputs.map_err(candle_core::Error::msg)?;
                     if i == 0 {
                         match pre_op {
-                            CacheInstruction::In(ref adapter_inst) => {
-                                match adapter_inst {
-                                    AdapterInstruction::Activate(adapters) => {
-                                        self.activate_adapters(adapters.clone()).map_err(|e| {
-                                            candle_core::Error::msg(<anyhow::Error as AsRef<
-                                                dyn std::error::Error,
-                                            >>::as_ref(
-                                                &e
-                                            ))
-                                        })?
-                                    }
-                                    AdapterInstruction::None => 0,
-                                };
-                                self.clone_in_cache(input_seqs)
-                            }
-                            CacheInstruction::Nothing(ref adapter_inst) => {
-                                match adapter_inst {
-                                    AdapterInstruction::Activate(adapters) => {
-                                        self.activate_adapters(adapters.clone()).map_err(|e| {
-                                            candle_core::Error::msg(<anyhow::Error as AsRef<
-                                                dyn std::error::Error,
-                                            >>::as_ref(
-                                                &e
-                                            ))
-                                        })?
-                                    }
-                                    AdapterInstruction::None => 0,
-                                };
-                            }
+                            CacheInstruction::In => self.clone_in_cache(input_seqs),
+                            CacheInstruction::Nothing => (),
                             CacheInstruction::Reset {
                                 load_preallocated_cache,
                                 reset_non_granular,
-                                ref adapter_inst,
-                            } => {
-                                match adapter_inst {
-                                    AdapterInstruction::Activate(adapters) => {
-                                        self.activate_adapters(adapters.clone()).map_err(|e| {
-                                            candle_core::Error::msg(<anyhow::Error as AsRef<
-                                                dyn std::error::Error,
-                                            >>::as_ref(
-                                                &e
-                                            ))
-                                        })?
-                                    }
-                                    AdapterInstruction::None => 0,
-                                };
-                                self.set_none_cache(
-                                    input_seqs,
-                                    reset_non_granular,
-                                    false,
-                                    load_preallocated_cache,
-                                )
-                            }
+                            } => self.set_none_cache(
+                                input_seqs,
+                                reset_non_granular,
+                                false,
+                                load_preallocated_cache,
+                            ),
                             _ => unreachable!("Unreachable PRE cache op."),
                         }
                     }
@@ -432,11 +383,10 @@ pub trait Pipeline:
 
                 match post_op {
                     CacheInstruction::Out => self.clone_out_cache(input_seqs),
-                    CacheInstruction::Nothing(_) => (),
+                    CacheInstruction::Nothing => (),
                     CacheInstruction::Reset {
                         load_preallocated_cache,
                         reset_non_granular,
-                        adapter_inst: _,
                     } => self.set_none_cache(
                         input_seqs,
                         reset_non_granular,

@@ -4,7 +4,7 @@ use std::{ops::Mul, sync::Arc};
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Conv2d, Conv2dConfig, Embedding, LayerNorm, LayerNormConfig, Module};
-use mistralrs_quant::{QuantMethod, ShardedVarBuilder};
+use mistralrs_quant::{ColumnParallelLayer, QuantMethod, RowParallelLayer, ShardedVarBuilder};
 
 use crate::{
     attention::SdpaParams,
@@ -34,6 +34,7 @@ impl MLlamaPrecomputedPositionEmbedding {
                 cfg.max_aspect_ratio_id() + 1,
                 cfg.max_num_tiles * num_patches * cfg.hidden_size,
                 vb.pp("tile_embedding"),
+                &None,
             )?,
             num_patches,
             hidden_size: cfg.hidden_size,
@@ -91,6 +92,7 @@ impl MLlamaPrecomputedAspectRatioEmbedding {
                 cfg.max_aspect_ratio_id() + 1,
                 cfg.max_num_tiles * cfg.hidden_size,
                 vb.pp("embedding"),
+                &None,
             )?,
             gate: if GATED {
                 Some(vb.get((1,), "gate")?)
@@ -136,31 +138,43 @@ struct MLlamaVisionAttention {
 }
 
 impl MLlamaVisionAttention {
-    fn new(cfg: &MLlamaVisionConfig, vb: ShardedVarBuilder) -> Result<Self> {
+    fn new(
+        cfg: &MLlamaVisionConfig,
+        vb: ShardedVarBuilder,
+        comm: &Arc<mistralrs_quant::Comm>,
+    ) -> Result<Self> {
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
         Ok(Self {
-            q_proj: mistralrs_quant::linear_no_bias(
+            q_proj: ColumnParallelLayer::new(
                 cfg.hidden_size,
                 cfg.num_attention_heads * head_dim,
                 &None,
+                false,
+                comm,
                 vb.pp("q_proj"),
             )?,
-            k_proj: mistralrs_quant::linear_no_bias(
+            k_proj: ColumnParallelLayer::new(
                 cfg.hidden_size,
                 cfg.num_attention_heads * head_dim,
                 &None,
+                false,
+                comm,
                 vb.pp("k_proj"),
             )?,
-            v_proj: mistralrs_quant::linear_no_bias(
+            v_proj: ColumnParallelLayer::new(
                 cfg.hidden_size,
                 cfg.num_attention_heads * head_dim,
                 &None,
+                false,
+                comm,
                 vb.pp("v_proj"),
             )?,
-            o_proj: mistralrs_quant::linear_no_bias(
+            o_proj: RowParallelLayer::new(
                 cfg.hidden_size,
                 cfg.num_attention_heads * head_dim,
                 &None,
+                false,
+                comm,
                 vb.pp("o_proj"),
             )?,
             sdpa_params: SdpaParams {
@@ -237,19 +251,27 @@ struct MLlamaMlp {
 }
 
 impl MLlamaMlp {
-    fn new(cfg: &MLlamaVisionConfig, vb: ShardedVarBuilder) -> Result<Self> {
+    fn new(
+        cfg: &MLlamaVisionConfig,
+        vb: ShardedVarBuilder,
+        comm: &Arc<mistralrs_quant::Comm>,
+    ) -> Result<Self> {
         Ok(Self {
             act: cfg.hidden_act,
-            fc1: mistralrs_quant::linear(
+            fc1: ColumnParallelLayer::new(
                 cfg.hidden_size,
                 cfg.intermediate_size,
                 &None,
+                true,
+                comm,
                 vb.pp("fc1"),
             )?,
-            fc2: mistralrs_quant::linear(
+            fc2: RowParallelLayer::new(
                 cfg.intermediate_size,
                 cfg.hidden_size,
                 &None,
+                true,
+                comm,
                 vb.pp("fc2"),
             )?,
         })
@@ -286,9 +308,10 @@ impl MLlamaVisionEncoderLayer {
         cfg: &MLlamaVisionConfig,
         vb: ShardedVarBuilder,
         real_dev: &Device,
+        comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
-        let self_attn = MLlamaVisionAttention::new(cfg, vb.pp("self_attn"))?;
-        let mlp = MLlamaMlp::new(cfg, vb.pp("mlp"))?;
+        let self_attn = MLlamaVisionAttention::new(cfg, vb.pp("self_attn"), comm)?;
+        let mlp = MLlamaMlp::new(cfg, vb.pp("mlp"), comm)?;
 
         let input_layernorm = layer_norm(
             cfg.hidden_size,
@@ -359,6 +382,7 @@ impl MLlamaVisionEncoder {
         num_layers: usize,
         vb: ShardedVarBuilder,
         real_dev: &Device,
+        comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
         let mut layers = Vec::with_capacity(num_layers);
         let layers_vb = vb.pp("layers");
@@ -367,6 +391,7 @@ impl MLlamaVisionEncoder {
                 cfg,
                 layers_vb.pp(i),
                 real_dev,
+                comm,
             )?);
         }
         Ok(Self { layers })
@@ -470,6 +495,7 @@ impl MLlamaVisionModel {
         cfg: &MLlamaVisionConfig,
         vb: ShardedVarBuilder,
         real_dev: &Device,
+        comm: &Arc<mistralrs_quant::Comm>,
     ) -> Result<Self> {
         let patch_embedding = conv2d_no_bias(
             cfg.num_channels,
@@ -520,12 +546,14 @@ impl MLlamaVisionModel {
             cfg.num_hidden_layers,
             vb.pp("transformer"),
             real_dev,
+            comm,
         )?;
         let global_transformer = MLlamaVisionEncoder::new::<true>(
             cfg,
             cfg.num_global_layers,
             vb.pp("global_transformer"),
             real_dev,
+            comm,
         )?;
 
         Ok(Self {

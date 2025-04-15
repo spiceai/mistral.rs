@@ -28,7 +28,7 @@ mod transforms;
 pub(crate) mod utils;
 
 pub use ops::{get_resize_image_size, make_pixel_mask, pad};
-pub use pad::pad_to_max_edge;
+pub use pad::{pad_to_max_edge, pad_to_max_image_size};
 pub use transforms::{InterpolateResize, Normalize, Rescale, ToTensor, ToTensorNoNorm};
 
 /// A transform over an image. The input may vary but the output is always a Tensor.
@@ -41,12 +41,14 @@ pub trait ImageTransform {
 
 /// Transforms to apply, starting with the `input` and then with each transform in
 /// `inner_transforms` applied sequentially
+#[derive(Clone, Copy)]
 pub struct Transforms<'a> {
     pub input: &'a dyn ImageTransform<Input = DynamicImage, Output = Tensor>,
     pub inner_transforms: &'a [&'a dyn ImageTransform<Input = Tensor, Output = Tensor>],
 }
 
 /// Transforms, with each of `inner_transforms` applied sequentially
+#[derive(Clone, Copy)]
 pub struct TensorTransforms<'a> {
     pub inner_transforms: &'a [&'a dyn ImageTransform<Input = Tensor, Output = Tensor>],
 }

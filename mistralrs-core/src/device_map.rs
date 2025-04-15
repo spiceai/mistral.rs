@@ -10,27 +10,6 @@ use mistralrs_quant::ShardedVarBuilder;
 use serde::Deserialize;
 use tracing::info;
 
-fn split_range(range: std::ops::Range<usize>, n: usize) -> Vec<std::ops::Range<usize>> {
-    assert!(n > 0, "n must be non-zero");
-
-    let total = range.end - range.start;
-    let chunk_size = total / n;
-    let remainder = total % n;
-
-    let mut chunks = Vec::with_capacity(n);
-    let mut start = range.start;
-
-    // Create each chunk. The first `remainder` chunks get an extra element.
-    for i in 0..n {
-        let extra = if i < remainder { 1 } else { 0 };
-        let end = start + chunk_size + extra;
-        chunks.push(start..end);
-        start = end;
-    }
-
-    chunks
-}
-
 #[derive(Debug, Default, Deserialize, Clone)]
 pub struct DeviceLayerMapMetadata {
     pub ordinal: usize,
@@ -44,11 +23,11 @@ pub enum DeviceMapSetting {
     /// Automatic device mapping (recommended).
     Auto(AutoDeviceMapParams),
     /// Dummy device mapping for a NCCL pipeline
-    Nccl { devices: Vec<Device> },
-    /// Device mapping when using PP (agnostic of TP)
-    NcclPipelineParallel {
-        devices_and_comms: Vec<(Arc<mistralrs_quant::Comm>, Device)>,
+    DummyNccl { nm_device: Device },
+    /// Real device mapping for a NCCL pipeline
+    Nccl {
         nm_device: Device,
+        comm: Arc<mistralrs_quant::Comm>,
     },
 }
 
@@ -87,27 +66,21 @@ impl DeviceMapSetting {
         topology: Option<&Topology>,
     ) -> Result<Box<dyn DeviceMapper + Send + Sync>> {
         match self {
-            Self::Nccl { devices } => {
+            Self::Nccl { nm_device, comm } => {
                 once_log_info("Loading model using a NCCL-parallelized pipeline.");
                 Ok(Box::new(NcclDeviceMapper {
-                    nm_device: devices[0].clone(),
-                    devices: devices.clone(),
+                    nm_device: nm_device.clone(),
+                    model_layers,
+                    comm: Some(comm.clone()),
                 }))
             }
-            Self::NcclPipelineParallel {
-                devices_and_comms,
-                nm_device,
-            } => {
-                let splits = split_range(0..model_layers, devices_and_comms.len());
 
-                let mut mappings = Vec::new();
-                for (split, device) in splits.into_iter().zip(devices_and_comms) {
-                    mappings.extend(vec![device.clone(); split.len()]);
-                }
-
-                Ok(Box::new(NcclPipelineParallelMapper {
-                    mappings,
+            Self::DummyNccl { nm_device } => {
+                once_log_info("Loading model using a NCCL-parallelized pipeline.");
+                Ok(Box::new(NcclDeviceMapper {
                     nm_device: nm_device.clone(),
+                    model_layers,
+                    comm: None,
                 }))
             }
 
@@ -182,10 +155,22 @@ impl DeviceMapSetting {
                     for DeviceLayerMapMetadata { ordinal, layers } in
                         device_layers.as_ref().unwrap()
                     {
-                        let dev = match device {
-                            Device::Cpu => Device::Cpu,
-                            Device::Cuda(_) => Device::cuda_if_available(*ordinal)?,
-                            Device::Metal(_) => Device::new_metal(*ordinal)?,
+                        let dev = match device.location() {
+                            DeviceLocation::Cpu => Device::Cpu,
+                            DeviceLocation::Cuda { gpu_id: device_ord } => {
+                                if device_ord == *ordinal {
+                                    device.clone()
+                                } else {
+                                    Device::new_cuda_with_stream(*ordinal)?
+                                }
+                            }
+                            DeviceLocation::Metal { gpu_id: device_ord } => {
+                                if device_ord == *ordinal {
+                                    device.clone()
+                                } else {
+                                    Device::new_metal(*ordinal)?
+                                }
+                            }
                         };
                         if !device.is_cpu() {
                             dev.set_seed(original_seed.unwrap())?;
@@ -256,12 +241,12 @@ pub trait DeviceMapper: Debug {
 
     // === DURING LOADING TIME ===
     /// If ISQ layer, then do not change the device. *They will do it later in NormalModel::quantize*
-    fn set_device<'a>(
+    fn set_device(
         &self,
         layer: usize,
-        varbuilder: ShardedVarBuilder<'a>,
+        varbuilder: ShardedVarBuilder,
         loading_isq: bool,
-    ) -> ShardedVarBuilder<'a>;
+    ) -> ShardedVarBuilder;
     /// If ISQ layer, then do not change the device (return None). *They will do it later in NormalModel::quantize*
     fn device_for(&self, layer: usize, loading_isq: bool) -> Option<&Device>;
     fn get_unique_devices(&self) -> Vec<Device>;
@@ -269,11 +254,7 @@ pub trait DeviceMapper: Debug {
     fn cast_nm_device(&self, x: &Tensor, loading_isq: bool) -> Result<Tensor>;
     /// Set non mapped layer device. This is for ISQ + device mapping support
     /// If ISQ layer, then do not change the device. *They will do it later in NormalModel::quantize*
-    fn set_nm_device<'a>(
-        &self,
-        varbuilder: ShardedVarBuilder<'a>,
-        loading_isq: bool,
-    ) -> ShardedVarBuilder<'a>;
+    fn set_nm_device(&self, varbuilder: ShardedVarBuilder, loading_isq: bool) -> ShardedVarBuilder;
     fn num_device_mapping_layers(&self) -> usize;
     fn get_comm_for(&self, layer_idx: usize) -> Result<Arc<mistralrs_quant::Comm>>;
 
@@ -295,9 +276,9 @@ impl DeviceMapper for LayerDeviceMapper {
     fn set_device<'a>(
         &self,
         layer: usize,
-        varbuilder: ShardedVarBuilder<'a>,
+        varbuilder: ShardedVarBuilder,
         loading_isq: bool,
-    ) -> ShardedVarBuilder<'a> {
+    ) -> ShardedVarBuilder {
         if loading_isq {
             return varbuilder;
         }
@@ -326,9 +307,9 @@ impl DeviceMapper for LayerDeviceMapper {
     }
     fn set_nm_device<'a>(
         &self,
-        varbuilder: ShardedVarBuilder<'a>,
+        varbuilder: ShardedVarBuilder,
         loading_isq: bool,
-    ) -> ShardedVarBuilder<'a> {
+    ) -> ShardedVarBuilder {
         if loading_isq {
             varbuilder
         } else {
@@ -366,9 +347,9 @@ impl DeviceMapper for DummyDeviceMapper {
     fn set_device<'a>(
         &self,
         _: usize,
-        varbuilder: ShardedVarBuilder<'a>,
+        varbuilder: ShardedVarBuilder,
         loading_isq: bool,
-    ) -> ShardedVarBuilder<'a> {
+    ) -> ShardedVarBuilder {
         if loading_isq {
             varbuilder.set_device(Device::Cpu)
         } else {
@@ -390,9 +371,9 @@ impl DeviceMapper for DummyDeviceMapper {
     }
     fn set_nm_device<'a>(
         &self,
-        varbuilder: ShardedVarBuilder<'a>,
+        varbuilder: ShardedVarBuilder,
         loading_isq: bool,
-    ) -> ShardedVarBuilder<'a> {
+    ) -> ShardedVarBuilder {
         if loading_isq {
             varbuilder.set_device(Device::Cpu)
         } else {
@@ -422,7 +403,8 @@ impl DeviceMapper for DummyDeviceMapper {
 #[derive(Debug)]
 pub struct NcclDeviceMapper {
     nm_device: Device,
-    devices: Vec<Device>,
+    model_layers: usize,
+    comm: Option<Arc<mistralrs_quant::Comm>>,
 }
 
 impl DeviceMapper for NcclDeviceMapper {
@@ -432,9 +414,9 @@ impl DeviceMapper for NcclDeviceMapper {
     fn set_device<'a>(
         &self,
         _: usize,
-        varbuilder: ShardedVarBuilder<'a>,
+        varbuilder: ShardedVarBuilder,
         loading_isq: bool,
-    ) -> ShardedVarBuilder<'a> {
+    ) -> ShardedVarBuilder {
         if loading_isq {
             varbuilder.set_device(Device::Cpu)
         } else {
@@ -445,7 +427,7 @@ impl DeviceMapper for NcclDeviceMapper {
         Some(&self.nm_device)
     }
     fn get_unique_devices(&self) -> Vec<Device> {
-        self.devices.clone()
+        vec![self.nm_device.clone()]
     }
     fn cast_nm_device(&self, x: &Tensor, loading_isq: bool) -> Result<Tensor> {
         if loading_isq {
@@ -456,9 +438,9 @@ impl DeviceMapper for NcclDeviceMapper {
     }
     fn set_nm_device<'a>(
         &self,
-        varbuilder: ShardedVarBuilder<'a>,
+        varbuilder: ShardedVarBuilder,
         loading_isq: bool,
-    ) -> ShardedVarBuilder<'a> {
+    ) -> ShardedVarBuilder {
         if loading_isq {
             varbuilder.set_device(Device::Cpu)
         } else {
@@ -467,21 +449,24 @@ impl DeviceMapper for NcclDeviceMapper {
     }
     fn get_min_dtype(&self, dtype: &dyn TryIntoDType) -> Result<DType> {
         dtype
-            .try_into_dtype(&self.devices.iter().collect::<Vec<_>>())
+            .try_into_dtype(&[&self.nm_device])
             .map_err(candle_core::Error::msg)
     }
     fn num_device_mapping_layers(&self) -> usize {
-        // Effectively one layer
-        1
+        self.model_layers
     }
     fn get_comm_for(&self, layer_idx: usize) -> Result<Arc<mistralrs_quant::Comm>> {
-        let id = mistralrs_quant::Id::new();
-        Ok(Arc::new(mistralrs_quant::Comm::from_device(
-            id,
-            self.device_for(layer_idx, false).unwrap_or(&self.nm_device),
-            0,
-            1,
-        )?))
+        if let Some(comm) = &self.comm {
+            Ok(comm.clone())
+        } else {
+            let id = mistralrs_quant::Id::new();
+            Ok(Arc::new(mistralrs_quant::Comm::from_device(
+                id,
+                self.device_for(layer_idx, false).unwrap_or(&self.nm_device),
+                0,
+                1,
+            )?))
+        }
     }
 }
 
@@ -499,9 +484,9 @@ impl DeviceMapper for NcclPipelineParallelMapper {
     fn set_device<'a>(
         &self,
         layer: usize,
-        varbuilder: ShardedVarBuilder<'a>,
+        varbuilder: ShardedVarBuilder,
         loading_isq: bool,
-    ) -> ShardedVarBuilder<'a> {
+    ) -> ShardedVarBuilder {
         if loading_isq {
             return varbuilder;
         }
@@ -532,9 +517,9 @@ impl DeviceMapper for NcclPipelineParallelMapper {
     }
     fn set_nm_device<'a>(
         &self,
-        varbuilder: ShardedVarBuilder<'a>,
+        varbuilder: ShardedVarBuilder,
         loading_isq: bool,
-    ) -> ShardedVarBuilder<'a> {
+    ) -> ShardedVarBuilder {
         if loading_isq {
             varbuilder
         } else {

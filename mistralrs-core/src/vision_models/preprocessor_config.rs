@@ -4,7 +4,7 @@ use candle_core::Result;
 use image::imageops::FilterType;
 use serde::Deserialize;
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct PreProcessorConfig {
     pub(crate) do_convert_rgb: Option<bool>,
@@ -19,6 +19,7 @@ pub struct PreProcessorConfig {
     #[serde(alias = "norm_std")]
     pub(crate) image_std: Option<[f64; 3]>,
     pub(crate) rescale_factor: Option<f64>,
+    #[serde(alias = "resample")]
     pub(crate) resampling: Option<usize>,
     pub(crate) max_image_size: Option<HashMap<String, u32>>,
     pub(crate) size: Option<HashMap<String, u32>>,
@@ -44,6 +45,15 @@ pub struct PreProcessorConfig {
     pub(crate) im_id_start: Option<String>,
     pub(crate) im_id_end: Option<String>,
     pub(crate) dynamic_hd: Option<usize>,
+    #[serde(alias = "image_seq_length")]
+    pub(crate) image_seq_len: Option<usize>,
+    pub(crate) pan_and_scan_min_crop_size: Option<usize>,
+    pub(crate) pan_and_scan_max_num_crops: Option<usize>,
+    pub(crate) pan_and_scan_min_ratio_to_activate: Option<f64>,
+    pub(crate) do_pan_and_scan: Option<bool>,
+    pub(crate) default_to_square: Option<bool>,
+    pub(crate) max_patches: Option<usize>,
+    pub(crate) resize_to_max_canvas: Option<bool>,
 }
 
 #[allow(dead_code)]

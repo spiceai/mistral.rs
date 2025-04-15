@@ -4,13 +4,25 @@ use candle_core::{DType, Device, Result, Tensor};
 use rand_isaac::Isaac64Rng;
 
 use crate::{
-    prefix_cacher_v2::PrefixCacheManagerV2,
+    prefix_cacher::PrefixCacheManagerV2,
     sampler::Logprobs,
-    sequence::{Sequence, SequenceRecognizer, StopReason},
+    sequence::{Sequence, SequenceRecognizer, SequenceState, StopReason},
     tools::parse_text_tools,
 };
 
 use super::Pipeline;
+
+macro_rules! fixup_sentencepiece {
+    ($txt:expr) => {
+        $txt.to_string().replace("▁", " ")
+    };
+    (Option $txt:expr) => {
+        match &$txt {
+            Some(txt) => Some(fixup_sentencepiece!(txt)),
+            None => None,
+        }
+    };
+}
 
 pub(crate) async fn finish_or_add_toks_to_seq(
     this: &dyn Pipeline,
@@ -34,6 +46,26 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             .decode(&[logprobs.token]),
         &is_done,
     );
+
+    // If we can have a tool and we got a tool, stop the sequence early.
+    // Doesn't conflict with the logic below because it does the same thing anyway.
+    if let Some(ref t) = seq.tools {
+        if let Ok(Some(ref d)) = seq.peek_delta() {
+            let (_tool_use_still_possible, tool_use_is_done) =
+                t.prefix_could_be_tool(this, d.as_str())?;
+
+            if tool_use_is_done
+                && matches!(
+                    parse_text_tools(this, d, seq.tools.clone()),
+                    Ok((None, _tools))
+                )
+            {
+                seq.set_state(SequenceState::Done(StopReason::Eos));
+                is_done = Some(StopReason::Eos);
+            }
+        }
+    };
+
     // Handle streaming requests
     if seq.get_mut_group().is_streaming {
         const STREAMING_RATE_LIMIT: usize = 3;
@@ -44,43 +76,31 @@ pub(crate) async fn finish_or_add_toks_to_seq(
         let mut tool_use_is_done = false;
         if let Some(ref t) = seq.tools {
             if let Ok(Some(ref d)) = seq.peek_delta() {
-                (tool_use_still_possible, tool_use_is_done) = t.prefix_could_be_tool(d.as_str());
+                (tool_use_still_possible, tool_use_is_done) =
+                    t.prefix_could_be_tool(this, d.as_str())?;
             }
         };
 
+        let send = seq.get_toks().len() % 2 == 0 || is_done.is_some();
         if (rate_limit_allowed && !tool_use_still_possible) || tool_use_is_done {
-            if let Some(delta) = crate::handle_seq_error_ok!(seq.get_delta(), seq.responder()) {
-                if seq.get_mut_group().is_chat {
-                    let (text_new, tool_calls) =
-                        parse_text_tools(delta.as_str(), seq.tools.clone())
-                            .map_err(candle_core::Error::msg)?;
+            if send {
+                if let Some(delta) = crate::handle_seq_error_ok!(seq.get_delta(), seq.responder()) {
+                    if seq.get_mut_group().is_chat {
+                        let (text_new, tool_calls) =
+                            parse_text_tools(this, delta.as_str(), seq.tools.clone())
+                                .map_err(candle_core::Error::msg)?;
 
-                    if !tool_calls.is_empty() && is_done.is_none() {
-                        is_done = Some(StopReason::Eos);
-                    };
-                    seq.add_streaming_chunk_choice_to_group(crate::ChunkChoice {
-                        delta: crate::Delta {
-                            content: text_new.map(ToString::to_string),
-                            role: "assistant".to_string(),
-                            tool_calls: Some(tool_calls),
-                        },
-                        index: seq.get_response_index(),
-                        finish_reason: is_done.map(|x| x.to_string()),
-                        logprobs: if seq.return_logprobs() {
-                            Some(crate::ResponseLogprob {
-                                token: delta,
-                                bytes: logprobs.bytes.clone().map(|b| b.into_bytes()),
-                                logprob: logprobs.logprob,
-                                top_logprobs: logprobs.top_logprobs.unwrap().clone(),
-                            })
-                        } else {
-                            None
-                        },
-                    });
-                } else {
-                    seq.add_streaming_completion_chunk_choice_to_group(
-                        crate::CompletionChunkChoice {
-                            text: delta.clone(),
+                        if !tool_calls.is_empty() && is_done.is_none() {
+                            is_done = Some(StopReason::Eos);
+                        };
+                        seq.add_streaming_chunk_choice_to_group(crate::ChunkChoice {
+                            delta: crate::Delta {
+                                content: fixup_sentencepiece!(
+                                    Option text_new.map(ToString::to_string)
+                                ),
+                                role: "assistant".to_string(),
+                                tool_calls: Some(tool_calls).filter(|v| !v.is_empty()),
+                            },
                             index: seq.get_response_index(),
                             finish_reason: is_done.map(|x| x.to_string()),
                             logprobs: if seq.return_logprobs() {
@@ -93,41 +113,59 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                             } else {
                                 None
                             },
-                        },
-                    );
-                }
-
-                if let Some(reason) = is_done {
-                    if use_prefix_cacher {
-                        prefix_cacher.add_sequence(seq);
-                        prefix_cacher.evict_to_cpu()?;
+                        });
+                    } else {
+                        seq.add_streaming_completion_chunk_choice_to_group(
+                            crate::CompletionChunkChoice {
+                                text: fixup_sentencepiece!(delta),
+                                index: seq.get_response_index(),
+                                finish_reason: is_done.map(|x| x.to_string()),
+                                logprobs: if seq.return_logprobs() {
+                                    Some(crate::ResponseLogprob {
+                                        token: delta,
+                                        bytes: logprobs.bytes.clone().map(|b| b.into_bytes()),
+                                        logprob: logprobs.logprob,
+                                        top_logprobs: logprobs.top_logprobs.unwrap().clone(),
+                                    })
+                                } else {
+                                    None
+                                },
+                            },
+                        );
                     }
-                    seq.set_state(crate::sequence::SequenceState::Done(reason));
-                    this.reset_non_granular_state();
                 }
+            }
 
-                // Send usage on final chunk.
-                let usage_opt = if is_done.is_some() {
-                    let usage = seq.get_mut_group().get_usage();
-                    seq.get_mut_group().total_prompt_toks = 0;
-                    seq.get_mut_group().total_toks = 0;
-                    Some(usage)
-                } else {
-                    None
-                };
-
-                if seq
-                    .get_mut_group()
-                    .maybe_send_streaming_response(seq, this.name().clone(), usage_opt)
-                    .await
-                    .is_err()
-                {
-                    // If we can't send the response, cancel the sequence
-                    seq.set_state(crate::sequence::SequenceState::Done(
-                        crate::sequence::StopReason::Canceled,
-                    ));
-                    this.reset_non_granular_state();
+            if let Some(reason) = is_done {
+                if use_prefix_cacher {
+                    prefix_cacher.add_sequence(seq);
+                    prefix_cacher.evict_to_cpu()?;
                 }
+                seq.set_state(crate::sequence::SequenceState::Done(reason));
+                this.reset_non_granular_state();
+            }
+
+            // Send usage on final chunk.
+            let usage_opt = if is_done.is_some() {
+                let usage = seq.get_mut_group().get_usage();
+                seq.get_mut_group().total_prompt_toks = 0;
+                seq.get_mut_group().total_toks = 0;
+                Some(usage)
+            } else {
+                None
+            };
+
+            if seq
+                .get_mut_group()
+                .maybe_send_streaming_response(seq, this.name().clone(), usage_opt)
+                .await
+                .is_err()
+            {
+                // If we can't send the response, cancel the sequence
+                seq.set_state(crate::sequence::SequenceState::Done(
+                    crate::sequence::StopReason::Canceled,
+                ));
+                this.reset_non_granular_state();
             }
         }
     } else if let Some(reason) = is_done {
@@ -191,22 +229,23 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             };
 
             if seq.get_mut_group().is_chat {
-                let (text_new, tool_calls) = parse_text_tools(text.as_str(), seq.tools.clone())
-                    .map_err(candle_core::Error::msg)?;
+                let (text_new, tool_calls) =
+                    parse_text_tools(this, text.as_str(), seq.tools.clone())
+                        .map_err(candle_core::Error::msg)?;
                 let choice = crate::Choice {
-                    finish_reason: reason.to_string(),
+                    finish_reason: fixup_sentencepiece!(reason),
                     index: seq.get_response_index(),
                     message: crate::ResponseMessage {
                         content: text_new.map(ToString::to_string),
                         role: "assistant".to_string(),
-                        tool_calls,
+                        tool_calls: Some(tool_calls).filter(|v| !v.is_empty()),
                     },
                     logprobs: logprobs.map(|l| crate::Logprobs { content: Some(l) }),
                 };
                 seq.add_choice_to_group(choice);
             } else {
                 let choice = crate::CompletionChoice {
-                    finish_reason: reason.to_string(),
+                    finish_reason: fixup_sentencepiece!(reason),
                     index: seq.get_response_index(),
                     text,
                     logprobs: None,
@@ -361,8 +400,9 @@ pub async fn sample_sequence(
                 }
             } else if step_res.is_stop() {
                 let mut acc = vec![-f32::INFINITY; logits.shape().dims1().unwrap()];
-                let trie = llg.tok_trie();
-                acc[trie.eos_token() as usize] = 0.0;
+                for eos_tok in seq.eos_tokens() {
+                    acc[*eos_tok as usize] = 0.0;
+                }
                 Some(acc)
             } else {
                 None

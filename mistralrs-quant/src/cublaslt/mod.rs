@@ -11,6 +11,9 @@ use std::sync::{Mutex, Once};
 mod api;
 #[cfg(feature = "cuda")]
 mod matmul;
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod tests;
 
 #[cfg(feature = "cuda")]
 pub use api::{fused_batch_matmul, fused_batch_matmul_f8, CublasLt};
@@ -25,7 +28,7 @@ static mut CUBLASLT: Option<CublasLtWrapper> = None;
 pub static CUBLASLT_HANDLE: Lazy<Mutex<Option<&'static CublasLtWrapper>>> =
     Lazy::new(|| Mutex::new(None));
 
-pub fn maybe_init_cublas_lt_wrapper() {
+pub fn maybe_init_cublas_lt_wrapper(device: Device) {
     unsafe {
         INIT.call_once(|| {
             #[cfg(not(feature = "cuda"))]
@@ -39,15 +42,12 @@ pub fn maybe_init_cublas_lt_wrapper() {
                 // Then check if we can create a device
                 // Then check that the device is CUDA
                 use candle_core::cuda_backend::cudarc::driver;
-                CUBLASLT = driver::result::init()
-                    .ok()
-                    .and_then(|_| Device::cuda_if_available(0).ok())
-                    .and_then(|device| match device {
-                        Device::Cuda(_) => Some(CublasLtWrapper {
-                            cublaslt: CublasLt::new(&device).unwrap(),
-                        }),
-                        _ => None,
-                    });
+                CUBLASLT = match device {
+                    Device::Cuda(_) => Some(CublasLtWrapper {
+                        cublaslt: CublasLt::new(&device).unwrap(),
+                    }),
+                    _ => None,
+                }
             }
             #[allow(static_mut_refs)]
             let cublaslt: Option<&'static CublasLtWrapper> = CUBLASLT.as_ref();
@@ -72,8 +72,7 @@ impl CublasLtWrapper {
     /// * `dequant_a_scale` - F32 scalar tensor, used to `a` the out tensor.
     /// * `dequant_b_scale` - F32 scalar tensor, used to `b` the out tensor.
     /// * `quantize_scale` - F32 scalar tensor, used to requantize.
-    /// * `out` - Optional Output tensor of size BxNxK.
-    ///           If set and beta != 0, will be added to the end result of A*B before `act`
+    /// * `out` - Optional Output tensor of size BxNxK. If set and beta != 0, will be added to the end result of A*B before `act`
     /// * `alpha` - Optional scaling factor for A*B
     /// * `beta` - Optional scaling factor for C
     /// * `bias` - Optional bias tensor of size M
@@ -134,8 +133,7 @@ impl CublasLtWrapper {
     ///
     /// * `a` - Input tensor of size BxMxK
     /// * `b` - Input tensor of size BxNxK
-    /// * `out` - Optional Output tensor of size BxNxK.
-    ///           If set and beta != 0, will be added to the end result of A*B before `act`
+    /// * `out` - Optional Output tensor of size BxNxK. If set and beta != 0, will be added to the end result of A*B before `act`
     /// * `alpha` - Optional scaling factor for A*B
     /// * `beta` - Optional scaling factor for C
     /// * `bias` - Optional bias tensor of size M
