@@ -12,8 +12,8 @@ license.workspace = true
 homepage.workspace = true
 
 [dependencies]
-candle-flash-attn-v3 = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "e9db971395936b520439083f57ef28c86a04d92a", optional = true }
-candle-flash-attn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "e9db971395936b520439083f57ef28c86a04d92a", optional = true }
+candle-flash-attn-v3 = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "3ebfe70222eca98bcd7cf47f9066fdd5941262f3", optional = true }
+candle-flash-attn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "3ebfe70222eca98bcd7cf47f9066fdd5941262f3", optional = true }
 
 dirs = "5.0.1"
 signal-hook = "0.3.17"
