@@ -3,12 +3,12 @@ use super::hf::{api_dir_list, api_get_file, get_paths, get_uqff_paths};
 use super::isq::ImatrixDataSource;
 use super::isq::UqffFullSer;
 use super::{
-    AdapterActivationMixin, AnyMoePipelineMixin, CacheManager, CacheManagerMixin, EitherCache,
-    ForwardInputsResult, GeneralMetadata, Idefics2Loader, Idefics3Loader, IsqPipelineMixin,
-    LLaVALoader, LLaVANextLoader, Loader, MetadataMixin, MiniCpmOLoader, ModelCategory, ModelKind,
-    ModelPaths, Phi3VLoader, Phi4MMLoader, PreProcessingMixin, Processor, Qwen2VLLoader,
-    TokenSource, VLlamaLoader, VisionLoaderType, VisionModel, VisionModelLoader,
-    VisionPromptPrefixer,
+    AdapterKind, AnyMoePipelineMixin, CacheManager, CacheManagerMixin, EitherCache,
+    ForwardInputsResult, Gemma3Loader, GeneralMetadata, Idefics2Loader, Idefics3Loader,
+    IsqPipelineMixin, LLaVALoader, LLaVANextLoader, Loader, MetadataMixin, MiniCpmOLoader,
+    Mistral3Loader, ModelCategory, ModelKind, ModelPaths, Phi3VLoader, Phi4MMLoader,
+    PreProcessingMixin, Processor, Qwen2VLLoader, Qwen2_5VLLoader, TokenSource, VLlama4Loader,
+    VLlamaLoader, VisionLoaderType, VisionModel, VisionModelLoader, VisionPromptPrefixer,
 };
 use crate::device_map::{self, DeviceMapper};
 use crate::distributed::{self, WorkerTransferData};
@@ -17,30 +17,20 @@ use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
 use crate::pipeline::llg::build_tok_env;
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::text_models_inputs_processor::make_prompt_chunk;
-use crate::pipeline::{get_chat_template, ChatTemplate, IsqOrganization, LocalModelPaths};
+use crate::pipeline::{get_chat_template, ChatTemplate, IsqOrganization};
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 use crate::utils::{tokens::get_token, varbuilder_utils::from_mmaped_safetensors};
-use crate::vision_models::preprocessor_config::PreProcessorConfig;
-use crate::vision_models::processor_config::ProcessorConfig;
-use crate::vision_models::ModelInputs;
 use crate::vision_models::{
     preprocessor_config::PreProcessorConfig, processor_config::ProcessorConfig, ModelInputs,
 };
 use crate::{
-    api_dir_list, api_get_file, get_paths, get_uqff_paths, vision_normal_model_loader,
-    vision_normal_model_loader_sharded, AnyMoeExpertType, DeviceMapSetting, Ordering,
-    PagedAttentionConfig, Pipeline, Topology, TryIntoDType, GLOBAL_HF_CACHE,
+    vision_normal_model_loader, vision_normal_model_loader_sharded, AnyMoeExpertType,
+    DeviceMapSetting, Ordering, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
+    GLOBAL_HF_CACHE,
 };
-use crate::{
-    vision_normal_model_loader, AnyMoeExpertType, DeviceMapSetting, Ordering, PagedAttentionConfig,
-    Pipeline, Topology, TryIntoDType,
-};
-
-use crate::prefix_cacher_v2::PrefixCacheManagerV2;
-use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 
 use anyhow::Result;
 use candle_core::{Device, Tensor, Var};

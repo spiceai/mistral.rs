@@ -4,8 +4,7 @@
 use std::sync::atomic::AtomicUsize;
 
 use crate::{
-    cublaslt::CUBLASLT_HANDLE, cuda::SUPPORTS_ATTN_SOFTMAX,
-    pipeline::text_models_inputs_processor::FlashParams, MemoryUsage,
+    cuda::SUPPORTS_ATTN_SOFTMAX, pipeline::text_models_inputs_processor::FlashParams, MemoryUsage,
 };
 
 use candle_core::{Device, Result, Tensor};
@@ -136,67 +135,6 @@ fn repeat_kv(x: Tensor, n_rep: usize) -> Result<Tensor> {
         let (b_sz, n_kv_head, seq_len, head_dim) = x.dims4()?;
         Tensor::cat(&vec![&x; n_rep], 2)?.reshape((b_sz, n_kv_head * n_rep, seq_len, head_dim))
     }
-}
-
-fn supports_attn_softmax() -> Result<bool> {
-    #[cfg(feature = "metal")]
-    {
-        use std::sync::atomic::Ordering;
-        let cache = METAL_VERSION_CACHE.load(Ordering::Relaxed);
-
-        let version = if cache != usize::MAX {
-            cache
-        } else {
-            // echo "__METAL_VERSION__" | xcrun -sdk macosx metal -E -x metal -P -
-
-            use std::process::{Command, Stdio};
-
-            // Create the `echo` command and pipe its output into `xcrun`
-            let mut echo = Command::new("echo")
-                .arg("__METAL_VERSION__")
-                .stdout(Stdio::piped())
-                .spawn()
-                .expect("Failed to start echo command");
-
-            echo.wait()?;
-
-            // Run the `xcrun` command, taking input from the `echo` command's output
-            let output = Command::new("xcrun")
-                .arg("-sdk")
-                .arg("macosx")
-                .arg("metal")
-                .arg("-E")
-                .arg("-x")
-                .arg("metal")
-                .arg("-P")
-                .arg("-")
-                .stdin(echo.stdout.unwrap())
-                .output()
-                .expect("Failed to run xcrun command");
-
-            // Handle the output
-            if output.status.success() {
-                let version = String::from_utf8_lossy(&output.stdout)
-                    .split('\n')
-                    .nth(1)
-                    .unwrap()
-                    .trim()
-                    .to_string()
-                    .parse::<usize>()
-                    .unwrap();
-                METAL_VERSION_CACHE.store(version, Ordering::Relaxed);
-                version
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                panic!("Error:\n{}", stderr);
-            }
-        };
-        // Attn softmax is only supported for metal >= 310
-        Ok(version >= 310)
-    }
-
-    #[cfg(not(feature = "metal"))]
-    Ok(true)
 }
 
 /// Not *really* sure why this is necessary but it is.

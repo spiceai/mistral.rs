@@ -202,7 +202,6 @@ async fn text_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool, do_s
                     {
                         assistant_output.push_str(content);
                         print!("{}", content);
-                        toks += 1usize; // NOTE: we send toks every 1.
                         io::stdout().flush().unwrap();
                         if finish_reason.is_some() {
                             if matches!(finish_reason.as_ref().unwrap().as_str(), "length") {

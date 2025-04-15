@@ -33,7 +33,6 @@ const SAFETENSOR_MATCH: &str = r"model-\d+-of-\d+\.safetensors\b";
 const QUANT_SAFETENSOR_MATCH: &str = r"model\.safetensors\b";
 const PICKLE_MATCH: &str = r"pytorch_model-\d{5}-of-\d{5}.((pth)|(pt)|(bin))\b";
 
-
 #[derive(Clone, Debug)]
 pub struct LoraAdapterPaths {
     pub lora_config: mistralrs_quant::LoraConfig,
@@ -75,15 +74,17 @@ pub fn get_xlora_paths(
                 }
                 api.build().map_err(candle_core::Error::msg)?
             };
-            let api = api.repo(Repo::with_revision(
+            let api = Arc::new(api.repo(Repo::with_revision(
                 xlora_id.clone(),
                 RepoType::Model,
                 revision,
-            ));
+            )));
             let model_id = Path::new(&xlora_id);
 
             // Get the path for the xlora classifier
-            let xlora_classifier = &api_dir_list!(api, model_id)
+            let files = api_dir_list(&api, model_id)?;
+            let xlora_classifier = files
+                .iter()
                 .filter(|x| x.contains("xlora_classifier.safetensors"))
                 .collect::<Vec<_>>();
             if xlora_classifier.len() > 1 {
@@ -93,11 +94,13 @@ pub fn get_xlora_paths(
             let xlora_classifier = xlora_classifier.first();
 
             let classifier_path = xlora_classifier
-                .map(|xlora_classifier| api_get_file!(api, xlora_classifier, model_id));
+                .map(|xlora_classifier| api_get_file(&api, xlora_classifier, model_id))
+                .transpose()?;
 
             // Get the path for the xlora config by checking all for valid versions.
             // NOTE(EricLBuehler): Remove this functionality because all configs should be deserializable
-            let xlora_configs = &api_dir_list!(api, model_id)
+            let xlora_configs = files
+                .iter()
                 .filter(|x| x.contains("xlora_config.json"))
                 .collect::<Vec<_>>();
             if xlora_configs.len() > 1 {
@@ -110,7 +113,7 @@ pub fn get_xlora_paths(
                 if xlora_configs.len() != 1 {
                     warn!("Selecting config: `{}`", config_path);
                 }
-                let config_path = api_get_file!(api, config_path, model_id);
+                let config_path = api_get_file(&api, config_path, model_id)?;
                 let conf = fs::read_to_string(config_path)?;
                 let deser: Result<XLoraConfig, serde_json::Error> = serde_json::from_str(&conf);
                 match deser {
@@ -138,7 +141,8 @@ pub fn get_xlora_paths(
             });
 
             // If there are adapters in the ordering file, get their names and remote paths
-            let adapter_files = api_dir_list(api, model_id)
+            let adapter_files = files
+                .iter()
                 .filter_map(|name| {
                     if let Some(ref adapters) = xlora_order.adapters {
                         for adapter_name in adapters {
@@ -158,9 +162,9 @@ pub fn get_xlora_paths(
             let mut adapters_paths: HashMap<String, Vec<PathBuf>> = HashMap::new();
             for (file, name) in adapter_files {
                 if let Some(paths) = adapters_paths.get_mut(&name) {
-                    paths.push(api_get_file(api, &file, model_id));
+                    paths.push(api_get_file(&api, &file, model_id)?);
                 } else {
-                    adapters_paths.insert(name, vec![api_get_file(api, &file, model_id)]);
+                    adapters_paths.insert(name, vec![api_get_file(&api, &file, model_id)?]);
                 }
             }
 
@@ -211,7 +215,8 @@ pub fn get_xlora_paths(
                     let mut output = HashMap::new();
                     for adapter in preload_adapters {
                         // Get the names and remote paths of the files associated with this adapter
-                        let adapter_files = api_dir_list(api, &adapter.adapter_model_id)
+                        let files = api_dir_list(&api, &adapter.adapter_model_id)?;
+                        let adapter_files = files.iter()
                             .filter_map(|f| {
                                 if f.contains(&adapter.name) {
                                     Some((f, adapter.name.clone()))
@@ -227,10 +232,10 @@ pub fn get_xlora_paths(
                         let mut adapters_paths: HashMap<String, Vec<PathBuf>> = HashMap::new();
                         for (file, name) in adapter_files {
                             if let Some(paths) = adapters_paths.get_mut(&name) {
-                                paths.push(api_get_file(api, &file, model_id));
+                                paths.push(api_get_file(&api, &file, model_id)?);
                             } else {
                                 adapters_paths
-                                    .insert(name, vec![api_get_file(api, &file, model_id)]);
+                                    .insert(name, vec![api_get_file(&api, &file, model_id)?]);
                             }
                         }
 
@@ -307,7 +312,6 @@ pub fn get_xlora_paths(
             "Incorrect configuration for an adapter model. Lora and XLora are mutually exclusive."
         ),
     }
->>>>>>> master
 }
 
 pub type XloraAdapterConfig = ((String, String), LoraConfig);
