@@ -124,61 +124,12 @@ impl InputsProcessor for MiniCpmOImageProcessor {
             ))));
         };
 
-        let text_models_inputs_processor::InnerInputProcessorOutput {
-            inputs:
-                text_models_inputs_processor::InputMetadata {
-                    input,
-                    positions,
-                    context_lens,
-                    position_ids,
-                    paged_attn_meta,
-                    flash_meta,
-                },
-            seq_indices,
-        } = if is_prompt {
-            get_prompt_input(
-                input_seqs
-                    .iter()
-                    .map(|seq| seq.get_toks().to_vec())
-                    .collect::<Vec<_>>(),
-                input_seqs,
-                device,
-                last_n_context_len,
-                return_raw_logits,
-                paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
-                mapper,
-            )
-            .nth(0)
-            .unwrap()
-            .unwrap()
-        } else {
-            get_completion_input(
-                input_seqs
-                    .iter()
-                    .map(|seq| seq.get_toks().to_vec())
-                    .collect::<Vec<_>>(),
-                input_seqs,
-                device,
-                no_kv_cache,
-                last_n_context_len,
-                return_raw_logits,
-                paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
-                mapper,
-            )
-            .nth(0)
-            .unwrap()
-            .unwrap()
-        };
         let config = other_config.expect("Need a PreProcessorConfig config.");
         let config: &PreProcessorConfig = config.downcast_ref().expect("Downcast failed.");
 
-        let has_images = input_seqs
-            .iter()
-            .all(|seq| seq.images().is_some_and(|images| !images.is_empty()));
+        let has_images = input_seqs.iter().all(|seq| seq.has_images());
 
-        let (new_input, pixel_values_all, image_bound, tgt_sizes) = if has_images {
+        let (pixel_values_all, image_bound, tgt_sizes) = if has_images {
             const IMAGE_TAG: &str = "(<image>./</image>)";
             const IMAGE_PATTERN: &str = r"\(<image>./</image>\)";
             const AUDIO_PATTERN: &str = r"\(<audio>./</audio>\)";
@@ -189,7 +140,6 @@ impl InputsProcessor for MiniCpmOImageProcessor {
 
             let mut pixel_values_accum = Vec::new();
             let mut tgt_sizes_accum = Vec::new();
-            let mut input_ids_accum = Vec::new();
             let mut image_bounds_accum = Vec::new();
 
             for seq in input_seqs.iter_mut() {
@@ -208,6 +158,7 @@ impl InputsProcessor for MiniCpmOImageProcessor {
                     pixel_values_list,
                     tgt_sizes,
                     image_sizes_all,
+                    num_crops: _,
                 } = self
                     .preprocess(
                         seq.take_images()
@@ -267,60 +218,55 @@ impl InputsProcessor for MiniCpmOImageProcessor {
                 let final_text = text_chunks.join("");
                 seq.set_initial_prompt(final_text.clone());
 
-                let (input_ids, image_bounds) = {
+                let image_bounds = {
                     let im_start_id = tokenizer
-                        .encode(
+                        .encode_fast(
                             self.config
                                 .im_start_token
                                 .clone()
                                 .unwrap_or(DEFAULT_IM_START_TOKEN.to_string()),
-                            true,
+                            false,
                         )
                         .unwrap()
                         .get_ids()[0];
                     let im_end_id = tokenizer
-                        .encode(
+                        .encode_fast(
                             self.config
                                 .im_end_token
                                 .clone()
                                 .unwrap_or(DEFAULT_IM_END_TOKEN.to_string()),
-                            true,
+                            false,
                         )
                         .unwrap()
                         .get_ids()[0];
                     let slice_start_id = tokenizer
-                        .encode(
+                        .encode_fast(
                             self.config
                                 .slice_start_token
                                 .clone()
                                 .unwrap_or(DEFAULT_SLICE_START_TOKEN.to_string()),
-                            true,
+                            false,
                         )
                         .unwrap()
                         .get_ids()[0];
                     let slice_end_id = tokenizer
-                        .encode(
+                        .encode_fast(
                             self.config
                                 .slice_end_token
                                 .clone()
                                 .unwrap_or(DEFAULT_SLICE_END_TOKEN.to_string()),
-                            true,
+                            false,
                         )
                         .unwrap()
                         .get_ids()[0];
 
                     let input_ids = tokenizer
-                        .encode(final_text, true)
+                        .encode_fast(final_text, false)
                         .unwrap()
                         .get_ids()
                         .to_vec();
 
-                    seq.set_toks(input_ids.clone());
-                    if let Some(ref mut metadata) = paged_attn_metadata {
-                        // Free and then reallocate as appropriate
-                        metadata.block_engine.free_sequence(*seq.id());
-                        metadata.block_engine.allocate(*seq);
-                    }
+                    seq.set_toks_and_reallocate(input_ids.clone(), paged_attn_metadata.as_mut());
 
                     let image_start_idx = input_ids
                         .iter()
@@ -361,38 +307,69 @@ impl InputsProcessor for MiniCpmOImageProcessor {
                     )
                     .unwrap();
 
-                    let image_bounds = Tensor::cat(&[image_start_idx, image_end_idx], 1).unwrap();
-
-                    (input_ids, image_bounds)
+                    Tensor::cat(&[image_start_idx, image_end_idx], 1).unwrap()
                 };
 
                 pixel_values_accum.push(pixel_values_list);
                 tgt_sizes_accum.push(tgt_sizes);
-                input_ids_accum.push(input_ids);
                 image_bounds_accum.push(image_bounds);
             }
 
-            let mut all_ids_new = Vec::new();
-            let max_len = input_ids_accum.iter().map(|ids| ids.len()).max().unwrap();
-            for ids in input_ids_accum {
-                let pad = max_len - ids.len();
-                all_ids_new
-                    .push(Tensor::new([ids, vec![0; pad]].concat(), input.device()).unwrap());
-            }
-
             (
-                Some(Tensor::stack(&all_ids_new, 0).unwrap()),
                 Some(pixel_values_accum),
                 Some(image_bounds_accum),
                 Some(tgt_sizes_accum),
             )
         } else {
-            (None, None, None, None)
+            (None, None, None)
         };
 
-        let input = match new_input {
-            Some(new_input) => new_input,
-            None => input,
+        let text_models_inputs_processor::InnerInputProcessorOutput {
+            inputs:
+                text_models_inputs_processor::InputMetadata {
+                    input,
+                    positions,
+                    context_lens,
+                    position_ids,
+                    paged_attn_meta,
+                    flash_meta,
+                },
+            seq_indices,
+        } = if is_prompt {
+            get_prompt_input(
+                input_seqs
+                    .iter()
+                    .map(|seq| seq.get_toks().to_vec())
+                    .collect::<Vec<_>>(),
+                input_seqs,
+                device,
+                last_n_context_len,
+                return_raw_logits,
+                paged_attn_metadata.as_mut(),
+                None, // TODO: evaluate if it is possible to batch this
+                mapper,
+            )
+            .nth(0)
+            .unwrap()
+            .unwrap()
+        } else {
+            get_completion_input(
+                input_seqs
+                    .iter()
+                    .map(|seq| seq.get_toks().to_vec())
+                    .collect::<Vec<_>>(),
+                input_seqs,
+                device,
+                no_kv_cache,
+                last_n_context_len,
+                return_raw_logits,
+                paged_attn_metadata.as_mut(),
+                None, // TODO: evaluate if it is possible to batch this
+                mapper,
+            )
+            .nth(0)
+            .unwrap()
+            .unwrap()
         };
 
         let args = MiniCpmOSpecificArgs {
@@ -784,6 +761,7 @@ impl ImagePreProcessor for MiniCpmOImageProcessor {
             pixel_values_list: Some(pixel_values),
             tgt_sizes: Some(tgt_sizes),
             image_sizes_all: Some(image_sizes),
+            num_crops: None,
         })
     }
 }

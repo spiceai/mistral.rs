@@ -109,9 +109,7 @@ impl InputsProcessor for Phi4MMInputsProcessor {
             .expect("Need a PreProcessorConfig config.");
         let config: &PreProcessorConfig = config.downcast_ref().expect("Downcast failed.");
 
-        let has_images = input_seqs
-            .iter()
-            .all(|seq| seq.images().is_some_and(|images| !images.is_empty()));
+        let has_images = input_seqs.iter().all(|seq| seq.has_images());
 
         let (pixel_values, pixel_attention_mask, image_sizes, num_img_tokens) = if has_images {
             let mut pixel_values_accum = Vec::new();
@@ -137,6 +135,7 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                     pixel_values_list: _,
                     tgt_sizes: _,
                     image_sizes_all,
+                    num_crops: _,
                 } = self
                     .preprocess(
                         imgs,
@@ -241,12 +240,13 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                 .replace_all(&detokenized, IMAGE_SPECIAL_TOKEN)
                 .to_string();
 
-            seq.set_toks(
+            seq.set_toks_and_reallocate(
                 tokenizer
-                    .encode(detokenized.clone(), true)
+                    .encode_fast(detokenized.clone(), false)
                     .expect("Encode failed")
                     .get_ids()
                     .to_vec(),
+                paged_attn_metadata.as_mut(),
             );
 
             seq.set_initial_prompt(detokenized);
@@ -265,16 +265,10 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                 let mut new_ids = seq.get_toks()[..i].to_vec();
                 new_ids.extend(vec![token_id; *token_count]);
                 new_ids.extend(seq.get_toks()[i + 1..].to_vec());
-                seq.set_toks(new_ids);
+                seq.set_toks_and_reallocate(new_ids, paged_attn_metadata.as_mut());
                 i += token_count;
             }
             toks.push(seq.get_toks().to_vec());
-
-            if let Some(ref mut metadata) = paged_attn_metadata {
-                // Free and then reallocate as appropriate
-                metadata.block_engine.free_sequence(*seq.id());
-                metadata.block_engine.allocate(*seq);
-            }
         }
 
         let iter = if is_prompt {
@@ -664,6 +658,7 @@ impl ImagePreProcessor for Phi4MMInputsProcessor {
             pixel_values_list: None,
             tgt_sizes: None,
             image_sizes_all: Some(image_sizes),
+            num_crops: None,
         })
     }
 }

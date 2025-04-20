@@ -3,7 +3,8 @@ use indexmap::IndexMap;
 use mistralrs_core::{
     ChunkChoice, Constraint, Delta, DiffusionGenerationParams, DrySamplingParams,
     ImageGenerationResponseFormat, MessageContent, MistralRs, ModelCategory, NormalRequest,
-    Request, RequestMessage, Response, ResponseOk, SamplingParams, TERMINATE_ALL_NEXT_STEP,
+    Request, RequestMessage, Response, ResponseOk, SamplingParams, WebSearchOptions,
+    TERMINATE_ALL_NEXT_STEP,
 };
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -29,11 +30,13 @@ fn terminate_handler() {
 static CTRLC_HANDLER: Lazy<Mutex<&'static (dyn Fn() + Sync)>> =
     Lazy::new(|| Mutex::new(&exit_handler));
 
-pub async fn interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool) {
+pub async fn interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool, do_search: bool) {
     match mistralrs.get_model_category() {
-        ModelCategory::Text => text_interactive_mode(mistralrs, throughput).await,
-        ModelCategory::Vision { .. } => vision_interactive_mode(mistralrs, throughput).await,
-        ModelCategory::Diffusion => diffusion_interactive_mode(mistralrs).await,
+        ModelCategory::Text => text_interactive_mode(mistralrs, throughput, do_search).await,
+        ModelCategory::Vision { .. } => {
+            vision_interactive_mode(mistralrs, throughput, do_search).await
+        }
+        ModelCategory::Diffusion => diffusion_interactive_mode(mistralrs, do_search).await,
     }
 }
 
@@ -78,7 +81,7 @@ const EXIT_CMD: &str = "\\exit";
 const SYSTEM_CMD: &str = "\\system";
 const IMAGE_CMD: &str = "\\image";
 
-async fn text_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool) {
+async fn text_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool, do_search: bool) {
     let sender = mistralrs.get_sender().unwrap();
     let mut messages: Vec<IndexMap<String, MessageContent>> = Vec::new();
 
@@ -172,21 +175,21 @@ async fn text_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool) {
             is_streaming: true,
             constraint: Constraint::None,
             suffix: None,
-            adapters: None,
             tool_choice: None,
             tools: None,
             logits_processors: None,
             return_raw_logits: false,
+            web_search_options: do_search.then(WebSearchOptions::default),
         });
         sender.send(req).await.unwrap();
 
         let mut assistant_output = String::new();
 
-        let start = Instant::now();
-        let mut toks = 0;
+        let mut last_usage = None;
         while let Some(resp) = rx.recv().await {
             match resp {
                 Response::Chunk(chunk) => {
+                    last_usage = chunk.usage.clone();
                     if let ChunkChoice {
                         delta:
                             Delta {
@@ -199,7 +202,6 @@ async fn text_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool) {
                     {
                         assistant_output.push_str(content);
                         print!("{}", content);
-                        toks += 1usize; // NOTE: we send toks every 1.
                         io::stdout().flush().unwrap();
                         if finish_reason.is_some() {
                             if matches!(finish_reason.as_ref().unwrap().as_str(), "length") {
@@ -229,10 +231,12 @@ async fn text_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool) {
                 Response::Raw { .. } => unreachable!(),
             }
         }
-        if throughput {
-            let time = Instant::now().duration_since(start).as_secs_f64();
+        if throughput && last_usage.is_some() {
             println!();
-            info!("Average T/s: {}", toks as f64 / time);
+            info!(
+                "Completion T/s: {}",
+                last_usage.unwrap().avg_compl_tok_per_sec
+            );
         }
         let mut assistant_message: IndexMap<String, Either<String, Vec<IndexMap<String, Value>>>> =
             IndexMap::new();
@@ -269,7 +273,7 @@ fn parse_image_path_and_message(input: &str) -> Option<(String, String)> {
     None
 }
 
-async fn vision_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool) {
+async fn vision_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool, do_search: bool) {
     let sender = mistralrs.get_sender().unwrap();
     let mut messages: Vec<IndexMap<String, MessageContent>> = Vec::new();
     let mut images = Vec::new();
@@ -403,21 +407,21 @@ async fn vision_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool) {
             is_streaming: true,
             constraint: Constraint::None,
             suffix: None,
-            adapters: None,
             tool_choice: None,
             tools: None,
             logits_processors: None,
             return_raw_logits: false,
+            web_search_options: do_search.then(WebSearchOptions::default),
         });
         sender.send(req).await.unwrap();
 
         let mut assistant_output = String::new();
 
-        let start = Instant::now();
-        let mut toks = 0;
+        let mut last_usage = None;
         while let Some(resp) = rx.recv().await {
             match resp {
                 Response::Chunk(chunk) => {
+                    last_usage = chunk.usage.clone();
                     if let ChunkChoice {
                         delta:
                             Delta {
@@ -430,7 +434,6 @@ async fn vision_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool) {
                     {
                         assistant_output.push_str(content);
                         print!("{}", content);
-                        toks += 1usize; // NOTE: we send toks every 3.
                         io::stdout().flush().unwrap();
                         if finish_reason.is_some() {
                             if matches!(finish_reason.as_ref().unwrap().as_str(), "length") {
@@ -461,9 +464,11 @@ async fn vision_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool) {
             }
         }
         if throughput {
-            let time = Instant::now().duration_since(start).as_secs_f64();
             println!();
-            info!("Average T/s: {}", toks as f64 / time);
+            info!(
+                "Completion T/s: {}",
+                last_usage.unwrap().avg_compl_tok_per_sec
+            );
         }
         let mut assistant_message: IndexMap<String, Either<String, Vec<IndexMap<String, Value>>>> =
             IndexMap::new();
@@ -474,7 +479,7 @@ async fn vision_interactive_mode(mistralrs: Arc<MistralRs>, throughput: bool) {
     }
 }
 
-async fn diffusion_interactive_mode(mistralrs: Arc<MistralRs>) {
+async fn diffusion_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) {
     let sender = mistralrs.get_sender().unwrap();
 
     let diffusion_params = DiffusionGenerationParams::default();
@@ -536,11 +541,11 @@ async fn diffusion_interactive_mode(mistralrs: Arc<MistralRs>) {
             is_streaming: false,
             suffix: None,
             constraint: Constraint::None,
-            adapters: None,
             tool_choice: None,
             tools: None,
             logits_processors: None,
             return_raw_logits: false,
+            web_search_options: do_search.then(WebSearchOptions::default),
         });
 
         let start = Instant::now();

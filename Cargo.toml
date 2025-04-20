@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Fast and easy LLM serving."
 homepage = "https://github.com/EricLBuehler/mistral.rs"
@@ -23,9 +23,12 @@ license = "MIT"
 rust-version = "1.82"
 
 [workspace.dependencies]
+base64 = "0.22.1"
 anyhow = "1.0.80"
-candle-core = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "e9db971395936b520439083f57ef28c86a04d92a" }
-candle-nn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "e9db971395936b520439083f57ef28c86a04d92a" }
+candle-core = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "3ebfe70222eca98bcd7cf47f9066fdd5941262f3" }
+candle-nn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "3ebfe70222eca98bcd7cf47f9066fdd5941262f3" }
+candle-flash-attn-v3 = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "3ebfe70222eca98bcd7cf47f9066fdd5941262f3" }
+candle-flash-attn = { git = "https://github.com/spiceai/candle.git", version = "0.8.0", rev = "3ebfe70222eca98bcd7cf47f9066fdd5941262f3" }
 serde = "1.0.197"
 serde_json = "1.0.114"
 indexmap = { version = "2.2.5", features = ["serde"] }
@@ -36,11 +39,9 @@ tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 futures = "0.3"
 clap = { version = "4.5.1", features = ["derive", "wrap_help"] }
-pyo3 = { version = "0.22.4", features = ["full", "extension-module", "either"] }
-tokio = { version = "1.36.0", features = ["full", "rt-multi-thread"] }
+pyo3 = { version = "0.24.1", features = ["full", "extension-module", "either"] }
+tokio = { version = "1", features = ["full", "rt-multi-thread"] }
 once_cell = "1.19.0"
-# All features but avif, avif increases the msrv dramatically
-
 image = { version = "0.25.1", default-features = false, features = [
     'bmp',
     'dds',
@@ -57,15 +58,29 @@ image = { version = "0.25.1", default-features = false, features = [
     'tiff',
     'webp',
 ] }
-buildstructor = "0.5.4"
-reqwest = { version = "0.12.4", features = ["blocking"] }
-base64 = "0.22.1"
+reqwest = { version = "0.12.4", default-features = false, features = [
+    "blocking",
+    "rustls-tls",
+    "charset",
+    "http2",
+    "macos-system-configuration",
+] }
 half = "2.4.0"
 rayon = "1.1.0"
 url = "2.5.2"
 data-url = "0.3.1"
-float8 = "0.1.3"
+float8 = "0.2.1"
 regex = "1.10.6"
 metal = { version = "0.27.0", features = ["mps"] }
 safetensors = "0.4.5"
 toml = "0.8.12"
+hf-hub = { version = "0.4.1", default-features = false, features = [
+    "ureq",
+    "tokio",
+    "rustls-tls",
+] }
+itertools = "0.13.0"
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true

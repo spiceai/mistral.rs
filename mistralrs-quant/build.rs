@@ -85,6 +85,7 @@ fn main() {
             "kernels/hqq/hqq.cu",
             "kernels/ops/ops.cu",
             "kernels/bitsandbytes/dequant.cu",
+            "kernels/rotary/rotary.cu",
         ];
         if cc_over_800 {
             lib_files.push("kernels/marlin/marlin_kernel.cu");
@@ -108,7 +109,9 @@ fn main() {
             .arg("--expt-relaxed-constexpr")
             .arg("--expt-extended-lambda")
             .arg("--use_fast_math")
-            .arg("--verbose");
+            .arg("--verbose")
+            .arg("--compiler-options")
+            .arg("-fPIC");
 
         // https://github.com/EricLBuehler/mistral.rs/issues/286
         if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {

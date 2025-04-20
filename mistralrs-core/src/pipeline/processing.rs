@@ -39,6 +39,16 @@ pub trait Processor {
         add_special_tokens: bool,
         tools: Vec<Tool>,
     ) -> Result<(Vec<u32>, String)> {
+        // for message in messages.iter_mut() {
+        //     if message["role"].as_ref().left().is_some_and(|x| x == "tool") {
+        //         message["role"] = Either::Left("ipython".to_string());
+        //         message["content"] = Either::Left(format!(
+        //             "{{\"output\": \"{}\"}}",
+        //             message["content"].as_ref().unwrap_left()
+        //         ));
+        //     }
+        // }
+
         let prompt = apply_chat_template(
             pipeline,
             messages,
@@ -52,7 +62,7 @@ pub trait Processor {
             .with_context(|| {
                 "Default `Processor::process` requires the model to have a tokenizer."
             })?
-            .encode(prompt.clone(), add_special_tokens)
+            .encode_fast(prompt.clone(), add_special_tokens)
             .map_err(anyhow::Error::msg)?;
         Ok((encoding.get_ids().to_vec(), prompt))
     }

@@ -19,7 +19,7 @@ use thiserror::Error;
 use tracing::info;
 
 use crate::{
-    pipeline::{get_model_paths, get_xlora_paths, XLoraPaths},
+    pipeline::{get_model_paths, get_xlora_paths, AdapterPaths},
     utils::tokens::{get_token, TokenRetrievalError},
     LocalModelPaths, Ordering,
 };
@@ -110,12 +110,12 @@ pub(crate) fn api_get_file(
 }
 
 pub fn get_uqff_paths(
-    from_uqff: impl AsRef<Path>,
+    from_uqff: &[impl AsRef<Path>],
     token_source: &TokenSource,
     revision: String,
     model_id: &str,
     silent: bool,
-) -> Result<PathBuf, HFError> {
+) -> Result<Vec<PathBuf>, HFError> {
     let api = {
         let mut api = ApiBuilder::new()
             .with_progress(!silent)
@@ -126,14 +126,19 @@ pub fn get_uqff_paths(
         api.build().map_err(HFError::HFHubApiError)?
     };
 
-    let api = api.repo(Repo::with_revision(
+    let api = Arc::new(api.repo(Repo::with_revision(
         model_id.to_string(),
         RepoType::Model,
         revision,
-    ));
+    )));
 
-    let uqff_str = from_uqff.as_ref().display().to_string();
-    api_get_file(&Arc::new(api), uqff_str.as_str(), Path::new(model_id))
+    let mut files = Vec::new();
+    for file in from_uqff {
+        let file = file.as_ref().display().to_string();
+
+        files.push(api_get_file(&api, file.as_str(), Path::new(model_id))?);
+    }
+    Ok(files)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -194,20 +199,16 @@ pub fn get_paths(
     )?;
 
     // Get XLora paths
-    let XLoraPaths {
-        adapter_configs: xlora_adapter_configs,
-        adapter_safetensors: xlora_adapter_safetensors,
-        classifier_path,
-        xlora_order,
-        xlora_config,
-        lora_preload_adapter_info,
-    } = get_xlora_paths(
+    let xlora_paths = get_xlora_paths(
         model_id.clone(),
-        xlora_model_id,
+        &xlora_model_id.map(ToString::to_string),
+        &xlora_order.and_then(|o| o.adapters.clone()),
         token_source,
         revision.clone(),
         &xlora_order.cloned(),
-    )?;
+    )
+    .ok()
+    .unwrap_or(AdapterPaths::None);
 
     // Get optional configs by checking directory contents
     let dir_contents: Vec<String> = api_dir_list(&api, Path::new(&model_id))?;
@@ -249,13 +250,8 @@ pub fn get_paths(
         config_filename,
         template_filename,
         filenames,
-        xlora_adapter_safetensors,
-        xlora_adapter_configs,
-        classifier_path,
-        xlora_config,
-        xlora_order,
+        xlora_paths,
         gen_conf,
-        lora_preload_adapter_info,
         preprocessor_config,
         processor_config,
         None,

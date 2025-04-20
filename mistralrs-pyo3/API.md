@@ -41,6 +41,10 @@ If you do not specify the architecture, an attempt will be made to use the model
 - `Idefics3`
 - `MiniCpmO`
 - `Phi4MM`
+- `Qwen2_5VL`
+- `Gemma3`
+- `Mistral3`
+- `Llama4`
 
 ### Architecture for diffusion models
 - `Flux`
@@ -50,6 +54,8 @@ If you do not specify the architecture, an attempt will be made to use the model
 - `Default`
 - `MoQE`: if applicable, only quantize MoE experts. https://arxiv.org/abs/2310.02410
 
+> Note: `from_uqff` specified a UQFF path to load from. If provided, this takes precedence over applying ISQ. Specify multiple files using a semicolon delimiter (;).
+
 ```py
 class Which(Enum):
     @dataclass
@@ -58,11 +64,14 @@ class Which(Enum):
         arch: Architecture | None = None
         tokenizer_json: str | None = None
         topology: str | None = None
-        organization: IsqOrganization | None = None
+        organization: str | None = None
+        from_uqff: str | list[str] | None = None
         write_uqff: str | None = None
         dtype: ModelDType = ModelDType.Auto
+        auto_map_params: TextAutoMapParams | None = (None,)
         calibration_file: str | None = None
         imatrix: str | None = None
+        hf_cache_path: str | None = None
 
     @dataclass
     class XLora:
@@ -73,19 +82,24 @@ class Which(Enum):
         tokenizer_json: str | None = None
         tgt_non_granular_index: int | None = None
         topology: str | None = None
+        from_uqff: str | list[str] | None = None
         write_uqff: str | None = None
         dtype: ModelDType = ModelDType.Auto
+        auto_map_params: TextAutoMapParams | None = (None,)
+        hf_cache_path: str | None = None
 
     @dataclass
     class Lora:
-        adapters_model_id: str
-        order: str
+        adapter_model_id: str
         arch: Architecture | None = None
         model_id: str | None = None
         tokenizer_json: str | None = None
         topology: str | None = None
+        from_uqff: str | list[str] | None = None
         write_uqff: str | None = None
         dtype: ModelDType = ModelDType.Auto
+        auto_map_params: TextAutoMapParams | None = (None,)
+        hf_cache_path: str | None = None
 
     @dataclass
     class GGUF:
@@ -94,6 +108,7 @@ class Which(Enum):
         tok_model_id: str | None = None
         topology: str | None = None
         dtype: ModelDType = ModelDType.Auto
+        auto_map_params: TextAutoMapParams | None = (None,)
 
     @dataclass
     class XLoraGGUF:
@@ -105,6 +120,7 @@ class Which(Enum):
         tgt_non_granular_index: int | None = None
         topology: str | None = None
         dtype: ModelDType = ModelDType.Auto
+        auto_map_params: TextAutoMapParams | None = (None,)
 
     @dataclass
     class LoraGGUF:
@@ -115,6 +131,7 @@ class Which(Enum):
         tok_model_id: str | None = None
         topology: str | None = None
         dtype: ModelDType = ModelDType.Auto
+        auto_map_params: TextAutoMapParams | None = (None,)
 
     @dataclass
     class GGML:
@@ -125,6 +142,7 @@ class Which(Enum):
         gqa: int | None = None
         topology: str | None = None
         dtype: ModelDType = ModelDType.Auto
+        auto_map_params: TextAutoMapParams | None = (None,)
 
     @dataclass
     class XLoraGGML:
@@ -138,6 +156,7 @@ class Which(Enum):
         gqa: int | None = None
         topology: str | None = None
         dtype: ModelDType = ModelDType.Auto
+        auto_map_params: TextAutoMapParams | None = (None,)
 
     @dataclass
     class LoraGGML:
@@ -149,6 +168,7 @@ class Which(Enum):
         tokenizer_json: str | None = None
         topology: str | None = None
         dtype: ModelDType = ModelDType.Auto
+        auto_map_params: TextAutoMapParams | None = (None,)
 
     @dataclass
     class VisionPlain:
@@ -156,11 +176,14 @@ class Which(Enum):
         arch: VisionArchitecture
         tokenizer_json: str | None = None
         topology: str | None = None
+        from_uqff: str | list[str] | None = None
         write_uqff: str | None = None
         dtype: ModelDType = ModelDType.Auto
         max_edge: int | None = None
+        auto_map_params: VisionAutoMapParams | None = (None,)
         calibration_file: str | None = None
         imatrix: str | None = None
+        hf_cache_path: str | None = None
 
     @dataclass
     class DiffusionPlain:

@@ -72,7 +72,6 @@ struct Attention {
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
     use_sliding_window: bool,
-    sliding_window: Option<usize>,
     paged_attn: Option<PagedAttention>,
     sdpa_params: SdpaParams,
 }
@@ -146,7 +145,6 @@ impl Attention {
             head_dim,
             rotary_emb,
             use_sliding_window: layer_idx % 2 == 0, // Order is SWA, global, SWA
-            sliding_window,
             paged_attn,
             sdpa_params: SdpaParams {
                 n_kv_groups: mistralrs_quant::compute_n_kv_groups(
@@ -249,17 +247,9 @@ impl Attention {
             },
             None => {
                 // self.sliding_window is None if !self.use_sliding_window
-                let (k, v, mask) =
-                    kv_cache.append_sliding_window(&k, &v, mask, self.sliding_window)?;
+                let (k, v) = kv_cache.append(&k, &v)?;
 
-                Sdpa.run_attention(
-                    &q,
-                    &k,
-                    &v,
-                    mask.as_ref(),
-                    Some(flash_params),
-                    &self.sdpa_params,
-                )?
+                Sdpa.run_attention(&q, &k, &v, mask, Some(flash_params), &self.sdpa_params)?
             }
         };
 
@@ -407,7 +397,7 @@ impl Model {
         if let Some(ref quant_cfg) = &cfg.quantization_config {
             tracing::info!(
                 "Using {} quantization: {}.",
-                quant_cfg.quant_method.to_string(),
+                quant_cfg.name(),
                 quant_cfg.get_bits_name(&vb)
             );
         }
@@ -418,6 +408,7 @@ impl Model {
             cfg.vocab_size,
             cfg.hidden_size,
             mapper.set_nm_device(vb_m.pp("embed_tokens"), false),
+            &cfg.quantization_config,
         )?;
         let mut ropes = HashMap::new();
         for layer_idx in 0..cfg.num_hidden_layers {
@@ -487,9 +478,10 @@ impl Model {
             ))?),
             device: normal_loading_metadata.real_device,
             hidden_size: cfg.hidden_size,
-            cache: EitherCache::Normal(NormalCache::new(
+            cache: EitherCache::Normal(NormalCache::new_sliding(
                 cfg.num_hidden_layers,
                 cfg.max_position_embeddings,
+                Some(cfg.sliding_window),
             )),
             max_seq_len: cfg.max_position_embeddings,
             sliding_window: cfg.sliding_window,

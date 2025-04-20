@@ -54,6 +54,10 @@ pub enum VisionArchitecture {
     Idefics3,
     MiniCpmO,
     Phi4MM,
+    Qwen2_5VL,
+    Gemma3,
+    Mistral3,
+    Llama4,
 }
 
 impl From<VisionArchitecture> for VisionLoaderType {
@@ -68,6 +72,10 @@ impl From<VisionArchitecture> for VisionLoaderType {
             VisionArchitecture::Idefics3 => VisionLoaderType::Idefics3,
             VisionArchitecture::MiniCpmO => VisionLoaderType::MiniCpmO,
             VisionArchitecture::Phi4MM => VisionLoaderType::Phi4MM,
+            VisionArchitecture::Qwen2_5VL => VisionLoaderType::Qwen2_5VL,
+            VisionArchitecture::Gemma3 => VisionLoaderType::Gemma3,
+            VisionArchitecture::Mistral3 => VisionLoaderType::Mistral3,
+            VisionArchitecture::Llama4 => VisionLoaderType::Llama4,
         }
     }
 }
@@ -176,6 +184,7 @@ pub enum Which {
         imatrix = None,
         calibration_file = None,
         auto_map_params = None,
+        hf_cache_path = None,
     ))]
     Plain {
         model_id: String,
@@ -184,11 +193,12 @@ pub enum Which {
         topology: Option<String>,
         organization: Option<IsqOrganization>,
         write_uqff: Option<PathBuf>,
-        from_uqff: Option<PathBuf>,
+        from_uqff: Option<Either<String, Vec<String>>>,
         dtype: ModelDType,
         imatrix: Option<PathBuf>,
         calibration_file: Option<PathBuf>,
         auto_map_params: Option<TextAutoMapParams>,
+        hf_cache_path: Option<PathBuf>,
     },
 
     #[pyo3(constructor = (
@@ -203,6 +213,7 @@ pub enum Which {
         from_uqff = None,
         dtype = ModelDType::Auto,
         auto_map_params = None,
+        hf_cache_path = None,
     ))]
     XLora {
         xlora_model_id: String,
@@ -213,14 +224,14 @@ pub enum Which {
         tgt_non_granular_index: Option<usize>,
         topology: Option<String>,
         write_uqff: Option<PathBuf>,
-        from_uqff: Option<PathBuf>,
+        from_uqff: Option<Either<String, Vec<String>>>,
         dtype: ModelDType,
         auto_map_params: Option<TextAutoMapParams>,
+        hf_cache_path: Option<PathBuf>,
     },
 
     #[pyo3(constructor = (
-        adapters_model_id,
-        order,
+        adapter_model_ids,
         arch = None,
         model_id = None,
         tokenizer_json = None,
@@ -229,18 +240,19 @@ pub enum Which {
         from_uqff = None,
         dtype = ModelDType::Auto,
         auto_map_params = None,
+        hf_cache_path = None,
     ))]
     Lora {
-        adapters_model_id: String,
-        order: String,
+        adapter_model_ids: Vec<String>,
         arch: Option<Architecture>,
         model_id: Option<String>,
         tokenizer_json: Option<String>,
         topology: Option<String>,
         write_uqff: Option<PathBuf>,
-        from_uqff: Option<PathBuf>,
+        from_uqff: Option<Either<String, Vec<String>>>,
         dtype: ModelDType,
         auto_map_params: Option<TextAutoMapParams>,
+        hf_cache_path: Option<PathBuf>,
     },
 
     #[pyo3(constructor = (
@@ -391,6 +403,7 @@ pub enum Which {
         calibration_file = None,
         imatrix = None,
         auto_map_params = None,
+        hf_cache_path = None,
     ))]
     VisionPlain {
         model_id: String,
@@ -398,12 +411,13 @@ pub enum Which {
         tokenizer_json: Option<String>,
         topology: Option<String>,
         write_uqff: Option<PathBuf>,
-        from_uqff: Option<PathBuf>,
+        from_uqff: Option<Either<String, Vec<String>>>,
         dtype: ModelDType,
         max_edge: Option<u32>,
         calibration_file: Option<PathBuf>,
         imatrix: Option<PathBuf>,
         auto_map_params: Option<VisionAutoMapParams>,
+        hf_cache_path: Option<PathBuf>,
     },
 
     #[pyo3(constructor = (

@@ -45,11 +45,11 @@ async fn process_chunk(runner: &MistralRs, chunk: Vec<u32>) -> anyhow::Result<(T
         id: 0,
         constraint: Constraint::None,
         suffix: None,
-        adapters: None,
         tools: None,
         tool_choice: None,
         logits_processors: None,
         return_raw_logits: true,
+        web_search_options: None,
     });
 
     runner.get_sender()?.send(request).await?;

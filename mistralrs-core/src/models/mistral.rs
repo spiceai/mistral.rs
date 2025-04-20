@@ -6,7 +6,7 @@ use mistralrs_quant::{
     ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
     ShardedVarBuilder,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
@@ -22,10 +22,14 @@ use crate::{
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
         EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, NormalModel,
     },
+    serde_default_fn,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
 
-#[derive(Debug, Clone, Default, Serialize)]
+serde_default_fn!(bool, use_flash_attn, false);
+serde_default_fn!(bool, tie_word_embeddings, false);
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     pub(crate) vocab_size: usize,
     pub(crate) hidden_size: usize,
@@ -38,9 +42,11 @@ pub struct Config {
     pub(crate) rms_norm_eps: f64,
     pub(crate) rope_theta: f64,
     pub(crate) sliding_window: Option<usize>,
+    #[serde(default = "use_flash_attn")]
     pub(crate) use_flash_attn: bool,
     pub(crate) head_dim: Option<usize>,
     pub(crate) quantization_config: Option<QuantizedConfig>,
+    #[serde(default = "tie_word_embeddings")]
     pub(crate) tie_word_embeddings: bool,
 }
 
@@ -60,7 +66,6 @@ struct Attention {
     num_kv_heads: usize,
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    sliding_window: Option<usize>,
     paged_attn: Option<PagedAttention>,
     sdpa_params: SdpaParams,
 }
@@ -125,7 +130,6 @@ impl Attention {
             num_kv_heads: (num_kv_heads / comm.world_size()).max(1),
             head_dim,
             rotary_emb,
-            sliding_window: cfg.sliding_window,
             paged_attn,
             sdpa_params: SdpaParams {
                 n_kv_groups: mistralrs_quant::compute_n_kv_groups(
@@ -220,14 +224,13 @@ impl Attention {
                 }
             },
             None => {
-                let (k, v, attn_mask) =
-                    kv_cache.append_sliding_window(&k, &v, attention_mask, self.sliding_window)?;
+                let (k, v) = kv_cache.append(&k, &v)?;
 
                 Sdpa.run_attention(
                     &q,
                     &k,
                     &v,
-                    attn_mask.as_ref(),
+                    attention_mask,
                     Some(flash_params),
                     &self.sdpa_params,
                 )?
@@ -375,7 +378,7 @@ impl Model {
         if let Some(ref quant_cfg) = &cfg.quantization_config {
             tracing::info!(
                 "Using {} quantization: {}.",
-                quant_cfg.quant_method.to_string(),
+                quant_cfg.name(),
                 quant_cfg.get_bits_name(&vb_m)
             );
         }
@@ -385,6 +388,7 @@ impl Model {
             cfg.vocab_size,
             cfg.hidden_size,
             mapper.set_nm_device(vb_m.pp("embed_tokens"), false),
+            &cfg.quantization_config,
         )?;
 
         let head_dim = cfg.head_dim();
@@ -468,9 +472,10 @@ impl Model {
             lm_head,
             sliding_window: cfg.sliding_window,
             device: normal_loading_metadata.real_device,
-            cache: EitherCache::Normal(NormalCache::new(
+            cache: EitherCache::Normal(NormalCache::new_sliding(
                 cfg.num_hidden_layers,
                 cfg.max_position_embeddings,
+                cfg.sliding_window,
             )),
             max_seq_len: cfg.max_position_embeddings,
             cfg: ModelConfigMetadata {

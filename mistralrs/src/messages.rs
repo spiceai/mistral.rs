@@ -16,6 +16,7 @@ pub trait RequestLike {
     fn take_constraint(&mut self) -> Constraint;
     fn take_tools(&mut self) -> Option<(Vec<Tool>, ToolChoice)>;
     fn take_sampling_params(&mut self) -> SamplingParams;
+    fn take_web_search_options(&mut self) -> Option<WebSearchOptions>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +106,9 @@ impl RequestLike for TextMessages {
     fn take_sampling_params(&mut self) -> SamplingParams {
         SamplingParams::deterministic()
     }
+    fn take_web_search_options(&mut self) -> Option<WebSearchOptions> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,91 +140,6 @@ impl VisionMessages {
         self.messages.push(IndexMap::from([
             ("role".to_string(), Either::Left(role.to_string())),
             ("content".to_string(), Either::Left(text.to_string())),
-        ]));
-        self
-    }
-
-    #[deprecated(since = "0.3.5", note = "use add_image_message")]
-    /// This handles adding the `<|image_{N}|>` prefix to the prompt.
-    pub fn add_phiv_image_message(
-        mut self,
-        role: TextMessageRole,
-        text: impl ToString,
-        image: DynamicImage,
-    ) -> Self {
-        self.images.push(image);
-        self.messages.push(IndexMap::from([
-            ("role".to_string(), Either::Left(role.to_string())),
-            (
-                "content".to_string(),
-                Either::Left(format!(
-                    "<|image_{}|>{}",
-                    self.images.len(),
-                    text.to_string()
-                )),
-            ),
-        ]));
-        self
-    }
-
-    #[deprecated(since = "0.3.5", note = "use add_image_message")]
-    /// This handles adding the `<|image|>` prefix to the prompt.
-    pub fn add_vllama_image_message(
-        mut self,
-        role: TextMessageRole,
-        text: impl ToString,
-        image: DynamicImage,
-    ) -> Self {
-        self.images.push(image);
-        self.messages.push(IndexMap::from([
-            ("role".to_string(), Either::Left(role.to_string())),
-            (
-                "content".to_string(),
-                Either::Left(format!("<|image|>{}", text.to_string())),
-            ),
-        ]));
-        self
-    }
-
-    #[deprecated(since = "0.3.5", note = "use add_image_message")]
-    /// This handles adding the `<image>` prefix to the prompt.
-    pub fn add_llava_image_message(
-        mut self,
-        role: TextMessageRole,
-        text: impl ToString,
-        image: DynamicImage,
-    ) -> Self {
-        self.images.push(image);
-        self.messages.push(IndexMap::from([
-            ("role".to_string(), Either::Left(role.to_string())),
-            (
-                "content".to_string(),
-                Either::Left(format!("<image>{}", text.to_string())),
-            ),
-        ]));
-        self
-    }
-
-    #[deprecated(since = "0.3.5", note = "use add_image_message")]
-    pub fn add_idefics_image_message(
-        mut self,
-        role: TextMessageRole,
-        text: impl ToString,
-        image: DynamicImage,
-    ) -> Self {
-        self.images.push(image);
-        self.messages.push(IndexMap::from([
-            ("role".to_string(), Either::Left(role.to_string())),
-            (
-                "content".to_string(),
-                Either::Right(vec![
-                    IndexMap::from([("type".to_string(), Value::String("image".to_string()))]),
-                    IndexMap::from([
-                        ("type".to_string(), Value::String("text".to_string())),
-                        ("content".to_string(), Value::String(text.to_string())),
-                    ]),
-                ]),
-            ),
         ]));
         self
     }
@@ -303,6 +222,9 @@ impl RequestLike for VisionMessages {
     fn take_sampling_params(&mut self) -> SamplingParams {
         SamplingParams::deterministic()
     }
+    fn take_web_search_options(&mut self) -> Option<WebSearchOptions> {
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -324,6 +246,7 @@ pub struct RequestBuilder {
     tools: Vec<Tool>,
     tool_choice: ToolChoice,
     sampling_params: SamplingParams,
+    web_search_options: Option<WebSearchOptions>,
 }
 
 impl Default for RequestBuilder {
@@ -344,6 +267,7 @@ impl From<TextMessages> for RequestBuilder {
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             sampling_params: SamplingParams::deterministic(),
+            web_search_options: None,
         }
     }
 }
@@ -360,6 +284,7 @@ impl From<VisionMessages> for RequestBuilder {
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             sampling_params: SamplingParams::deterministic(),
+            web_search_options: None,
         }
     }
 }
@@ -376,7 +301,13 @@ impl RequestBuilder {
             tools: Vec::new(),
             tool_choice: ToolChoice::Auto,
             sampling_params: SamplingParams::deterministic(),
+            web_search_options: None,
         }
+    }
+
+    pub fn with_web_search_options(mut self, web_search_options: WebSearchOptions) -> Self {
+        self.web_search_options = Some(web_search_options);
+        self
     }
 
     /// Add a message to the request.
@@ -629,6 +560,12 @@ impl RequestLike for RequestBuilder {
     fn take_sampling_params(&mut self) -> SamplingParams {
         let mut other = SamplingParams::deterministic();
         std::mem::swap(&mut other, &mut self.sampling_params);
+        other
+    }
+
+    fn take_web_search_options(&mut self) -> Option<WebSearchOptions> {
+        let mut other = None;
+        std::mem::swap(&mut other, &mut self.web_search_options);
         other
     }
 }

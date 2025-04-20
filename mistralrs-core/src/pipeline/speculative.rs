@@ -15,22 +15,19 @@ use tracing::warn;
 use crate::{
     device_map::DeviceMapper,
     get_mut_arcmutex,
-    pipeline::{
-        sampling::{
-            finish_or_add_toks_to_seq, sample_sequence, sample_target_sequence_speculative,
-        },
-        AdapterInstruction,
+    pipeline::sampling::{
+        finish_or_add_toks_to_seq, sample_sequence, sample_target_sequence_speculative,
     },
-    prefix_cacher_v2::PrefixCacheManagerV2,
+    prefix_cacher::PrefixCacheManagerV2,
     sequence::{Sequence, SequenceRecognizer},
     DeviceMapSetting, Loader, ModelKind, PagedAttentionConfig, Pipeline, TokenSource, TryIntoDType,
 };
 
 use super::{
     cache_manager::NormalCacheManager, chat_template::ChatTemplate, sampling::SpeculativeSample,
-    AdapterActivationMixin, AnyMoePipelineMixin, CacheBackendMetadata, CacheInstruction,
-    CacheManager, CacheManagerMixin, EitherCache, ForwardInputsResult, GeneralMetadata,
-    IsqPipelineMixin, MetadataMixin, ModelCategory, ModelPaths, PreProcessingMixin,
+    AnyMoePipelineMixin, CacheBackendMetadata, CacheInstruction, CacheManager, CacheManagerMixin,
+    EitherCache, ForwardInputsResult, GeneralMetadata, IsqPipelineMixin, MetadataMixin,
+    ModelCategory, ModelPaths, PreProcessingMixin,
 };
 
 /// A loader for a speculative pipeline using 2 [`Loader`]s.
@@ -284,16 +281,6 @@ impl CacheManagerMixin for SpeculativePipeline {
     }
 }
 
-impl AdapterActivationMixin for SpeculativePipeline {
-    /// Returns the number of activated adapters.
-    fn activate_adapters(&mut self, adapters: Vec<String>) -> anyhow::Result<usize> {
-        let mut res = 0;
-        res += get_mut_arcmutex!(self.draft).activate_adapters(adapters.clone())?;
-        res += get_mut_arcmutex!(self.target).activate_adapters(adapters)?;
-        Ok(res)
-    }
-}
-
 impl MetadataMixin for SpeculativePipeline {
     fn device(&self) -> Device {
         get_mut_arcmutex!(self.target).device()
@@ -353,59 +340,17 @@ impl Pipeline for SpeculativePipeline {
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
                 match pre_op {
-                    CacheInstruction::In(adapter_inst) => {
-                        match adapter_inst {
-                            AdapterInstruction::Activate(adapters) => {
-                                self.activate_adapters(adapters).map_err(|e| {
-                                    candle_core::Error::msg(<anyhow::Error as AsRef<
-                                        dyn std::error::Error,
-                                    >>::as_ref(
-                                        &e
-                                    ))
-                                })?
-                            }
-                            AdapterInstruction::None => 0,
-                        };
-                        self.clone_in_cache(input_seqs)
-                    }
-                    CacheInstruction::Nothing(adapter_inst) => {
-                        match adapter_inst {
-                            AdapterInstruction::Activate(adapters) => {
-                                self.activate_adapters(adapters).map_err(|e| {
-                                    candle_core::Error::msg(<anyhow::Error as AsRef<
-                                        dyn std::error::Error,
-                                    >>::as_ref(
-                                        &e
-                                    ))
-                                })?
-                            }
-                            AdapterInstruction::None => 0,
-                        };
-                    }
+                    CacheInstruction::In => self.clone_in_cache(input_seqs),
+                    CacheInstruction::Nothing => (),
                     CacheInstruction::Reset {
                         reset_non_granular,
-                        adapter_inst,
                         load_preallocated_cache,
-                    } => {
-                        match adapter_inst {
-                            AdapterInstruction::Activate(adapters) => {
-                                self.activate_adapters(adapters).map_err(|e| {
-                                    candle_core::Error::msg(<anyhow::Error as AsRef<
-                                        dyn std::error::Error,
-                                    >>::as_ref(
-                                        &e
-                                    ))
-                                })?
-                            }
-                            AdapterInstruction::None => 0,
-                        };
-                        self.set_none_cache(
-                            input_seqs,
-                            reset_non_granular,
-                            true,
-                            load_preallocated_cache,
-                        )
-                    }
+                    } => self.set_none_cache(
+                        input_seqs,
+                        reset_non_granular,
+                        true,
+                        load_preallocated_cache,
+                    ),
                     _ => unreachable!("Unreachable PRE cache op."),
                 }
 
@@ -559,7 +504,9 @@ impl Pipeline for SpeculativePipeline {
                     }
                     EitherCache::Normal(normal) => {
                         for cache in &mut *normal.lock().unwrap().0 {
-                            cache.set_len(cache.current_seq_len() - n_not_accepted);
+                            cache
+                                .set_len(cache.current_seq_len() - n_not_accepted)
+                                .map_err(|_| candle_core::Error::msg("KV cache set_len failed."))?;
                         }
                     }
                 }
@@ -585,7 +532,9 @@ impl Pipeline for SpeculativePipeline {
                     }
                     EitherCache::Normal(normal) => {
                         for cache in &mut *normal.lock().unwrap().0 {
-                            cache.set_len(cache.current_seq_len() - n_not_accepted);
+                            cache
+                                .set_len(cache.current_seq_len() - n_not_accepted)
+                                .map_err(|_| candle_core::Error::msg("KV cache set_len failed."))?;
                         }
                     }
                 }
@@ -654,10 +603,9 @@ impl Pipeline for SpeculativePipeline {
                     CacheInstruction::Out => {
                         self.clone_out_cache(input_seqs);
                     }
-                    CacheInstruction::Nothing(_) => (),
+                    CacheInstruction::Nothing => (),
                     CacheInstruction::Reset {
                         reset_non_granular,
-                        adapter_inst: _,
                         load_preallocated_cache,
                     } => self.set_none_cache(
                         input_seqs,

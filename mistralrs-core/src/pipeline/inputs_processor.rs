@@ -9,7 +9,7 @@ use tokenizers::Tokenizer;
 
 use crate::{device_map::DeviceMapper, sequence::Sequence};
 
-pub const DEFAULT_PROMPT_CHUNK_SIZE: usize = 512;
+pub const DEFAULT_PROMPT_CHUNK_SIZE: usize = 1024;
 
 #[derive(PartialEq)]
 pub enum InputsProcessorType {
@@ -51,13 +51,10 @@ pub trait InputsProcessor {
 // ========================= Test models input processor
 
 pub mod text_models_inputs_processor {
-    use std::{
-        any::Any, collections::HashMap, fmt::Debug, iter::repeat, num::NonZeroUsize, sync::Arc,
-    };
+    use std::{any::Any, collections::HashMap, fmt::Debug, num::NonZeroUsize, sync::Arc};
 
     use anyhow::Result;
     use candle_core::{DType, Device, DeviceLocation, Tensor, WithDType};
-    use mistralrs_quant::set_use_matmul_via_f16;
     use tokenizers::Tokenizer;
 
     use crate::{
@@ -67,8 +64,6 @@ pub mod text_models_inputs_processor {
     };
 
     use super::{InputProcessorOutput, InputsProcessor, InputsProcessorType};
-
-    const VIA_F16_TOK_THRESHOLD: usize = 512;
 
     fn _make_tensor_with_pad<D: WithDType>(
         x: Vec<Vec<D>>,
@@ -173,7 +168,10 @@ pub mod text_models_inputs_processor {
             seqlen_offsets.push(offset.1 + chunk_offset_toks);
 
             position_ids.push(ctxt.len() + chunk_offset_toks);
-            ctxt.extend(repeat(padding_tok).take(max_len.saturating_sub(ctxt.len())));
+            ctxt.extend(std::iter::repeat_n(
+                padding_tok,
+                max_len.saturating_sub(ctxt.len()),
+            ));
             // If we are returning raw logits, we want to not trim the logits at all.
             if return_raw_logits {
                 if last_n_context_len.is_some() {
@@ -267,12 +265,6 @@ pub mod text_models_inputs_processor {
         }
 
         let input = Tensor::cat(&seqs_tensors, 0).unwrap();
-        // Only use matmul via f16 if prompt and seqlen > 512
-        if input.dim(1)? > VIA_F16_TOK_THRESHOLD {
-            set_use_matmul_via_f16(true);
-        } else {
-            set_use_matmul_via_f16(false);
-        }
 
         let paged_attn_meta = if paged_attn_metadata.is_some() {
             let max_slot_mapping_len = slot_mappings.iter().map(|x| x.len()).max().unwrap();
@@ -444,8 +436,6 @@ pub mod text_models_inputs_processor {
             seqlens_q_map.insert(device.location(), seqlens_q.to_device(&device)?);
             seqlens_k_map.insert(device.location(), seqlens_k.to_device(&device)?);
         }
-
-        set_use_matmul_via_f16(false);
 
         let paged_attn_meta = if paged_attn_metadata.is_some() {
             let slot_mappings = _make_tensor_with_pad(slot_mappings, 1, _PAD_SLOT_ID, device)?;

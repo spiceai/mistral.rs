@@ -12,7 +12,7 @@ use candle_core::{Device, Error, Result, Tensor, D};
 use pyo3::pyclass;
 
 use once_cell::sync::Lazy;
-use rand::distributions::{Distribution, WeightedIndex};
+use rand::distr::{weighted::WeightedIndex, Distribution};
 use rand_isaac::Isaac64Rng;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,7 @@ impl SamplingParams {
     pub fn deterministic() -> Self {
         Self {
             temperature: None,
-            top_k: None,
+            top_k: Some(1),
             top_p: None,
             min_p: None,
             top_n_logprobs: 0,
@@ -127,7 +127,7 @@ impl DrySamplingParamsInner {
                             // FIXME: This is a hack. See https://github.com/LostRuins/koboldcpp/pull/982
                             //        for the correct solution which covers multi-token sequence breakers
                             //        and ambiguous encodings.
-                            .encode(["a", &breaker].concat(), true)
+                            .encode_fast(["a", &breaker].concat(), true)
                             .map_err(anyhow::Error::msg)
                             .map(|enc| {
                                 let ids = enc.get_ids();
