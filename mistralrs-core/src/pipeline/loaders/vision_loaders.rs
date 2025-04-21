@@ -173,7 +173,7 @@ impl FromStr for VisionLoaderType {
             "idefics3" => Ok(Self::Idefics3),
             "minicpmo" => Ok(Self::MiniCpmO),
             "phi4mm" => Ok(Self::Phi4MM),
-            "qwen2_5vl" => Ok(Self::Qwen2_5VL),
+            "qwen2_5_vl" | "qwen2_5vl" => Ok(Self::Qwen2_5VL),
             "gemma3" => Ok(Self::Gemma3),
             "mistral3" => Ok(Self::Mistral3),
             "llama4" => Ok(Self::Llama4),

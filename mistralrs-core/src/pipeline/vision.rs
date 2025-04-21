@@ -151,7 +151,7 @@ impl VisionLoaderBuilder {
         self
     }
 
-    pub fn build(self, loader: VisionLoaderType) -> Box<dyn Loader> {
+    pub fn build_as_vision(self, loader: VisionLoaderType) -> Box<VisionLoader> {
         let loader: Box<dyn VisionModelLoader> = match loader {
             VisionLoaderType::Phi3V => Box::new(Phi3VLoader),
             VisionLoaderType::Idefics2 => Box::new(Idefics2Loader),
@@ -183,6 +183,10 @@ impl VisionLoaderBuilder {
             hf_cache_path: self.hf_cache_path,
             lora_adapter_ids: self.lora_adapter_ids,
         })
+    }
+
+    pub fn build(self, loader: VisionLoaderType) -> Box<dyn Loader> {
+        self.build_as_vision(loader)
     }
 }
 
@@ -714,6 +718,12 @@ impl Loader for VisionLoader {
 
     fn get_kind(&self) -> ModelKind {
         self.kind.clone()
+    }
+}
+
+impl VisionLoader {
+    pub fn get_prefixer(&self) -> Arc<dyn VisionPromptPrefixer> {
+        self.inner.prefixer()
     }
 }
 
