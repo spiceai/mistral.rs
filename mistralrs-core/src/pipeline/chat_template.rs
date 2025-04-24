@@ -310,6 +310,9 @@ pub fn apply_chat_template_to(
             date_string => date_string,
         })?)
     } else {
+        if !tools_are_supported(&tmpl) {
+            warn!("tools were provided to a 'chat_template' that does not support them. Tools will be ignored...");
+        }
         Ok(tmpl.render(context! {
             messages => new_messages,
             add_generation_prompt => add_generation_prompt,
@@ -320,4 +323,8 @@ pub fn apply_chat_template_to(
             date_string => date_string,
         })?)
     }
+}
+
+fn tools_are_supported(t: &Template) -> bool {
+    t.undeclared_variables(true).contains("tools")
 }
