@@ -1,5 +1,3 @@
-use super::cache_manager::{FullCacheManager, NormalCacheManager};
-use super::hf::{api_dir_list, api_get_file, get_paths, get_uqff_paths};
 use super::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
 use super::isq::ImatrixDataSource;
 use super::llg::build_llg_factory;
@@ -12,20 +10,25 @@ use super::{
     IsqPipelineMixin, MetadataMixin, ModelCategory, PreProcessingMixin,
 };
 use super::{
-    AutoLoader, DeepSeekV2Loader, DeepSeekV3Loader, Gemma2Loader, GemmaLoader, LlamaLoader,
-    MistralLoader, MixtralLoader, NormalLoaderType, Phi2Loader, Phi3Loader, Phi3_5MoELoader,
-    Qwen2Loader, Starcoder2Loader,
+    AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, GLM4Loader, Gemma2Loader, GemmaLoader,
+    LlamaLoader, MistralLoader, MixtralLoader, NormalLoaderType, Phi2Loader, Phi3Loader,
+    Phi3_5MoELoader, Qwen2Loader, Qwen3Loader, Qwen3MoELoader, SmolLm3Loader, Starcoder2Loader,
 };
 use crate::amoe::AnyMoeExpertType;
 use crate::device_map::{self, DeviceMapper};
 use crate::distributed::{self, WorkerTransferData};
+use crate::kv_cache::{FullCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
 use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
+use crate::pipeline::hf::{api_dir_list, api_get_file, get_paths, get_uqff_paths};
 use crate::pipeline::isq::UqffFullSer;
+use crate::pipeline::loaders::auto_device_map;
+use crate::pipeline::loaders::QuantizationConfigShim;
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::text_models_inputs_processor::make_prompt_chunk;
-use crate::pipeline::{get_chat_template, ChatTemplate, LocalModelPaths};
+use crate::pipeline::ChatTemplate;
+use crate::pipeline::{get_chat_template, Modalities, SupportedModality};
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::tokenizer::get_tokenizer;
@@ -42,6 +45,7 @@ use candle_core::{Device, Tensor, Var};
 use hf_hub::Cache;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use indicatif::MultiProgress;
+use mistralrs_quant::log::once_log_info;
 use mistralrs_quant::{AfqLayer, GgufMatMul, HqqLayer, IsqType, QuantizedSerdeType};
 use rand_isaac::Isaac64Rng;
 use regex_automata::meta::Regex;
@@ -49,7 +53,6 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::num::{NonZero, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use std::{env, fs};
@@ -116,7 +119,6 @@ pub struct NormalLoaderBuilder {
 #[derive(Clone, Default)]
 /// Config specific to loading a normal model.
 pub struct NormalSpecificConfig {
-    pub use_flash_attn: bool,
     pub prompt_chunksize: Option<NonZeroUsize>,
     pub topology: Option<Topology>,
     pub organization: IsqOrganization,
@@ -125,6 +127,8 @@ pub struct NormalSpecificConfig {
     pub imatrix: Option<PathBuf>,
     pub calibration_file: Option<PathBuf>,
     pub hf_cache_path: Option<PathBuf>,
+    pub matformer_config_path: Option<PathBuf>,
+    pub matformer_slice_name: Option<String>,
 }
 
 impl NormalLoaderBuilder {
@@ -218,7 +222,11 @@ impl NormalLoaderBuilder {
             Some(NormalLoaderType::Phi3_5MoE) => Box::new(Phi3_5MoELoader),
             Some(NormalLoaderType::DeepSeekV2) => Box::new(DeepSeekV2Loader),
             Some(NormalLoaderType::DeepSeekV3) => Box::new(DeepSeekV3Loader),
-            None => Box::new(AutoLoader),
+            Some(NormalLoaderType::Qwen3) => Box::new(Qwen3Loader),
+            Some(NormalLoaderType::GLM4) => Box::new(GLM4Loader),
+            Some(NormalLoaderType::Qwen3Moe) => Box::new(Qwen3MoELoader),
+            Some(NormalLoaderType::SmolLm3) => Box::new(SmolLm3Loader),
+            None => Box::new(AutoNormalLoader),
         };
         Ok(Box::new(NormalLoader {
             inner: loader,
@@ -307,7 +315,7 @@ impl Loader for NormalLoader {
         device: &Device,
         silent: bool,
         mut mapper: DeviceMapSetting,
-        in_situ_quant: Option<IsqType>,
+        mut in_situ_quant: Option<IsqType>,
         mut paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
         let config = std::fs::read_to_string(paths.get_config_filename())?;
@@ -336,20 +344,25 @@ impl Loader for NormalLoader {
         } else {
             device_map::get_all_similar_devices(device)?
         };
-        let device = if use_nccl {
+        let device = if use_nccl || cfg!(feature = "ring") {
             available_devices[0].clone()
         } else {
             device.clone()
         };
 
         // If auto, convert to Map if not using nccl
-        if use_nccl {
+        if use_nccl || cfg!(feature = "ring") {
             mapper = DeviceMapSetting::DummyNccl {
                 nm_device: available_devices[0].clone(),
             };
         } else if let DeviceMapSetting::Auto(params) = mapper.clone() {
             // Initial dtype
             let dtype = dtype.try_into_dtype(&available_devices.iter().collect::<Vec<_>>())?;
+
+            // Disable ISQ if we are loading a prequantized model.
+            if QuantizationConfigShim::get_quant_config_pack_factor(&config, dtype)? != 1 {
+                in_situ_quant = None;
+            }
 
             // ISQ or UQFF: quantized path
             // Match logic below where UQFF has priority
@@ -388,12 +401,18 @@ impl Loader for NormalLoader {
                         total_pack_factors / total_tensors
                     };
 
-                    let layer_sizes_in_bytes =
-                        self.inner
-                            .layer_sizes_in_bytes(&config, dtype, weight_pack_factor)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner
-                            .non_mapped_size_in_bytes(&config, dtype, weight_pack_factor)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -402,12 +421,18 @@ impl Loader for NormalLoader {
                     )
                 } else if let Some(isq) = in_situ_quant {
                     let weight_pack_factor = isq.pack_factor(dtype);
-                    let layer_sizes_in_bytes =
-                        self.inner
-                            .layer_sizes_in_bytes(&config, dtype, weight_pack_factor)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner
-                            .non_mapped_size_in_bytes(&config, dtype, weight_pack_factor)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -415,10 +440,21 @@ impl Loader for NormalLoader {
                         layer_sizes_sum + non_mapped_size_in_bytes,
                     )
                 } else {
-                    let layer_sizes_in_bytes =
-                        self.inner.layer_sizes_in_bytes(&config, dtype, 1)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner.non_mapped_size_in_bytes(&config, dtype, 1)?;
+                    // Be sure to get the weight pack factor here; we might be loading a prequantized model.
+                    let weight_pack_factor =
+                        QuantizationConfigShim::get_quant_config_pack_factor(&config, dtype)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -427,7 +463,8 @@ impl Loader for NormalLoader {
                     )
                 };
 
-            let new = self.inner.get_device_layers(
+            let new = auto_device_map::get_device_layers(
+                &*self.inner,
                 &config,
                 self.inner.num_layers(&config)?,
                 layer_sizes_in_bytes,
@@ -462,18 +499,39 @@ impl Loader for NormalLoader {
         // TODO: PagedAttention is not supported with CPU for now.
         // This check is not really necessary because `get_device_layers` should prevent it.
         let mapping_uses_cpu = mapper.get_unique_devices().iter().any(Device::is_cpu);
-        if mapping_uses_cpu {
+        if mapping_uses_cpu && paged_attn_config.is_some() {
             warn!("Device mapping contains a mix of GPU and CPU. There is no CPU support for PagedAttention, disabling PagedAttention.");
             paged_attn_config = None;
         }
 
-        info!(
-            "Model config: {:?}",
-            self.inner
-                .get_config_repr(&config, self.config.use_flash_attn)?
-        );
+        info!("Model config: {:?}", self.inner.get_config_repr(&config)?);
+        if crate::using_flash_attn() {
+            once_log_info("FlashAttention is enabled.");
+        }
 
-        let mut loading_isq = in_situ_quant.is_some() || self.config.from_uqff.is_some();
+        // Logic for ISQ here: if no calibration (i.e imatrix), then allow immediate ISQ. Otherwise, back to normal.
+        let mut loading_isq = if self.config.imatrix.is_none()
+            && self.config.calibration_file.is_none()
+            && !device.is_cuda()
+            && self.config.write_uqff.is_none()
+            && in_situ_quant.is_some()
+        {
+            let predicates = if matches!(self.config.organization, IsqOrganization::MoeExpertsOnly)
+            {
+                self.inner.immediate_isq_predicates_moqe(&config)?
+            } else {
+                self.inner.immediate_isq_predicates(&config)?
+            };
+            info!("Applying ISQ to {in_situ_quant:?}");
+            if predicates.is_empty() {
+                warn!("No predicates for this model and ISQ setting detected. ISQ will not be applied to any weights!");
+            }
+            mistralrs_quant::set_immediate_isq(in_situ_quant, predicates);
+            false
+        } else {
+            in_situ_quant.is_some()
+        };
+
         if let Some(ref topology) = self.config.topology {
             loading_isq |= topology
                 .0
@@ -505,7 +563,28 @@ impl Loader for NormalLoader {
 
         let multi_progress = Arc::new(MultiProgress::new());
 
-        let mut model = if use_nccl {
+        // Load matformer slicing config if provided
+        let matformer_slicing_config = if let Some(matformer_path) =
+            &self.config.matformer_config_path
+        {
+            use crate::matformer::{MatformerConfig, MatformerSliceConfig};
+            info!("Loading Matformer config from {:?}", matformer_path);
+            let config = Arc::new(MatformerConfig::from_file(matformer_path)?);
+
+            if let Some(slice_name) = &self.config.matformer_slice_name {
+                info!("Using Matformer slice: {}", slice_name);
+                Some(MatformerSliceConfig::new(slice_name.clone(), config))
+            } else {
+                // If no slice name is provided but config exists, we'll need to handle this
+                // For now, return None and let the model handle the default slice selection
+                warn!("Matformer config loaded but no slice name specified. Models will use their default slice.");
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut model = if use_nccl || cfg!(feature = "ring") {
             let (mapper, sharded_vb) = distributed::prepare_distributed_mapper(
                 dtype,
                 &device,
@@ -525,12 +604,12 @@ impl Loader for NormalLoader {
                     sharded_vb,
                     config,
                     self.inner,
-                    self.config.use_flash_attn,
                     mapper,
                     loading_isq,
                     device.clone(),
                     attention_mechanism,
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::XLora,
@@ -541,12 +620,12 @@ impl Loader for NormalLoader {
                     layer_devices.clone(),
                     config,
                     self.inner,
-                    self.config.use_flash_attn,
                     silent,
                     mapper,
                     loading_isq,
                     device.clone(),
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::Lora,
@@ -557,7 +636,6 @@ impl Loader for NormalLoader {
                     layer_devices.clone(),
                     config,
                     self.inner,
-                    self.config.use_flash_attn,
                     silent,
                     mapper,
                     loading_isq,
@@ -566,6 +644,7 @@ impl Loader for NormalLoader {
                     attention_mechanism,
                     matches!(self.config.organization, IsqOrganization::MoeExpertsOnly),
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 _ => unreachable!(),
             }
@@ -578,7 +657,6 @@ impl Loader for NormalLoader {
                     layer_devices.clone(),
                     config,
                     self.inner,
-                    self.config.use_flash_attn,
                     silent,
                     mapper,
                     loading_isq,
@@ -587,6 +665,7 @@ impl Loader for NormalLoader {
                     attention_mechanism,
                     matches!(self.config.organization, IsqOrganization::MoeExpertsOnly),
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::XLora,
@@ -597,12 +676,12 @@ impl Loader for NormalLoader {
                     layer_devices.clone(),
                     config,
                     self.inner,
-                    self.config.use_flash_attn,
                     silent,
                     mapper,
                     loading_isq,
                     device.clone(),
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::Lora,
@@ -613,7 +692,6 @@ impl Loader for NormalLoader {
                     layer_devices.clone(),
                     config,
                     self.inner,
-                    self.config.use_flash_attn,
                     silent,
                     mapper,
                     loading_isq,
@@ -622,26 +700,32 @@ impl Loader for NormalLoader {
                     attention_mechanism,
                     matches!(self.config.organization, IsqOrganization::MoeExpertsOnly),
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 _ => unreachable!(),
             }
         };
 
         let tokenizer = get_tokenizer(paths.get_tokenizer_filename(), None)?;
-        let gen_conf: Option<GenerationConfig> = paths.get_gen_conf_filename().map(|f| {
-            serde_json::from_str(&fs::read_to_string(f).unwrap())
-                .expect("bos_token_id/eos_token_id missing in generation_config.json")
+        let gen_conf: Option<GenerationConfig> = paths.get_gen_conf_filename().and_then(|f| {
+            match serde_json::from_str::<GenerationConfig>(&fs::read_to_string(f).unwrap()) {
+                Ok(conf) => Some(conf),
+                Err(e) => {
+                    warn!("Failed to parse generation_config.json: {}", e);
+                    None
+                }
+            }
         });
 
+        let chat_template_explicit = paths
+            .get_chat_template_explicit()
+            .as_ref()
+            .map(|x| x.to_string_lossy().to_string());
         let chat_template = get_chat_template(
             paths,
-            &self.jinja_explicit,
-            &paths
-                .get_chat_template_explicit()
-                .as_ref()
-                .map(|x| x.to_string_lossy().to_string())
-                .clone(),
-            &self.chat_template,
+            self.jinja_explicit.as_ref(),
+            chat_template_explicit.as_ref(),
+            self.chat_template.as_ref(),
             None,
         );
 
@@ -678,7 +762,7 @@ impl Loader for NormalLoader {
                 let start = Instant::now();
                 let inputs = make_prompt_chunk(
                     0,
-                    vec![chunk],
+                    vec![&chunk],
                     &[0],
                     &load_device,
                     None,
@@ -724,9 +808,8 @@ impl Loader for NormalLoader {
             );
         }
 
-        if (in_situ_quant.is_some() || self.config.topology.is_some())
-            && self.config.from_uqff.is_none()
-        {
+        // Only if loading from UQFF
+        if (loading_isq || self.config.topology.is_some()) && self.config.from_uqff.is_none() {
             let imatrix_source = match (
                 self.config.imatrix.as_ref(),
                 self.config.calibration_file.is_some(),
@@ -788,6 +871,7 @@ impl Loader for NormalLoader {
                 paged_attn_config.mem_cpu,
                 paged_attn_config.block_size,
                 dtype,
+                paged_attn_config.cache_type,
                 model.config(),
                 &device,
                 &pipeline_mapper
@@ -853,6 +937,10 @@ impl Loader for NormalLoader {
                 cache_engine,
                 prompt_chunksize: Some(NonZero::new(prompt_chunksize).unwrap()),
                 model_metadata: Some(model_metadata),
+                modalities: Modalities {
+                    input: vec![SupportedModality::Text],
+                    output: vec![SupportedModality::Text],
+                },
             }),
             topology: self.config.topology.clone(),
             silent,
@@ -1005,38 +1093,6 @@ impl Pipeline for NormalPipeline {
             }
             (None, None) => None,
         };
-        #[cfg(feature = "metal")]
-        let logits = objc::rc::autoreleasepool(|| -> candle_core::Result<Tensor> {
-            match self.model.is_xlora() {
-                false => {
-                    let paged_attn_meta = paged_attn_meta
-                        .as_ref()
-                        .map(|meta| (meta.0.get_kv_cache().clone(), meta.1.clone()));
-
-                    self.model.forward(
-                        &input_ids,
-                        &seqlen_offsets,
-                        context_lens,
-                        position_ids,
-                        paged_attn_meta.as_ref().map(|(a, b)| (a.clone(), b)),
-                        &flash_meta,
-                    )
-                }
-                true => self.model.xlora_forward(
-                    &input_ids,
-                    input_ids_full.as_ref().unwrap_or(&input_ids),
-                    &seqlen_offsets,
-                    seqlen_offsets_full.as_ref().unwrap_or(&seqlen_offsets),
-                    self.no_kv_cache,
-                    &self.non_granular_state,
-                    context_lens,
-                    position_ids,
-                    &flash_meta,
-                    flash_meta_full.as_ref().unwrap_or(&flash_meta),
-                ),
-            }
-        })?;
-        #[cfg(not(feature = "metal"))]
         let logits = match self.model.is_xlora() {
             false => {
                 let paged_attn_meta = paged_attn_meta

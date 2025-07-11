@@ -27,7 +27,7 @@ use crate::models::quantized_llama::PropsGGUF;
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 
-const MAX_SEQ_LEN: u32 = 4096;
+const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
 const SUPPORTED_LAYERS: [&str; 8] = [
     "self_attn.q_proj",
     "self_attn.k_proj",
@@ -77,7 +77,7 @@ impl Mlp {
 
 #[derive(Debug)]
 enum MlpOrMoe {
-    Mlp(Mlp),
+    Mlp(Box<Mlp>),
     MoE {
         n_expert_used: usize,
         feed_forward_gate_inp: QMatMul,
@@ -281,7 +281,7 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
         let rotary = RotaryEmbedding::new_partial(
             10000.,
             ct.hparams.n_rot as usize,
-            MAX_SEQ_LEN as usize,
+            DEFAULT_MAX_SEQ_LEN as usize,
             &ct.device,
             false,
             dtype,
@@ -305,7 +305,7 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
                 let cfg_w1 = get_lora_cfg(&feed_forward_w1);
                 let cfg_w2 = get_lora_cfg(&feed_forward_w2);
                 let cfg_w3 = get_lora_cfg(&feed_forward_w3);
-                MlpOrMoe::Mlp(Mlp {
+                MlpOrMoe::Mlp(Box::new(Mlp {
                     feed_forward_w1: QLoraLinear::new(
                         QMatMul::from_qtensor(feed_forward_w1)?,
                         &cfg_w1,
@@ -336,7 +336,7 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
                         &mut count,
                         preload_adapters,
                     )?,
-                })
+                }))
             };
             let attention_norm = ct.remove(&format!("{prefix}.attention_norm.weight"))?;
             let ffn_norm = ct.remove(&format!("{prefix}.ffn_norm.weight"))?;
@@ -395,7 +395,6 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
                 rotary: rotary.clone().into(),
                 sdpa_params: SdpaParams {
                     n_kv_groups: ct.hparams.n_head as usize / n_kv_head,
-                    use_flash_attn: false,
                     softcap: None,
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: None,
@@ -457,7 +456,7 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
                 XLoraClassifier::new(xlora_config, count, lora_config.len(), vb.clone(), true)
                     .unwrap()
             }),
-            max_seq_len: MAX_SEQ_LEN as usize, // Cannot determine from ggml.
+            max_seq_len: DEFAULT_MAX_SEQ_LEN as usize, // Cannot determine from ggml.
             mapper: None,
             dtype,
         })
@@ -556,7 +555,7 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
                 let cfg_w1 = get_lora_cfg(&feed_forward_w1);
                 let cfg_w2 = get_lora_cfg(&feed_forward_w2);
                 let cfg_w3 = get_lora_cfg(&feed_forward_w3);
-                MlpOrMoe::Mlp(Mlp {
+                MlpOrMoe::Mlp(Box::new(Mlp {
                     feed_forward_w1: QLoraLinear::new(
                         QMatMul::from_qtensor(feed_forward_w1)?,
                         &cfg_w1,
@@ -587,7 +586,7 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
                         &mut count,
                         preload_adapters,
                     )?,
-                })
+                }))
             } else {
                 let feed_forward_gate_inp =
                     ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
@@ -697,7 +696,6 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
                 rotary: rotary.clone(),
                 sdpa_params: SdpaParams {
                     n_kv_groups: head_count / head_count_kv,
-                    use_flash_attn: false,
                     softcap: None,
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: None,

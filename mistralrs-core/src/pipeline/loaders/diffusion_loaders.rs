@@ -26,7 +26,10 @@ use crate::{
         DiffusionGenerationParams,
     },
     paged_attention::AttentionImplementation,
-    pipeline::{hf::{api_dir_list, api_get_file}, paths::AdapterPaths},
+    pipeline::{
+        hf::{api_dir_list, api_get_file},
+        paths::AdapterPaths,
+    },
 };
 
 pub trait DiffusionModel {
@@ -50,7 +53,6 @@ pub trait DiffusionModelLoader: Send + Sync {
     fn load(
         &self,
         configs: Vec<String>,
-        use_flash_attn: bool,
         vbs: Vec<ShardedVarBuilder>,
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
@@ -157,7 +159,6 @@ impl DiffusionModelLoader for FluxLoader {
     fn load(
         &self,
         mut configs: Vec<String>,
-        _use_flash_attn: bool,
         mut vbs: Vec<ShardedVarBuilder>,
         normal_loading_metadata: NormalLoadingMetadata,
         _attention_mechanism: AttentionImplementation,

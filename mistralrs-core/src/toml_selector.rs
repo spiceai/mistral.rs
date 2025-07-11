@@ -394,7 +394,7 @@ pub enum TomlModelSelected {
         model_id: String,
 
         /// The architecture of the model.
-        arch: VisionLoaderType,
+        arch: Option<VisionLoaderType>,
 
         /// Model data type. Defaults to `auto`.
         #[serde(default = "default_dtype")]
@@ -489,7 +489,6 @@ pub struct TomlSelector {
 
 #[derive(Clone)]
 struct TomlLoaderInnerParams {
-    use_flash_attn: bool,
     chat_template: Option<String>,
     no_kv_cache: bool,
     tokenizer_json: Option<String>,
@@ -498,7 +497,6 @@ struct TomlLoaderInnerParams {
 }
 
 pub struct TomlLoaderArgs {
-    pub use_flash_attn: bool,
     pub chat_template: Option<String>,
     pub no_kv_cache: bool,
     pub prompt_chunksize: Option<NonZeroUsize>,
@@ -591,7 +589,6 @@ fn loader_from_selected(
     args: TomlLoaderInnerParams,
     model: TomlModelSelected,
 ) -> anyhow::Result<Box<dyn Loader>> {
-    let use_flash_attn = args.use_flash_attn;
     let loader: Box<dyn Loader> = match model {
         TomlModelSelected::Plain {
             model_id,
@@ -608,7 +605,6 @@ fn loader_from_selected(
             hf_cache_path,
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
-                use_flash_attn,
                 prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: organization.unwrap_or_default(),
@@ -622,6 +618,8 @@ fn loader_from_selected(
                 imatrix,
                 calibration_file,
                 hf_cache_path,
+                matformer_config_path: None,
+                matformer_slice_name: None,
             },
             args.chat_template,
             args.tokenizer_json,
@@ -645,7 +643,6 @@ fn loader_from_selected(
             hf_cache_path,
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
-                use_flash_attn,
                 prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
@@ -659,6 +656,8 @@ fn loader_from_selected(
                 imatrix: None,
                 calibration_file: None,
                 hf_cache_path,
+                matformer_config_path: None,
+                matformer_slice_name: None,
             },
             args.chat_template,
             args.tokenizer_json,
@@ -689,7 +688,6 @@ fn loader_from_selected(
             hf_cache_path,
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
-                use_flash_attn,
                 prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
@@ -703,6 +701,8 @@ fn loader_from_selected(
                 imatrix: None,
                 calibration_file: None,
                 hf_cache_path,
+                matformer_config_path: None,
+                matformer_slice_name: None,
             },
             args.chat_template,
             args.tokenizer_json,
@@ -918,7 +918,6 @@ fn loader_from_selected(
             hf_cache_path,
         } => VisionLoaderBuilder::new(
             VisionSpecificConfig {
-                use_flash_attn,
                 prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 write_uqff,
@@ -932,6 +931,8 @@ fn loader_from_selected(
                 calibration_file,
                 imatrix,
                 hf_cache_path,
+                matformer_config_path: None,
+                matformer_slice_name: None,
             },
             args.chat_template,
             args.tokenizer_json,
@@ -948,7 +949,6 @@ impl TryInto<Box<dyn Loader>> for (TomlSelector, TomlLoaderArgs) {
     fn try_into(self) -> Result<Box<dyn Loader>, Self::Error> {
         let (selector, args) = self;
         let args = TomlLoaderInnerParams {
-            use_flash_attn: args.use_flash_attn,
             chat_template: args.chat_template,
             no_kv_cache: args.no_kv_cache,
             tokenizer_json: selector.tokenizer_json,

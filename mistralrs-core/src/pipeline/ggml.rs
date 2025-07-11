@@ -1,5 +1,4 @@
-use super::cache_manager::FullCacheManager;
-use super::hf::get_paths;
+use super::llg::build_llg_factory;
 use super::{
     text_models_inputs_processor::ModelInputs, AdapterKind, CacheManager, GeneralMetadata, Loader,
     ModelKind, ModelPaths, QuantizationKind, TokenSource,
@@ -9,13 +8,14 @@ use super::{
     MetadataMixin, ModelCategory, PreProcessingMixin,
 };
 use crate::device_map::DeviceMapper;
+use crate::kv_cache::FullCacheManager;
 use crate::lora::Ordering;
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
-use crate::pipeline::get_chat_template;
+use crate::pipeline::hf::get_paths;
 use crate::pipeline::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
-use crate::pipeline::llg::build_llg_factory;
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::ChatTemplate;
+use crate::pipeline::{get_chat_template, Modalities, SupportedModality};
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::debug::DeviceRepr;
@@ -42,7 +42,7 @@ use tracing::{info, warn};
 
 enum Model {
     Llama(QLlama),
-    XLoraLlama(XLoraQLlama),
+    XLoraLlama(Box<XLoraQLlama>),
 }
 
 pub struct GGMLPipeline {
@@ -332,25 +332,24 @@ impl Loader for GGMLLoader {
         let model = match self.kind {
             ModelKind::GgufQuantized { .. } => Model::Llama(QLlama::try_from(model_config)?),
             ModelKind::GgufAdapter { .. } => {
-                Model::XLoraLlama(XLoraQLlama::try_from(model_config)?)
+                Model::XLoraLlama(Box::new(XLoraQLlama::try_from(model_config)?))
             }
             _ => unreachable!(),
         };
 
         let tokenizer = get_tokenizer(paths.get_tokenizer_filename(), None)?;
-        let gen_conf: Option<GenerationConfig> = paths.get_gen_conf_filename().map(|f| {
-            serde_json::from_str(&fs::read_to_string(f).unwrap())
-                .expect("bos_token_id/eos_token_id missing in generation_config.json")
-        });
+        let gen_conf: Option<GenerationConfig> = paths
+            .get_gen_conf_filename()
+            .map(|f| serde_json::from_str(&fs::read_to_string(f).unwrap()).unwrap());
+        let chat_template_explicit = paths
+            .get_chat_template_explicit()
+            .as_ref()
+            .map(|x| x.to_string_lossy().to_string());
         let chat_template = get_chat_template(
             paths,
-            &self.jinja_explicit,
-            &paths
-                .get_chat_template_explicit()
-                .as_ref()
-                .map(|x| x.to_string_lossy().to_string())
-                .clone(),
-            &self.chat_template,
+            self.jinja_explicit.as_ref(),
+            chat_template_explicit.as_ref(),
+            self.chat_template.as_ref(),
             None,
         );
 
@@ -391,6 +390,10 @@ impl Loader for GGMLLoader {
                 cache_engine: None,
                 prompt_chunksize: Some(NonZero::new(prompt_chunksize).unwrap()),
                 model_metadata: None,
+                modalities: Modalities {
+                    input: vec![SupportedModality::Text],
+                    output: vec![SupportedModality::Text],
+                },
             }),
         })))
     }

@@ -1,53 +1,24 @@
 use anyhow::Result;
-use axum::{
-    extract::{DefaultBodyLimit, Json, State},
-    http::{self, Method},
-    routing::{get, post},
-    Router,
-};
-use candle_core::Device;
 use clap::Parser;
 use mistralrs_core::{
-    get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, initialize_logging,
-    paged_attn_supported, parse_isq_value, BertEmbeddingModel, DefaultSchedulerMethod,
-    DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, IsqType, Loader, LoaderBuilder,
-    MemoryGpuConfig, MistralRs, MistralRsBuilder, ModelSelected, PagedAttentionConfig, Request,
-    SchedulerConfig, TokenSource,
+    initialize_logging, McpClientConfig, ModelSelected, PagedCacheType, TokenSource,
 };
-use openai::{
-    ChatCompletionRequest, CompletionRequest, ImageGenerationRequest, Message, ModelObjects,
-    StopTokens,
-};
-use serde::{Deserialize, Serialize};
-use std::{num::NonZeroUsize, sync::Arc};
+use rust_mcp_sdk::schema::LATEST_PROTOCOL_VERSION;
+use std::collections::HashMap;
+use tokio::join;
+use tracing::{error, info};
 
-mod chat_completion;
-mod completions;
-mod image_generation;
+use mistralrs_server_core::{
+    mistralrs_for_server_builder::{
+        configure_paged_attn_from_flags, defaults, get_bert_model, MistralRsForServerBuilder,
+        ModelConfig,
+    },
+    mistralrs_server_router_builder::MistralRsServerRouterBuilder,
+};
+
 mod interactive_mode;
-mod openai;
-mod util;
-
-use crate::openai::ModelObject;
-use crate::{
-    chat_completion::{__path_chatcompletions, chatcompletions},
-    completions::completions,
-    image_generation::image_generation,
-};
-
 use interactive_mode::interactive_mode;
-use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{info, warn};
-use utoipa::{OpenApi, ToSchema};
-use utoipa_swagger_ui::SwaggerUi;
-
-// NOTE(EricLBuehler): Accept up to 50mb input
-const N_INPUT_SIZE: usize = 50;
-const MB_TO_B: usize = 1024 * 1024; // 1024 kb in a mb
-
-fn parse_token_source(s: &str) -> Result<TokenSource, String> {
-    s.parse()
-}
+mod mcp_server;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -62,7 +33,7 @@ struct Args {
 
     /// Port to serve on.
     #[arg(short, long)]
-    port: Option<String>,
+    port: Option<u16>,
 
     /// Log all responses and requests to this file
     #[clap(long, short)]
@@ -79,11 +50,11 @@ struct Args {
     model: ModelSelected,
 
     /// Maximum running sequences at any time. If the `tgt_non_granular_index` flag is set for X-LoRA models, this will be set to 1.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = defaults::MAX_SEQS)]
     max_seqs: usize,
 
     /// Use no KV cache.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = defaults::NO_KV_CACHE)]
     no_kv_cache: bool,
 
     /// Chat template file with a JINJA file with `messages`, `add_generation_prompt`, `bos_token`, `eos_token`, and `unk_token` as inputs.
@@ -98,7 +69,7 @@ struct Args {
     /// Source of the token for authentication.
     /// Can be in the formats: `literal:<value>`, `env:<value>`, `path:<value>`, `cache` to use a cached token, or `none` to use no token.
     /// Defaults to `cache`.
-    #[arg(long, default_value_t = TokenSource::CacheToken, value_parser = parse_token_source)]
+    #[arg(long, default_value_t = defaults::TOKEN_SOURCE, value_parser = parse_token_source)]
     token_source: TokenSource,
 
     /// Enter interactive mode instead of serving a chat server.
@@ -106,7 +77,7 @@ struct Args {
     interactive_mode: bool,
 
     /// Number of prefix caches to hold on the device. Other caches are evicted to the CPU based on a LRU strategy.
-    #[arg(long, default_value_t = 16)]
+    #[arg(long, default_value_t = defaults::PREFIX_CACHE_N)]
     prefix_cache_n: usize,
 
     /// NOTE: This can be omitted to use automatic device mapping!
@@ -117,8 +88,8 @@ struct Args {
     num_device_layers: Option<Vec<String>>,
 
     /// In-situ quantization to apply.
-    #[arg(long = "isq", value_parser = parse_isq_value)]
-    in_situ_quant: Option<IsqType>,
+    #[arg(long = "isq")]
+    in_situ_quant: Option<String>,
 
     /// GPU memory to allocate for KV cache with PagedAttention in MBs.
     /// PagedAttention is supported on CUDA and Metal. It is automatically activated on CUDA but not on Metal.
@@ -140,17 +111,30 @@ struct Args {
     #[arg(long = "pa-ctxt-len")]
     paged_ctxt_len: Option<usize>,
 
+    /// PagedAttention KV cache type (auto or f8e4m3).
+    /// Defaults to `auto`.
+    #[arg(long = "pa-cache-type", value_parser = parse_cache_type)]
+    cache_type: Option<PagedCacheType>,
+
     /// Block size (number of tokens per block) for PagedAttention. If this is not set and the device is CUDA, it will default to 32.
     /// PagedAttention is supported on CUDA and Metal. It is automatically activated on CUDA but not on Metal.
     #[arg(long = "pa-blk-size")]
     paged_attn_block_size: Option<usize>,
 
     /// Disable PagedAttention on CUDA. Because PagedAttention is already disabled on Metal, this is only applicable on CUDA.
-    #[arg(long = "no-paged-attn", default_value_t = false)]
+    #[arg(
+        long = "no-paged-attn",
+        default_value_t = false,
+        conflicts_with = "paged_attn"
+    )]
     no_paged_attn: bool,
 
     /// Enable PagedAttention on Metal. Because PagedAttention is already enabled on CUDA, this is only applicable on Metal.
-    #[arg(long = "paged-attn", default_value_t = false)]
+    #[arg(
+        long = "paged-attn",
+        default_value_t = false,
+        conflicts_with_all = ["no_paged_attn", "cpu"]
+    )]
     paged_attn: bool,
 
     /// Number of tokens to batch the prompt step into. This can help with OOM errors when in the prompt step, but reduces performance.
@@ -161,10 +145,6 @@ struct Args {
     #[arg(long)]
     cpu: bool,
 
-    /// Enable web searching for interactive mode.
-    #[arg(long = "interactive-search")]
-    interactive_search: bool,
-
     /// Enable searching compatible with the OpenAI `web_search_options` setting. This uses the BERT model specified below or the default.
     #[arg(long = "enable-search")]
     enable_search: bool,
@@ -172,339 +152,325 @@ struct Args {
     /// Specify a Hugging Face model ID for a BERT model to assist web searching. Defaults to Snowflake Arctic Embed L.
     #[arg(long = "search-bert-model")]
     search_bert_model: Option<String>,
+
+    /// Enable thinking for interactive mode and models that support it.
+    #[arg(long = "enable-thinking")]
+    enable_thinking: bool,
+
+    /// Port to serve MCP protocol on
+    #[arg(long)]
+    mcp_port: Option<u16>,
+
+    /// MCP client configuration file path
+    #[arg(long)]
+    mcp_config: Option<String>,
 }
 
-#[utoipa::path(
-    get,
-    tag = "Mistral.rs",
-    path = "/v1/models",
-    responses((status = 200, description = "Served model info", body = ModelObjects))
-)]
-async fn models(State(state): State<Arc<MistralRs>>) -> Json<ModelObjects> {
-    Json(ModelObjects {
-        object: "list",
-        data: vec![ModelObject {
-            id: state.get_id(),
-            object: "model",
-            created: state.get_creation_time(),
-            owned_by: "local",
-        }],
-    })
+fn parse_token_source(s: &str) -> Result<TokenSource, String> {
+    s.parse()
 }
 
-#[utoipa::path(
-    get,
-    tag = "Mistral.rs",
-    path = "/health",
-    responses((status = 200, description = "Server is healthy"))
-)]
-async fn health() -> &'static str {
-    "OK"
+fn parse_cache_type(s: &str) -> Result<PagedCacheType, String> {
+    s.parse()
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-struct ReIsqRequest {
-    #[schema(example = "Q4K")]
-    ggml_type: String,
+/// Load MCP configuration from file path or environment variable
+fn load_mcp_config(mcp_config_path: Option<&str>) -> Result<Option<McpClientConfig>> {
+    let config_path = if let Some(path) = mcp_config_path {
+        Some(path.to_string())
+    } else {
+        // Check environment variable if no CLI arg provided
+        std::env::var("MCP_CONFIG_PATH").ok()
+    };
+
+    if let Some(path) = config_path {
+        match std::fs::read_to_string(&path) {
+            Ok(config_content) => {
+                match serde_json::from_str::<McpClientConfig>(&config_content) {
+                    Ok(config) => {
+                        // Validate configuration
+                        if let Err(e) = validate_mcp_config(&config) {
+                            error!("MCP configuration validation failed: {}", e);
+                            anyhow::bail!("Invalid MCP configuration: {}", e);
+                        }
+
+                        info!("Loaded and validated MCP configuration from {}", path);
+                        info!("Configured {} MCP servers", config.servers.len());
+                        Ok(Some(config))
+                    }
+                    Err(e) => {
+                        error!("Failed to parse MCP configuration: {}", e);
+                        error!("Please check your JSON syntax and ensure it matches the MCP configuration schema");
+                        anyhow::bail!("Invalid MCP configuration format: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to read MCP configuration file {}: {}", path, e);
+                error!("Please ensure the file exists and is readable");
+                anyhow::bail!("Cannot read MCP configuration file: {}", e);
+            }
+        }
+    } else {
+        Ok(None)
+    }
 }
 
-#[utoipa::path(
-    post,
-    tag = "Mistral.rs",
-    path = "/re_isq",
-    request_body = ReIsqRequest,
-    responses((status = 200, description = "Reapply ISQ to a non GGUF or GGML model."))
-)]
-async fn re_isq(
-    State(state): State<Arc<MistralRs>>,
-    Json(request): Json<ReIsqRequest>,
-) -> Result<String, String> {
-    let repr = format!("Re ISQ: {:?}", request.ggml_type);
-    MistralRs::maybe_log_request(state.clone(), repr.clone());
-    let request = Request::ReIsq(parse_isq_value(&request.ggml_type)?);
-    state.get_sender().unwrap().send(request).await.unwrap();
-    Ok(repr)
+/// Validate MCP configuration for common issues
+fn validate_mcp_config(config: &McpClientConfig) -> Result<()> {
+    use std::collections::HashSet;
+
+    // Check for duplicate server IDs
+    let mut seen_ids = HashSet::new();
+    for server in &config.servers {
+        if !seen_ids.insert(&server.id) {
+            anyhow::bail!("Duplicate server ID: {}", server.id);
+        }
+
+        // Validate server ID format
+        if !server
+            .id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            anyhow::bail!(
+                "Invalid server ID '{}': must contain only alphanumeric, hyphen, underscore",
+                server.id
+            );
+        }
+
+        // Validate URLs for HTTP/WebSocket sources
+        match &server.source {
+            mistralrs_core::McpServerSource::Http { url, .. }
+            | mistralrs_core::McpServerSource::WebSocket { url, .. } => {
+                // Basic URL validation - check for scheme
+                if !url.starts_with("http://")
+                    && !url.starts_with("https://")
+                    && !url.starts_with("ws://")
+                    && !url.starts_with("wss://")
+                {
+                    anyhow::bail!("Invalid URL for server '{}': must start with http://, https://, ws://, or wss://", server.id);
+                }
+                if url.len() < 10 {
+                    anyhow::bail!("Invalid URL for server '{}': URL too short", server.id);
+                }
+            }
+            mistralrs_core::McpServerSource::Process { command, .. } => {
+                if command.is_empty() {
+                    anyhow::bail!("Empty command for server '{}'", server.id);
+                }
+            }
+        }
+    }
+
+    // Validate global settings
+    if let Some(timeout) = config.tool_timeout_secs {
+        if timeout == 0 {
+            anyhow::bail!("tool_timeout_secs must be greater than 0");
+        }
+    }
+
+    if let Some(max_calls) = config.max_concurrent_calls {
+        if max_calls == 0 {
+            anyhow::bail!("max_concurrent_calls must be greater than 0");
+        }
+    }
+
+    Ok(())
 }
 
-fn get_router(state: Arc<MistralRs>) -> Router {
-    #[derive(OpenApi)]
-    #[openapi(
-        paths(models, health, chatcompletions),
-        components(
-            schemas(ModelObjects, ModelObject, ChatCompletionRequest, CompletionRequest, ImageGenerationRequest, StopTokens, Message)),
-        tags(
-            (name = "Mistral.rs", description = "Mistral.rs API")
-        ),
-        info(
-            title = "Mistral.rs",
-            license(
-            name = "MIT",
+/// Configuration for a single model in a multi-model setup (parsing format)
+#[derive(Clone, serde::Deserialize)]
+struct ModelConfigParsed {
+    /// Model selector
+    #[serde(flatten)]
+    model: ModelSelected,
+    /// Model-specific chat template
+    chat_template: Option<String>,
+    /// Model-specific JINJA template
+    jinja_explicit: Option<String>,
+    /// Model-specific device layers
+    num_device_layers: Option<Vec<String>>,
+    /// Model-specific in-situ quantization
+    in_situ_quant: Option<String>,
+}
+
+/// Load multi-model configuration from file
+fn load_multi_model_config(config_path: &str) -> Result<Vec<ModelConfig>> {
+    let config_content = std::fs::read_to_string(config_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read multi-model config file {}: {}",
+            config_path,
+            e
         )
-        )
-    )]
-    struct ApiDoc;
+    })?;
 
-    let doc = { ApiDoc::openapi() };
+    let configs_parsed: HashMap<String, ModelConfigParsed> = serde_json::from_str(&config_content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse multi-model config: {}", e))?;
 
-    let allow_origin = AllowOrigin::any();
-    let cors_layer = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST])
-        .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION])
-        .allow_origin(allow_origin);
+    if configs_parsed.is_empty() {
+        anyhow::bail!("Multi-model configuration file is empty");
+    }
 
-    Router::new()
-        .merge(SwaggerUi::new("/docs").url("/api-doc/openapi.json", doc))
-        .route("/v1/chat/completions", post(chatcompletions))
-        .route("/v1/completions", post(completions))
-        .route("/v1/models", get(models))
-        .route("/health", get(health))
-        .route("/", get(health))
-        .route("/re_isq", post(re_isq))
-        .route("/v1/images/generations", post(image_generation))
-        .layer(cors_layer)
-        .layer(DefaultBodyLimit::max(N_INPUT_SIZE * MB_TO_B))
-        .with_state(state)
+    let mut configs = Vec::new();
+    for (model_id, parsed_config) in configs_parsed {
+        let config = ModelConfig {
+            model_id,
+            model: parsed_config.model,
+            chat_template: parsed_config.chat_template,
+            jinja_explicit: parsed_config.jinja_explicit,
+            num_device_layers: parsed_config.num_device_layers,
+            in_situ_quant: parsed_config.in_situ_quant,
+        };
+        configs.push(config);
+    }
+
+    info!(
+        "Loaded multi-model configuration with {} models",
+        configs.len()
+    );
+    Ok(configs)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args = Args::parse();
+    let args = Args::parse();
+
     initialize_logging();
 
-    let use_flash_attn = mistralrs_core::using_flash_attn();
+    // Load MCP configuration if provided
+    let mcp_config = load_mcp_config(args.mcp_config.as_deref())?;
 
-    let tgt_non_granular_index = get_tgt_non_granular_index(&args.model);
-    let dtype = get_model_dtype(&args.model)?;
-    let auto_device_map_params = get_auto_device_map_params(&args.model)?;
+    let paged_attn = configure_paged_attn_from_flags(args.paged_attn, args.no_paged_attn)?;
 
-    if tgt_non_granular_index.is_some() {
-        args.max_seqs = 1;
-    }
+    let mistralrs = match args.model {
+        ModelSelected::MultiModel {
+            config,
+            default_model_id,
+        } => {
+            // Multi-model mode
+            let model_configs = load_multi_model_config(&config)?;
 
-    let prompt_chunksize = match args.prompt_chunksize {
-        Some(0) => {
-            anyhow::bail!("`prompt_chunksize` must be a strictly positive integer, got 0.",)
-        }
-        Some(x) => Some(NonZeroUsize::new(x).unwrap()),
-        None => None,
-    };
+            let mut builder = MistralRsForServerBuilder::new()
+                .with_truncate_sequence(args.truncate_sequence)
+                .with_max_seqs(args.max_seqs)
+                .with_no_kv_cache(args.no_kv_cache)
+                .with_token_source(args.token_source)
+                .with_interactive_mode(args.interactive_mode)
+                .with_prefix_cache_n(args.prefix_cache_n)
+                .set_paged_attn(paged_attn)
+                .with_cpu(args.cpu)
+                .with_enable_search(args.enable_search)
+                .with_seed_optional(args.seed)
+                .with_log_optional(args.log)
+                .with_prompt_chunksize_optional(args.prompt_chunksize)
+                .with_mcp_config_optional(mcp_config)
+                .with_paged_attn_cache_type(args.cache_type.unwrap_or_default());
 
-    let max_seq_len = auto_device_map_params.max_seq_len();
-
-    let loader: Box<dyn Loader> = LoaderBuilder::new(args.model)
-        .with_no_kv_cache(args.no_kv_cache)
-        .with_chat_template(args.chat_template)
-        .with_use_flash_attn(use_flash_attn)
-        .with_prompt_chunksize(prompt_chunksize)
-        .with_jinja_explicit(args.jinja_explicit)
-        .build()?;
-
-    #[cfg(feature = "metal")]
-    let device = Device::new_metal(0)?;
-    #[cfg(not(feature = "metal"))]
-    let device = if args.cpu {
-        args.no_paged_attn = true;
-        Device::Cpu
-    } else if mistralrs_core::distributed::use_nccl() {
-        Device::Cpu
-    } else {
-        Device::cuda_if_available(0)?
-    };
-
-    if let Some(seed) = args.seed {
-        device.set_seed(seed)?;
-    }
-
-    info!(
-        "avx: {}, neon: {}, simd128: {}, f16c: {}",
-        candle_core::utils::with_avx(),
-        candle_core::utils::with_neon(),
-        candle_core::utils::with_simd128(),
-        candle_core::utils::with_f16c()
-    );
-    info!("Sampling method: penalties -> temperature -> topk -> topp -> minp -> multinomial");
-    if use_flash_attn {
-        info!("Using flash attention.");
-    }
-    if use_flash_attn && loader.get_kind().is_quantized() {
-        warn!("Using flash attention with a quantized model has no effect!")
-    }
-    info!("Model kind is: {}", loader.get_kind().to_string());
-
-    // Parse device mapper
-    let mapper = if let Some(device_layers) = args.num_device_layers {
-        if device_layers.len() == 1 && device_layers[0].parse::<usize>().is_ok() {
-            let layers = device_layers[0].parse::<usize>().unwrap();
-            DeviceMapSetting::Map(DeviceMapMetadata::from_num_device_layers(vec![
-                DeviceLayerMapMetadata { ordinal: 0, layers },
-            ]))
-        } else {
-            let mut mapping = Vec::new();
-            for layer in device_layers {
-                let split = layer.splitn(2, ':').collect::<Vec<_>>();
-                if split.len() < 2 {
-                    panic!("Expected layer to be of format ORD:NUM, got {layer}");
-                }
-                let ord = split[0]
-                    .parse::<usize>()
-                    .unwrap_or_else(|_| panic!("Failed to parse {} as integer.", split[0]));
-                let num = split[1]
-                    .parse::<usize>()
-                    .unwrap_or_else(|_| panic!("Failed to parse {} as integer.", split[1]));
-                for DeviceLayerMapMetadata { ordinal, layers: _ } in &mapping {
-                    if *ordinal == ord {
-                        panic!("Duplicate ordinal {ord}");
-                    }
-                }
-                mapping.push(DeviceLayerMapMetadata {
-                    ordinal: ord,
-                    layers: num,
-                });
+            // Add models to builder
+            for config in model_configs {
+                builder = builder.add_model_config(config);
             }
-            DeviceMapSetting::Map(DeviceMapMetadata::from_num_device_layers(mapping))
-        }
-    } else {
-        DeviceMapSetting::Auto(auto_device_map_params)
-    };
 
-    let no_paged_attn = if device.is_cuda() || mistralrs_core::distributed::use_nccl() {
-        args.no_paged_attn
-    } else if device.is_metal() {
-        !args.paged_attn
-    } else {
-        true
-    };
-
-    // Allocate 0.5 GB of CPU memory just as a placeholder.
-    // Nothing happens here as we have no `swap_out`, see `_preempt_by_swap`.
-    let cache_config = match (
-        args.paged_attn_block_size,
-        args.paged_attn_gpu_mem,
-        args.paged_attn_gpu_mem_usage,
-        args.paged_ctxt_len,
-        paged_attn_supported(),
-        no_paged_attn,
-    ) {
-        (block_size, None, None, None, true, false) => Some(PagedAttentionConfig::new(
-            block_size,
-            512,
-            MemoryGpuConfig::ContextSize(max_seq_len),
-        )?),
-        (block_size, None, None, Some(ctxt), true, false) => Some(PagedAttentionConfig::new(
-            block_size,
-            512,
-            MemoryGpuConfig::ContextSize(ctxt),
-        )?),
-        (block_size, None, Some(f), None, true, false) => Some(PagedAttentionConfig::new(
-            block_size,
-            512,
-            MemoryGpuConfig::Utilization(f),
-        )?),
-        (block_size, Some(m), None, None, true, false) => Some(PagedAttentionConfig::new(
-            block_size,
-            512,
-            MemoryGpuConfig::MbAmount(m),
-        )?),
-        (block_size, Some(_m), Some(f), None, true, false) => {
-            info!("Both memory size, and usage were specified, defaulting to the usage value.");
-            Some(PagedAttentionConfig::new(
-                block_size,
-                512,
-                MemoryGpuConfig::Utilization(f),
-            )?)
-        }
-        (block_size, Some(_m), None, Some(ctxt), true, false) => {
-            info!("All memory size and ctxt len, defaulting to the context len value.");
-            Some(PagedAttentionConfig::new(
-                block_size,
-                512,
-                MemoryGpuConfig::ContextSize(ctxt),
-            )?)
-        }
-        (block_size, None, Some(f), Some(_ctxt), true, false) => {
-            info!("Both ctxt len and usage were specified, defaulting to the usage value.");
-            Some(PagedAttentionConfig::new(
-                block_size,
-                512,
-                MemoryGpuConfig::Utilization(f),
-            )?)
-        }
-        (_, _, _, _, _, _) => None,
-    };
-
-    let pipeline = loader.load_model_from_hf(
-        None,
-        args.token_source,
-        &dtype,
-        &device,
-        false,
-        mapper,
-        args.in_situ_quant,
-        cache_config,
-    )?;
-    info!("Model loaded.");
-
-    let scheduler_config = if cache_config.is_some() {
-        // Handle case where we may have device mapping
-        if let Some(ref cache_config) = pipeline.lock().await.get_metadata().cache_config {
-            SchedulerConfig::PagedAttentionMeta {
-                max_num_seqs: args.max_seqs,
-                config: cache_config.clone(),
+            // Set default model if specified
+            if let Some(default_id) = default_model_id {
+                builder = builder.with_default_model_id(default_id);
             }
-        } else {
-            SchedulerConfig::DefaultScheduler {
-                method: DefaultSchedulerMethod::Fixed(args.max_seqs.try_into().unwrap()),
-            }
+
+            builder.build_multi_model().await?
         }
-    } else {
-        SchedulerConfig::DefaultScheduler {
-            method: DefaultSchedulerMethod::Fixed(args.max_seqs.try_into().unwrap()),
+        model => {
+            // Single-model mode
+            MistralRsForServerBuilder::new()
+                .with_truncate_sequence(args.truncate_sequence)
+                .with_model(model)
+                .with_max_seqs(args.max_seqs)
+                .with_no_kv_cache(args.no_kv_cache)
+                .with_token_source(args.token_source)
+                .with_interactive_mode(args.interactive_mode)
+                .with_prefix_cache_n(args.prefix_cache_n)
+                .set_paged_attn(paged_attn)
+                .with_cpu(args.cpu)
+                .with_enable_search(args.enable_search)
+                .with_seed_optional(args.seed)
+                .with_log_optional(args.log)
+                .with_chat_template_optional(args.chat_template)
+                .with_jinja_explicit_optional(args.jinja_explicit)
+                .with_num_device_layers_optional(args.num_device_layers)
+                .with_in_situ_quant_optional(args.in_situ_quant)
+                .with_paged_attn_gpu_mem_optional(args.paged_attn_gpu_mem)
+                .with_paged_attn_gpu_mem_usage_optional(args.paged_attn_gpu_mem_usage)
+                .with_paged_ctxt_len_optional(args.paged_ctxt_len)
+                .with_paged_attn_block_size_optional(args.paged_attn_block_size)
+                .with_prompt_chunksize_optional(args.prompt_chunksize)
+                .with_mcp_config_optional(mcp_config)
+                .with_paged_attn_cache_type(args.cache_type.unwrap_or_default())
+                .build()
+                .await?
         }
     };
-    let bert_model = if args.enable_search {
-        Some(
-            args.search_bert_model
-                .map(BertEmbeddingModel::Custom)
-                .unwrap_or_default(),
-        )
-    } else {
-        None
-    };
-    // Throughput logging in the server
-    let mistralrs = MistralRsBuilder::new(
-        pipeline,
-        scheduler_config,
-        !args.interactive_mode,
-        bert_model,
-    )
-    .with_opt_log(args.log)
-    .with_truncate_sequence(args.truncate_sequence)
-    .with_no_kv_cache(args.no_kv_cache)
-    .with_prefix_cache_n(args.prefix_cache_n)
-    .build();
+
+    // TODO: refactor this
+    let bert_model = get_bert_model(args.enable_search, args.search_bert_model);
 
     if args.interactive_mode {
-        interactive_mode(mistralrs, args.interactive_search).await;
+        interactive_mode(
+            mistralrs,
+            bert_model.is_some(),
+            args.enable_thinking.then_some(true),
+        )
+        .await;
         return Ok(());
     }
 
-    // Needs to be after the .build call as that is where the daemon waits.
-    let setting_server = if !args.interactive_mode {
-        let port = args.port.expect("Interactive mode was not specified, so expected port to be specified. Perhaps you forgot `-i` or `--port`?");
-        let ip = args.serve_ip.unwrap_or_else(|| "0.0.0.0".to_string());
+    if !args.interactive_mode && args.port.is_none() && args.mcp_port.is_none() {
+        anyhow::bail!("Interactive mode was not specified, so expected port to be specified. Perhaps you forgot `-i` or `--port` or `--mcp-port`?")
+    }
+
+    let mcp_port = if let Some(port) = args.mcp_port {
+        let host = args
+            .serve_ip
+            .clone()
+            .unwrap_or_else(|| "0.0.0.0".to_string());
+        info!("MCP server listening on http://{host}:{port}/mcp.");
+        info!("MCP protocol version is {}.", LATEST_PROTOCOL_VERSION);
+        let mcp_server = mcp_server::create_http_mcp_server(mistralrs.clone(), host, port);
+
+        tokio::spawn(async move {
+            if let Err(e) = mcp_server.await {
+                eprintln!("MCP server error: {e}");
+            }
+        })
+    } else {
+        tokio::spawn(async {})
+    };
+
+    let oai_port = if let Some(port) = args.port {
+        let ip = args
+            .serve_ip
+            .clone()
+            .unwrap_or_else(|| "0.0.0.0".to_string());
 
         // Create listener early to validate address before model loading
         let listener = tokio::net::TcpListener::bind(format!("{ip}:{port}")).await?;
-        Some((listener, ip, port))
+
+        let app = MistralRsServerRouterBuilder::new()
+            .with_mistralrs(mistralrs)
+            .build()
+            .await?;
+
+        info!("OpenAI-compatible server listening on http://{ip}:{port}.");
+
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, app).await {
+                eprintln!("OpenAI server error: {e}");
+            }
+        })
     } else {
-        None
+        tokio::spawn(async {})
     };
 
-    let app = get_router(mistralrs);
-    if let Some((listener, ip, port)) = setting_server {
-        info!("Serving on http://{ip}:{}.", port);
-        axum::serve(listener, app).await?;
-    };
+    let (_, _) = join!(oai_port, mcp_port);
 
     Ok(())
 }

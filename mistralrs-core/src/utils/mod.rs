@@ -1,6 +1,5 @@
 pub(crate) mod debug;
 pub(crate) mod gguf_metadata;
-pub(crate) mod log;
 pub(crate) mod memory_usage;
 pub(crate) mod model_config;
 pub(crate) mod normal;
@@ -32,10 +31,9 @@ macro_rules! handle_seq_error {
             Ok(v) => v,
             Err(e) => {
                 use $crate::response::Response;
-                $response
-                    .send(Response::InternalError(e.into()))
-                    .await
-                    .expect("Expected receiver.");
+                if let Err(_) = $response.send(Response::InternalError(e.into())).await {
+                    tracing::warn!("Receiver disconnected");
+                }
                 return;
             }
         }
@@ -50,10 +48,9 @@ macro_rules! handle_seq_error_ok {
             Ok(v) => v,
             Err(e) => {
                 use $crate::response::Response;
-                $response
-                    .send(Response::InternalError(e.into()))
-                    .await
-                    .expect("Expected receiver.");
+                if let Err(_) = $response.send(Response::InternalError(e.into())).await {
+                    tracing::warn!("Receiver disconnected");
+                }
                 return Ok(());
             }
         }
@@ -69,10 +66,13 @@ macro_rules! handle_seq_error_stateaware_ok {
             Err(e) => {
                 use $crate::response::Response;
                 use $crate::sequence::SequenceState;
-                $seq.responder()
+                if let Err(_) = $seq
+                    .responder()
                     .send(Response::InternalError(e.into()))
                     .await
-                    .expect("Expected receiver.");
+                {
+                    tracing::warn!("Receiver disconnected");
+                }
                 $seq.set_state(SequenceState::Error);
                 return Ok(());
             }
@@ -100,13 +100,13 @@ macro_rules! handle_pipeline_forward_error {
                 error!("{} - Model failed with error: {:?}", $stage, &e);
                 for seq in $seq_slice.iter_mut() {
                     // Step 1: Add all choices to groups
-                    let res = match &tokenizer
-                    {
-                        Some(tok) => match tok.decode(&seq.get_toks()[seq.prompt_tokens()..], false) {
+                    let start = seq.prompt_tokens().min(seq.get_toks().len());
+                    let res = match &tokenizer {
+                        Some(tok) => match tok.decode(&seq.get_toks()[start..], false) {
                             Ok(t) => t,
-                            Err(_) => "".to_string()
+                            Err(_) => "".to_string(),
                         },
-                        None => "".to_string()
+                        None => "".to_string(),
                     };
 
                     if seq.get_mut_group().is_chat {
@@ -185,7 +185,7 @@ macro_rules! handle_pipeline_forward_error {
                 // - The sequence is gone
                 // - We should reset the state then, including draft.
                 p.set_none_cache($seq_slice, true, true, false);
-                get_mut_arcmutex!($prefix_cacher).evict_all_to_cpu().unwrap();
+                get_mut_arcmutex!($prefix_cacher).evict_all_caches().unwrap();
 
                 continue $label;
             }

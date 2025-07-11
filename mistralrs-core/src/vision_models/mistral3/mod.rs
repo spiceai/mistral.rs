@@ -7,7 +7,7 @@ use crate::{
     device_map::DeviceMapper,
     layers::{self, Activation, RmsNorm},
     models,
-    ops::{NonZeroOp, SplitOp},
+    ops::SplitOp,
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
@@ -20,7 +20,7 @@ use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Linear, Module};
 pub use config::Mistral3Config;
 pub use inputs_processor::Mistral3Processor;
-use mistralrs_quant::{QuantMethod, ShardedVarBuilder};
+use mistralrs_quant::{NonZeroOp, QuantMethod, ShardedVarBuilder};
 use models::mistral::Model as Mistral;
 use vision::Mistral3VisionModel;
 
@@ -283,6 +283,8 @@ impl IsqModel for Mistral3Model {
         let uvb = UnVarBuilder::new();
         uvb.pp("multi_modal_projector")
             .extend(self.mmproj.residual_tensors());
+        uvb.pp("vision_tower")
+            .extend(self.vision_model.residual_tensors());
         uvb.pp("language_model")
             .extend(self.text_model.residual_tensors());
 
@@ -341,9 +343,6 @@ impl VisionModel for Mistral3Model {
     }
     fn config(&self) -> &ModelConfigMetadata {
         self.text_model.config()
-    }
-    fn has_conv2d(&self) -> bool {
-        true
     }
 }
 

@@ -1,22 +1,19 @@
 use crate::{
     pipeline::NormalCache,
-    request::{DetokenizationRequest, NormalRequest, SearchContextSize, TokenizationRequest},
-    search::{self, SearchFunctionParameters, SearchResult},
+    prefix_cacher::MatchingCache,
+    request::{DetokenizationRequest, NormalRequest, TokenizationRequest},
     sequence::SeqStepType,
     tools::{ToolCallingMatcher, ToolChoice},
-    MessageContent, RequestMessage, Response, ResponseOk,
+    ModelCategory, RequestMessage, Response,
 };
 use candle_core::Tensor;
 use either::Either;
-use indexmap::IndexMap;
 use std::{
-    borrow::Cow,
     ops::Deref,
     sync::{atomic::Ordering, Arc},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokenizers::InputSequence;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{
     get_mut_arcmutex, handle_seq_error,
@@ -26,7 +23,7 @@ use crate::{
     StopTokens,
 };
 
-use super::{Engine, TERMINATE_ALL_NEXT_STEP};
+use super::{search_request, Engine, TERMINATE_ALL_NEXT_STEP};
 
 impl Engine {
     pub async fn handle_request(self: Arc<Self>, request: Request) {
@@ -36,172 +33,12 @@ impl Engine {
                     request.messages,
                     RequestMessage::Chat { .. } | RequestMessage::VisionChat { .. }
                 ) && request.web_search_options.is_some()
-                    && !request.is_streaming
-                    && get_mut_arcmutex!(self.bert_pipeline).is_some()
+                    || !self.tool_callbacks.is_empty()
+                    || !self.tool_callbacks_with_tools.is_empty()
                 {
-                    let Some(web_search_options) = request.web_search_options.clone() else {
-                        unreachable!()
-                    };
-                    let mut first_request = request.clone();
-                    // Actually add the search tool here
-                    first_request
-                        .tools
-                        .get_or_insert_with(Vec::new)
-                        .push(search::get_search_tool(&web_search_options).unwrap());
-
-                    let mut second_request = first_request.clone();
-                    first_request.web_search_options = None;
-                    second_request.web_search_options = None;
-
-                    let this = self.clone();
-                    let handle = tokio::spawn(async move {
-                        let (new_sender, mut first_receiver) = tokio::sync::mpsc::channel(1);
-                        second_request.response = new_sender;
-                        std::mem::swap(&mut first_request.response, &mut second_request.response);
-
-                        this.add_request(first_request).await;
-                        let ResponseOk::Done(done) =
-                            first_receiver.recv().await.unwrap().as_result().unwrap()
-                        else {
-                            unreachable!()
-                        };
-
-                        let tool_calls = match &done.choices[0].message.tool_calls {
-                            Some(tool_calls)
-                                if tool_calls.len() == 1
-                                    && tool_calls[0].function.name == search::SEARCH_TOOL_NAME =>
-                            {
-                                &tool_calls[0]
-                            }
-                            None => {
-                                second_request
-                                    .response
-                                    .send(Response::Done(done))
-                                    .await
-                                    .unwrap();
-                                return;
-                            }
-                            Some(_) => {
-                                second_request
-                                    .response
-                                    .send(Response::Done(done))
-                                    .await
-                                    .unwrap();
-                                return;
-                            }
-                        };
-
-                        let RequestMessage::Chat(messages) = &mut second_request.messages else {
-                            unreachable!()
-                        };
-
-                        // Add assistant call message
-                        {
-                            let mut message: IndexMap<String, MessageContent> = IndexMap::new();
-                            message
-                                .insert("role".to_string(), Either::Left("assistant".to_string()));
-                            message.insert(
-                                "content".to_string(),
-                                Either::Left(format!(
-                                    "{{\"name\":\"{}\",\"arguments\":\"{}\"}}",
-                                    tool_calls.function.name, tool_calls.function.arguments
-                                )),
-                            );
-                            messages.push(message);
-                        }
-                        let tool_call_params: SearchFunctionParameters =
-                            serde_json::from_str(&tool_calls.function.arguments).unwrap();
-
-                        // Add tool response
-                        {
-                            let tokenizer = get_mut_arcmutex!(this.pipeline)
-                                .tokenizer()
-                                .expect("A tokenizer is expected for non-diffusion models.");
-                            let mut results = search::run_search_tool(&tool_call_params)
-                                .unwrap()
-                                .into_iter()
-                                .map(|result| {
-                                    let len = {
-                                        let inp = InputSequence::Raw(Cow::from(&result.content));
-                                        tokenizer
-                                            .encode_fast(inp, false)
-                                            .map(|x| x.len())
-                                            .unwrap_or(usize::MAX)
-                                    };
-                                    (result, len)
-                                })
-                                .collect::<Vec<_>>();
-                            // Sort increasing by tokenized length, if it fails, put it at the end.
-                            results.sort_by_key(|(_, len)| *len);
-
-                            {
-                                let device = get_mut_arcmutex!(this.pipeline).device();
-
-                                let Some(bert_pipeline) =
-                                    &mut *get_mut_arcmutex!(this.bert_pipeline)
-                                else {
-                                    unreachable!()
-                                };
-
-                                let decreasing_indexes = search::rag::compute_most_similar(
-                                    &device,
-                                    &tool_call_params.query,
-                                    results.iter().map(|(res, _)| res).collect::<Vec<_>>(),
-                                    bert_pipeline,
-                                )
-                                .unwrap();
-
-                                // Rerank the results
-                                let mut results_old = Vec::new();
-                                std::mem::swap(&mut results_old, &mut results);
-                                for &index in &decreasing_indexes {
-                                    let mut current_result: (SearchResult, usize) =
-                                        Default::default();
-                                    std::mem::swap(&mut current_result, &mut results_old[index]);
-
-                                    results.push(current_result);
-                                }
-                            }
-
-                            // Manage context size by # of tokens. Apply default here.
-                            let max_results_budget_toks =
-                                match web_search_options.search_context_size.unwrap_or_default() {
-                                    SearchContextSize::High => 10000_usize,
-                                    SearchContextSize::Medium => 7500_usize,
-                                    SearchContextSize::Low => 3000_usize,
-                                };
-                            let mut used_results = Vec::new();
-                            let mut used_len = 0;
-                            for (item, len) in results {
-                                if used_len + len >= max_results_budget_toks {
-                                    break;
-                                }
-                                // So the info! below gets the correct value
-                                used_len += len;
-                                used_results.push(item);
-                            }
-
-                            let tool_result = serde_json::to_string(&used_results)
-                                .unwrap()
-                                .replace("\\n", "\n")
-                                .replace("\\\"", "\"")
-                                .replace("\\\\", "\\");
-                            info!("Web search executed, using {used_len} tokens of {} search results.", used_results.len());
-
-                            let mut message: IndexMap<String, MessageContent> = IndexMap::new();
-                            message.insert("role".to_string(), Either::Left("tool".to_string()));
-                            message.insert(
-                                "content".to_string(),
-                                Either::Left(format!("{{\"output\": \"{tool_result}\"}}")),
-                            );
-                            messages.push(message);
-                        }
-
-                        this.add_request(second_request).await;
-                    });
-                    get_mut_arcmutex!(self.handles).push(handle);
+                    search_request::search_request(self.clone(), *request).await;
                 } else {
-                    self.add_request(request).await
+                    self.add_request(*request).await
                 }
             }
             Request::ReIsq(level) => {
@@ -218,10 +55,10 @@ impl Engine {
         }
     }
 
-    async fn add_request(&self, request: NormalRequest) {
+    pub(super) async fn add_request(&self, request: NormalRequest) {
         let is_chat = matches!(
             request.messages,
-            RequestMessage::Chat(_) | RequestMessage::VisionChat { .. }
+            RequestMessage::Chat { .. } | RequestMessage::VisionChat { .. }
         );
         let echo_prompt = matches!(
             request.messages,
@@ -233,10 +70,11 @@ impl Engine {
 
         let best_of = match request.messages {
             RequestMessage::Completion { best_of, .. } => best_of,
-            RequestMessage::Chat(_)
+            RequestMessage::Chat { .. }
             | RequestMessage::CompletionTokens(_)
             | RequestMessage::VisionChat { .. }
-            | RequestMessage::ImageGeneration { .. } => None,
+            | RequestMessage::ImageGeneration { .. }
+            | RequestMessage::SpeechGeneration { .. } => None,
         };
         if is_chat
             && !get_mut_arcmutex!(self.pipeline)
@@ -248,15 +86,55 @@ impl Engine {
                     .response
                     .send(Response::ValidationError(
                         "Received messages for a model which does not have a chat template. Either use a different model or pass a single string as the prompt".into(),
-                    )).await.expect("Expected receiver.");
+                    ))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
             return;
+        }
+
+        // Verify the model's category matches the messages received.
+        match (
+            get_mut_arcmutex!(self.pipeline).category(),
+            &request.messages,
+        ) {
+            (
+                ModelCategory::Text | ModelCategory::Vision { .. },
+                RequestMessage::Chat { .. }
+                | RequestMessage::VisionChat { .. }
+                | RequestMessage::Completion { .. }
+                | RequestMessage::CompletionTokens(_),
+            ) => (),
+            (ModelCategory::Diffusion, RequestMessage::ImageGeneration { .. }) => (),
+            (ModelCategory::Speech, RequestMessage::SpeechGeneration { .. }) => (),
+            _ => {
+                request
+                    .response
+                    .send(Response::ValidationError(
+                        "Received a request incompatible for this model's category.".into(),
+                    ))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                return;
+            }
         }
 
         let images = match request.messages {
             RequestMessage::VisionChat {
                 ref images,
                 messages: _,
+                enable_thinking: _,
+                audios: _,
             } => Some(images.clone()),
+            _ => None,
+        };
+
+        let audios = match request.messages {
+            RequestMessage::VisionChat {
+                images: _,
+                messages: _,
+                enable_thinking: _,
+                ref audios,
+            } => Some(audios.clone()),
             _ => None,
         };
 
@@ -271,7 +149,9 @@ impl Engine {
         };
 
         let seq_step_type = match &request.messages {
-            RequestMessage::ImageGeneration { .. } => SeqStepType::OneShot,
+            RequestMessage::ImageGeneration { .. } | RequestMessage::SpeechGeneration { .. } => {
+                SeqStepType::OneShot
+            }
             _ => SeqStepType::PromptAndDecode,
         };
 
@@ -283,16 +163,26 @@ impl Engine {
         };
 
         let (mut prompt_tokens, prompt_text) = match request.messages {
-            RequestMessage::Chat(messages)
+            RequestMessage::Chat {
+                messages,
+                enable_thinking,
+            }
             | RequestMessage::VisionChat {
                 images: _,
+                audios: _,
                 messages,
+                enable_thinking,
             } => {
                 let pipeline = &*get_mut_arcmutex!(self.pipeline);
                 let tools = request.tools.unwrap_or_default();
-                let template = pipeline
-                    .get_processor()
-                    .process(pipeline, messages, true, true, tools);
+                let template = pipeline.get_processor().process(
+                    pipeline,
+                    messages,
+                    true,
+                    true,
+                    enable_thinking,
+                    tools,
+                );
                 handle_seq_error!(template, request.response)
             }
             RequestMessage::Completion { text, .. } => {
@@ -303,7 +193,7 @@ impl Engine {
                             "Completion requests require the pipeline to have a tokenizer".into(),
                         ))
                         .await
-                        .expect("Expected receiver.");
+                        .unwrap_or_else(|_| warn!("Receiver disconnected"));
                     return;
                 };
                 let prompt = tokenizer
@@ -316,7 +206,8 @@ impl Engine {
                     text,
                 )
             }
-            RequestMessage::ImageGeneration { prompt, .. } => (vec![u32::MAX], prompt),
+            RequestMessage::ImageGeneration { prompt, .. }
+            | RequestMessage::SpeechGeneration { prompt } => (vec![u32::MAX], prompt),
             RequestMessage::CompletionTokens(it) => {
                 let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
                     request
@@ -325,7 +216,7 @@ impl Engine {
                             "Completion requests w/ raw tokens require the pipeline to have a tokenizer".into(),
                         ))
                         .await
-                        .expect("Expected receiver.");
+                        .unwrap_or_else(|_| warn!("Receiver disconnected"));
                     return;
                 };
                 let prompt = tokenizer
@@ -341,7 +232,7 @@ impl Engine {
                     "Received an empty prompt.".into(),
                 ))
                 .await
-                .expect("Expected receiver.");
+                .unwrap_or_else(|_| warn!("Receiver disconnected"));
             return;
         }
 
@@ -351,7 +242,9 @@ impl Engine {
                     .response
                     .send(Response::ValidationError(
                         format!("Prompt sequence length is greater than {}, perhaps consider using `truncate_sequence`?", get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len).into(),
-                    )).await.expect("Expected receiver.");
+                    ))
+                    .await
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
                 return;
             } else {
                 let prompt_len = prompt_tokens.len();
@@ -370,13 +263,6 @@ impl Engine {
                 warn!("Prompt for request {} was {} tokens over the model maximum length. The last {} tokens were truncated to make space for generation.", request.id, currently_over, prompt_len - prompt_tokens.len());
             }
         }
-        let prefill_cache = handle_seq_error!(
-            get_mut_arcmutex!(self.prefix_cacher).search_for_matching_cache(
-                &prompt_tokens,
-                images.as_ref().is_some_and(|x| !x.is_empty())
-            ),
-            request.response
-        );
 
         let topk = request
             .sampling_params
@@ -406,7 +292,8 @@ impl Engine {
                                 .send(Response::ValidationError(
                                     format!("Stop token {:?} is also a prefix of other tokens and cannot be used as a stop token.", tok_trie.token_str(*id)).into(),
                                 ))
-                                .await .expect("Expected receiver.");
+                                .await
+                                .unwrap_or_else(|_| warn!("Receiver disconnected"));
                             return;
                         }
                     }
@@ -434,7 +321,7 @@ impl Engine {
                                     .into(),
                             ))
                             .await
-                            .expect("Expected receiver.");
+                            .unwrap_or_else(|_| warn!("Receiver disconnected"));
                         return;
                     };
                     let encoded = tokenizer.encode_fast(stop_txt.to_string(), true);
@@ -490,7 +377,7 @@ impl Engine {
                     "Number of choices must be greater than 0.".into(),
                 ))
                 .await
-                .expect("Expected receiver.");
+                .unwrap_or_else(|_| warn!("Receiver disconnected"));
             return;
         }
 
@@ -506,10 +393,10 @@ impl Engine {
                     request
                         .response
                         .send(Response::ValidationError(
-                            format!("Invalid grammar. {}", err).into(),
+                            format!("Invalid grammar. {err}").into(),
                         ))
                         .await
-                        .expect("Expected receiver.");
+                        .unwrap_or_else(|_| warn!("Receiver disconnected"));
                     return;
                 }
             };
@@ -565,7 +452,7 @@ impl Engine {
                                         .into(),
                                 ))
                                 .await
-                                .expect("Expected receiver.");
+                                .unwrap_or_else(|_| warn!("Receiver disconnected"));
                             return;
                         }
                     }
@@ -586,7 +473,7 @@ impl Engine {
                                         .into(),
                                 ))
                                 .await
-                                .expect("Expected receiver.");
+                                .unwrap_or_else(|_| warn!("Receiver disconnected"));
                             return;
                         }
                     }
@@ -623,6 +510,7 @@ impl Engine {
                     None
                 },
                 images.clone(),
+                audios.clone(),
                 block_size,
                 Some(matcher.clone()),
                 image_generation_format,
@@ -632,21 +520,14 @@ impl Engine {
                 request.return_raw_logits,
                 eos_toks,
             );
-            self.logger.add_new_sequence();
-            seq = if let Some(prefill_cache) = prefill_cache.clone() {
-                self.logger.add_prefix_cache_hit();
 
-                seq.prefill_v2(
-                    prefill_cache.normal,
-                    prefill_cache.toks,
-                    prefill_cache.offset,
-                )
-            } else {
-                seq
-            };
+            // Only "track" a new sequence if it is a traditional one
+            if matches!(seq_step_type, SeqStepType::PromptAndDecode) {
+                self.logger.add_new_sequence();
+            }
 
             // Run the inputs processor to update the prompt for multimodal models.
-            if images.is_some() {
+            if images.is_some() || audios.is_some() {
                 let pipeline = get_mut_arcmutex!(self.pipeline);
                 let _ = pipeline.get_processor().inputs_processor().process_inputs(
                     pipeline.tokenizer(),
@@ -664,6 +545,46 @@ impl Engine {
                 );
             }
 
+            let prefill_cache = handle_seq_error!(
+                get_mut_arcmutex!(self.prefix_cacher).search_for_matching_cache(
+                    seq.get_toks(),
+                    seq.image_hashes(),
+                    seq.audio_hashes(),
+                ),
+                request.response
+            );
+
+            seq = match prefill_cache.clone() {
+                Some(MatchingCache::Normal {
+                    normal,
+                    images_to_keep,
+                    audios_to_keep,
+                    toks,
+                    offset,
+                }) => {
+                    self.logger.add_prefix_cache_hit();
+
+                    seq.keep_num_images(images_to_keep);
+                    seq.keep_num_audios(audios_to_keep);
+                    seq.prefill_v2_normal(normal, toks, offset)
+                }
+                Some(MatchingCache::Paged {
+                    logical_blocks,
+                    physical_blocks,
+                    images_to_keep,
+                    audios_to_keep,
+                    toks,
+                    offset,
+                }) => {
+                    self.logger.add_prefix_cache_hit();
+
+                    seq.keep_num_images(images_to_keep);
+                    seq.keep_num_audios(audios_to_keep);
+                    seq.prefill_v2_paged(logical_blocks, physical_blocks, toks, offset)
+                }
+                None => seq,
+            };
+
             *get_mut_arcmutex!(self.id) += 1;
             get_mut_arcmutex!(self.scheduler).add_seq(seq);
         }
@@ -679,6 +600,7 @@ impl Engine {
                     messages,
                     request.add_generation_prompt,
                     request.add_special_tokens,
+                    request.enable_thinking,
                     tools,
                 );
                 let toks = match template {
@@ -688,7 +610,7 @@ impl Engine {
                             .response
                             .send(Err(e))
                             .await
-                            .expect("Expected receiver.");
+                            .unwrap_or_else(|_| warn!("Receiver disconnected"));
                         return;
                     }
                 };
@@ -710,7 +632,7 @@ impl Engine {
                                 "Pipeline does not include a toksnizer.",
                             )))
                             .await
-                            .expect("Expected receiver.");
+                            .unwrap_or_else(|_| warn!("Receiver disconnected"));
                         return;
                     }
                 };
@@ -722,7 +644,7 @@ impl Engine {
                             .response
                             .send(Err(anyhow::Error::msg(e)))
                             .await
-                            .expect("Expected receiver.");
+                            .unwrap_or_else(|_| warn!("Receiver disconnected"));
                         return;
                     }
                 };
@@ -747,7 +669,7 @@ impl Engine {
                         "Pipeline does not include a toksnizer.",
                     )))
                     .await
-                    .expect("Expected receiver.");
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
                 return;
             }
         };
@@ -759,7 +681,7 @@ impl Engine {
                     .response
                     .send(Err(anyhow::Error::msg(e)))
                     .await
-                    .expect("Expected receiver.");
+                    .unwrap_or_else(|_| warn!("Receiver disconnected"));
                 return;
             }
         };

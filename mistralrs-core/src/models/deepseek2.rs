@@ -5,8 +5,8 @@ use std::{collections::HashMap, sync::Arc};
 use candle_core::{Context, DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Embedding, Module};
 use mistralrs_quant::{
-    ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
-    ShardedVarBuilder, SumAllReduce,
+    ColumnParallelLayer, NonZeroOp, QuantMethod, QuantizedConfig, ReplicatedLayer,
+    RowParallelLayer, ShardedVarBuilder, SumAllReduce,
 };
 use serde::Deserialize;
 
@@ -19,7 +19,7 @@ use crate::{
         DeepSeekV2RotaryEmbedding, Mlp, RmsNorm, Sdpa,
     },
     layers_masker::{masked_fill, PastKvLenCache},
-    ops::{NonZeroOp, SplitOp, TopKLastDimOp, TopKOutput},
+    ops::{SplitOp, TopKLastDimOp, TopKOutput},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
         extract_logits,
@@ -29,6 +29,7 @@ use crate::{
     serde_default_fn,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
+
 use std::collections::HashSet;
 use std::iter::FromIterator;
 serde_default_fn!(f64, routed_scaling_factor, 1.0);
@@ -39,7 +40,6 @@ serde_default_fn!(bool, norm_topk_prob, false);
 serde_default_fn!(ScoringFunc, scoring_func, ScoringFunc::Softmax);
 serde_default_fn!(Activation, hidden_act, Activation::Silu);
 serde_default_fn!(bool, tie_word_embeddings, false);
-serde_default_fn!(bool, use_flash_attn_default, false);
 
 #[derive(Deserialize, Clone, Debug)]
 enum TopkMethod {
@@ -93,8 +93,6 @@ pub struct DeepSeekV2Config {
     pub(crate) kv_lora_rank: usize,
     pub(crate) v_head_dim: usize,
     pub(crate) qk_nope_head_dim: usize,
-    #[serde(default = "use_flash_attn_default")]
-    pub(crate) use_flash_attn: bool,
     pub(crate) quantization_config: Option<QuantizedConfig>,
     pub(crate) n_group: usize,
     pub(crate) topk_group: usize,
@@ -244,7 +242,6 @@ impl Attention {
             num_attention_heads: cfg.num_attention_heads / comm.world_size(),
             sdpa_params: SdpaParams {
                 n_kv_groups: 1,
-                use_flash_attn: cfg.use_flash_attn,
                 softcap: None,
                 softmax_scale: cfg.softmax_scale(),
                 sliding_window: None,
@@ -644,7 +641,7 @@ impl Moe {
 }
 
 enum MoeOrMlp {
-    Moe(Moe),
+    Moe(Box<Moe>),
     Mlp(Mlp),
 }
 
@@ -700,7 +697,7 @@ impl DecoderLayer {
             && layer_idx >= cfg.first_k_dense_replace
             && layer_idx % cfg.moe_layer_freq == 0
         {
-            MoeOrMlp::Moe(Moe::new(
+            MoeOrMlp::Moe(Box::new(Moe::new(
                 cfg,
                 vb.pp("mlp"),
                 mapper,
@@ -709,7 +706,7 @@ impl DecoderLayer {
                 cfg.n_shared_experts,
                 cfg.n_routed_experts.unwrap(),
                 comm,
-            )?)
+            )?))
         } else {
             MoeOrMlp::Mlp(Mlp::new(
                 mapper.set_device(layer_idx, vb.pp("mlp"), loading_isq),
@@ -791,7 +788,7 @@ impl DeepSeekV2 {
             ReplicatedLayer::new(
                 cfg.hidden_size,
                 cfg.vocab_size,
-                &None,
+                &cfg.quantization_config,
                 false,
                 mapper.set_nm_device(vb.pp("lm_head"), normal_loading_metadata.loading_isq),
             )?
@@ -831,13 +828,13 @@ impl DeepSeekV2 {
             );
         }
 
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
-        for layer_idx in NiceProgressBar::<_, 'b'>(
+        let layers: Vec<DecoderLayer> = NiceProgressBar::<_, 'b'>(
             0..cfg.num_hidden_layers,
             "Loading repeating layers",
             &normal_loading_metadata.multi_progress,
-        ) {
+        )
+        .par_iter_if_isq(|layer_idx| {
             let device = mapper
                 .device_for(layer_idx, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
@@ -853,7 +850,7 @@ impl DeepSeekV2 {
                 ),
             };
             let comm = mapper.get_comm_for(layer_idx)?;
-            let layer = DecoderLayer::new(
+            DecoderLayer::new(
                 rotary_emb.clone(),
                 cfg,
                 vb_l.pp(layer_idx),
@@ -862,9 +859,8 @@ impl DeepSeekV2 {
                 normal_loading_metadata.loading_isq,
                 paged_attn,
                 &comm,
-            )?;
-            layers.push(layer)
-        }
+            )
+        })?;
 
         Ok(Self {
             lm_head,

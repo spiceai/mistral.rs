@@ -1,4 +1,3 @@
-use super::cache_manager::{FullCacheManager, NormalCacheManager};
 use super::llg::build_llg_factory;
 use super::{
     get_model_paths, get_xlora_paths, text_models_inputs_processor::ModelInputs, AdapterKind,
@@ -14,16 +13,17 @@ use crate::gguf::{
     get_gguf_chat_template, {convert_gguf_to_hf_tokenizer, GgufTokenizerConversion},
 };
 use crate::gguf::{Content, GGUFArchitecture};
+use crate::kv_cache::{FullCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
 use crate::paged_attention::{
     calculate_cache_config, AttentionImplementation, CacheEngine, ModelConfigLike,
 };
 use crate::pipeline::chat_template::{calculate_eos_tokens, BeginEndUnkPadTok, GenerationConfig};
-use crate::pipeline::get_chat_template;
 use crate::pipeline::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
 use crate::pipeline::loaders::DeviceMappedModelLoader;
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::ChatTemplate;
+use crate::pipeline::{get_chat_template, Modalities, SupportedModality};
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::gguf_metadata::{ContentConfig, GgufDeviceMapLoaderInner};
@@ -38,7 +38,8 @@ use crate::{
     models::quantized_llama::ModelWeights as QLlama,
     models::quantized_phi2::ModelWeights as QPhi,
     models::quantized_phi3::ModelWeights as QPhi3,
-    models::quantized_qwen2::ModelWeights as QQwen2,
+    models::quantized_qwen::ModelWeights as QQwen,
+    models::quantized_qwen3::ModelWeights as QQwen3,
     models::quantized_starcoder2::ModelWeights as QStarcoder2,
     utils::tokens::get_token,
     xlora_models::{XLoraQLlama, XLoraQPhi3},
@@ -66,7 +67,8 @@ enum Model {
     XLoraPhi3(XLoraQPhi3),
     Phi3(QPhi3),
     Starcoder2(QStarcoder2),
-    Qwen2(QQwen2),
+    Qwen(QQwen),
+    Qwen3(QQwen3),
 }
 
 pub struct GGUFPipeline {
@@ -340,9 +342,9 @@ impl Loader for GGUFLoader {
             };
 
             let layer_sizes_in_bytes =
-                model.layer_sizes_in_bytes("this is a dummy config!", dtype, 1)?;
+                model.layer_sizes_in_bytes("this is a dummy config!", dtype, 1, None)?;
             let non_mapped_size_in_bytes =
-                model.non_mapped_size_in_bytes("this is a dummy config!", dtype, 1)?;
+                model.non_mapped_size_in_bytes("this is a dummy config!", dtype, 1, None)?;
             let total_model_size_in_bytes =
                 layer_sizes_in_bytes.iter().sum::<usize>() + non_mapped_size_in_bytes;
 
@@ -448,7 +450,8 @@ impl Loader for GGUFLoader {
                 GGUFArchitecture::Starcoder2 => {
                     Model::Starcoder2(QStarcoder2::try_from(model_config)?)
                 }
-                GGUFArchitecture::Qwen2 => Model::Qwen2(QQwen2::try_from(model_config)?),
+                GGUFArchitecture::Qwen2 => Model::Qwen(QQwen::try_from(model_config)?),
+                GGUFArchitecture::Qwen3 => Model::Qwen3(QQwen3::try_from(model_config)?),
                 a => bail!("Unsupported architecture `{a:?}` for GGUF"),
             },
             ModelKind::GgufAdapter { adapter, .. } => match arch {
@@ -469,6 +472,7 @@ impl Loader for GGUFLoader {
                 paged_attn_config.mem_cpu,
                 paged_attn_config.block_size,
                 internal_dtype,
+                paged_attn_config.cache_type,
                 model_config,
                 device,
                 &layer_devices,
@@ -486,19 +490,18 @@ impl Loader for GGUFLoader {
             (None, None)
         };
 
-        let gen_conf: Option<GenerationConfig> = paths.get_gen_conf_filename().map(|f| {
-            serde_json::from_str(&fs::read_to_string(f).unwrap())
-                .expect("bos_token_id/eos_token_id missing in generation_config.json")
-        });
+        let gen_conf: Option<GenerationConfig> = paths
+            .get_gen_conf_filename()
+            .map(|f| serde_json::from_str(&fs::read_to_string(f).unwrap()).unwrap());
+        let chat_template_explicit = paths
+            .get_chat_template_explicit()
+            .as_ref()
+            .map(|x| x.to_string_lossy().to_string());
         let mut chat_template = get_chat_template(
             paths,
-            &self.jinja_explicit,
-            &paths
-                .get_chat_template_explicit()
-                .as_ref()
-                .map(|x| x.to_string_lossy().to_string())
-                .clone(),
-            &self.chat_template,
+            self.jinja_explicit.as_ref(),
+            chat_template_explicit.as_ref(),
+            self.chat_template.as_ref(),
             gguf_chat_template,
         );
 
@@ -509,7 +512,8 @@ impl Loader for GGUFLoader {
             Model::Phi3(ref p) => p.max_seq_len,
             Model::XLoraPhi3(ref p) => p.max_seq_len,
             Model::Starcoder2(ref p) => p.max_seq_len,
-            Model::Qwen2(ref p) => p.max_seq_len,
+            Model::Qwen(ref p) => p.max_seq_len,
+            Model::Qwen3(ref p) => p.max_seq_len,
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model {
@@ -519,7 +523,8 @@ impl Loader for GGUFLoader {
             Model::Phi3(ref model) => model.cache.normal().0.len(),
             Model::XLoraPhi3(ref model) => model.cache.full().lock().len(),
             Model::Starcoder2(ref model) => model.cache.normal().0.len(),
-            Model::Qwen2(ref model) => model.cache.normal().0.len(),
+            Model::Qwen(ref model) => model.cache.normal().0.len(),
+            Model::Qwen3(ref model) => model.cache.normal().0.len(),
         };
 
         if chat_template.bos_token.is_none() && bos.is_some() {
@@ -563,6 +568,10 @@ impl Loader for GGUFLoader {
                 cache_engine,
                 prompt_chunksize: Some(NonZero::new(prompt_chunksize).unwrap()),
                 model_metadata: Some(Arc::new(model_config_metadata)),
+                modalities: Modalities {
+                    input: vec![SupportedModality::Text],
+                    output: vec![SupportedModality::Text],
+                },
             }),
             mapper: pipeline_mapper,
         })))
@@ -641,7 +650,8 @@ impl CacheManagerMixin for GGUFPipeline {
             Model::Phi3(ref model) => &model.cache,
             Model::XLoraPhi3(ref model) => &model.cache,
             Model::Starcoder2(ref model) => &model.cache,
-            Model::Qwen2(ref model) => &model.cache,
+            Model::Qwen(ref model) => &model.cache,
+            Model::Qwen3(ref model) => &model.cache,
         }
     }
 }
@@ -655,7 +665,8 @@ impl MetadataMixin for GGUFPipeline {
             Model::Phi3(ref model) => model.device.clone(),
             Model::XLoraPhi3(ref model) => model.device.clone(),
             Model::Starcoder2(ref model) => model.device.clone(),
-            Model::Qwen2(ref model) => model.device.clone(),
+            Model::Qwen(ref model) => model.device.clone(),
+            Model::Qwen3(ref model) => model.device.clone(),
         }
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
@@ -744,7 +755,10 @@ impl Pipeline for GGUFPipeline {
             Model::Starcoder2(ref model) => {
                 model.forward(&input_ids, &seqlen_offsets, paged_attn_meta)?
             }
-            Model::Qwen2(ref model) => {
+            Model::Qwen(ref model) => {
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+            }
+            Model::Qwen3(ref model) => {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
         };

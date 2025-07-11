@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use candle_core::{DType, Device, Result, Tensor};
+use candle_core::{DType, Result, Tensor};
 use rand_isaac::Isaac64Rng;
 
 use crate::{
@@ -88,10 +88,10 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                         let (text_new, tool_calls) =
                             parse_text_tools(this, delta.as_str(), seq.tools.clone())
                                 .map_err(candle_core::Error::msg)?;
+                        if !tool_calls.is_empty() {
+                            is_done = Some(StopReason::ToolCalls);
+                        }
 
-                        if !tool_calls.is_empty() && is_done.is_none() {
-                            is_done = Some(StopReason::Eos);
-                        };
                         seq.add_streaming_chunk_choice_to_group(crate::ChunkChoice {
                             delta: crate::Delta {
                                 content: fixup_sentencepiece!(
@@ -138,7 +138,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             if let Some(reason) = is_done {
                 if use_prefix_cacher {
                     prefix_cacher.add_sequence(seq);
-                    prefix_cacher.evict_to_cpu()?;
+                    prefix_cacher.evict_caches()?;
                 }
                 seq.set_state(crate::sequence::SequenceState::Done(reason));
                 this.reset_non_granular_state();
@@ -167,7 +167,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 this.reset_non_granular_state();
             }
         }
-    } else if let Some(reason) = is_done {
+    } else if let Some(mut reason) = is_done {
         /*
         ***********************
         Finish the sequence now
@@ -210,7 +210,8 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 | crate::sequence::StopReason::ModelLength(_)
                 | crate::sequence::StopReason::Eos
                 | crate::sequence::StopReason::StopTok(_)
-                | crate::sequence::StopReason::Canceled => {
+                | crate::sequence::StopReason::Canceled
+                | crate::sequence::StopReason::ToolCalls => {
                     String::from_utf8_lossy(seq.completion_bytes())
                         .trim_start()
                         .to_string()
@@ -222,7 +223,8 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                     let txt = String::from_utf8_lossy(seq.completion_bytes());
                     txt[..completion_bytes_pos].trim_start().to_string()
                 }
-                crate::sequence::StopReason::GeneratedImage => {
+                crate::sequence::StopReason::GeneratedImage
+                | crate::sequence::StopReason::GeneratedSpeech => {
                     candle_core::bail!("Stop reason was `GeneratedImage`.")
                 }
             };
@@ -231,6 +233,10 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 let (text_new, tool_calls) =
                     parse_text_tools(this, text.as_str(), seq.tools.clone())
                         .map_err(candle_core::Error::msg)?;
+                if !tool_calls.is_empty() {
+                    reason = StopReason::ToolCalls;
+                }
+
                 let choice = crate::Choice {
                     finish_reason: fixup_sentencepiece!(reason),
                     index: seq.get_response_index(),
@@ -254,7 +260,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
 
             if use_prefix_cacher {
                 prefix_cacher.add_sequence(seq);
-                prefix_cacher.evict_to_cpu()?;
+                prefix_cacher.evict_caches()?;
             }
 
             let group = seq.get_mut_group();
@@ -411,38 +417,9 @@ pub async fn sample_sequence(
         }
         SequenceRecognizer::None => None,
     };
-
-    let bias_if_not_allowed = match &mut seq.recognizer {
-        SequenceRecognizer::Llguidance(ref mut llg) => {
-            if !llg.is_stopped()
-                && llg
-                    .validate_tokens(&[first_lobprobs_response.token])
-                    .unwrap_or(0)
-                    == 1
-            {
-                None
-            } else {
-                let mask = llg.compute_mask_or_eos().map_err(candle_core::Error::msg)?;
-                if mask.is_allowed(first_lobprobs_response.token) {
-                    // shouldn't really happen, except for EOS
-                    None
-                } else {
-                    let mut acc = vec![-f32::INFINITY; logits.shape().dims1().unwrap()];
-                    mask.iter_set_entries(|idx| {
-                        if idx < acc.len() {
-                            acc[idx] = 0.0;
-                        }
-                    });
-
-                    Some(acc)
-                }
-            }
-        }
-        SequenceRecognizer::None => None,
-    };
     let second_logprobs_response = match bias_if_not_allowed {
         Some(acc) => {
-            let new_logits = (logits + Tensor::from_slice(&acc, acc.len(), &Device::Cpu)?)?;
+            let new_logits = (&logits + Tensor::from_slice(&acc, acc.len(), logits.device())?)?;
 
             let ctx_clone = seq.get_toks().to_vec();
             let rng_clone = rng.clone();

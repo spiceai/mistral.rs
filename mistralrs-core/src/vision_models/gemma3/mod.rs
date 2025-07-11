@@ -4,14 +4,13 @@ use std::sync::Arc;
 
 use candle_core::{Context, DType, Device, Result, Tensor, D};
 use config::Gemma3Config;
-use mistralrs_quant::{QuantMethod, ShardedVarBuilder};
+use mistralrs_quant::{NonZeroOp, QuantMethod, ShardedVarBuilder};
 use mmproj::Gemma3MultiModalProjector;
 use text::TextModel;
 
 use crate::{
     amoe::{AnyMoeBaseModelMixin, MlpLayer},
     device_map::DeviceMapper,
-    ops::NonZeroOp,
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
@@ -135,14 +134,15 @@ impl Gemma3Model {
 
             input_embeds = x_flat.reshape(input_embeds.shape())?;
         };
-        self.language_model.forward_embeds(
+        let res = self.language_model.forward_embeds(
             input_ids,
             input_embeds,
             seqlen_offsets,
             context_lens,
             metadata,
             flash_params,
-        )
+        )?;
+        Ok(res)
     }
 }
 
@@ -222,10 +222,6 @@ impl VisionModel for Gemma3Model {
     }
     fn config(&self) -> &ModelConfigMetadata {
         self.language_model.config()
-    }
-    fn has_conv2d(&self) -> bool {
-        // TODO
-        false
     }
 }
 

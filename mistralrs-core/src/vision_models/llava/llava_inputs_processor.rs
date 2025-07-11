@@ -86,7 +86,7 @@ impl InputsProcessor for LLaVAInputProcessor {
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
         other_config: Option<Arc<dyn Any>>,
-        mut paged_attn_metadata: Option<PagedAttentionMeta<'_>>,
+        mut paged_attn_metadata: Option<PagedAttentionMeta>,
         prompt_chunksize: Option<NonZeroUsize>,
         mapper: Option<&dyn DeviceMapper>,
     ) -> Box<dyn Iterator<Item = anyhow::Result<InputProcessorOutput>>> {
@@ -264,12 +264,12 @@ impl InputsProcessor for LLaVAInputProcessor {
                 .iter()
                 .map(|x| if *x < 0 { 0u32 } else { *x as u32 })
                 .collect::<Vec<_>>();
-            if !seq.has_changed_prompt {
+            if !seq.multimodal.has_changed_prompt {
                 let new_prompt = tokenizer.decode(&new_ids, false).unwrap();
                 seq.set_initial_prompt(new_prompt);
                 // NOTE(EricLBuehler): Casting to u32 is fine, we don't care about the other toks
                 seq.set_toks_and_reallocate(new_ids, paged_attn_metadata.as_mut());
-                seq.has_changed_prompt = true;
+                seq.multimodal.has_changed_prompt = true;
             }
 
             toks.push(input_ids);
@@ -277,7 +277,7 @@ impl InputsProcessor for LLaVAInputProcessor {
 
         let iter = if is_prompt {
             get_prompt_input(
-                toks,
+                toks.iter().map(Vec::as_slice).collect(),
                 input_seqs,
                 device,
                 last_n_context_len,
@@ -288,7 +288,7 @@ impl InputsProcessor for LLaVAInputProcessor {
             )
         } else {
             get_completion_input(
-                toks,
+                toks.iter().map(Vec::as_slice).collect(),
                 input_seqs,
                 device,
                 no_kv_cache,

@@ -21,6 +21,10 @@ pub enum Architecture {
     Phi3_5MoE,
     DeepseekV2,
     DeepseekV3,
+    Qwen3,
+    GLM4,
+    Qwen3Moe,
+    SmolLm3,
 }
 
 impl From<Architecture> for NormalLoaderType {
@@ -38,6 +42,10 @@ impl From<Architecture> for NormalLoaderType {
             Architecture::Phi3_5MoE => Self::Phi3_5MoE,
             Architecture::DeepseekV2 => Self::DeepSeekV2,
             Architecture::DeepseekV3 => Self::DeepSeekV3,
+            Architecture::Qwen3 => Self::Qwen3,
+            Architecture::GLM4 => Self::GLM4,
+            Architecture::Qwen3Moe => Self::Qwen3Moe,
+            Architecture::SmolLm3 => Self::SmolLm3,
         }
     }
 }
@@ -58,6 +66,7 @@ pub enum VisionArchitecture {
     Gemma3,
     Mistral3,
     Llama4,
+    Gemma3n,
 }
 
 impl From<VisionArchitecture> for VisionLoaderType {
@@ -76,6 +85,7 @@ impl From<VisionArchitecture> for VisionLoaderType {
             VisionArchitecture::Gemma3 => VisionLoaderType::Gemma3,
             VisionArchitecture::Mistral3 => VisionLoaderType::Mistral3,
             VisionArchitecture::Llama4 => VisionLoaderType::Llama4,
+            VisionArchitecture::Gemma3n => VisionLoaderType::Gemma3n,
         }
     }
 }
@@ -92,6 +102,20 @@ impl From<DiffusionArchitecture> for DiffusionLoaderType {
         match value {
             DiffusionArchitecture::Flux => DiffusionLoaderType::Flux,
             DiffusionArchitecture::FluxOffloaded => DiffusionLoaderType::FluxOffloaded,
+        }
+    }
+}
+
+#[pyclass(eq, eq_int)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpeechLoaderType {
+    Dia,
+}
+
+impl From<SpeechLoaderType> for mistralrs_core::SpeechLoaderType {
+    fn from(value: SpeechLoaderType) -> Self {
+        match value {
+            SpeechLoaderType::Dia => mistralrs_core::SpeechLoaderType::Dia,
         }
     }
 }
@@ -185,6 +209,8 @@ pub enum Which {
         calibration_file = None,
         auto_map_params = None,
         hf_cache_path = None,
+        matformer_config_path = None,
+        matformer_slice_name = None,
     ))]
     Plain {
         model_id: String,
@@ -199,6 +225,8 @@ pub enum Which {
         calibration_file: Option<PathBuf>,
         auto_map_params: Option<TextAutoMapParams>,
         hf_cache_path: Option<PathBuf>,
+        matformer_config_path: Option<PathBuf>,
+        matformer_slice_name: Option<String>,
     },
 
     #[pyo3(constructor = (
@@ -393,7 +421,7 @@ pub enum Which {
 
     #[pyo3(constructor = (
         model_id,
-        arch,
+        arch = None,
         tokenizer_json = None,
         topology = None,
         write_uqff = None,
@@ -404,10 +432,12 @@ pub enum Which {
         imatrix = None,
         auto_map_params = None,
         hf_cache_path = None,
+        matformer_config_path = None,
+        matformer_slice_name = None,
     ))]
     VisionPlain {
         model_id: String,
-        arch: VisionArchitecture,
+        arch: Option<VisionArchitecture>,
         tokenizer_json: Option<String>,
         topology: Option<String>,
         write_uqff: Option<PathBuf>,
@@ -418,6 +448,8 @@ pub enum Which {
         imatrix: Option<PathBuf>,
         auto_map_params: Option<VisionAutoMapParams>,
         hf_cache_path: Option<PathBuf>,
+        matformer_config_path: Option<PathBuf>,
+        matformer_slice_name: Option<String>,
     },
 
     #[pyo3(constructor = (
@@ -428,6 +460,19 @@ pub enum Which {
     DiffusionPlain {
         model_id: String,
         arch: DiffusionArchitecture,
+        dtype: ModelDType,
+    },
+
+    #[pyo3(constructor = (
+        model_id,
+        arch,
+        dac_model_id = None,
+        dtype = ModelDType::Auto,
+    ))]
+    Speech {
+        model_id: String,
+        arch: SpeechLoaderType,
+        dac_model_id: Option<String>,
         dtype: ModelDType,
     },
 }

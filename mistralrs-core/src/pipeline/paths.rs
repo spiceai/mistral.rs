@@ -80,7 +80,6 @@ pub fn get_xlora_paths(
                 revision,
             )));
             let model_id = Path::new(&xlora_id);
-
             // Get the path for the xlora classifier
             let files = api_dir_list(&api, model_id)?;
             let xlora_classifier = files
@@ -132,10 +131,7 @@ pub fn get_xlora_paths(
             }
             let xlora_config = xlora_config.map(Some).unwrap_or_else(|| {
                 if let Some(last_err) = last_err {
-                    panic!(
-                        "Unable to derserialize any configs. Last error: {}",
-                        last_err
-                    )
+                    panic!("Unable to derserialize any configs. Last error: {last_err}")
                 } else {
                     None
                 }
@@ -440,7 +436,7 @@ pub fn get_model_paths(
 ) -> Result<Vec<PathBuf>, HFError> {
     match &quantized_filename {
         Some(names) => {
-            let id = quantized_model_id.as_ref().unwrap();
+            let id = quantized_model_id.unwrap();
             let mut files = Vec::new();
 
             for name in names {
@@ -538,9 +534,9 @@ pub fn get_model_paths(
 #[allow(clippy::borrowed_box)]
 pub(crate) fn get_chat_template(
     paths: &Box<dyn ModelPaths>,
-    jinja_explicit: &Option<String>,
-    chat_template_explicit: &Option<String>,
-    chat_template_fallback: &Option<String>,
+    jinja_explicit: Option<&String>,
+    chat_template_explicit: Option<&String>,
+    chat_template_fallback: Option<&String>,
     chat_template_ovrd: Option<String>,
 ) -> ChatTemplate {
     // Get template content, this may be overridden.
@@ -556,13 +552,9 @@ pub(crate) fn get_chat_template(
             panic!("Template filename {template_filename:?} must end with `.json` or `.jinja`.");
         }
         Some(fs::read_to_string(template_filename).expect("Loading chat template failed."))
-    } else if chat_template_fallback
-        .as_ref()
-        .is_some_and(|f| f.ends_with(".json"))
-    {
+    } else if chat_template_fallback.is_some_and(|f| f.ends_with(".json")) {
         // User specified a file
         let template_filename = chat_template_fallback
-            .as_ref()
             .expect("A tokenizer config or chat template file path must be specified.");
         Some(fs::read_to_string(template_filename).expect("Loading chat template failed."))
     } else if chat_template_ovrd.is_some() {
@@ -578,7 +570,23 @@ pub(crate) fn get_chat_template(
             template.chat_template = Some(ChatTemplateValue(Either::Left(chat_template)));
             template
         }
-        None => serde_json::from_str(&template_content.as_ref().unwrap().clone()).unwrap(),
+        None => {
+            // Check if template_filename is a .jinja file
+            if let Some(template_filename) = paths.get_template_filename() {
+                if template_filename.extension().map(|e| e.to_str()) == Some(Some("jinja")) {
+                    info!("Using chat template from .jinja file.");
+                    let mut template = ChatTemplate::default();
+                    template.chat_template = Some(ChatTemplateValue(Either::Left(
+                        template_content.as_ref().unwrap().clone(),
+                    )));
+                    template
+                } else {
+                    serde_json::from_str(&template_content.as_ref().unwrap().clone()).unwrap()
+                }
+            } else {
+                serde_json::from_str(&template_content.as_ref().unwrap().clone()).unwrap()
+            }
+        }
     };
     // Overwrite to use any present `chat_template.json`, only if there is not one present already.
     if template.chat_template.is_none() {
@@ -643,7 +651,7 @@ pub(crate) fn get_chat_template(
             let mut deser: HashMap<String, Value> =
                 serde_json::from_str(&template_content.unwrap()).unwrap();
 
-            match chat_template_fallback.clone() {
+            match chat_template_fallback.cloned() {
                 Some(t) => {
                     info!("Loading specified loading chat template file at `{t}`.");
                     let templ: SpecifiedTemplate =
@@ -672,7 +680,7 @@ pub(crate) fn get_chat_template(
                     }
                 }
                 None => {
-                    info!("No specified chat template. No chat template will be used. Only prompts will be accepted, not messages.");
+                    warn!("No specified chat template. No chat template will be used. Only prompts will be accepted, not messages.");
                     deser.insert("chat_template".to_string(), Value::Null);
                 }
             }

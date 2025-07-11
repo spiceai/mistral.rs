@@ -18,6 +18,8 @@ The Rust API takes an image from the [image](https://docs.rs/image/latest/image/
 > The Phi 4 Multimodal model does not automatically add the image tokens!
 > They should be added to messages manually, and are of the format `<|image_{N}|>` where N starts from 1.
 
+[**Phi 4 multimodal supports audio inputs!**](#audio-input).
+
 ## HTTP server
 You can find this example [here](../examples/server/phi3v.py).
 
@@ -49,7 +51,7 @@ A mountain with snow on it.
 > You should replace `--features ...` with one of the features specified [here](../README.md#supported-accelerators), or remove it for pure CPU inference.
 
 ```
-cargo run --release --features ... -- --port 1234 vision-plain -m microsoft/Phi-4-multimodal-instruct -a phi4mm
+cargo run --release --features ... -- --port 1234 vision-plain -m microsoft/Phi-4-multimodal-instruct
 ```
 
 2) Send a request
@@ -60,7 +62,7 @@ from openai import OpenAI
 client = OpenAI(api_key="foobar", base_url="http://localhost:1234/v1/")
 
 completion = client.chat.completions.create(
-    model="phi4mm",
+    model="default",
     messages=[
         {
             "role": "user",
@@ -100,12 +102,12 @@ This is a minimal example of running the Phi 4 Multimodal model with a dummy ima
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, VisionLoaderType, VisionMessages, VisionModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let model =
-        VisionModelBuilder::new("microsoft/Phi-4-multimodal-instruct", VisionLoaderType::Phi4MM)
+        VisionModelBuilder::new("microsoft/Phi-4-multimodal-instruct")
             .with_isq(IsqType::Q4K)
             .with_logging()
             .build()
@@ -157,7 +159,7 @@ runner = Runner(
 
 res = runner.send_chat_completion_request(
     ChatCompletionRequest(
-        model="phi4mm",
+        model="default",
         messages=[
             {
                 "role": "user",
@@ -165,7 +167,7 @@ res = runner.send_chat_completion_request(
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": "https://upload.wikimedia.org/wikipedia/commons/e/e7/ Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg"
+                            "url": "https://upload.wikimedia.org/wikipedia/commons/e/e7/Everest_North_Face_toward_Base_Camp_Tibet_Luca_Galuzzi_2006.jpg"
                         },
                     },
                     {
@@ -184,6 +186,82 @@ res = runner.send_chat_completion_request(
 print(res.choices[0].message.content)
 print(res.usage)
 ```
+
+## Audio input
+
+Alongside vision, Phi 4 Multimodal in `mistral.rs` can accept **audio** as an additional modality.  This unlocks fully-local pipelines such as **text + speech + vision → text** where the model can reason jointly over what it *hears* and what it *sees*.
+
+`mistral.rs` automatically decodes the supplied audio (WAV/MP3/FLAC/OGG/… – anything [Symphonia](https://github.com/pdeljanov/Symphonia) can handle) into 16-bit PCM.
+
+### OpenAI HTTP API
+
+Audio is delivered with the `audio_url` content-type that mirrors OpenAIʼs official specification:
+
+```json
+{
+  "role": "user",
+  "content": [
+    {
+      "type": "audio_url",
+      "audio_url": { "url": "https://upload.wikimedia.org/wikipedia/commons/4/42/Bird_singing.ogg" }
+    },
+    {
+      "type": "image_url",
+      "image_url": { "url": "https://www.allaboutbirds.org/guide/assets/og/528129121-1200px.jpg" }
+    },
+    {
+      "type": "text",
+      "text": "<|audio_1|><|image_1|>\nDescribe what is happening in this clip in as much detail as possible."
+    }
+  ]
+}
+```
+
+### Rust API
+
+```rust
+use anyhow::Result;
+use mistralrs::{AudioInput, IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let model = VisionModelBuilder::new("microsoft/Phi-4-multimodal-instruct")
+        .with_isq(IsqType::Q4K)
+        .with_logging()
+        .build()
+        .await?;
+
+    let audio_bytes = reqwest::blocking::get(
+        "https://upload.wikimedia.org/wikipedia/commons/4/42/Bird_singing.ogg",
+    )?
+    .bytes()?
+    .to_vec();
+    let audio = AudioInput::from_bytes(&audio_bytes)?;
+
+    let image_bytes = reqwest::blocking::get(
+        "https://www.allaboutbirds.org/guide/assets/og/528129121-1200px.jpg",
+    )?
+    .bytes()?
+    .to_vec();
+    let image = image::load_from_memory(&image_bytes)?;
+
+    let messages = VisionMessages::new()
+        .add_multimodal_message(
+            TextMessageRole::User,
+            "Describe in detail what is happening.",
+            vec![image],
+            vec![audio],
+            &model,
+        )?;
+
+    let response = model.send_chat_request(messages).await?;
+
+    println!("{}", response.choices[0].message.content.as_ref().unwrap());
+    Ok(())
+}
+```
+
+With this, you now have a single-call pipeline that fuses *sound*, *vision*, and *text* – all running locally through `mistral.rs`! 🔥
 
 - You can find an example of encoding the [image via base64 here](../examples/python/phi3v_base64.py).
 - You can find an example of loading an [image locally here](../examples/python/phi3v_local_img.py).
