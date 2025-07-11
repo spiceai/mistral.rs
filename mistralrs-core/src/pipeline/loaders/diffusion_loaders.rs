@@ -26,10 +26,7 @@ use crate::{
         DiffusionGenerationParams,
     },
     paged_attention::AttentionImplementation,
-    pipeline::hf::{api_dir_list, api_get_file},
-    pipeline::paths::AdapterPaths,
-    xlora_models::XLoraConfig,
-    Ordering,
+    pipeline::{hf::{api_dir_list, api_get_file}, paths::AdapterPaths},
 };
 
 pub trait DiffusionModel {

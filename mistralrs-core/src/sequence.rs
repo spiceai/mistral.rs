@@ -65,7 +65,7 @@ pub enum SequenceState {
 }
 
 pub enum SequenceRecognizer {
-    Llguidance(Box<llguidance::Constraint>),
+    Llguidance(Box<llguidance::Matcher>),
     None,
 }
 
@@ -208,10 +208,12 @@ pub struct Sequence {
     pub cached_pixel_values: Option<Tensor>,
     pub cached_img_thw: Option<Tensor>,
     pub cached_vid_thw: Option<Tensor>,
+    pub has_changed_prompt: bool,
 
     // GPU things
     pub prompt_tok_per_sec: f32,
     pub prompt_timestamp: Option<u128>,
+    pub total_prompt_time: Option<u128>,
     group: Arc<Mutex<SequenceGroup>>,
     state: RwLock<SequenceState>,
 
@@ -350,6 +352,8 @@ impl Sequence {
             return_raw_logits,
             token_offset: 0,
             eos_tokens,
+            has_changed_prompt: false,
+            total_prompt_time: None,
         }
     }
 
@@ -722,7 +726,7 @@ impl Sequence {
 
         if let Some(ts) = self.prompt_timestamp {
             get_mut_group!(self).total_completion_time = now - ts;
-            get_mut_group!(self).total_prompt_time = ts - self.timestamp;
+            get_mut_group!(self).total_prompt_time = self.total_prompt_time.unwrap();
         }
 
         get_mut_group!(self).total_time = now - self.timestamp;
@@ -780,7 +784,14 @@ impl Sequence {
     }
 
     pub fn take_images(&mut self) -> Option<Vec<image::DynamicImage>> {
-        self.input_images.take()
+        // So that we don't keep having an image after the actual prompt
+        if self.has_changed_prompt {
+            // Actual prompt
+            self.input_images.take()
+        } else {
+            // Dummy inputs processing
+            self.input_images.clone()
+        }
     }
 
     pub fn clone_images(&mut self) -> Option<Vec<image::DynamicImage>> {

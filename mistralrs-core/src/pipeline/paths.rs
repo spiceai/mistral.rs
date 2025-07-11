@@ -99,9 +99,10 @@ pub fn get_xlora_paths(
 
             // Get the path for the xlora config by checking all for valid versions.
             // NOTE(EricLBuehler): Remove this functionality because all configs should be deserializable
-            let xlora_configs = files
+            let xlora_configs = &api_dir_list(&api, model_id)?
                 .iter()
                 .filter(|x| x.contains("xlora_config.json"))
+                .cloned()
                 .collect::<Vec<_>>();
             if xlora_configs.len() > 1 {
                 warn!("Detected multiple X-LoRA configs: {xlora_configs:?}");
@@ -141,6 +142,7 @@ pub fn get_xlora_paths(
             });
 
             // If there are adapters in the ordering file, get their names and remote paths
+            let files = api_dir_list(&api, model_id)?;
             let adapter_files = files
                 .iter()
                 .filter_map(|name| {
@@ -216,7 +218,8 @@ pub fn get_xlora_paths(
                     for adapter in preload_adapters {
                         // Get the names and remote paths of the files associated with this adapter
                         let files = api_dir_list(&api, &adapter.adapter_model_id)?;
-                        let adapter_files = files.iter()
+                        let adapter_files = files
+                            .iter()
                             .filter_map(|f| {
                                 if f.contains(&adapter.name) {
                                     Some((f, adapter.name.clone()))
@@ -451,13 +454,13 @@ pub fn get_model_paths(
                     }
                     api.build().map_err(HFError::HFHubApiError)?
                 };
-                let qapi = qapi.repo(Repo::with_revision(
+                let qapi = Arc::new(qapi.repo(Repo::with_revision(
                     id.to_string(),
                     RepoType::Model,
                     revision.clone(),
-                ));
+                )));
                 let model_id = Path::new(&id);
-                files.push(api_get_file(&Arc::new(qapi), name, model_id)?);
+                files.push(api_get_file(&qapi, name, model_id)?);
             }
             Ok(files)
         }
@@ -479,15 +482,18 @@ pub fn get_model_paths(
             let safetensors = listing
                 .clone()
                 .filter(|x| x.ends_with(".safetensors"))
-                .collect::<Vec<_>>();
+                .cloned()
+                .collect::<Vec<String>>();
             let pickles = listing
                 .clone()
                 .filter(|x| x.ends_with(".pth") || x.ends_with(".pt") || x.ends_with(".bin"))
-                .collect::<Vec<_>>();
+                .cloned()
+                .collect::<Vec<String>>();
             let uqff_residual = listing
                 .clone()
                 .filter(|&x| x == UQFF_RESIDUAL_SAFETENSORS)
-                .collect::<Vec<_>>();
+                .cloned()
+                .collect::<Vec<String>>();
             let files = if !safetensors.is_empty() {
                 // Always prefer safetensors
                 safetensors
@@ -506,11 +512,11 @@ pub fn get_model_paths(
                 "Found model weight filenames {:?}",
                 files
                     .iter()
-                    .map(|x| x.split('/').next_back().unwrap())
+                    .map(|x| x.split('/').last().unwrap())
                     .collect::<Vec<_>>()
             );
             for rfilename in files {
-                filenames.push(api_get_file(&api, rfilename, model_id)?);
+                filenames.push(api_get_file(&api, &rfilename, model_id)?);
             }
             Ok(filenames)
         }

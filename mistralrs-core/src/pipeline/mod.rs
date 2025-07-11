@@ -22,6 +22,7 @@ pub use super::diffusion_models::DiffusionGenerationParams;
 use crate::amoe::{AnyMoeConfig, AnyMoeExpertType, AnyMoeTrainingInputs, AnyMoeTrainingResult};
 use crate::device_map::DeviceMapper;
 use crate::paged_attention::{CacheConfig, CacheEngine, ModelConfigLike};
+use llguidance::toktrie::TokEnv;
 use crate::prefix_cacher::PrefixCacheManagerV2;
 pub use amoe::{AnyMoeLoader, AnyMoePipeline};
 use chat_template::ChatTemplate;
@@ -45,8 +46,10 @@ pub use loaders::{
 };
 use mistralrs_quant::IsqType;
 pub use normal::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
-pub(crate) use paths::{get_chat_template, get_model_paths, get_xlora_paths};
 pub use paths::{AdapterPaths, LoraAdapterPaths};
+pub(crate) use paths::{
+    get_chat_template, get_model_paths, get_xlora_paths,
+};
 pub(crate) use processing::{
     apply_chat_template, BasicProcessor, MessagesAction, Processor, ProcessorCreator,
 };
@@ -76,8 +79,8 @@ use self::text_models_inputs_processor::PagedAttentionMeta;
 
 pub struct GeneralMetadata {
     pub max_seq_len: usize,
-    /// Only None if it doesnt make sense for the model
-    pub tok_env: Option<llguidance::toktrie::TokEnv>,
+    /// Only None if it doesn't make sense for the model
+    pub llg_factory: Option<Arc<llguidance::ParserFactory>>,
     pub no_kv_cache: bool,
     pub no_prefix_cache: bool,
     pub num_hidden_layers: usize,
@@ -92,6 +95,12 @@ pub struct GeneralMetadata {
     pub cache_engine: Option<CacheEngine>,
     pub prompt_chunksize: Option<NonZeroUsize>,
     pub model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>>,
+}
+
+impl GeneralMetadata {
+    pub fn tok_env(&self) -> Option<TokEnv> {
+        self.llg_factory.as_ref().map(|f| f.tok_env().clone())
+    }
 }
 
 pub enum CacheInstruction {
@@ -411,6 +420,7 @@ pub trait Pipeline:
                     return Ok(exec_duration);
                 }
 
+                let start = Instant::now();
                 let logits = logits
                     .into_iter()
                     .map(|l| {
@@ -419,7 +429,6 @@ pub trait Pipeline:
                     })
                     .collect::<candle_core::Result<Vec<_>>>()?;
 
-                let start = Instant::now();
                 match &logits[0] {
                     ForwardInputsResult::RawLogits { .. } => unreachable!(),
                     ForwardInputsResult::CausalGeneration { .. } => {
@@ -484,9 +493,9 @@ pub trait Pipeline:
                     .as_ref()
                     .expect("PagedAttention must have cache engines.")
                     .execute_scheduler_ops(
-                        blocks_to_swap_in.clone(),
-                        blocks_to_swap_out.clone(),
-                        blocks_to_copy.clone(),
+                        &blocks_to_swap_in,
+                        &blocks_to_swap_out,
+                        &blocks_to_copy,
                     )?;
 
                 let inputs_iter = self.get_processor().inputs_processor().process_inputs(
@@ -555,6 +564,7 @@ pub trait Pipeline:
                     return Ok(exec_duration);
                 }
 
+                let start = Instant::now();
                 let logits = logits
                     .into_iter()
                     .map(|l| {
@@ -563,7 +573,6 @@ pub trait Pipeline:
                     })
                     .collect::<candle_core::Result<Vec<_>>>()?;
 
-                let start = Instant::now();
                 match &logits[0] {
                     ForwardInputsResult::RawLogits { .. } => unreachable!(),
                     ForwardInputsResult::CausalGeneration { .. } => {

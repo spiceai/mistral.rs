@@ -185,9 +185,8 @@ macro_rules! handle_pipeline_forward_error {
                 // - The sequence is gone
                 // - We should reset the state then, including draft.
                 p.set_none_cache($seq_slice, true, true, false);
-                if let Err(e) = get_mut_arcmutex!($prefix_cacher).evict_all_to_cpu() {
-                    error!("{} - Failed to evict prefix caches from CPU: {:?}", $stage, &e);
-                }
+                get_mut_arcmutex!($prefix_cacher).evict_all_to_cpu().unwrap();
+
                 continue $label;
             }
         }

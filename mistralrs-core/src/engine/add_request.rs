@@ -394,7 +394,7 @@ impl Engine {
             Some(StopTokens::Ids(ref i)) => {
                 let tok_env = {
                     let pipeline = get_mut_arcmutex!(self.pipeline);
-                    pipeline.get_metadata().tok_env.clone()
+                    pipeline.get_metadata().tok_env()
                 };
                 for id in i {
                     // We can't use ` ` (space) as a stop token because other tokens like ` moon` start with a space.
@@ -420,7 +420,7 @@ impl Engine {
 
                 let (tok_env, tokenizer) = {
                     let pipeline = get_mut_arcmutex!(self.pipeline);
-                    let tok_env = pipeline.get_metadata().tok_env.clone();
+                    let tok_env = pipeline.get_metadata().tok_env();
                     let tokenizer = pipeline.tokenizer();
                     (tok_env, tokenizer)
                 };
@@ -496,11 +496,11 @@ impl Engine {
 
         // Add sequences
         for response_index in 0..request.sampling_params.n_choices {
-            let trie = get_mut_arcmutex!(self.pipeline)
+            let factory = get_mut_arcmutex!(self.pipeline)
                 .get_metadata()
-                .tok_env
+                .llg_factory
                 .clone();
-            let recognizer = match Self::build_sequence_recognizer(&trie, &request.constraint) {
+            let recognizer = match Self::build_sequence_recognizer(&factory, &request.constraint) {
                 Ok(recognizer) => recognizer,
                 Err(err) => {
                     request
@@ -599,7 +599,7 @@ impl Engine {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("Time travel has occurred!");
-            let seq = Sequence::new_waiting(
+            let mut seq = Sequence::new_waiting(
                 prompt_tokens.clone(),
                 prompt_text.clone(),
                 *get_mut_arcmutex!(self.id).deref(),
@@ -633,7 +633,7 @@ impl Engine {
                 eos_toks,
             );
             self.logger.add_new_sequence();
-            let seq = if let Some(prefill_cache) = prefill_cache.clone() {
+            seq = if let Some(prefill_cache) = prefill_cache.clone() {
                 self.logger.add_prefix_cache_hit();
 
                 seq.prefill_v2(
@@ -644,6 +644,26 @@ impl Engine {
             } else {
                 seq
             };
+
+            // Run the inputs processor to update the prompt for multimodal models.
+            if images.is_some() {
+                let pipeline = get_mut_arcmutex!(self.pipeline);
+                let _ = pipeline.get_processor().inputs_processor().process_inputs(
+                    pipeline.tokenizer(),
+                    &mut [&mut seq],
+                    true,
+                    pipeline.get_metadata().is_xlora,
+                    &pipeline.device(),
+                    pipeline.get_metadata().no_kv_cache,
+                    None,
+                    false,
+                    pipeline.get_input_processor_config(),
+                    None,
+                    pipeline.get_metadata().prompt_chunksize,
+                    pipeline.device_mapper(),
+                );
+            }
+
             *get_mut_arcmutex!(self.id) += 1;
             get_mut_arcmutex!(self.scheduler).add_seq(seq);
         }

@@ -171,6 +171,50 @@ macro_rules! get_paths {
 
 #[doc(hidden)]
 #[macro_export]
+macro_rules! get_uqff_paths {
+    ($from_uqff:expr, $this:expr, $silent:expr) => {{
+        let api = {
+            use $crate::GLOBAL_HF_CACHE;
+            let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
+            let mut api = ApiBuilder::from_cache(cache)
+                .with_progress(!$silent)
+                .with_token(get_token(
+                    &$this
+                        .token_source
+                        .read()
+                        .expect("Failed to read token source")
+                        .clone()
+                        .unwrap_or(TokenSource::None),
+                )?);
+            if let Ok(x) = std::env::var("HF_HUB_CACHE") {
+                api = api.with_cache_dir(x.into());
+            }
+            api.build()?
+        };
+        let revision = $this
+            .revision
+            .read()
+            .expect("Failed to read revision")
+            .clone()
+            .unwrap_or("main".to_string());
+        let api = api.repo(Repo::with_revision(
+            $this.model_id.to_string(),
+            RepoType::Model,
+            revision.clone(),
+        ));
+
+        let mut files = Vec::new();
+        for file in $from_uqff {
+            let file = file.display().to_string();
+
+            files.push(api_get_file(&api, &file, Path::new(&$this.model_id)));
+        }
+        files
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
 macro_rules! get_paths_gguf {
     (
         $path_name:ident,
@@ -241,7 +285,7 @@ macro_rules! get_paths_gguf {
             &$this.xlora_order.clone(),
         )?;
 
-        let gen_conf = if $crate::api_dir_list!(&api, model_id)
+        let gen_conf = if $crate::api_dir_list!(api, model_id)
             .collect::<Vec<_>>()
             .contains(&"generation_config.json".to_string())
         {
