@@ -5,10 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     layers::{Activation, Phi4MMRopeScalingConfig},
-    serde_default_fn,
+    vision_models::conformer::config::ConformerEncoderConfig,
 };
-
-serde_default_fn!(bool, d_flash_attn, false);
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Phi4MMLoraConfig {
@@ -31,14 +29,30 @@ pub struct Phi4MMImageEmbedConfig {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Phi4MMAudioEmbedConfig {
+    pub n_embd: Option<usize>,
+    pub compression_rate: usize,
+    pub downsample_rate: usize,
+    pub embedding_cls: String,
+    pub projection_cls: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Phi4MMEmbdLayerConfig {
     pub image_embd_layer: Option<Phi4MMImageEmbedConfig>,
+    pub audio_embd_layer: Option<Phi4MMAudioEmbedConfig>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Phi4MMImgProcessorConfig {
     pub layer_idx: Option<isize>,
     pub type_feature: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Phi4MMAudioConfig {
+    pub config: ConformerEncoderConfig,
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -69,12 +83,10 @@ pub struct Phi4MMConfig {
     pub sliding_window: Option<usize>,
     pub embd_layer: Phi4MMEmbdLayerConfig,
     pub img_processor: Option<Phi4MMImgProcessorConfig>,
-    // pub audio_processor: Option<String>,
+    pub audio_processor: Option<Phi4MMAudioConfig>,
     pub vision_lora: StaticLoraConfig,
     pub speech_lora: StaticLoraConfig,
     pub quantization_config: Option<QuantizedConfig>,
-    #[serde(default = "d_flash_attn")]
-    pub use_flash_attn: bool,
 }
 
 impl Phi4MMConfig {
@@ -89,7 +101,7 @@ impl Phi4MMConfig {
     pub fn loras(&self) -> HashMap<String, StaticLoraConfig> {
         let mut accum = HashMap::new();
         // Add all the loras
-        accum.insert("speech".to_string(), self.speech_lora.clone());
+        // accum.insert("speech".to_string(), self.speech_lora.clone());
         accum.insert("vision".to_string(), self.vision_lora.clone());
         accum
     }

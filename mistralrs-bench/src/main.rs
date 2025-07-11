@@ -4,14 +4,14 @@ use cli_table::{format::Justify, print_stdout, Cell, CellStruct, Style, Table};
 use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, initialize_logging, paged_attn_supported,
     parse_isq_value, Constraint, DefaultSchedulerMethod, DeviceLayerMapMetadata, DeviceMapMetadata,
-    DeviceMapSetting, DrySamplingParams, IsqType, Loader, LoaderBuilder, MemoryGpuConfig,
-    MistralRs, MistralRsBuilder, ModelSelected, NormalRequest, PagedAttentionConfig, Request,
+    DeviceMapSetting, DrySamplingParams, Loader, LoaderBuilder, MemoryGpuConfig, MistralRs,
+    MistralRsBuilder, ModelSelected, NormalRequest, PagedAttentionConfig, PagedCacheType, Request,
     RequestMessage, Response, SamplingParams, SchedulerConfig, TokenSource, Usage,
 };
 use std::sync::Arc;
 use std::{fmt::Display, num::NonZeroUsize};
 use tokio::sync::mpsc::channel;
-use tracing::{info, warn};
+use tracing::info;
 
 enum TestName {
     Prompt(usize),
@@ -21,10 +21,10 @@ enum TestName {
 impl Display for TestName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
-            TestName::Prompt(n) => format!("pp {}", n),
-            TestName::Gen(n) => format!("tg {}", n),
+            TestName::Prompt(n) => format!("pp {n}"),
+            TestName::Gen(n) => format!("tg {n}"),
         };
-        write!(f, "{}", name)
+        write!(f, "{name}")
     }
 }
 
@@ -67,10 +67,10 @@ fn run_bench(
         n_choices: 1,
         dry_params: Some(DrySamplingParams::default()),
     };
-    let sender = mistralrs.get_sender().unwrap();
+    let sender = mistralrs.get_sender(None).unwrap();
     let (tx, mut rx) = channel(10_000);
 
-    let req = Request::Normal(NormalRequest {
+    let req = Request::Normal(Box::new(NormalRequest {
         id: mistralrs.next_request_id(),
         messages: prompt,
         sampling_params: sampling_params.clone(),
@@ -84,15 +84,16 @@ fn run_bench(
         logits_processors: None,
         return_raw_logits: false,
         web_search_options: None,
-    });
+        model_id: None,
+    }));
 
     let mut usages = Vec::new();
 
     for _ in 0..repetitions {
         for _ in 0..concurrency {
-            sender
-                .blocking_send(req.clone())
-                .expect("Expected receiver.");
+            if sender.blocking_send(req.clone()).is_err() {
+                eprintln!("Receiver disconnected");
+            }
         }
         for _ in 0..concurrency {
             match rx.blocking_recv() {
@@ -116,6 +117,7 @@ fn run_bench(
                     }
                     Response::CompletionChunk(_) => unreachable!(),
                     Response::ImageGeneration(_) => unreachable!(),
+                    Response::Speech { .. } => unreachable!(),
                     Response::Raw { .. } => unreachable!(),
                 },
                 None => unreachable!("Expected a Done response, got None",),
@@ -234,10 +236,10 @@ fn warmup_run(mistralrs: Arc<MistralRs>) {
         n_choices: 1,
         dry_params: Some(DrySamplingParams::default()),
     };
-    let sender = mistralrs.get_sender().unwrap();
+    let sender = mistralrs.get_sender(None).unwrap();
     let (tx, mut rx) = channel(10_000);
 
-    let req = Request::Normal(NormalRequest {
+    let req = Request::Normal(Box::new(NormalRequest {
         id: mistralrs.next_request_id(),
         messages: RequestMessage::Completion {
             text: "Hello!".to_string(),
@@ -255,13 +257,18 @@ fn warmup_run(mistralrs: Arc<MistralRs>) {
         logits_processors: None,
         return_raw_logits: false,
         web_search_options: None,
-    });
+        model_id: None,
+    }));
 
-    sender
-        .blocking_send(req.clone())
-        .expect("Expected receiver.");
+    if sender.blocking_send(req.clone()).is_err() {
+        eprintln!("Receiver disconnected");
+    }
 
     let _ = rx.blocking_recv();
+}
+
+fn parse_cache_type(s: &str) -> Result<PagedCacheType, String> {
+    s.parse()
 }
 
 #[derive(Parser)]
@@ -299,8 +306,8 @@ struct Args {
     num_device_layers: Option<Vec<String>>,
 
     /// In-situ quantization to apply.
-    #[arg(long = "isq", value_parser = parse_isq_value)]
-    in_situ_quant: Option<IsqType>,
+    #[arg(long = "isq")]
+    in_situ_quant: Option<String>,
 
     /// GPU memory to allocate for KV cache with PagedAttention in MBs.
     /// PagedAttention is supported on CUDA and Metal. It is automatically activated on CUDA but not on Metal.
@@ -322,6 +329,11 @@ struct Args {
     #[arg(long = "pa-ctxt-len")]
     paged_ctxt_len: Option<usize>,
 
+    /// PagedAttention KV cache type (auto or f8e4m3).
+    /// Defaults to `auto`.
+    #[arg(long = "pa-cache-type", value_parser = parse_cache_type)]
+    cache_type: Option<PagedCacheType>,
+
     /// Block size (number of tokens per block) for PagedAttention. If this is not set and the device is CUDA, it will default to 32.
     /// PagedAttention is only supported on CUDA and is always automatically activated.
     #[arg(long = "pa-blk-size")]
@@ -340,13 +352,12 @@ struct Args {
     prompt_chunksize: Option<usize>,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
     initialize_logging();
 
     args.concurrency = Some(args.concurrency.unwrap_or(vec![1]));
-
-    let use_flash_attn = mistralrs_core::using_flash_attn();
 
     let prompt_chunksize = match args.prompt_chunksize {
         Some(0) => {
@@ -362,7 +373,6 @@ fn main() -> anyhow::Result<()> {
     let max_seq_len = auto_device_map_params.max_seq_len();
 
     let loader: Box<dyn Loader> = LoaderBuilder::new(args.model)
-        .with_use_flash_attn(use_flash_attn)
         .with_prompt_chunksize(prompt_chunksize)
         .build()?;
     let model_name = loader.get_id();
@@ -389,12 +399,6 @@ fn main() -> anyhow::Result<()> {
         candle_core::utils::with_f16c()
     );
     info!("Sampling method: penalties -> temperature -> topk -> topp -> minp -> multinomial");
-    if use_flash_attn {
-        info!("Using flash attention.");
-    }
-    if use_flash_attn && loader.get_kind().is_quantized() {
-        warn!("Using flash attention with a quantized model has no effect!")
-    }
     info!("Model kind is: {}", loader.get_kind().to_string());
 
     // Parse device mapper
@@ -455,21 +459,25 @@ fn main() -> anyhow::Result<()> {
             block_size,
             512,
             MemoryGpuConfig::ContextSize(max_seq_len),
+            args.cache_type.unwrap_or_default(),
         )?),
         (block_size, None, None, Some(ctxt), true, false) => Some(PagedAttentionConfig::new(
             block_size,
             512,
             MemoryGpuConfig::ContextSize(ctxt),
+            args.cache_type.unwrap_or_default(),
         )?),
         (block_size, None, Some(f), None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
             512,
             MemoryGpuConfig::Utilization(f),
+            args.cache_type.unwrap_or_default(),
         )?),
         (block_size, Some(m), None, None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
             512,
             MemoryGpuConfig::MbAmount(m),
+            args.cache_type.unwrap_or_default(),
         )?),
         (block_size, Some(_m), Some(f), None, true, false) => {
             info!("Both memory size, and usage were specified, defaulting to the usage value.");
@@ -477,6 +485,7 @@ fn main() -> anyhow::Result<()> {
                 block_size,
                 512,
                 MemoryGpuConfig::Utilization(f),
+                args.cache_type.unwrap_or_default(),
             )?)
         }
         (block_size, Some(_m), None, Some(ctxt), true, false) => {
@@ -485,6 +494,7 @@ fn main() -> anyhow::Result<()> {
                 block_size,
                 512,
                 MemoryGpuConfig::ContextSize(ctxt),
+                args.cache_type.unwrap_or_default(),
             )?)
         }
         (block_size, None, Some(f), Some(_ctxt), true, false) => {
@@ -493,10 +503,16 @@ fn main() -> anyhow::Result<()> {
                 block_size,
                 512,
                 MemoryGpuConfig::Utilization(f),
+                args.cache_type.unwrap_or_default(),
             )?)
         }
         (_, _, _, _, _, _) => None,
     };
+
+    let isq = args
+        .in_situ_quant
+        .as_ref()
+        .and_then(|isq| parse_isq_value(isq, Some(&device)).ok());
 
     let pipeline = loader.load_model_from_hf(
         None,
@@ -505,7 +521,7 @@ fn main() -> anyhow::Result<()> {
         &device,
         false,
         mapper,
-        args.in_situ_quant,
+        isq,
         cache_config,
     )?;
     info!("Model loaded.");
@@ -538,7 +554,8 @@ fn main() -> anyhow::Result<()> {
     let mistralrs = MistralRsBuilder::new(pipeline, scheduler_config, false, None)
         .with_no_prefix_cache(true)
         .with_disable_eos_stop(true)
-        .build();
+        .build()
+        .await;
 
     info!("Starting warmup run.");
     warmup_run(mistralrs.clone());

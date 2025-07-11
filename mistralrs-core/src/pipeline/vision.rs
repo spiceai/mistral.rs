@@ -1,20 +1,28 @@
-use super::cache_manager::{FullCacheManager, NormalCacheManager};
-use super::hf::{api_dir_list, api_get_file, get_paths, get_uqff_paths};
 use super::isq::ImatrixDataSource;
 use super::isq::UqffFullSer;
 use super::{
-    AdapterKind, AnyMoePipelineMixin, CacheManager, CacheManagerMixin, EitherCache,
-    ForwardInputsResult, Gemma3Loader, GeneralMetadata, Idefics2Loader, Idefics3Loader,
-    IsqPipelineMixin, LLaVALoader, LLaVANextLoader, Loader, MetadataMixin, MiniCpmOLoader,
-    Mistral3Loader, ModelCategory, ModelKind, ModelPaths, Phi3VLoader, Phi4MMLoader,
-    PreProcessingMixin, Processor, Qwen2VLLoader, Qwen2_5VLLoader, TokenSource, VLlama4Loader,
-    VLlamaLoader, VisionLoaderType, VisionModel, VisionModelLoader, VisionPromptPrefixer,
+    AdapterKind, AnyMoePipelineMixin, AutoVisionLoader, CacheManager, CacheManagerMixin,
+    EitherCache, ForwardInputsResult, Gemma3Loader, GeneralMetadata, IsqPipelineMixin, Loader,
+    MetadataMixin, MiniCpmOLoader, ModelCategory, ModelKind, ModelPaths, MultimodalPromptPrefixer,
+    Phi4MMLoader, PreProcessingMixin, Processor, Qwen2VLLoader, TokenSource, VLlama4Loader,
+    VLlamaLoader, VisionModel, VisionModelLoader,
+};
+use super::{
+    Gemma3nLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader, Mistral3Loader,
+    Phi3VLoader, Qwen2_5VLLoader, VisionLoaderType,
 };
 use crate::device_map::{self, DeviceMapper};
 use crate::distributed::{self, WorkerTransferData};
+use crate::kv_cache::{FullCacheManager, NormalCacheManager};
 use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
-use crate::pipeline::llg::build_tok_env;
+use crate::pipeline::hf::api_dir_list;
+use crate::pipeline::hf::api_get_file;
+use crate::pipeline::hf::get_paths;
+use crate::pipeline::hf::get_uqff_paths;
+use crate::pipeline::llg::build_llg_factory;
+use crate::pipeline::loaders::auto_device_map;
+use crate::pipeline::loaders::QuantizationConfigShim;
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::text_models_inputs_processor::make_prompt_chunk;
 use crate::pipeline::{get_chat_template, ChatTemplate, IsqOrganization};
@@ -23,9 +31,9 @@ use crate::sequence::Sequence;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 use crate::utils::{tokens::get_token, varbuilder_utils::from_mmaped_safetensors};
-use crate::vision_models::{
-    preprocessor_config::PreProcessorConfig, processor_config::ProcessorConfig, ModelInputs,
-};
+use crate::vision_models::preprocessor_config::PreProcessorConfig;
+use crate::vision_models::processor_config::ProcessorConfig;
+use crate::vision_models::ModelInputs;
 use crate::{
     vision_normal_model_loader, vision_normal_model_loader_sharded, AnyMoeExpertType,
     DeviceMapSetting, Ordering, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
@@ -37,6 +45,7 @@ use candle_core::{Device, Tensor, Var};
 use hf_hub::Cache;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use indicatif::MultiProgress;
+use mistralrs_quant::log::once_log_info;
 use mistralrs_quant::{AfqLayer, GgufMatMul, HqqLayer, IsqType, QuantizedSerdeType};
 use rand_isaac::Isaac64Rng;
 use regex_automata::meta::Regex;
@@ -61,7 +70,7 @@ pub struct VisionPipeline {
     preprocessor_config: Arc<PreProcessorConfig>,
     topology: Option<Topology>,
     silent: bool,
-    prefixer: Arc<dyn VisionPromptPrefixer>,
+    prefixer: Arc<dyn MultimodalPromptPrefixer>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
 
     // For full UQFF serialization
@@ -107,7 +116,6 @@ pub struct VisionLoaderBuilder {
 #[derive(Clone, Default)]
 /// Config specific to loading a vision model.
 pub struct VisionSpecificConfig {
-    pub use_flash_attn: bool,
     pub prompt_chunksize: Option<NonZeroUsize>,
     pub topology: Option<Topology>,
     pub write_uqff: Option<PathBuf>,
@@ -116,6 +124,8 @@ pub struct VisionSpecificConfig {
     pub imatrix: Option<PathBuf>,
     pub calibration_file: Option<PathBuf>,
     pub hf_cache_path: Option<PathBuf>,
+    pub matformer_config_path: Option<PathBuf>,
+    pub matformer_slice_name: Option<String>,
 }
 
 impl VisionLoaderBuilder {
@@ -151,21 +161,23 @@ impl VisionLoaderBuilder {
         self
     }
 
-    pub fn build(self, loader: VisionLoaderType) -> Box<dyn Loader> {
+    pub fn build(self, loader: Option<VisionLoaderType>) -> Box<dyn Loader> {
         let loader: Box<dyn VisionModelLoader> = match loader {
-            VisionLoaderType::Phi3V => Box::new(Phi3VLoader),
-            VisionLoaderType::Idefics2 => Box::new(Idefics2Loader),
-            VisionLoaderType::LLaVANext => Box::new(LLaVANextLoader),
-            VisionLoaderType::LLaVA => Box::new(LLaVALoader),
-            VisionLoaderType::VLlama => Box::new(VLlamaLoader),
-            VisionLoaderType::Qwen2VL => Box::new(Qwen2VLLoader),
-            VisionLoaderType::Idefics3 => Box::new(Idefics3Loader),
-            VisionLoaderType::MiniCpmO => Box::new(MiniCpmOLoader),
-            VisionLoaderType::Phi4MM => Box::new(Phi4MMLoader),
-            VisionLoaderType::Qwen2_5VL => Box::new(Qwen2_5VLLoader),
-            VisionLoaderType::Gemma3 => Box::new(Gemma3Loader),
-            VisionLoaderType::Mistral3 => Box::new(Mistral3Loader),
-            VisionLoaderType::Llama4 => Box::new(VLlama4Loader),
+            Some(VisionLoaderType::Phi3V) => Box::new(Phi3VLoader),
+            Some(VisionLoaderType::Idefics2) => Box::new(Idefics2Loader),
+            Some(VisionLoaderType::LLaVANext) => Box::new(LLaVANextLoader),
+            Some(VisionLoaderType::LLaVA) => Box::new(LLaVALoader),
+            Some(VisionLoaderType::VLlama) => Box::new(VLlamaLoader),
+            Some(VisionLoaderType::Qwen2VL) => Box::new(Qwen2VLLoader),
+            Some(VisionLoaderType::Idefics3) => Box::new(Idefics3Loader),
+            Some(VisionLoaderType::MiniCpmO) => Box::new(MiniCpmOLoader),
+            Some(VisionLoaderType::Phi4MM) => Box::new(Phi4MMLoader),
+            Some(VisionLoaderType::Qwen2_5VL) => Box::new(Qwen2_5VLLoader),
+            Some(VisionLoaderType::Gemma3) => Box::new(Gemma3Loader),
+            Some(VisionLoaderType::Mistral3) => Box::new(Mistral3Loader),
+            Some(VisionLoaderType::Llama4) => Box::new(VLlama4Loader),
+            Some(VisionLoaderType::Gemma3n) => Box::new(Gemma3nLoader),
+            None => Box::new(AutoVisionLoader),
         };
         Box::new(VisionLoader {
             inner: loader,
@@ -254,12 +266,12 @@ impl Loader for VisionLoader {
         device: &Device,
         silent: bool,
         mut mapper: DeviceMapSetting,
-        in_situ_quant: Option<IsqType>,
+        mut in_situ_quant: Option<IsqType>,
         mut paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
         let config = std::fs::read_to_string(paths.get_config_filename())?;
 
-        if !self.inner.supports_paged_attention() {
+        if !self.inner.supports_paged_attention(&config) {
             paged_attn_config = None;
         }
 
@@ -280,14 +292,43 @@ impl Loader for VisionLoader {
             device.clone()
         };
 
+        // Load matformer slicing config if provided
+        let matformer_slicing_config = if let Some(matformer_path) =
+            &self.config.matformer_config_path
+        {
+            use crate::matformer::{MatformerConfig, MatformerSliceConfig};
+            info!("Loading Matformer config from {:?}", matformer_path);
+            let config = Arc::new(MatformerConfig::from_file(matformer_path)?);
+
+            if let Some(slice_name) = &self.config.matformer_slice_name {
+                info!("Using Matformer slice: {}", slice_name);
+                Some(MatformerSliceConfig::new(slice_name.clone(), config))
+            } else {
+                // If no slice name is provided but config exists, we'll need to handle this
+                // For now, return None and let the model handle the default slice selection
+                warn!("Matformer config loaded but no slice name specified. Models will use their default slice.");
+                None
+            }
+        } else {
+            None
+        };
+
         // If auto, convert to Map if not using nccl
         if use_nccl {
             mapper = DeviceMapSetting::DummyNccl {
                 nm_device: available_devices[0].clone(),
             };
-        } else if let DeviceMapSetting::Auto(params) = mapper.clone() {
+        } else if let DeviceMapSetting::Auto(mut params) = mapper.clone() {
+            // We can promote to vision params if we get text params
+            params = params.maybe_promote_to_vision();
+
             // Initial dtype
             let dtype = dtype.try_into_dtype(&available_devices.iter().collect::<Vec<_>>())?;
+
+            // Disable ISQ if we are loading a prequantized model.
+            if QuantizationConfigShim::get_quant_config_pack_factor(&config, dtype)? != 1 {
+                in_situ_quant = None;
+            }
 
             // ISQ or UQFF: quantized path
             // Match logic below where UQFF has priority
@@ -326,12 +367,18 @@ impl Loader for VisionLoader {
                         total_pack_factors / total_tensors
                     };
 
-                    let layer_sizes_in_bytes =
-                        self.inner
-                            .layer_sizes_in_bytes(&config, dtype, weight_pack_factor)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner
-                            .non_mapped_size_in_bytes(&config, dtype, weight_pack_factor)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -340,12 +387,18 @@ impl Loader for VisionLoader {
                     )
                 } else if let Some(isq) = in_situ_quant {
                     let weight_pack_factor = isq.pack_factor(dtype);
-                    let layer_sizes_in_bytes =
-                        self.inner
-                            .layer_sizes_in_bytes(&config, dtype, weight_pack_factor)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner
-                            .non_mapped_size_in_bytes(&config, dtype, weight_pack_factor)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -353,10 +406,21 @@ impl Loader for VisionLoader {
                         layer_sizes_sum + non_mapped_size_in_bytes,
                     )
                 } else {
-                    let layer_sizes_in_bytes =
-                        self.inner.layer_sizes_in_bytes(&config, dtype, 1)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner.non_mapped_size_in_bytes(&config, dtype, 1)?;
+                    // Be sure to get the weight pack factor here; we might be loading a prequantized model.
+                    let weight_pack_factor =
+                        QuantizationConfigShim::get_quant_config_pack_factor(&config, dtype)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -365,7 +429,8 @@ impl Loader for VisionLoader {
                     )
                 };
 
-            let new = self.inner.get_device_layers(
+            let new = auto_device_map::get_device_layers(
+                &*self.inner,
                 &config,
                 self.inner.num_layers(&config)?,
                 layer_sizes_in_bytes,
@@ -400,18 +465,34 @@ impl Loader for VisionLoader {
         // TODO: PagedAttention is not supported with CPU for now.
         // This check is not really necessary because `get_device_layers` should prevent it.
         let mapping_uses_cpu = mapper.get_unique_devices().iter().any(Device::is_cpu);
-        if mapping_uses_cpu {
+        if mapping_uses_cpu && paged_attn_config.is_some() {
             warn!("Device mapping contains a mix of GPU and CPU. There is no CPU support for PagedAttention, disabling PagedAttention.");
             paged_attn_config = None;
         }
 
-        info!(
-            "Model config: {:?}",
-            self.inner
-                .get_config_repr(&config, self.config.use_flash_attn)?
-        );
+        info!("Model config: {:?}", self.inner.get_config_repr(&config)?);
+        if crate::using_flash_attn() {
+            once_log_info("FlashAttention is enabled.");
+        }
 
-        let mut loading_isq = in_situ_quant.is_some() || self.config.from_uqff.is_some();
+        // Logic for ISQ here: if no calibration (i.e imatrix), then allow immediate ISQ. Otherwise, back to normal.
+        let mut loading_isq = if self.config.imatrix.is_none()
+            && self.config.calibration_file.is_none()
+            && !device.is_cuda()
+            && self.config.write_uqff.is_none()
+            && in_situ_quant.is_some()
+        {
+            let predicates = self.inner.immediate_isq_predicates(&config)?;
+            info!("Applying ISQ to {in_situ_quant:?}");
+            if predicates.is_empty() {
+                warn!("No predicates for this model and ISQ setting detected. ISQ will not be applied to any weights!");
+            }
+            mistralrs_quant::set_immediate_isq(in_situ_quant, predicates);
+            false
+        } else {
+            in_situ_quant.is_some()
+        };
+
         if let Some(ref topology) = self.config.topology {
             loading_isq |= topology
                 .0
@@ -461,12 +542,12 @@ impl Loader for VisionLoader {
                     sharded_vb,
                     config,
                     self.inner,
-                    self.config.use_flash_attn,
                     mapper,
                     loading_isq,
                     device.clone(),
                     attention_mechanism,
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 _ => unreachable!(),
             }
@@ -479,7 +560,6 @@ impl Loader for VisionLoader {
                     layer_devices.clone(),
                     config,
                     self.inner,
-                    self.config.use_flash_attn,
                     silent,
                     mapper,
                     loading_isq,
@@ -487,6 +567,7 @@ impl Loader for VisionLoader {
                     device.clone(),
                     attention_mechanism,
                     multi_progress,
+                    matformer_slicing_config.clone(),
                 ),
                 _ => unreachable!(),
             }
@@ -517,19 +598,18 @@ impl Loader for VisionLoader {
             Some(processor.get_special_tokens()),
         )?;
 
-        let gen_conf: Option<GenerationConfig> = paths.get_gen_conf_filename().map(|f| {
-            serde_json::from_str(&fs::read_to_string(f).unwrap())
-                .expect("bos_token_id/eos_token_id missing in generation_config.json")
-        });
+        let gen_conf: Option<GenerationConfig> = paths
+            .get_gen_conf_filename()
+            .map(|f| serde_json::from_str(&fs::read_to_string(f).unwrap()).unwrap());
+        let chat_template_explicit = paths
+            .get_chat_template_explicit()
+            .as_ref()
+            .map(|x| x.to_string_lossy().to_string());
         let chat_template = get_chat_template(
             paths,
-            &self.jinja_explicit,
-            &paths
-                .get_chat_template_explicit()
-                .as_ref()
-                .map(|x| x.to_string_lossy().to_string())
-                .clone(),
-            &self.chat_template,
+            self.jinja_explicit.as_ref(),
+            chat_template_explicit.as_ref(),
+            self.chat_template.as_ref(),
             None,
         );
 
@@ -563,8 +643,16 @@ impl Loader for VisionLoader {
                 let chunk_len = chunk.len();
 
                 let start = Instant::now();
-                let inputs =
-                    make_prompt_chunk(0, vec![chunk], &[0], &load_device, None, false, None, None)?;
+                let inputs = make_prompt_chunk(
+                    0,
+                    vec![&chunk],
+                    &[0],
+                    &load_device,
+                    None,
+                    false,
+                    None,
+                    None,
+                )?;
                 let _ = model.forward(
                     &inputs.input,
                     None, // NOTE: We ONLY calibrate the text bits of these models!!
@@ -602,9 +690,8 @@ impl Loader for VisionLoader {
             );
         }
 
-        if (in_situ_quant.is_some() || self.config.topology.is_some())
-            && self.config.from_uqff.is_none()
-        {
+        // Only if loading from UQFF
+        if (loading_isq || self.config.topology.is_some()) && self.config.from_uqff.is_none() {
             let imatrix_source = match (
                 self.config.imatrix.as_ref(),
                 self.config.calibration_file.is_some(),
@@ -651,6 +738,7 @@ impl Loader for VisionLoader {
                 paged_attn_config.mem_cpu,
                 paged_attn_config.block_size,
                 dtype,
+                paged_attn_config.cache_type,
                 model.config(),
                 &device,
                 &layer_devices,
@@ -664,7 +752,7 @@ impl Loader for VisionLoader {
         };
 
         let max_seq_len = model.max_seq_len();
-        let tok_env = build_tok_env(tokenizer.clone());
+        let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model.cache() {
             EitherCache::Full(full) => full.lock().len(),
             EitherCache::Normal(normal) => normal.lock().unwrap().0.len(),
@@ -679,22 +767,23 @@ impl Loader for VisionLoader {
             model_id: self.model_id.clone(),
             metadata: Arc::new(GeneralMetadata {
                 max_seq_len,
-                tok_env: Some(tok_env),
+                llg_factory: Some(llg_factory),
                 is_xlora: false,
                 num_hidden_layers,
                 eos_tok: eos,
                 kind: self.kind.clone(),
                 no_kv_cache: false,
-                no_prefix_cache: false,
+                no_prefix_cache: !self.inner.supports_prefix_cacher(&config),
                 activation_dtype: dtype,
                 sliding_window,
                 cache_config,
                 cache_engine,
                 prompt_chunksize: self.config.prompt_chunksize,
                 model_metadata: Some(model_metadata),
+                modalities: self.inner.modalities(&config)?,
             }),
             processor,
-            prefixer: self.inner.prefixer(),
+            prefixer: self.inner.prefixer(&config),
             preprocessor_config: Arc::new(preprocessor_config),
             topology: self.config.topology.clone(),
             silent,
@@ -846,20 +935,6 @@ impl Pipeline for VisionPipeline {
             }
             (None, None) => None,
         };
-        #[cfg(feature = "metal")]
-        let logits = objc::rc::autoreleasepool(|| {
-            self.model.forward(
-                &input_ids,
-                pixel_values,
-                &seqlen_offsets,
-                context_lens,
-                position_ids,
-                model_specific_args,
-                paged_attn_meta,
-                &flash_meta,
-            )
-        })?;
-        #[cfg(not(feature = "metal"))]
         let logits = self.model.forward(
             &input_ids,
             pixel_values,
@@ -887,9 +962,7 @@ impl Pipeline for VisionPipeline {
         sample_and_add_toks(self, seqs, logits, prefix_cacher, disable_eos_stop, rng).await
     }
     fn category(&self) -> ModelCategory {
-        let has_conv2d = self.model.has_conv2d();
         ModelCategory::Vision {
-            has_conv2d,
             prefixer: self.prefixer.clone(),
         }
     }

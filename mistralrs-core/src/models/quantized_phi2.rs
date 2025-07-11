@@ -29,7 +29,7 @@ use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::NiceProgressBar;
 
-pub const MAX_SEQ_LEN: usize = 4096;
+pub const DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
 #[derive(Clone)]
 struct Mlp {
@@ -214,7 +214,7 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             max_seq_len: c
                 .get_value::<u64>("context_length")
                 .ok()
-                .unwrap_or(MAX_SEQ_LEN as u64) as usize,
+                .unwrap_or(DEFAULT_MAX_SEQ_LEN as u64) as usize,
         };
 
         Ok(props)
@@ -321,7 +321,6 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 paged_attn,
                 sdpa_params: SdpaParams {
                     n_kv_groups: head_count / head_count_kv,
-                    use_flash_attn: false,
                     softcap: None,
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: None,

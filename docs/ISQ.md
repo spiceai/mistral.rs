@@ -41,7 +41,7 @@ cargo run --release --features ... -- -i --isq 4 plain -m meta-llama/Llama-3.2-3
 - FP8
 
 ```
-cargo run --release --features ... -- -i --isq q4k plain -m meta-llama/Llama-3.2-3B-Instruct
+cargo run --release --features ... -- -i --isq 4 plain -m meta-llama/Llama-3.2-3B-Instruct
 ```
 
 When using ISQ, it will automatically load ISQ-able weights into CPU memory before applying ISQ. The ISQ application process moves the weights to device memory. This process is implemented to avoid memory spikes from loading the model in full precision.
@@ -56,7 +56,7 @@ For Mixture of Expert models, a method called [MoQE](https://arxiv.org/abs/2310.
 Accuracy of ISQ can be measured by the performance degradation versus the unquantized model.
 This is commonly measured with perplexity. Please see the [perplexity](../mistralrs/examples/perplexity/README.md) example.
 
-To improve the accuracy of a model with ISQ, use an imatrix file. These can be found online (for example, on Hugging Face), and should be passed with the `--imatrix` flag for `plain` models. This will increase the accuracy of the quantization significantly and brings the ISQ quantization up to par with the GGUF counterpart.
+To improve the accuracy of a model with ISQ, use an imatrix file. These can be found online (for example, on Hugging Face), and should be passed with the `--imatrix` flag for `plain` models. This will increase the accuracy of the quantization significantly and bring the ISQ quantization up to par with the GGUF counterpart.
 
 Check out the [imatrix docs](IMATRIX.md).
 
@@ -68,7 +68,7 @@ runner = Runner(
         quantized_model_id="TheBloke/Mistral-7B-Instruct-v0.1-GGUF",
         quantized_filename="mistral-7b-instruct-v0.1.Q4_K_M.gguf",
     ),
-    in_situ_quant="Q4K",
+    in_situ_quant="4",
 )
 ```
 
@@ -86,5 +86,5 @@ let model = TextModelBuilder::new("microsoft/Phi-3.5-mini-instruct")
 
 ## Server example
 ```
-cargo run --release --features "cuda flash-attn" -- --port 1234 --log output.txt --isq Q2K plain -m mistralai/Mistral-7B-Instruct-v0.1 -a mistral
+cargo run --release --features "cuda flash-attn" -- --port 1234 --log output.txt --isq Q2K plain -m mistralai/Mistral-7B-Instruct-v0.1
 ```

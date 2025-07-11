@@ -1,11 +1,22 @@
+use candle_core::Device;
 use mistralrs_core::*;
+use mistralrs_core::{SearchCallback, Tool, ToolCallback};
+use std::collections::HashMap;
 use std::{
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
     path::PathBuf,
+    sync::Arc,
 };
 
 use crate::{best_device, Model};
+
+/// A tool callback with its associated Tool definition.
+#[derive(Clone)]
+pub struct ToolCallbackWithTool {
+    pub callback: Arc<ToolCallback>,
+    pub tool: Tool,
+}
 
 #[derive(Clone)]
 /// Configure a text model with the various parameters for loading, running, and other inference behaviors.
@@ -24,9 +35,15 @@ pub struct TextModelBuilder {
     pub(crate) device_mapping: Option<DeviceMapSetting>,
     pub(crate) hf_cache_path: Option<PathBuf>,
     pub(crate) search_bert_model: Option<BertEmbeddingModel>,
+    pub(crate) search_callback: Option<Arc<SearchCallback>>,
+    pub(crate) tool_callbacks: HashMap<String, Arc<ToolCallback>>,
+    pub(crate) tool_callbacks_with_tools: HashMap<String, ToolCallbackWithTool>,
+    pub(crate) mcp_client_config: Option<McpClientConfig>,
+    pub(crate) device: Option<Device>,
+    pub(crate) matformer_config_path: Option<PathBuf>,
+    pub(crate) matformer_slice_name: Option<String>,
 
     // Model running
-    pub(crate) use_flash_attn: bool,
     pub(crate) prompt_chunksize: Option<NonZeroUsize>,
     pub(crate) topology: Option<Topology>,
     pub(crate) organization: IsqOrganization,
@@ -49,6 +66,7 @@ pub struct PagedAttentionMetaBuilder {
     block_size: Option<usize>,
     mem_cpu: usize,
     mem_gpu: MemoryGpuConfig,
+    cache_type: PagedCacheType,
 }
 
 impl Default for PagedAttentionMetaBuilder {
@@ -57,6 +75,7 @@ impl Default for PagedAttentionMetaBuilder {
             block_size: None,
             mem_cpu: 64,
             mem_gpu: MemoryGpuConfig::ContextSize(4096),
+            cache_type: PagedCacheType::Auto,
         }
     }
 }
@@ -72,8 +91,13 @@ impl PagedAttentionMetaBuilder {
         self
     }
 
+    pub fn with_paged_cache_type(mut self, cache_type: PagedCacheType) -> Self {
+        self.cache_type = cache_type;
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<PagedAttentionConfig> {
-        PagedAttentionConfig::new(self.block_size, self.mem_cpu, self.mem_gpu)
+        PagedAttentionConfig::new(self.block_size, self.mem_cpu, self.mem_gpu, self.cache_type)
     }
 }
 
@@ -88,7 +112,6 @@ impl TextModelBuilder {
     pub fn new(model_id: impl ToString) -> Self {
         Self {
             model_id: model_id.to_string(),
-            use_flash_attn: cfg!(feature = "flash-attn"),
             prompt_chunksize: None,
             topology: None,
             organization: IsqOrganization::Default,
@@ -114,12 +137,56 @@ impl TextModelBuilder {
             throughput_logging: false,
             hf_cache_path: None,
             search_bert_model: None,
+            search_callback: None,
+            tool_callbacks: HashMap::new(),
+            tool_callbacks_with_tools: HashMap::new(),
+            mcp_client_config: None,
+            device: None,
+            matformer_config_path: None,
+            matformer_slice_name: None,
         }
     }
 
     /// Enable searching compatible with the OpenAI `web_search_options` setting. This uses the BERT model specified or the default.
     pub fn with_search(mut self, search_bert_model: BertEmbeddingModel) -> Self {
         self.search_bert_model = Some(search_bert_model);
+        self
+    }
+
+    /// Override the search function used when `web_search_options` is enabled.
+    pub fn with_search_callback(mut self, callback: Arc<SearchCallback>) -> Self {
+        self.search_callback = Some(callback);
+        self
+    }
+
+    /// Register a callback for a specific tool name.
+    pub fn with_tool_callback(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+    ) -> Self {
+        self.tool_callbacks.insert(name.into(), callback);
+        self
+    }
+
+    /// Register a callback with an associated Tool definition that will be automatically
+    /// added to requests when tool callbacks are active.
+    pub fn with_tool_callback_and_tool(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+        tool: Tool,
+    ) -> Self {
+        let name = name.into();
+        self.tool_callbacks_with_tools
+            .insert(name, ToolCallbackWithTool { callback, tool });
+        self
+    }
+
+    /// Configure MCP client to connect to external MCP servers and automatically
+    /// register their tools for use in automatic tool calling.
+    pub fn with_mcp_client(mut self, config: McpClientConfig) -> Self {
+        self.mcp_client_config = Some(config);
         self
     }
 
@@ -285,9 +352,26 @@ impl TextModelBuilder {
         self
     }
 
+    /// Set the main device to load this model onto. Automatic device mapping will be performed starting with this device.
+    pub fn with_device(mut self, device: Device) -> Self {
+        self.device = Some(device);
+        self
+    }
+
+    /// Path to a Matryoshka Transformer configuration CSV file.
+    pub fn with_matformer_config_path(mut self, path: PathBuf) -> Self {
+        self.matformer_config_path = Some(path);
+        self
+    }
+
+    /// Name of the slice to use from the Matryoshka Transformer configuration.
+    pub fn with_matformer_slice_name(mut self, name: String) -> Self {
+        self.matformer_slice_name = Some(name);
+        self
+    }
+
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = NormalSpecificConfig {
-            use_flash_attn: self.use_flash_attn,
             prompt_chunksize: self.prompt_chunksize,
             topology: self.topology,
             organization: self.organization,
@@ -296,6 +380,8 @@ impl TextModelBuilder {
             imatrix: self.imatrix,
             calibration_file: self.calibration_file,
             hf_cache_path: self.hf_cache_path,
+            matformer_config_path: self.matformer_config_path,
+            matformer_slice_name: self.matformer_slice_name,
         };
 
         if self.with_logging {
@@ -317,7 +403,7 @@ impl TextModelBuilder {
             self.hf_revision,
             self.token_source,
             &self.dtype,
-            &best_device(self.force_cpu)?,
+            &self.device.unwrap_or(best_device(self.force_cpu).unwrap()),
             !self.with_logging,
             self.device_mapping
                 .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
@@ -333,12 +419,17 @@ impl TextModelBuilder {
                     .get_metadata()
                     .cache_config
                     .as_ref()
-                    .unwrap()
-                    .clone();
+                    .cloned();
 
-                SchedulerConfig::PagedAttentionMeta {
-                    max_num_seqs: self.max_num_seqs,
-                    config,
+                if let Some(config) = config {
+                    SchedulerConfig::PagedAttentionMeta {
+                        max_num_seqs: self.max_num_seqs,
+                        config,
+                    }
+                } else {
+                    SchedulerConfig::DefaultScheduler {
+                        method: DefaultSchedulerMethod::Fixed(self.max_num_seqs.try_into()?),
+                    }
                 }
             }
             None => SchedulerConfig::DefaultScheduler {
@@ -351,15 +442,32 @@ impl TextModelBuilder {
             scheduler_method,
             self.throughput_logging,
             self.search_bert_model,
-        )
-        .with_no_kv_cache(self.no_kv_cache)
-        .with_no_prefix_cache(self.prefix_cache_n.is_none());
+        );
+        if let Some(cb) = self.search_callback.clone() {
+            runner = runner.with_search_callback(cb);
+        }
+        for (name, cb) in &self.tool_callbacks {
+            runner = runner.with_tool_callback(name.clone(), cb.clone());
+        }
+        for (name, callback_with_tool) in &self.tool_callbacks_with_tools {
+            runner = runner.with_tool_callback_and_tool(
+                name.clone(),
+                callback_with_tool.callback.clone(),
+                callback_with_tool.tool.clone(),
+            );
+        }
+        if let Some(mcp_config) = self.mcp_client_config {
+            runner = runner.with_mcp_client(mcp_config);
+        }
+        runner = runner
+            .with_no_kv_cache(self.no_kv_cache)
+            .with_no_prefix_cache(self.prefix_cache_n.is_none());
 
         if let Some(n) = self.prefix_cache_n {
             runner = runner.with_prefix_cache_n(n)
         }
 
-        Ok(Model::new(runner.build()))
+        Ok(Model::new(runner.build().await))
     }
 }
 

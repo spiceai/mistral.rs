@@ -147,7 +147,7 @@ where
     Adapted(Config<Q, Adapter<'a>>),
 }
 
-// A `builder()` method is derived from the `new()` method and it's params (derived builder struct fields).
+// A `builder()` method is derived from the `new()` method and its params (derived builder struct fields).
 // NOTE: Intended to be built via fluent API in a single line, cannot conditionally append params.
 // `.adapter(Adapter<' >)` or for conditional usage `.and_adapter(Option<Adapter<' >)` can be used.
 // Otherwise omitting an `.adapter()` call prior to calling `build()` is ok, defaults to `None`.
@@ -298,7 +298,8 @@ use crate::{
     models::quantized_llama::ModelWeights as QLlama,
     models::quantized_phi2::ModelWeights as QPhi,
     models::quantized_phi3::ModelWeights as QPhi3,
-    models::quantized_qwen2::ModelWeights as QQwen2,
+    models::quantized_qwen::ModelWeights as QQwen,
+    models::quantized_qwen3::ModelWeights as QQwen3,
     models::quantized_starcoder2::ModelWeights as QStarcoder2,
     xlora_models::{XLoraQLlama, XLoraQPhi3},
 };
@@ -323,7 +324,7 @@ impl TryFrom<ModelParams<'_, ParamsGGML>> for XLoraQLlama {
 }
 
 akin! {
-    let &models_gguf = [QLlama, QPhi, QPhi3, QStarcoder2, QQwen2];
+    let &models_gguf = [QLlama, QPhi, QPhi3, QStarcoder2, QQwen, QQwen3];
 
     impl<R: std::io::Seek + std::io::Read> TryFrom<ModelParams<'_, ParamsGGUF<'_, R>>> for *models_gguf {
         type Error = candle_core::Error;

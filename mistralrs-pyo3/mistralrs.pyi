@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterator, Literal, Optional
+from typing import Iterator, Literal, Mapping, Optional, Callable
 
 class SearchContextSize(Enum):
     Low = "low"
@@ -61,6 +61,7 @@ class ChatCompletionRequest:
     tool_schemas: list[str] | None = None
     tool_choice: ToolChoice | None = None
     web_search_options: WebSearchOptions | None = None
+    enable_thinking: bool | None = None
 
 @dataclass
 class CompletionRequest:
@@ -102,6 +103,10 @@ class Architecture(Enum):
     Phi3_5MoE = "phi3.5moe"
     DeepseekV2 = "deepseekv2"
     DeepseekV3 = "deepseekv3"
+    Qwen3 = "qwen3"
+    GLM4 = "glm4"
+    Qwen3Moe = "qwen3moe"
+    SmolLm3 = "smollm3"
 
 @dataclass
 class VisionArchitecture(Enum):
@@ -118,6 +123,7 @@ class VisionArchitecture(Enum):
     Gemma3 = "gemma3"
     Mistral3 = "mistral3"
     Llama4 = "llama4"
+    Gemma3n = "Gemma3n"
 
 @dataclass
 class DiffusionArchitecture(Enum):
@@ -140,6 +146,16 @@ class ModelDType(Enum):
 class ImageGenerationResponseFormat(Enum):
     Url = "url"
     B64Json = "b64json"
+
+@dataclass
+class SpeechGenerationResponse:
+    """
+    This wraps PCM values, sampling rate and the number of channels.
+    """
+
+    pcm: list[float]
+    rate: int
+    channels: int
 
 @dataclass
 class TextAutoMapParams:
@@ -185,6 +201,7 @@ class Which(Enum):
         calibration_file: str | None = None
         imatrix: str | None = None
         hf_cache_path: str | None = None
+        matformer_config_path: str | None = None
 
     @dataclass
     class XLora:
@@ -297,12 +314,24 @@ class Which(Enum):
         calibration_file: str | None = None
         imatrix: str | None = None
         hf_cache_path: str | None = None
+        matformer_config_path: str | None = None
 
     @dataclass
     class DiffusionPlain:
         model_id: str
         arch: DiffusionArchitecture
         dtype: ModelDType = ModelDType.Auto
+
+    @dataclass
+    class Speech:
+        model_id: str
+        arch: DiffusionArchitecture
+        dac_model_id: str | None = None
+        dtype: ModelDType = ModelDType.Auto
+
+class PagedCacheType(Enum):
+    Auto: int = 0
+    F8E4M3: int = 1
 
 class Runner:
     def __init__(
@@ -321,11 +350,15 @@ class Runner:
         anymoe_config: AnyMoeConfig | None = None,
         pa_gpu_mem: int | float | None = None,
         pa_blk_size: int | None = None,
+        pa_cache_type: PagedCacheType | None = None,
         no_paged_attn: bool = False,
         paged_attn: bool = False,
         prompt_batchsize: int | None = None,
         seed: int | None = None,
+        enable_search: bool = False,
         search_bert_model: str | None = None,
+        search_callback: Callable[[str], list[dict[str, str]]] | None = None,
+        tool_callbacks: Mapping[str, Callable[[str, dict], str]] | None = None,
         no_bert_model: bool = False,
     ) -> None:
         """
@@ -363,12 +396,15 @@ class Runner:
             This is the default setting, and it defaults to the `max-seq-len` specified in after the model type.
         - `pa_blk_size` sets the block size (number of tokens per block) for PagedAttention. If this is not set and the device is CUDA,
             it will default to 32. PagedAttention is supported on CUDA and Metal. It is automatically activated on CUDA but not on Metal.
+        - `pa_cache_type` sets the PagedAttention KV cache type (auto or f8e4m3). Defaults to `auto`.
         - `no_paged_attn` disables PagedAttention on CUDA. Because PagedAttention is already disabled on Metal, this is only applicable on CUDA.
         - `paged_attn` enables PagedAttention on Metal. Because PagedAttention is already enabled on CUDA, this is only applicable on Metal.
         - `prompt_batchsize` Number of tokens to batch the prompt step into. This can help with OOM errors when in the prompt step, but reduces performance.
         - `seed`, used to ensure reproducible random number generation.
         - `enable_search`: Enable searching compatible with the OpenAI `web_search_options` setting. This uses the BERT model specified below or the default.
         - `search_bert_model`: specify a Hugging Face model ID for a BERT model to assist web searching. Defaults to Snowflake Arctic Embed L.
+        - `search_callback`: Custom Python callable to perform web searches. Should accept a query string and return a list of dicts with keys "title", "description", "url", and "content".
+        - `tool_callbacks`: Mapping from tool name to Python callable invoked for generic tool calls. Each callable receives the tool name and a dict of arguments and should return the tool output as a string.
         """
         ...
 
@@ -396,14 +432,23 @@ class Runner:
         Generate an image.
         """
 
+    def generate_audio(self, prompt: str) -> SpeechGenerationResponse:
+        """
+        Generate audio given a (model specific) prompt. PCM and sampling rate as well as the number of channels is returned.
+        """
+
     def send_re_isq(self, dtype: str) -> CompletionResponse:
         """
         Send a request to re-ISQ the model. If the model was loaded as GGUF or GGML then nothing will happen.
         """
 
-    def tokenize_text(self, text: str, add_special_tokens: bool) -> list[int]:
+    def tokenize_text(
+        self, text: str, add_special_tokens: bool, enable_thinking: bool | None = None
+    ) -> list[int]:
         """
         Tokenize some text, returning raw tokens.
+
+        `enable_thinking` enables thinking for models that support this configuration.
         """
 
     def detokenize_text(self, tokens: list[int], skip_special_tokens: bool) -> str:
@@ -576,3 +621,33 @@ class ImageChoice:
 class ImageGenerationResponse:
     choices: list[ImageChoice]
     created: int
+
+# MCP (Model Context Protocol) Client Types
+
+class McpServerSourcePy(Enum):
+    """MCP server transport source configuration"""
+
+    Http = "Http"
+    Process = "Process"
+    WebSocket = "WebSocket"
+
+@dataclass
+class McpServerConfigPy:
+    """Configuration for an individual MCP server"""
+
+    id: str
+    name: str
+    source: McpServerSourcePy
+    enabled: bool = True
+    tool_prefix: Optional[str] = None
+    resources: Optional[list[str]] = None
+    bearer_token: Optional[str] = None
+
+@dataclass
+class McpClientConfigPy:
+    """Configuration for MCP client integration"""
+
+    servers: list[McpServerConfigPy]
+    auto_register_tools: bool = True
+    tool_timeout_secs: Optional[int] = None
+    max_concurrent_calls: Optional[int] = None

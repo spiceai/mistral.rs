@@ -1,11 +1,22 @@
+use candle_core::Device;
 use mistralrs_core::*;
+use mistralrs_core::{SearchCallback, Tool, ToolCallback};
+use std::collections::HashMap;
 use std::{
     num::NonZeroUsize,
     ops::{Deref, DerefMut},
     path::PathBuf,
+    sync::Arc,
 };
 
 use crate::{best_device, Model};
+
+/// A tool callback with its associated Tool definition.
+#[derive(Clone)]
+pub struct ToolCallbackWithTool {
+    pub callback: Arc<ToolCallback>,
+    pub tool: Tool,
+}
 
 #[derive(Clone)]
 /// Configure a vision model with the various parameters for loading, running, and other inference behaviors.
@@ -25,12 +36,17 @@ pub struct VisionModelBuilder {
     pub(crate) max_edge: Option<u32>,
     pub(crate) hf_cache_path: Option<PathBuf>,
     pub(crate) search_bert_model: Option<BertEmbeddingModel>,
+    pub(crate) search_callback: Option<Arc<SearchCallback>>,
+    pub(crate) tool_callbacks: HashMap<String, Arc<ToolCallback>>,
+    pub(crate) tool_callbacks_with_tools: HashMap<String, ToolCallbackWithTool>,
+    pub(crate) device: Option<Device>,
+    pub(crate) matformer_config_path: Option<PathBuf>,
+    pub(crate) matformer_slice_name: Option<String>,
 
     // Model running
-    pub(crate) use_flash_attn: bool,
     pub(crate) prompt_chunksize: Option<NonZeroUsize>,
     pub(crate) topology: Option<Topology>,
-    pub(crate) loader_type: VisionLoaderType,
+    pub(crate) loader_type: Option<VisionLoaderType>,
     pub(crate) dtype: ModelDType,
     pub(crate) force_cpu: bool,
     pub(crate) isq: Option<IsqType>,
@@ -48,10 +64,9 @@ impl VisionModelBuilder {
     /// - Maximum number of sequences running is 32
     /// - Automatic device mapping with model defaults according to `AutoDeviceMapParams`
     /// - By default, web searching compatible with the OpenAI `web_search_options` setting is disabled.
-    pub fn new(model_id: impl ToString, loader_type: VisionLoaderType) -> Self {
+    pub fn new(model_id: impl ToString) -> Self {
         Self {
             model_id: model_id.to_string(),
-            use_flash_attn: cfg!(feature = "flash-attn"),
             topology: None,
             write_uqff: None,
             from_uqff: None,
@@ -59,7 +74,7 @@ impl VisionModelBuilder {
             chat_template: None,
             tokenizer_json: None,
             max_edge: None,
-            loader_type,
+            loader_type: None,
             dtype: ModelDType::Auto,
             force_cpu: false,
             token_source: TokenSource::CacheToken,
@@ -75,12 +90,47 @@ impl VisionModelBuilder {
             paged_attn_cfg: None,
             hf_cache_path: None,
             search_bert_model: None,
+            search_callback: None,
+            tool_callbacks: HashMap::new(),
+            tool_callbacks_with_tools: HashMap::new(),
+            device: None,
+            matformer_config_path: None,
+            matformer_slice_name: None,
         }
     }
 
     /// Enable searching compatible with the OpenAI `web_search_options` setting. This uses the BERT model specified or the default.
     pub fn with_search(mut self, search_bert_model: BertEmbeddingModel) -> Self {
         self.search_bert_model = Some(search_bert_model);
+        self
+    }
+
+    /// Override the search function used when `web_search_options` is enabled.
+    pub fn with_search_callback(mut self, callback: Arc<SearchCallback>) -> Self {
+        self.search_callback = Some(callback);
+        self
+    }
+
+    pub fn with_tool_callback(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+    ) -> Self {
+        self.tool_callbacks.insert(name.into(), callback);
+        self
+    }
+
+    /// Register a callback with an associated Tool definition that will be automatically
+    /// added to requests when tool callbacks are active.
+    pub fn with_tool_callback_and_tool(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+        tool: Tool,
+    ) -> Self {
+        let name = name.into();
+        self.tool_callbacks_with_tools
+            .insert(name, ToolCallbackWithTool { callback, tool });
         self
     }
 
@@ -117,6 +167,13 @@ impl VisionModelBuilder {
     /// Path to a discrete `tokenizer.json` file.
     pub fn with_tokenizer_json(mut self, tokenizer_json: impl ToString) -> Self {
         self.tokenizer_json = Some(tokenizer_json.to_string());
+        self
+    }
+
+    /// Manually set the model loader type. Otherwise, it will attempt to automatically
+    /// determine the loader type.
+    pub fn with_loader_type(mut self, loader_type: VisionLoaderType) -> Self {
+        self.loader_type = Some(loader_type);
         self
     }
 
@@ -157,7 +214,7 @@ impl VisionModelBuilder {
     }
 
     /// Enable PagedAttention. Configure PagedAttention with a [`PagedAttentionConfig`] object, which
-    /// can be created with sensible values with a [`PagedAttentionMetaBuilder`].
+    /// can be created with sensible values with a [`PagedAttentionMetaBuilder`](crate::PagedAttentionMetaBuilder).
     ///
     /// If PagedAttention is not supported (query with [`paged_attn_supported`]), this will do nothing.
     pub fn with_paged_attn(
@@ -222,9 +279,26 @@ impl VisionModelBuilder {
         self
     }
 
+    /// Set the main device to load this model onto. Automatic device mapping will be performed starting with this device.
+    pub fn with_device(mut self, device: Device) -> Self {
+        self.device = Some(device);
+        self
+    }
+
+    /// Path to a Matryoshka Transformer configuration CSV file.
+    pub fn with_matformer_config_path(mut self, path: PathBuf) -> Self {
+        self.matformer_config_path = Some(path);
+        self
+    }
+
+    /// Name of the slice to use from the Matryoshka Transformer configuration.
+    pub fn with_matformer_slice_name(mut self, name: String) -> Self {
+        self.matformer_slice_name = Some(name);
+        self
+    }
+
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = VisionSpecificConfig {
-            use_flash_attn: self.use_flash_attn,
             prompt_chunksize: self.prompt_chunksize,
             topology: self.topology,
             write_uqff: self.write_uqff,
@@ -233,6 +307,8 @@ impl VisionModelBuilder {
             calibration_file: self.calibration_file,
             imatrix: self.imatrix,
             hf_cache_path: self.hf_cache_path,
+            matformer_config_path: self.matformer_config_path,
+            matformer_slice_name: self.matformer_slice_name,
         };
 
         if self.with_logging {
@@ -253,7 +329,7 @@ impl VisionModelBuilder {
             self.hf_revision,
             self.token_source,
             &self.dtype,
-            &best_device(self.force_cpu)?,
+            &self.device.unwrap_or(best_device(self.force_cpu).unwrap()),
             !self.with_logging,
             self.device_mapping
                 .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_vision())),
@@ -269,12 +345,17 @@ impl VisionModelBuilder {
                     .get_metadata()
                     .cache_config
                     .as_ref()
-                    .unwrap()
-                    .clone();
+                    .cloned();
 
-                SchedulerConfig::PagedAttentionMeta {
-                    max_num_seqs: self.max_num_seqs,
-                    config,
+                if let Some(config) = config {
+                    SchedulerConfig::PagedAttentionMeta {
+                        max_num_seqs: self.max_num_seqs,
+                        config,
+                    }
+                } else {
+                    SchedulerConfig::DefaultScheduler {
+                        method: DefaultSchedulerMethod::Fixed(self.max_num_seqs.try_into()?),
+                    }
                 }
             }
             None => SchedulerConfig::DefaultScheduler {
@@ -282,16 +363,28 @@ impl VisionModelBuilder {
             },
         };
 
-        let runner = MistralRsBuilder::new(
+        let mut runner = MistralRsBuilder::new(
             pipeline,
             scheduler_method,
             self.throughput_logging,
             self.search_bert_model,
-        )
-        .with_no_kv_cache(false)
-        .with_no_prefix_cache(false);
+        );
+        if let Some(cb) = self.search_callback.clone() {
+            runner = runner.with_search_callback(cb);
+        }
+        for (name, cb) in &self.tool_callbacks {
+            runner = runner.with_tool_callback(name.clone(), cb.clone());
+        }
+        for (name, callback_with_tool) in &self.tool_callbacks_with_tools {
+            runner = runner.with_tool_callback_and_tool(
+                name.clone(),
+                callback_with_tool.callback.clone(),
+                callback_with_tool.tool.clone(),
+            );
+        }
+        let runner = runner.with_no_kv_cache(false).with_no_prefix_cache(false);
 
-        Ok(Model::new(runner.build()))
+        Ok(Model::new(runner.build().await))
     }
 }
 
@@ -305,12 +398,8 @@ impl UqffVisionModelBuilder {
     /// - Token source is from the cache (.cache/huggingface/token)
     /// - Maximum number of sequences running is 32
     /// - Automatic device mapping with model defaults according to `AutoDeviceMapParams`
-    pub fn new(
-        model_id: impl ToString,
-        loader_type: VisionLoaderType,
-        uqff_file: Vec<PathBuf>,
-    ) -> Self {
-        let mut inner = VisionModelBuilder::new(model_id, loader_type);
+    pub fn new(model_id: impl ToString, uqff_file: Vec<PathBuf>) -> Self {
+        let mut inner = VisionModelBuilder::new(model_id);
         inner = inner.from_uqff(uqff_file);
         Self(inner)
     }

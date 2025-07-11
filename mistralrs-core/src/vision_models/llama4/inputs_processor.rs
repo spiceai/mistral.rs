@@ -137,7 +137,7 @@ impl InputsProcessor for Llama4ImageProcessor {
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
         other_config: Option<Arc<dyn Any>>,
-        mut paged_attn_metadata: Option<PagedAttentionMeta<'_>>,
+        mut paged_attn_metadata: Option<PagedAttentionMeta>,
         prompt_chunksize: Option<NonZeroUsize>,
         mapper: Option<&dyn DeviceMapper>,
     ) -> Box<dyn Iterator<Item = anyhow::Result<InputProcessorOutput>>> {
@@ -268,13 +268,16 @@ impl InputsProcessor for Llama4ImageProcessor {
                 }
                 let prompt = new_prompt.join("");
 
-                seq.set_initial_prompt(prompt.clone());
-                let toks = tokenizer
-                    .encode_fast(prompt, false)
-                    .expect("Detokenization failed!");
+                if !seq.multimodal.has_changed_prompt {
+                    seq.set_initial_prompt(prompt.clone());
+                    let toks = tokenizer
+                        .encode_fast(prompt, false)
+                        .expect("Detokenization failed!");
 
-                let ids = toks.get_ids().to_vec();
-                seq.set_toks_and_reallocate(ids, paged_attn_metadata.as_mut());
+                    let ids = toks.get_ids().to_vec();
+                    seq.set_toks_and_reallocate(ids, paged_attn_metadata.as_mut());
+                    seq.multimodal.has_changed_prompt = true;
+                }
             }
 
             Some(pixel_values)
@@ -297,7 +300,7 @@ impl InputsProcessor for Llama4ImageProcessor {
             get_prompt_input(
                 input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().to_vec())
+                    .map(|seq| seq.get_toks())
                     .collect::<Vec<_>>(),
                 input_seqs,
                 device,
@@ -314,7 +317,7 @@ impl InputsProcessor for Llama4ImageProcessor {
             get_completion_input(
                 input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().to_vec())
+                    .map(|seq| seq.get_toks())
                     .collect::<Vec<_>>(),
                 input_seqs,
                 device,

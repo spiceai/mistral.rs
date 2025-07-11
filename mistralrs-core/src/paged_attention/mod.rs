@@ -11,9 +11,9 @@ mod layers;
 mod scheduler;
 pub const _PAD_SLOT_ID: i64 = -1;
 
-pub use block_engine::{BlockEngine, BlockTables, LogicalTokenBlock};
+pub use block_engine::{BlockEngine, BlockTables, LogicalTokenBlock, PhysicalTokenBlock};
 pub use block_engine_sequence::BlockEngineSequence;
-pub use cache_engine::{CacheConfig, CacheEngine};
+pub use cache_engine::{CacheConfig, CacheEngine, PagedCacheType};
 use candle_core::{DType, Device};
 pub use config::{ModelConfigLike, ModelConfigMetadata};
 pub use layers::PagedAttention;
@@ -22,7 +22,7 @@ pub use scheduler::{
 };
 
 use crate::MemoryUsage;
-use tracing::info;
+use tracing::{info, warn};
 
 pub const DEFAULT_PAGED_ATTENTION_BLOCK_SIZE: usize = 32;
 
@@ -32,6 +32,7 @@ pub struct PagedAttentionConfig {
     pub(crate) block_size: Option<usize>,
     pub(crate) mem_cpu: usize,
     pub(crate) mem_gpu: MemoryGpuConfig,
+    pub(crate) cache_type: PagedCacheType,
 }
 
 impl PagedAttentionConfig {
@@ -39,11 +40,13 @@ impl PagedAttentionConfig {
         block_size: Option<usize>,
         mem_cpu: usize,
         mem_gpu: MemoryGpuConfig,
+        cache_type: PagedCacheType,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             block_size,
             mem_cpu,
             mem_gpu,
+            cache_type,
         })
     }
 }
@@ -97,6 +100,7 @@ pub fn calculate_cache_config(
     mem_cpu: usize,
     block_size: Option<usize>,
     dtype: DType,
+    cache_type: PagedCacheType,
     config: &dyn ModelConfigLike,
     device: &Device,
     layer_devices: &[Option<Device>],
@@ -106,6 +110,7 @@ pub fn calculate_cache_config(
     if !SUPPORTED_BLOCK_SIZE.contains(&block_size) {
         anyhow::bail!("Block size must be in {SUPPORTED_BLOCK_SIZE:?}, got {block_size}");
     }
+    let dtype = cache_type.to_dtype(dtype);
     let dtype_size = dtype.size_in_bytes();
 
     let mut min_mem_gpu = usize::MAX;
@@ -132,7 +137,30 @@ pub fn calculate_cache_config(
     // let mem_for_toks =
     //     ctxt_to_blocks!(config.max_seq_len(), dtype_size, block_size, config) / SIZE_IN_MB;
     // let mem_gpu = min_mem_gpu.min(mem_for_toks);
-    let mem_gpu = min_mem_gpu;
+
+    // Cap Metal GPU memory to the wired (non‑paged) allocation limit reported by the kernel (`iogpu.wired_limit_mb`).
+    // Users can raise this limit with `sudo sysctl -w iogpu.wired_limit_mb=<desired_mb>`.
+    let mem_gpu = if matches!(device, Device::Metal(_)) {
+        let metal_cap_mb = MemoryUsage.get_total_memory(device)? as usize / SIZE_IN_MB;
+
+        info!("Metal GPU wired limit is {metal_cap_mb} MB.");
+
+        if min_mem_gpu > metal_cap_mb {
+            if !silent {
+                warn!(
+                    "Capping Metal GPU memory allocation from {} MB to {} MB (limited by iogpu.wired_limit_mb). \
+To raise this cap run: `sudo sysctl -w iogpu.wired_limit_mb=<desired_mb>`.",
+                    min_mem_gpu,
+                    metal_cap_mb
+                );
+            }
+            metal_cap_mb
+        } else {
+            min_mem_gpu
+        }
+    } else {
+        min_mem_gpu
+    };
 
     let num_gpu_blocks = mb_to_blocks!(mem_gpu * SIZE_IN_MB, dtype_size, block_size, config);
     let num_cpu_blocks = mb_to_blocks!(mem_cpu * SIZE_IN_MB, dtype_size, block_size, config);
@@ -142,11 +170,13 @@ pub fn calculate_cache_config(
 
     if !silent {
         info!("Allocating {mem_gpu} MB for PagedAttention KV cache per GPU");
+        info!("PagedAttention KV cache type is {dtype:?}");
         info!("Using PagedAttention with block size {block_size} and {num_gpu_blocks} GPU blocks: available context length is {} tokens", num_gpu_blocks*block_size);
     }
     Ok(CacheConfig {
         block_size,
         num_gpu_blocks,
         num_cpu_blocks,
+        cache_type,
     })
 }

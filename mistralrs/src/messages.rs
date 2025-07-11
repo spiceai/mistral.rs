@@ -9,10 +9,12 @@ use serde_json::{json, Value};
 /// A type which can be used as a chat request.
 pub trait RequestLike {
     fn messages_ref(&self) -> &[IndexMap<String, MessageContent>];
+    fn images_ref(&self) -> &[DynamicImage];
     fn take_messages(&mut self) -> RequestMessage;
     fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>>;
     fn take_adapters(&mut self) -> Option<Vec<String>>;
     fn return_logprobs(&self) -> bool;
+    fn enable_search(&self) -> Option<bool>;
     fn take_constraint(&mut self) -> Constraint;
     fn take_tools(&mut self) -> Option<(Vec<Tool>, ToolChoice)>;
     fn take_sampling_params(&mut self) -> SamplingParams;
@@ -25,14 +27,18 @@ pub trait RequestLike {
 /// No constraints, logits processors, logprobs, tools, or adapters.
 ///
 /// Sampling is deterministic.
-pub struct TextMessages(Vec<IndexMap<String, MessageContent>>);
+pub struct TextMessages {
+    messages: Vec<IndexMap<String, MessageContent>>,
+    enable_thinking: Option<bool>,
+}
 
 impl From<TextMessages> for Vec<IndexMap<String, MessageContent>> {
     fn from(value: TextMessages) -> Self {
-        value.0
+        value.messages
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
 /// A chat message role.
 pub enum TextMessageRole {
     User,
@@ -62,11 +68,14 @@ impl Default for TextMessages {
 
 impl TextMessages {
     pub fn new() -> Self {
-        Self(Vec::new())
+        Self {
+            messages: Vec::new(),
+            enable_thinking: None,
+        }
     }
 
     pub fn add_message(mut self, role: TextMessageRole, text: impl ToString) -> Self {
-        self.0.push(IndexMap::from([
+        self.messages.push(IndexMap::from([
             ("role".to_string(), Either::Left(role.to_string())),
             ("content".to_string(), Either::Left(text.to_string())),
         ]));
@@ -74,19 +83,33 @@ impl TextMessages {
     }
 
     pub fn clear(mut self) -> Self {
-        self.0.clear();
+        self.messages.clear();
+        self
+    }
+
+    pub fn enable_thinking(mut self, enable_thinking: bool) -> Self {
+        self.enable_thinking = Some(enable_thinking);
         self
     }
 }
 
 impl RequestLike for TextMessages {
     fn messages_ref(&self) -> &[IndexMap<String, MessageContent>] {
-        &self.0
+        &self.messages
+    }
+    fn images_ref(&self) -> &[DynamicImage] {
+        &[]
     }
     fn take_messages(&mut self) -> RequestMessage {
         let mut other = Vec::new();
-        std::mem::swap(&mut other, &mut self.0);
-        RequestMessage::Chat(other)
+        std::mem::swap(&mut other, &mut self.messages);
+        RequestMessage::Chat {
+            messages: other,
+            enable_thinking: self.enable_thinking,
+        }
+    }
+    fn enable_search(&self) -> Option<bool> {
+        None
     }
     fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>> {
         None
@@ -112,7 +135,7 @@ impl RequestLike for TextMessages {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-/// Text (chat) messages with images.
+/// Text (chat) messages with images and/or audios.
 ///
 /// No constraints, logits processors, logprobs, tools, or adapters.
 ///
@@ -120,6 +143,8 @@ impl RequestLike for TextMessages {
 pub struct VisionMessages {
     messages: Vec<IndexMap<String, MessageContent>>,
     images: Vec<DynamicImage>,
+    audios: Vec<AudioInput>,
+    enable_thinking: Option<bool>,
 }
 
 impl Default for VisionMessages {
@@ -133,6 +158,8 @@ impl VisionMessages {
         Self {
             images: Vec::new(),
             messages: Vec::new(),
+            audios: Vec::new(),
+            enable_thinking: None,
         }
     }
 
@@ -145,40 +172,80 @@ impl VisionMessages {
     }
 
     pub fn add_image_message(
+        self,
+        role: TextMessageRole,
+        text: impl ToString,
+        images: Vec<DynamicImage>,
+        model: &Model,
+    ) -> anyhow::Result<Self> {
+        self.add_multimodal_message(role, text, images, vec![], model)
+    }
+
+    pub fn add_audio_message(
+        self,
+        role: TextMessageRole,
+        text: impl ToString,
+        audios: Vec<AudioInput>,
+        model: &Model,
+    ) -> anyhow::Result<Self> {
+        self.add_multimodal_message(role, text, vec![], audios, model)
+    }
+
+    pub fn add_multimodal_message(
         mut self,
         role: TextMessageRole,
         text: impl ToString,
-        image: DynamicImage,
+        images: Vec<DynamicImage>,
+        audios: Vec<AudioInput>,
         model: &Model,
     ) -> anyhow::Result<Self> {
-        let prefixer = match &model.config().category {
-            ModelCategory::Text | ModelCategory::Diffusion => {
+        let config = model.config().unwrap();
+        let prefixer = match &config.category {
+            ModelCategory::Vision { prefixer } => prefixer,
+            ModelCategory::Text
+            | ModelCategory::Diffusion
+            | ModelCategory::Speech
+            | ModelCategory::Audio => {
                 anyhow::bail!("`add_image_message` expects a vision model.")
             }
-            ModelCategory::Vision {
-                has_conv2d: _,
-                prefixer,
-            } => prefixer,
         };
-        self.images.push(image);
-        self.messages.push(IndexMap::from([
-            ("role".to_string(), Either::Left(role.to_string())),
-            (
-                "content".to_string(),
-                Either::Right(vec![
-                    IndexMap::from([("type".to_string(), Value::String("image".to_string()))]),
-                    IndexMap::from([
-                        ("type".to_string(), Value::String("text".to_string())),
-                        (
-                            "text".to_string(),
-                            Value::String(
-                                prefixer.prefix_image(self.images.len() - 1, &text.to_string()),
-                            ),
-                        ),
+
+        // Images
+        let n_added_images = images.len();
+        let prefixed = prefixer.prefix_image(
+            (self.images.len()..self.images.len() + n_added_images).collect(),
+            &text.to_string(),
+        );
+        self.images.extend(images);
+
+        // Audios
+        let n_added_audios = audios.len();
+        let prefixed = prefixer.prefix_audio(
+            (self.audios.len()..self.audios.len() + n_added_audios).collect(),
+            &prefixed,
+        );
+        self.audios.extend(audios);
+
+        if n_added_images > 0 {
+            self.messages.push(IndexMap::from([
+                ("role".to_string(), Either::Left(role.to_string())),
+                (
+                    "content".to_string(),
+                    Either::Right(vec![
+                        IndexMap::from([("type".to_string(), Value::String("image".to_string()))]),
+                        IndexMap::from([
+                            ("type".to_string(), Value::String("text".to_string())),
+                            ("text".to_string(), Value::String(prefixed)),
+                        ]),
                     ]),
-                ]),
-            ),
-        ]));
+                ),
+            ]));
+        } else {
+            self.messages.push(IndexMap::from([
+                ("role".to_string(), Either::Left(role.to_string())),
+                ("content".to_string(), Either::Left(prefixed)),
+            ]));
+        }
         Ok(self)
     }
 
@@ -188,21 +255,36 @@ impl VisionMessages {
 
         self
     }
+
+    pub fn enable_thinking(mut self, enable_thinking: bool) -> Self {
+        self.enable_thinking = Some(enable_thinking);
+        self
+    }
 }
 
 impl RequestLike for VisionMessages {
     fn messages_ref(&self) -> &[IndexMap<String, MessageContent>] {
         &self.messages
     }
+    fn images_ref(&self) -> &[DynamicImage] {
+        &self.images
+    }
     fn take_messages(&mut self) -> RequestMessage {
         let mut other_messages = Vec::new();
         std::mem::swap(&mut other_messages, &mut self.messages);
         let mut other_images = Vec::new();
         std::mem::swap(&mut other_images, &mut self.images);
+        let mut other_audios = Vec::new();
+        std::mem::swap(&mut other_audios, &mut self.audios);
         RequestMessage::VisionChat {
             images: other_images,
             messages: other_messages,
+            audios: other_audios,
+            enable_thinking: self.enable_thinking,
         }
+    }
+    fn enable_search(&self) -> Option<bool> {
+        None
     }
     fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>> {
         None
@@ -236,9 +318,11 @@ impl RequestLike for VisionMessages {
 /// - Logprobs
 /// - Tools
 /// - Sampling
+/// - Enable thinking for models that support the configuration
 pub struct RequestBuilder {
     messages: Vec<IndexMap<String, MessageContent>>,
     images: Vec<DynamicImage>,
+    audios: Vec<AudioInput>,
     logits_processors: Vec<Arc<dyn CustomLogitsProcessor>>,
     adapters: Vec<String>,
     return_logprobs: bool,
@@ -247,6 +331,7 @@ pub struct RequestBuilder {
     tool_choice: ToolChoice,
     sampling_params: SamplingParams,
     web_search_options: Option<WebSearchOptions>,
+    enable_thinking: Option<bool>,
 }
 
 impl Default for RequestBuilder {
@@ -258,8 +343,9 @@ impl Default for RequestBuilder {
 impl From<TextMessages> for RequestBuilder {
     fn from(value: TextMessages) -> Self {
         Self {
-            messages: value.0,
+            messages: value.messages,
             images: Vec::new(),
+            audios: Vec::new(),
             logits_processors: Vec::new(),
             adapters: Vec::new(),
             return_logprobs: false,
@@ -268,6 +354,7 @@ impl From<TextMessages> for RequestBuilder {
             tool_choice: ToolChoice::Auto,
             sampling_params: SamplingParams::deterministic(),
             web_search_options: None,
+            enable_thinking: None,
         }
     }
 }
@@ -277,6 +364,7 @@ impl From<VisionMessages> for RequestBuilder {
         Self {
             messages: value.messages,
             images: value.images,
+            audios: value.audios,
             logits_processors: Vec::new(),
             adapters: Vec::new(),
             return_logprobs: false,
@@ -285,6 +373,7 @@ impl From<VisionMessages> for RequestBuilder {
             tool_choice: ToolChoice::Auto,
             sampling_params: SamplingParams::deterministic(),
             web_search_options: None,
+            enable_thinking: None,
         }
     }
 }
@@ -294,6 +383,7 @@ impl RequestBuilder {
         Self {
             messages: Vec::new(),
             images: Vec::new(),
+            audios: Vec::new(),
             logits_processors: Vec::new(),
             adapters: Vec::new(),
             return_logprobs: false,
@@ -302,6 +392,7 @@ impl RequestBuilder {
             tool_choice: ToolChoice::Auto,
             sampling_params: SamplingParams::deterministic(),
             web_search_options: None,
+            enable_thinking: None,
         }
     }
 
@@ -372,17 +463,81 @@ impl RequestBuilder {
     }
 
     pub fn add_image_message(
+        self,
+        role: TextMessageRole,
+        text: impl ToString,
+        images: Vec<DynamicImage>,
+        model: &Model,
+    ) -> anyhow::Result<Self> {
+        self.add_multimodal_message(role, text, images, vec![], model)
+    }
+
+    pub fn add_audio_message(
+        self,
+        role: TextMessageRole,
+        text: impl ToString,
+        audios: Vec<AudioInput>,
+        model: &Model,
+    ) -> anyhow::Result<Self> {
+        self.add_multimodal_message(role, text, vec![], audios, model)
+    }
+
+    pub fn add_multimodal_message(
         mut self,
         role: TextMessageRole,
         text: impl ToString,
-        image: DynamicImage,
-    ) -> Self {
-        self.messages.push(IndexMap::from([
-            ("role".to_string(), Either::Left(role.to_string())),
-            ("content".to_string(), Either::Left(text.to_string())),
-        ]));
-        self.images.push(image);
-        self
+        images: Vec<DynamicImage>,
+        audios: Vec<AudioInput>,
+        model: &Model,
+    ) -> anyhow::Result<Self> {
+        let config = model.config().unwrap();
+        let prefixer = match &config.category {
+            ModelCategory::Vision { prefixer } => prefixer,
+            ModelCategory::Text
+            | ModelCategory::Diffusion
+            | ModelCategory::Speech
+            | ModelCategory::Audio => {
+                anyhow::bail!("`add_image_message` expects a vision model.")
+            }
+        };
+
+        // Images
+        let n_added_images = images.len();
+        let prefixed = prefixer.prefix_image(
+            (self.images.len()..self.images.len() + n_added_images).collect(),
+            &text.to_string(),
+        );
+        self.images.extend(images);
+
+        // Audios
+        let n_added_audios = audios.len();
+        let prefixed = prefixer.prefix_audio(
+            (self.audios.len()..self.audios.len() + n_added_audios).collect(),
+            &prefixed,
+        );
+        self.audios.extend(audios);
+
+        if n_added_images > 0 {
+            self.messages.push(IndexMap::from([
+                ("role".to_string(), Either::Left(role.to_string())),
+                (
+                    "content".to_string(),
+                    Either::Right(vec![
+                        IndexMap::from([("type".to_string(), Value::String("image".to_string()))]),
+                        IndexMap::from([
+                            ("type".to_string(), Value::String("text".to_string())),
+                            ("text".to_string(), Value::String(prefixed)),
+                        ]),
+                    ]),
+                ),
+            ]));
+        } else {
+            self.messages.push(IndexMap::from([
+                ("role".to_string(), Either::Left(role.to_string())),
+                ("content".to_string(), Either::Left(prefixed)),
+            ]));
+        }
+        Ok(self)
     }
 
     pub fn add_logits_processor(mut self, processor: Arc<dyn CustomLogitsProcessor>) -> Self {
@@ -491,6 +646,11 @@ impl RequestBuilder {
         self.sampling_params.dry_params = Some(dry_params);
         self
     }
+
+    pub fn enable_thinking(mut self, enable_thinking: bool) -> Self {
+        self.enable_thinking = Some(enable_thinking);
+        self
+    }
 }
 
 impl RequestLike for RequestBuilder {
@@ -498,21 +658,36 @@ impl RequestLike for RequestBuilder {
         &self.messages
     }
 
+    fn images_ref(&self) -> &[DynamicImage] {
+        &self.images
+    }
+
     fn take_messages(&mut self) -> RequestMessage {
-        if self.images.is_empty() {
+        if self.images.is_empty() && self.audios.is_empty() {
             let mut other = Vec::new();
             std::mem::swap(&mut other, &mut self.messages);
-            RequestMessage::Chat(other)
+            RequestMessage::Chat {
+                messages: other,
+                enable_thinking: self.enable_thinking,
+            }
         } else {
             let mut other_messages = Vec::new();
             std::mem::swap(&mut other_messages, &mut self.messages);
             let mut other_images = Vec::new();
             std::mem::swap(&mut other_images, &mut self.images);
+            let mut other_audios = Vec::new();
+            std::mem::swap(&mut other_audios, &mut self.audios);
             RequestMessage::VisionChat {
                 images: other_images,
                 messages: other_messages,
+                audios: other_audios,
+                enable_thinking: self.enable_thinking,
             }
         }
+    }
+
+    fn enable_search(&self) -> Option<bool> {
+        self.enable_thinking
     }
 
     fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>> {

@@ -1,7 +1,18 @@
+use candle_core::Device;
 use mistralrs_core::*;
+use mistralrs_core::{SearchCallback, Tool, ToolCallback};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
 use crate::{best_device, Model};
+use std::sync::Arc;
+
+/// A tool callback with its associated Tool definition.
+#[derive(Clone)]
+pub struct ToolCallbackWithTool {
+    pub callback: Arc<ToolCallback>,
+    pub tool: Tool,
+}
 
 /// Configure a text GGUF model with the various parameters for loading, running, and other inference behaviors.
 pub struct GgufModelBuilder {
@@ -16,6 +27,10 @@ pub struct GgufModelBuilder {
     pub(crate) tokenizer_json: Option<String>,
     pub(crate) device_mapping: Option<DeviceMapSetting>,
     pub(crate) search_bert_model: Option<BertEmbeddingModel>,
+    pub(crate) search_callback: Option<Arc<SearchCallback>>,
+    pub(crate) tool_callbacks: HashMap<String, Arc<ToolCallback>>,
+    pub(crate) tool_callbacks_with_tools: HashMap<String, ToolCallbackWithTool>,
+    pub(crate) device: Option<Device>,
 
     // Model running
     pub(crate) prompt_chunksize: Option<NonZeroUsize>,
@@ -59,12 +74,45 @@ impl GgufModelBuilder {
             jinja_explicit: None,
             throughput_logging: false,
             search_bert_model: None,
+            search_callback: None,
+            tool_callbacks: HashMap::new(),
+            tool_callbacks_with_tools: HashMap::new(),
+            device: None,
         }
     }
 
     /// Enable searching compatible with the OpenAI `web_search_options` setting. This uses the BERT model specified or the default.
     pub fn with_search(mut self, search_bert_model: BertEmbeddingModel) -> Self {
         self.search_bert_model = Some(search_bert_model);
+        self
+    }
+
+    /// Override the search function used when `web_search_options` is enabled.
+    pub fn with_search_callback(mut self, callback: Arc<SearchCallback>) -> Self {
+        self.search_callback = Some(callback);
+        self
+    }
+
+    pub fn with_tool_callback(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+    ) -> Self {
+        self.tool_callbacks.insert(name.into(), callback);
+        self
+    }
+
+    /// Register a callback with an associated Tool definition that will be automatically
+    /// added to requests when tool callbacks are active.
+    pub fn with_tool_callback_and_tool(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+        tool: Tool,
+    ) -> Self {
+        let name = name.into();
+        self.tool_callbacks_with_tools
+            .insert(name, ToolCallbackWithTool { callback, tool });
         self
     }
 
@@ -176,6 +224,12 @@ impl GgufModelBuilder {
         self
     }
 
+    /// Set the main device to load this model onto. Automatic device mapping will be performed starting with this device.
+    pub fn with_device(mut self, device: Device) -> Self {
+        self.device = Some(device);
+        self
+    }
+
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = GGUFSpecificConfig {
             prompt_chunksize: self.prompt_chunksize,
@@ -202,7 +256,7 @@ impl GgufModelBuilder {
             self.hf_revision,
             self.token_source,
             &ModelDType::Auto,
-            &best_device(self.force_cpu)?,
+            &self.device.unwrap_or(best_device(self.force_cpu).unwrap()),
             !self.with_logging,
             self.device_mapping
                 .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
@@ -236,14 +290,28 @@ impl GgufModelBuilder {
             scheduler_method,
             self.throughput_logging,
             self.search_bert_model,
-        )
-        .with_no_kv_cache(self.no_kv_cache)
-        .with_no_prefix_cache(self.prefix_cache_n.is_none());
+        );
+        if let Some(cb) = self.search_callback.clone() {
+            runner = runner.with_search_callback(cb);
+        }
+        for (name, cb) in &self.tool_callbacks {
+            runner = runner.with_tool_callback(name.clone(), cb.clone());
+        }
+        for (name, callback_with_tool) in &self.tool_callbacks_with_tools {
+            runner = runner.with_tool_callback_and_tool(
+                name.clone(),
+                callback_with_tool.callback.clone(),
+                callback_with_tool.tool.clone(),
+            );
+        }
+        runner = runner
+            .with_no_kv_cache(self.no_kv_cache)
+            .with_no_prefix_cache(self.prefix_cache_n.is_none());
 
         if let Some(n) = self.prefix_cache_n {
             runner = runner.with_prefix_cache_n(n)
         }
 
-        Ok(Model::new(runner.build()))
+        Ok(Model::new(runner.build().await))
     }
 }

@@ -9,18 +9,21 @@ use crate::{
     prefix_cacher::PrefixCacheManagerV2,
     response::CompletionChoice,
     scheduler::{Scheduler, SchedulerOutput},
+    search,
     sequence::{SeqStepType, StopReason},
-    CompletionResponse, SchedulerConfig, DEBUG,
+    tools, CompletionResponse, SchedulerConfig, DEBUG,
 };
 use interprocess::local_socket::{traits::Listener, ListenerOptions};
-use llguidance::toktrie::TokEnv;
-use logger::IntervalLogger;
+use llguidance::ParserFactory;
+pub use logger::IntervalLogger;
+use mistralrs_quant::RingConfig;
 use once_cell::sync::Lazy;
 use rand::SeedableRng;
 use rand_isaac::Isaac64Rng;
 use std::{
     collections::HashMap,
     io::{BufWriter, Write},
+    net::TcpListener,
     ops::Deref,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -44,6 +47,7 @@ use crate::{
 
 mod add_request;
 mod logger;
+mod search_request;
 
 pub enum EngineInstruction {
     Terminate,
@@ -59,7 +63,49 @@ pub enum BertEmbeddingModel {
 
 const SEED: u64 = 0;
 /// Terminate all sequences on the next scheduling step. Be sure to reset this.
+/// This is a global flag for terminating all engines at once (e.g., Ctrl+C).
 pub static TERMINATE_ALL_NEXT_STEP: AtomicBool = AtomicBool::new(false);
+
+/// Engine-specific termination flags, per Engine thread ID.
+static ENGINE_TERMINATE_FLAGS: Lazy<
+    std::sync::Mutex<HashMap<std::thread::ThreadId, Arc<AtomicBool>>>,
+> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Get or create a termination flag for the current engine thread.
+pub fn get_engine_terminate_flag() -> Arc<AtomicBool> {
+    let thread_id = std::thread::current().id();
+    let mut flags = ENGINE_TERMINATE_FLAGS.lock().unwrap();
+    flags
+        .entry(thread_id)
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
+/// Check if the current engine should terminate sequences.
+pub fn should_terminate_engine_sequences() -> bool {
+    // Check global flag first
+    if TERMINATE_ALL_NEXT_STEP.load(Ordering::SeqCst) {
+        return true;
+    }
+    // Then check engine-specific flag
+    let thread_id = std::thread::current().id();
+    if let Ok(flags) = ENGINE_TERMINATE_FLAGS.lock() {
+        if let Some(flag) = flags.get(&thread_id) {
+            return flag.load(Ordering::SeqCst);
+        }
+    }
+    false
+}
+
+/// Reset termination flags for the current engine.
+pub fn reset_engine_terminate_flag() {
+    let thread_id = std::thread::current().id();
+    if let Ok(flags) = ENGINE_TERMINATE_FLAGS.lock() {
+        if let Some(flag) = flags.get(&thread_id) {
+            flag.store(false, Ordering::SeqCst);
+        }
+    }
+}
 
 /// Engine instructions, per Engine (MistralRs) ID.
 pub static ENGINE_INSTRUCTIONS: Lazy<std::sync::Mutex<HashMap<usize, Option<EngineInstruction>>>> =
@@ -69,6 +115,9 @@ pub struct Engine {
     rx: Arc<Mutex<Receiver<Request>>>,
     pipeline: Arc<Mutex<dyn Pipeline>>,
     bert_pipeline: Arc<Mutex<Option<BertPipeline>>>,
+    search_callback: Option<Arc<search::SearchCallback>>,
+    tool_callbacks: tools::ToolCallbacks,
+    tool_callbacks_with_tools: tools::ToolCallbacksWithTools,
     scheduler: Arc<Mutex<dyn Scheduler>>,
     id: Arc<Mutex<usize>>,
     truncate_sequence: bool,
@@ -102,12 +151,16 @@ impl Engine {
         disable_eos_stop: bool,
         throughput_logging_enabled: bool,
         search_embedding_model: Option<BertEmbeddingModel>,
+        search_callback: Option<Arc<search::SearchCallback>>,
+        tool_callbacks: tools::ToolCallbacks,
+        tool_callbacks_with_tools: tools::ToolCallbacksWithTools,
     ) -> anyhow::Result<Self> {
         no_kv_cache |= get_mut_arcmutex!(pipeline).get_metadata().no_kv_cache;
 
-        no_prefix_cache = matches!(config, SchedulerConfig::PagedAttentionMeta { .. })
-            || no_prefix_cache
-            || no_kv_cache;
+        no_prefix_cache = no_prefix_cache
+            || no_kv_cache
+            || get_mut_arcmutex!(pipeline).get_metadata().no_prefix_cache
+            || prefix_cache_n == 0;
 
         let bert_pipeline = match search_embedding_model {
             Some(search_embedding_model) => Some(BertPipeline::new(
@@ -117,17 +170,24 @@ impl Engine {
             None => None,
         };
 
+        let scheduler = config.into_scheduler();
+        let block_engine = get_mut_arcmutex!(scheduler).block_engine();
+
         Ok(Self {
             rx: Arc::new(Mutex::new(rx)),
             pipeline,
             bert_pipeline: Arc::new(Mutex::new(bert_pipeline)),
-            scheduler: config.into_scheduler(),
+            search_callback,
+            tool_callbacks,
+            tool_callbacks_with_tools,
+            scheduler: scheduler.clone(),
             id: Arc::new(Mutex::new(0)),
             truncate_sequence,
             no_kv_cache,
             prefix_cacher: Arc::new(Mutex::new(PrefixCacheManagerV2::new(
                 prefix_cache_n,
                 no_prefix_cache,
+                block_engine,
             ))),
             is_debug: DEBUG.load(Ordering::Relaxed),
             disable_eos_stop,
@@ -148,7 +208,7 @@ impl Engine {
             if matches!(
                 ENGINE_INSTRUCTIONS
                     .lock()
-                    .expect("`ENGINE_INSTRUCTIONS` was poisioned")
+                    .expect("`ENGINE_INSTRUCTIONS` was poisoned")
                     .get(get_mut_arcmutex!(self.id).deref()),
                 Some(Some(EngineInstruction::Terminate))
             ) {
@@ -170,7 +230,7 @@ impl Engine {
 
             let run_start = Instant::now();
             let mut scheduler = get_mut_arcmutex!(self.scheduler);
-            let scheduled = scheduler.schedule();
+            let scheduled = scheduler.schedule(&self.logger);
 
             match scheduled {
                 SchedulerOutput::DefaultScheduler {
@@ -314,6 +374,7 @@ impl Engine {
                                 seq.len() as f32 / prompt_exec_time.as_secs_f32();
                             seq.prompt_tok_per_sec = prompt_tok_per_sec;
                             seq.prompt_timestamp = Some(now);
+                            seq.total_prompt_time = Some(prompt_exec_time.as_millis());
                         }
                         last_completion_ids = vec![];
                     }
@@ -452,6 +513,7 @@ impl Engine {
                                     seq.len() as f32 / (now - seq.timestamp()) as f32;
                                 seq.prompt_tok_per_sec = prompt_tok_per_sec * 1000.;
                                 seq.prompt_timestamp = Some(now);
+                                seq.total_prompt_time = Some(now - seq.timestamp());
                             }
                         }
                     }
@@ -463,14 +525,14 @@ impl Engine {
     }
 
     fn build_sequence_recognizer(
-        tok_env: &Option<TokEnv>,
+        factory: &Option<Arc<ParserFactory>>,
         constraint: &Constraint,
     ) -> anyhow::Result<SequenceRecognizer> {
         if let Some(grm) = llg_grammar_from_constraint(constraint)? {
-            let tok_env = tok_env
+            let factory = factory
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("No token environment found."))?;
-            let llg = constraint_from_llg_grammar(tok_env.clone(), grm)?;
+                .ok_or_else(|| anyhow::anyhow!("No token environment (llg_factory) found."))?;
+            let llg = constraint_from_llg_grammar(factory, grm)?;
             Ok(SequenceRecognizer::Llguidance(Box::new(llg)))
         } else {
             Ok(SequenceRecognizer::None)
@@ -490,6 +552,19 @@ impl Engine {
                 let req = format!("{}\n", serde_json::to_string(&request).unwrap());
                 writer.write_all(req.as_bytes()).unwrap();
             }
-        };
+        } else if !distributed::is_daemon() && cfg!(feature = "ring") {
+            let num_workers =
+                mistralrs_quant::distributed::get_global_tp_size_from_devices().unwrap() - 1;
+            let master_port = RingConfig::load().master_port;
+            let listener =
+                TcpListener::bind(format!("0.0.0.0:{master_port}")).expect("bind replicator");
+
+            for _ in 0..num_workers {
+                let (stream, _) = listener.accept().unwrap();
+                let mut writer = BufWriter::new(stream);
+                let req = format!("{}\n", serde_json::to_string(&request).unwrap());
+                writer.write_all(req.as_bytes()).unwrap();
+            }
+        }
     }
 }

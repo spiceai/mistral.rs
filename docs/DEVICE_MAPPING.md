@@ -4,8 +4,8 @@ In mistral.rs, device mapping is **automatically managed** to be as performant a
 by default in the CLI/server and Python API and does not make any changes when the model fits entirely on the GPU.
 
 > [!NOTE]
-> If your system has more than one CUDA device, mistral.rs will automatically use [tensor parallelism](DISTRIBUTED.md). If the model does not
-> completely fit on the available GPUs, or you with to use automatic device mapping, you can disable tensor parallelism by setting `MISTRALRS_NO_NCCL=1`.
+> If your system has more than one CUDA device, mistral.rs will automatically use [tensor parallelism](DISTRIBUTED/DISTRIBUTED.md). If the model does not
+> completely fit on the available GPUs, or you wish to use automatic device mapping, you can disable tensor parallelism by setting `MISTRALRS_NO_NCCL=1`.
 
 Automatic device mapping works by prioritizing loading models into GPU memory, and any remaining parts are loaded into CPU memory.
 Models architectures such as vision models which greatly benefit from GPU acceleration also automatically prioritize keeping those
@@ -33,11 +33,11 @@ These parameters do not translate to hard limits during runtime, they only contr
 - Server
     - Text models: 
     ```
-    ./mistralrs-server -i --isq q4k plain -m meta-llama/Llama-3.3-70B-Instruct --max-seq-len 4096 --max-batch-size 2
+    ./mistralrs-server -i --isq 4 plain -m meta-llama/Llama-3.3-70B-Instruct --max-seq-len 4096 --max-batch-size 2
     ```
     - Vision models:
     ```
-    ./mistralrs-server -i --isq q4k vision-plain -m meta-llama/Llama-3.2-11B-Vision-Instruct --max-seq-len 4096 --max-batch-size 2 --max-num-images 2 --max-image-length 1024
+    ./mistralrs-server -i --isq 4 vision-plain -m meta-llama/Llama-3.2-11B-Vision-Instruct --max-seq-len 4096 --max-batch-size 2 --max-num-images 2 --max-image-length 1024
     ```
 
 ---
@@ -59,12 +59,12 @@ The format for the ordinals and number of layers is `ORD:NUM;...` where ORD is t
 
 ## Example of specifying ordinals
 ```
-cargo run --release --features cuda -- -n "0:16;1:16" -i plain -m gradientai/Llama-3-8B-Instruct-262k -a llama
+cargo run --release --features cuda -- -n "0:16;1:16" -i plain -m gradientai/Llama-3-8B-Instruct-262k
 ```
 
 > Note: In the Python API, the "0:16;1:16" string is passed as the list `["0:16", "1:16"]`.
 
 ## Example of specifying the number of GPU layers
 ```
-cargo run --release --features cuda -- -n 16 -i plain -m gradientai/Llama-3-8B-Instruct-262k -a llama
+cargo run --release --features cuda -- -n 16 -i plain -m gradientai/Llama-3-8B-Instruct-262k
 ```

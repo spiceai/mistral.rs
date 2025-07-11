@@ -8,7 +8,7 @@ runner = Runner(
     num_device_layers=["500"],
 )
 
-# see llguidance.py for a better way of dealing with JSON and Lark together
+# see lark_llg.py for a better way of dealing with JSON and Lark together
 
 json_lark = r"""
 start: object # we only want objects
@@ -35,7 +35,7 @@ NUMBER: /-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/
 
 res = runner.send_chat_completion_request(
     ChatCompletionRequest(
-        model="phi",
+        model="default",
         messages=[{"role": "user", "content": "Give me a sample address."}],
         max_tokens=30,
         temperature=0.1,
