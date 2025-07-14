@@ -12,12 +12,12 @@ runner = Runner(
     which=Which.Plain(
         model_id="microsoft/Phi-3.5-mini-instruct",
     ),
-    in_situ_quant="Q4K",
+    in_situ_quant="4",
 )
 
 res = runner.send_chat_completion_request(
     ChatCompletionRequest(
-        model="mistral",
+        model="default",
         messages=[
             {"role": "user", "content": "Tell me a story about the Rust type system."}
         ],
@@ -93,39 +93,9 @@ All installations will install the `mistralrs` package. The suffix on the packag
 7) Install `mistralrs`
     Install `mistralrs` by executing the following in this directory where [features](../README.md#supported-accelerators) such as `cuda` or `flash-attn` may be specified with the `--features` argument just like they would be for `cargo run`.
 
-    The base build command is:
-    ```bash
-    maturin develop -r
-    ```
-
-    - To build for CUDA:
     
     ```bash
-    maturin develop -r --features cuda
-    ```
-    
-    - To build for CUDA with flash attention:
-    
-    ```bash
-    maturin develop -r --features "cuda flash-attn"
-    ```
-
-    - To build for Metal:  
-
-    ```bash
-    maturin develop -r --features metal
-    ```
-
-    - To build for Accelerate:  
-      
-    ```bash
-    maturin develop -r --features accelerate
-    ```
-
-    - To build for MKL:  
-      
-    ```bash
-    maturin develop -r --features mkl
+    maturin develop -r --features <specify feature(s) here>
     ```
     
 Please find [API docs here](API.md) and the type stubs [here](mistralrs.pyi), which are another great form of documentation.

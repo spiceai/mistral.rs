@@ -410,6 +410,7 @@ impl AnyMoePipelineMixin for AnyMoePipeline {
                             ])],
                             true,
                             true,
+                            None,
                             Vec::new(),
                         )
                         .map_err(candle_core::Error::msg)?;
@@ -583,6 +584,7 @@ fn new_dummy_seq(
         None,
         None,
         images,
+        None,
         None, // TODO incorrect for PagedAttention
         None,
         None,

@@ -9,7 +9,7 @@ use candle_core::{quantized::GgmlDType, DType, Device, DeviceLocation, Result, S
 use candle_nn::Linear;
 
 use crate::{
-    cublaslt::{maybe_init_cublas_lt_wrapper, CUBLASLT_HANDLE},
+    cublaslt::{maybe_init_cublas_lt_wrapper, CUBLASLT_CONTROLLER},
     generate_isq, generate_isq_imatrix,
     hqq::{HqqAxis, HqqBits, HqqConfig, HqqLayer, ISQ_HQQ_DEFAULT_OPT_STEPS, ISQ_HQQ_GROUP_SIZE},
     utils::{deserialize_tensor, serialize_tensor, version_is_compatible, UQFF_VERSION},
@@ -31,7 +31,7 @@ impl QuantMethod for UnquantLinear {
     {
         match method {
             QuantMethodConfig::Gguf { .. }
-            | QuantMethodConfig::Gptq { .. }
+            | QuantMethodConfig::GptqAwq { .. }
             | QuantMethodConfig::Hqq { .. }
             | QuantMethodConfig::Dummy
             | QuantMethodConfig::FP8 { .. }
@@ -73,7 +73,7 @@ impl QuantMethod for UnquantLinear {
                 DeviceLocation::Cuda { .. } => {
                     // Try to use cublaslt, otherwise fallback to gemm
                     if let (Device::Cuda(_), Some(cublaslt)) =
-                        (a.device(), *CUBLASLT_HANDLE.lock().unwrap())
+                        (a.device(), CUBLASLT_CONTROLLER.get())
                     {
                         cublaslt
                             .batch_matmul(
@@ -117,9 +117,7 @@ impl QuantMethod for UnquantLinear {
                     }
                 }
             }
-        } else if let (Device::Cuda(_), Some(cublaslt)) =
-            (a.device(), *CUBLASLT_HANDLE.lock().unwrap())
-        {
+        } else if let (Device::Cuda(_), Some(cublaslt)) = (a.device(), CUBLASLT_CONTROLLER.get()) {
             cublaslt
                 .batch_matmul(a, &w, None, None, None, None, None)?
                 .t()
@@ -162,7 +160,7 @@ impl QuantMethod for UnquantLinear {
         match dtype {
             /*Some(IsqType::HQQ1 | IsqType::HQQ2 | IsqType::HQQ3 | */
             Some(IsqType::HQQ4 | IsqType::HQQ8) => {
-                let _acquired_quantize_guard = guard.acquire();
+                let _acquired_quantize_guard = guard.acquire(&device);
                 if imatrix_weight.is_some() {
                     // TODO just warn?
                     candle_core::bail!("HQQ does not support imatrix.");
@@ -196,7 +194,7 @@ impl QuantMethod for UnquantLinear {
                 }
             }
             Some(IsqType::AFQ2 | IsqType::AFQ3 | IsqType::AFQ4 | IsqType::AFQ6 | IsqType::AFQ8) => {
-                let _acquired_quantize_guard = guard.acquire();
+                let _acquired_quantize_guard = guard.acquire(&device);
                 if imatrix_weight.is_some() {
                     // TODO just warn?
                     candle_core::bail!("AFQ does not support imatrix.");
@@ -248,7 +246,7 @@ impl QuantMethod for UnquantLinear {
                 })?))
             }
             Some(IsqType::F8E4M3) => {
-                let _acquired_quantize_guard = guard.acquire();
+                let _acquired_quantize_guard = guard.acquire(&device);
                 if imatrix_weight.is_some() {
                     // TODO just warn?
                     candle_core::bail!("F8E4M3 does not support imatrix.");
@@ -266,7 +264,7 @@ impl QuantMethod for UnquantLinear {
                 })?))
             }
             None => {
-                let _acquired_quantize_guard = guard.acquire();
+                let _acquired_quantize_guard = guard.acquire(&device);
                 // Ignore imatrix altogether
 
                 let w = self.w.to_device(&device)?;
@@ -376,7 +374,7 @@ impl QuantizedSerde for UnquantLinear {
 
         let has_bias = buffer.read_u8()? != 0;
 
-        let _acquired_load_guard = guard.acquire();
+        let _acquired_load_guard = guard.acquire(device);
         let w = deserialize_tensor(&mut buffer, device)?;
 
         let b = if has_bias {
@@ -412,7 +410,7 @@ impl QuantizedSerde for UnquantLinear {
 
         let has_bias = buffer.read_u8()? != 0;
 
-        let _acquired_load_guard = guard.acquire();
+        let _acquired_load_guard = guard.acquire(device);
         let w = deserialize_tensor(&mut buffer, device)?;
 
         let b = if has_bias {

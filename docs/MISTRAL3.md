@@ -17,7 +17,7 @@ The Mistral Small 3.1 model itself does not come with the correct JINJA chat tem
 tool calling with Mistral Small 3.1, and you can use it by specifying the `jinja_explicit` parameter in the various APIs. For example:
 
 ```bash
-./mistralrs-server --port 1234 --isq q4k --jinja-explicit chat_templates/mistral_small_tool_call.jinja vision-plain -m mistralai/Mistral-Small-3.1-24B-Instruct-2503 -a mistral3  
+./mistralrs-server --port 1234 --isq 4 --jinja-explicit chat_templates/mistral_small_tool_call.jinja vision-plain -m mistralai/Mistral-Small-3.1-24B-Instruct-2503  
 ```
 
 
@@ -57,7 +57,7 @@ If there's anything specific about this flower or its care that interests you fu
 > You should replace `--features ...` with one of the features specified [here](../README.md#supported-accelerators), or remove it for pure CPU inference.
 
 ```
-cargo run --release --features ... -- --port 1234 vision-plain -m mistralai/Mistral-Small-3.1-24B-Instruct-2503 -a mistral3
+cargo run --release --features ... -- --port 1234 vision-plain -m mistralai/Mistral-Small-3.1-24B-Instruct-2503
 ```
 
 2) Send a request
@@ -73,7 +73,7 @@ client = OpenAI(api_key="foobar", base_url="http://localhost:1234/v1/")
 
 
 completion = client.chat.completions.create(
-    model="mistral3",
+    model="default",
     messages=[
         {
             "role": "user",
@@ -113,12 +113,12 @@ This is a minimal example of running the Mistral 3 model with a dummy image.
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, VisionLoaderType, VisionMessages, VisionModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let model =
-        VisionModelBuilder::new("mistralai/Mistral-Small-3.1-24B-Instruct-2503", VisionLoaderType::Mistral3)
+        VisionModelBuilder::new("mistralai/Mistral-Small-3.1-24B-Instruct-2503")
             .with_isq(IsqType::Q4K)
             .with_logging()
             .build()
@@ -166,12 +166,12 @@ runner = Runner(
         model_id="mistralai/Mistral-Small-3.1-24B-Instruct-2503",
         arch=VisionArchitecture.Mistral3,
     ),
-    in_situ_quant="Q4K"
+    in_situ_quant="4"
 )
 
 res = runner.send_chat_completion_request(
     ChatCompletionRequest(
-        model="mistral3",
+        model="default",
         messages=[
             {
                 "role": "user",

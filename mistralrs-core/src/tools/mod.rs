@@ -5,29 +5,51 @@ use candle_core::Result;
 use regex::Regex;
 pub use request::*;
 pub use response::*;
-use serde_json::Value;
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
-};
+use serde::de::{self, Deserializer, MapAccess, Visitor};
+use serde_json::{Map, Value};
+use std::collections::HashMap;
+use std::fmt;
+use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 use crate::Pipeline;
+use mistralrs_mcp::CalledFunction;
+
+// Re-export the types so they're accessible as tools::Type
+pub use mistralrs_mcp::{ToolCallback, ToolCallbackWithTool};
+
+/// Collection of callbacks keyed by tool name.
+pub type ToolCallbacks = HashMap<String, Arc<ToolCallback>>;
+
+/// Collection of callbacks with their tool definitions keyed by tool name.
+pub type ToolCallbacksWithTools = HashMap<String, ToolCallbackWithTool>;
+
+fn contains_tool_call_prefix(prefix: &str) -> bool {
+    prefix.contains("<tool_call>")
+        || prefix.contains("<｜tool▁call▁begin｜>")
+        || prefix.contains("<|python_tag|>")
+        || prefix.contains("[TOOL_CALLS]")
+}
 
 fn process_model_specific_message(message: &str) -> Result<String> {
     static DEEPSEEK_REGEX: OnceLock<Regex> = OnceLock::new();
+    static QWEN_REGEX: OnceLock<Regex> = OnceLock::new();
+
+    // These are reasoning models so we need a regex.
     let deepseek_regex = DEEPSEEK_REGEX.get_or_init(|| Regex::new(
-        r"<｜tool▁call▁begin｜>function<｜tool▁sep｜>(?P<name>[^\n]+)\n```json\n(?P<json>.+?)\n```<｜tool▁call▁end｜>",
+        r"(?s)<｜tool▁call▁begin｜>function<｜tool▁sep｜>(?P<name>[^\n]+)\n```json\n(?P<json>.+?)\n```<｜tool▁call▁end｜>",
     ).unwrap());
+    let qwen_regex = QWEN_REGEX
+        .get_or_init(|| Regex::new(r"(?s)<tool_call>(?P<inner>.*?)</tool_call>").unwrap());
 
     if let Some(message) = message.strip_prefix("<|python_tag|>") {
         // Llama case
         Ok(message.to_string())
-    } else if let Some(message) = message
-        .strip_prefix("<tool_call>")
-        .and_then(|s| s.strip_suffix("</tool_call>"))
-    {
-        // Hermes case
+    } else if qwen_regex.is_match(message) {
+        if let Some(caps) = qwen_regex.captures(message) {
+            let inner = caps.name("inner").unwrap().as_str();
+            return Ok(inner.trim().to_string());
+        }
         Ok(message.to_string())
     } else if let Some(message) = message
         .strip_prefix("[TOOL_CALLS][")
@@ -75,8 +97,57 @@ pub struct ToolCallingMatcher {
 pub struct CalledFunctionParameters {
     #[serde(alias = "function")]
     pub name: String,
-    #[serde(alias = "arguments")]
-    pub parameters: HashMap<String, Value>,
+    #[serde(alias = "arguments", deserialize_with = "flexible_args")]
+    pub parameters: Value,
+}
+
+// Accept either `{...}` **or** a `"stringified { ... }"`
+fn flexible_args<'de, D>(d: D) -> std::result::Result<Value, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ArgVisitor;
+
+    impl<'de> Visitor<'de> for ArgVisitor {
+        type Value = Value;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an object or a JSON-encoded string containing an object")
+        }
+
+        // Case 1 – the good case: already a JSON object
+        fn visit_map<M>(self, mut m: M) -> std::result::Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut map = Map::new();
+            while let Some((k, v)) = m.next_entry()? {
+                map.insert(k, v);
+            }
+            Ok(Value::Object(map))
+        }
+
+        // Case 2 – got a *string*; try parsing it as JSON
+        fn visit_str<E>(self, s: &str) -> std::result::Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            serde_json::from_str(s).map_err(|e| E::custom(format!("inner JSON error: {e}")))
+        }
+    }
+
+    d.deserialize_any(ArgVisitor)
+}
+
+/// Fixup potentially broken JSON
+/// 1) allow/handle arguments as maps in quotations
+fn fix_broken_json(raw: &str) -> anyhow::Result<String> {
+    // 1) Delete the opening quote that shouldn’t be there
+    let tmp = raw.replacen(r#""arguments":"{"#, r#""arguments":{"#, 1);
+    // 2) Delete the closing quote that matches it
+    let fixed = tmp.replacen(r#"}"}"#, r#"}}"#, 1);
+
+    Ok(fixed)
 }
 
 impl ToolCallingMatcher {
@@ -84,7 +155,7 @@ impl ToolCallingMatcher {
         Ok(Self { tool_choice })
     }
 
-    // Checks if the the `message_prefix` could be a tool call. If false, either
+    // Checks if the `message_prefix` could be a tool call. If false, either
     // [`ToolChoice::None`] was selected, or the prefix could not match.
     //
     // If the start of a message could be a tool call, then it looks like an incomplete JSON of a given structure, e.g. `{"name": "foo", "param`.
@@ -99,6 +170,7 @@ impl ToolCallingMatcher {
             return Ok((false, false));
         }
         let message_prefix = process_model_specific_message(message_prefix)?;
+        let message_prefix = fix_broken_json(&message_prefix).unwrap();
 
         // Check if the prefix could be a JSON serialization of any of the following types.
         Ok([
@@ -114,7 +186,7 @@ impl ToolCallingMatcher {
                 None
             }
         })
-        .unwrap_or_default())
+        .unwrap_or((contains_tool_call_prefix(&message_prefix), false)))
     }
 
     pub fn get_call(
@@ -126,10 +198,12 @@ impl ToolCallingMatcher {
             return Ok(Vec::new());
         }
         let message = process_model_specific_message(message)?;
+        let message = fix_broken_json(&message).unwrap();
 
         if let Ok(deser) = serde_json::from_str::<CalledFunctionParameters>(&message) {
             let id = format!("call-{}", Uuid::new_v4());
             Ok(vec![ToolCallResponse {
+                index: 0,
                 id,
                 tp: ToolCallType::Function,
                 function: CalledFunction {
@@ -140,9 +214,11 @@ impl ToolCallingMatcher {
         } else if let Ok(deser) = serde_json::from_str::<Vec<CalledFunctionParameters>>(&message) {
             Ok(deser
                 .into_iter()
-                .map(|deser| {
+                .enumerate()
+                .map(|(idx, deser)| {
                     let id = format!("call-{}", Uuid::new_v4());
                     Ok(ToolCallResponse {
+                        index: idx,
                         id,
                         tp: ToolCallType::Function,
                         function: CalledFunction {
@@ -168,7 +244,7 @@ fn could_be_json<T>(text_prefix: &str) -> (bool, bool)
 where
     T: serde::de::DeserializeOwned,
 {
-    if text_prefix.is_empty() {
+    if text_prefix.trim().is_empty() {
         return (false, false);
     }
     match serde_json::from_str::<T>(text_prefix) {

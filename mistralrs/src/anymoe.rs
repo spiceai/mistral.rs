@@ -42,7 +42,6 @@ impl AnyMoeModelBuilder {
 
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = NormalSpecificConfig {
-            use_flash_attn: self.base.use_flash_attn,
             prompt_chunksize: self.base.prompt_chunksize,
             topology: self.base.topology,
             organization: self.base.organization,
@@ -51,6 +50,8 @@ impl AnyMoeModelBuilder {
             imatrix: None,
             calibration_file: None,
             hf_cache_path: self.base.hf_cache_path,
+            matformer_config_path: None,
+            matformer_slice_name: None,
         };
 
         if self.base.with_logging {
@@ -117,14 +118,21 @@ impl AnyMoeModelBuilder {
             scheduler_method,
             self.base.throughput_logging,
             self.base.search_bert_model,
-        )
-        .with_no_kv_cache(self.base.no_kv_cache)
-        .with_no_prefix_cache(self.base.prefix_cache_n.is_none());
+        );
+        if let Some(cb) = self.base.search_callback.clone() {
+            runner = runner.with_search_callback(cb);
+        }
+        for (name, cb) in &self.base.tool_callbacks {
+            runner = runner.with_tool_callback(name.clone(), cb.clone());
+        }
+        runner = runner
+            .with_no_kv_cache(self.base.no_kv_cache)
+            .with_no_prefix_cache(self.base.prefix_cache_n.is_none());
 
         if let Some(n) = self.base.prefix_cache_n {
             runner = runner.with_prefix_cache_n(n)
         }
 
-        Ok(Model::new(runner.build()))
+        Ok(Model::new(runner.build().await))
     }
 }

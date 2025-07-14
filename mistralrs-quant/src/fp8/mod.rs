@@ -12,7 +12,7 @@ use quantize::QuantizationResult;
 mod quantize;
 
 use crate::{
-    cublaslt::{maybe_init_cublas_lt_wrapper, F8MatmulOutType, CUBLASLT_HANDLE},
+    cublaslt::{maybe_init_cublas_lt_wrapper, F8MatmulOutType, CUBLASLT_CONTROLLER},
     utils::{
         deserialize_tensor, read_dtype, serialize_tensor, version_is_compatible, write_dtype,
         UQFF_VERSION,
@@ -37,7 +37,7 @@ impl QuantMethod for FP8Linear {
     {
         match method {
             QuantMethodConfig::Gguf { .. }
-            | QuantMethodConfig::Gptq { .. }
+            | QuantMethodConfig::GptqAwq { .. }
             | QuantMethodConfig::Hqq { .. }
             | QuantMethodConfig::Dummy
             | QuantMethodConfig::Unquantized(_)
@@ -68,7 +68,7 @@ impl QuantMethod for FP8Linear {
         // Batch matrix multiplication
         maybe_init_cublas_lt_wrapper(x.device().clone());
 
-        match *CUBLASLT_HANDLE.lock().unwrap() {
+        match CUBLASLT_CONTROLLER.get() {
             Some(handle) => {
                 let n_dims = x.dims().len();
                 if n_dims < 3 {
@@ -252,7 +252,7 @@ impl QuantizedSerde for FP8Linear {
 
         let w = deserialize_tensor(&mut buffer, device)?;
 
-        let _acquired_load_guard = guard.acquire();
+        let _acquired_load_guard = guard.acquire(device);
         let dequant_w_scale = Tensor::new(buffer.read_f32::<LittleEndian>()?, device)?;
         let dequant_x_scale = Tensor::new(buffer.read_f32::<LittleEndian>()?, device)?;
         let quant_scale = Tensor::new(buffer.read_f32::<LittleEndian>()?, device)?;
@@ -299,7 +299,7 @@ impl QuantizedSerde for FP8Linear {
 
         let has_bias = buffer.read_u8()? != 0;
 
-        let _acquired_load_guard = guard.acquire();
+        let _acquired_load_guard = guard.acquire(device);
         let w = deserialize_tensor(&mut buffer, device)?;
 
         let dequant_w_scale = Tensor::new(buffer.read_f32::<LittleEndian>()?, device)?;

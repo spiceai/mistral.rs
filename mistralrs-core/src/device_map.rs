@@ -1,11 +1,10 @@
 use std::{fmt::Debug, sync::Arc};
 
 use crate::{
-    pipeline::AutoDeviceMapParams,
-    utils::{debug::DeviceRepr, log::once_log_info},
-    MemoryUsage, Topology, TryIntoDType,
+    pipeline::AutoDeviceMapParams, utils::debug::DeviceRepr, MemoryUsage, Topology, TryIntoDType,
 };
 use candle_core::{DType, Device, DeviceLocation, Result, Tensor};
+use mistralrs_quant::log::once_log_info;
 use mistralrs_quant::ShardedVarBuilder;
 use serde::Deserialize;
 use tracing::info;
@@ -161,7 +160,7 @@ impl DeviceMapSetting {
                                 if device_ord == *ordinal {
                                     device.clone()
                                 } else {
-                                    Device::new_cuda_with_stream(*ordinal)?
+                                    Device::new_cuda(*ordinal)?
                                 }
                             }
                             DeviceLocation::Metal { gpu_id: device_ord } => {
@@ -337,7 +336,7 @@ impl DeviceMapper for LayerDeviceMapper {
 
 #[derive(Debug)]
 pub struct DummyDeviceMapper {
-    nm_device: Device,
+    pub(crate) nm_device: Device,
 }
 
 impl DeviceMapper for DummyDeviceMapper {

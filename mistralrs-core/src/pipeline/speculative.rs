@@ -1,6 +1,5 @@
 use std::{
     any::Any,
-    iter::zip,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -15,19 +14,22 @@ use tracing::warn;
 use crate::{
     device_map::DeviceMapper,
     get_mut_arcmutex,
+    kv_cache::NormalCacheManager,
     pipeline::sampling::{
         finish_or_add_toks_to_seq, sample_sequence, sample_target_sequence_speculative,
     },
     prefix_cacher::PrefixCacheManagerV2,
-    sequence::{Sequence, SequenceRecognizer},
+    sequence::Sequence,
     DeviceMapSetting, Loader, ModelKind, PagedAttentionConfig, Pipeline, TokenSource, TryIntoDType,
 };
 
+use crate::kv_cache::CacheManager;
+
 use super::{
-    cache_manager::NormalCacheManager, chat_template::ChatTemplate, sampling::SpeculativeSample,
-    AnyMoePipelineMixin, CacheBackendMetadata, CacheInstruction, CacheManager, CacheManagerMixin,
-    EitherCache, ForwardInputsResult, GeneralMetadata, IsqPipelineMixin, MetadataMixin,
-    ModelCategory, ModelPaths, PreProcessingMixin,
+    chat_template::ChatTemplate, sampling::SpeculativeSample, AnyMoePipelineMixin,
+    CacheBackendMetadata, CacheInstruction, CacheManagerMixin, EitherCache, ForwardInputsResult,
+    GeneralMetadata, IsqPipelineMixin, MetadataMixin, ModelCategory, ModelPaths,
+    PreProcessingMixin,
 };
 
 /// A loader for a speculative pipeline using 2 [`Loader`]s.
@@ -335,7 +337,7 @@ impl Pipeline for SpeculativePipeline {
         prefix_cacher: &mut PrefixCacheManagerV2,
         disable_eos_stop: bool,
         rng: Arc<Mutex<Isaac64Rng>>,
-        backend_metadata: CacheBackendMetadata<'_>,
+        backend_metadata: CacheBackendMetadata,
     ) -> Result<Duration> {
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
@@ -402,8 +404,8 @@ impl Pipeline for SpeculativePipeline {
                         seq.return_logprobs(),
                         rng.clone(),
                         false, // todo tune
-                        false, // do not add to tok trie yet
                         true,
+                        false,
                     )
                     .await?;
                     seq.add_tmp_tok(sample.token);
@@ -475,26 +477,21 @@ impl Pipeline for SpeculativePipeline {
 
                 // ======================= Rejection sampling. ============================
                 // Map from each target sample to corresponding in draft sample
+                // this will first rollback LLG state if any, and then advance for the accepted tokens only
                 let samples = sample_target_sequence_speculative(
                     logits.clone(),
                     seq,
                     seq.return_logprobs(),
                     rng.clone(),
-                    self.gamma,
+                    &draft_samples,
                 )
                 .await?;
 
-                let mut accepted_tokens = Vec::new();
-                for (target_sample, draft_sample) in zip(samples, draft_samples) {
-                    let tok = target_sample.sample.token;
-                    accepted_tokens.push(target_sample.sample);
-                    if draft_sample.sample.token != tok {
-                        break;
-                    }
-                }
+                let accepted_tokens = samples.into_iter().map(|s| s.sample).collect::<Vec<_>>();
 
                 // ======================= Narrow caches to account for rejections ============================
                 let n_not_accepted = self.gamma - accepted_tokens.len();
+
                 match get_mut_arcmutex!(self.draft).cache() {
                     EitherCache::Full(full) => {
                         for (k, v) in full.lock().iter_mut().flatten() {
@@ -573,13 +570,6 @@ impl Pipeline for SpeculativePipeline {
                         false,
                     )
                     .await?;
-                    match seq.recognizer {
-                        SequenceRecognizer::Llguidance(ref mut llg) => {
-                            llg.commit_token(Some(accepted.token))
-                                .map_err(candle_core::Error::msg)?;
-                        }
-                        SequenceRecognizer::None => {}
-                    }
                 }
 
                 // Trick to improve lower bounds. Sample last token in multinomial
