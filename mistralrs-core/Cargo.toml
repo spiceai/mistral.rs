@@ -105,6 +105,7 @@ rust-mcp-schema.workspace = true
 mistralrs-mcp = { workspace = true, features = ["utoipa"] }
 statrs.workspace = true
 openai-harmony = "0.0.8"
+signal-hook = "0.3"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc = { workspace = true, optional = true }

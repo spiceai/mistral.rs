@@ -2,10 +2,17 @@ use std::{
     env, fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
 use hf_hub::api::sync::{ApiError, ApiRepo};
+use signal_hook::consts::TERM_SIGNALS;
 use tracing::{info, warn};
 
 use super::FileListCache;
@@ -294,6 +301,33 @@ pub(crate) fn get_file(api: &ApiRepo, model_id: &Path, file: &str) -> Result<Pat
         return Ok(path);
     }
 
-    api.get(file)
-        .map_err(|err| hf_api_error(model_id, Some(file), &err))
+    // Set up SIGTERM handling to allow graceful cancellation of downloads
+    let should_terminate = Arc::new(AtomicBool::new(false));
+    for sig in TERM_SIGNALS {
+        if let Err(e) = signal_hook::flag::register(*sig, Arc::clone(&should_terminate)) {
+            warn!("Failed to register signal handler for signal {sig}: {e}");
+        }
+    }
+
+    // Use scoped threads to allow borrowing api into the download thread
+    let download_result = thread::scope(|s| {
+        let handle = s.spawn(|| api.get(file));
+
+        // Poll for completion while checking for termination signal
+        loop {
+            if handle.is_finished() {
+                return handle.join().expect("Download thread panicked");
+            }
+            if should_terminate.load(Ordering::SeqCst) {
+                // We can't actually cancel the download, but we can return early
+                // The download will continue in the background but we'll report cancellation
+                return Err(hf_hub::api::sync::ApiError::InvalidHeader(
+                    "Download cancelled due to termination signal".into(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    download_result.map_err(|err| hf_api_error(model_id, Some(file), &err))
 }

@@ -3570,6 +3570,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "serde_plain",
+ "signal-hook",
  "statrs",
  "strum 0.27.2",
  "symphonia",
