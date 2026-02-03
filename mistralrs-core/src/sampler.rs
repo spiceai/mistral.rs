@@ -217,7 +217,17 @@ pub struct Logprobs {
 /// Comparator for descending order by probability (second element of tuple).
 #[inline]
 fn cmp_desc_by_prob(a: &(u32, f32), b: &(u32, f32)) -> std::cmp::Ordering {
-    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    match (a.1.is_nan(), b.1.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => b.1.partial_cmp(&a.1).unwrap_or_else(|| {
+            panic!(
+                "Incomparable log probs at indices i={}, j={}. Cannot compare probs[i]={} & probs[j]={}",
+                a.0, b.0, a.1, b.1
+            )
+        }),
+    }
 }
 
 /// Returns the top-k (index, probability) pairs from `probs`, sorted in descending order.
