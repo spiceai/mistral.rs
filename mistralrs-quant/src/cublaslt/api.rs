@@ -9,8 +9,9 @@ use candle_core::{CpuStorage, DType, Device, Layout, Result, Shape, Storage, Ten
 use half::{bf16, f16};
 use std::sync::Arc;
 
-use super::matmul::{Activation, CublasLTDType, CudaBlasLT, Matmul, MatmulConfig, OutSlice};
-use super::F8MatmulOutType;
+use crate::cublaslt::matmul::MatmulShared;
+
+use super::matmul::{Activation, CublasLTDType, CudaBlasLT, Matmul, MatmulConfig};
 
 #[derive(Debug, Clone)]
 pub struct CublasLt(Arc<CudaBlasLT>);
@@ -22,13 +23,13 @@ impl CublasLt {
             _ => candle_core::bail!("`device` must be a `cuda` device"),
         };
 
-        let inner = CudaBlasLT::new(dev.cuda_device()).unwrap();
+        let inner = CudaBlasLT::new(dev.cuda_stream()).unwrap();
 
         Ok(Self(Arc::new(inner)))
     }
 }
 
-pub struct CublasLTBatchMatmulF8 {
+pub struct CublasLTBatchMatmulF8Scalar {
     pub cublaslt: Arc<CudaBlasLT>,
     pub act: Option<Activation>,
     pub c: Option<Tensor>,
@@ -39,11 +40,10 @@ pub struct CublasLTBatchMatmulF8 {
     pub b_scale: Tensor,
     // Quantize
     pub d_scale: Tensor,
-    pub out_dtype: F8MatmulOutType,
 }
 
-impl CublasLTBatchMatmulF8 {
-    pub fn fwd_f8e4m3(
+impl CublasLTBatchMatmulF8Scalar {
+    pub fn fwd_f8e4m3_scalar(
         &self,
         a: &candle_core::CudaStorage,
         a_l: &Layout,
@@ -154,20 +154,14 @@ impl CublasLTBatchMatmulF8 {
         } else {
             // Allocate out tensor
             (
-                unsafe { dev.alloc::<bf16>(out_shape.elem_count()).w()? },
+                unsafe { dev.alloc::<bf16>(out_shape.elem_count())? },
                 (n * m),
             )
         };
-        let (mut out, stride_c) = match self.out_dtype {
-            F8MatmulOutType::BF16 => (
-                OutSlice::BF16(unsafe { dev.alloc::<bf16>(out_shape.elem_count()).w()? }),
-                (n * m),
-            ),
-            F8MatmulOutType::F8 => (
-                OutSlice::F8(unsafe { dev.alloc::<F8E4M3>(out_shape.elem_count()).w()? }),
-                (n * m),
-            ),
-        };
+        let (mut out, stride_c) = (
+            unsafe { dev.alloc::<bf16>(out_shape.elem_count())? },
+            (n * m),
+        );
 
         let cases = [
             k * std::mem::size_of::<F8E4M3>(),
@@ -176,12 +170,12 @@ impl CublasLTBatchMatmulF8 {
             lda * std::mem::size_of::<F8E4M3>(), // A type size
             ldb * std::mem::size_of::<F8E4M3>(), // B type size
             ldc * std::mem::size_of::<F8E4M3>(), // C type size
-            *a.device_ptr() as usize,
-            *b.device_ptr() as usize,
-            *c.device_ptr() as usize,
-            *a_scale.device_ptr() as usize,
-            *b_scale.device_ptr() as usize,
-            *d_scale.device_ptr() as usize,
+            a.device_ptr(self.cublaslt.stream()).0 as usize,
+            b.device_ptr(self.cublaslt.stream()).0 as usize,
+            c.device_ptr(self.cublaslt.stream()).0 as usize,
+            a_scale.device_ptr(self.cublaslt.stream()).0 as usize,
+            b_scale.device_ptr(self.cublaslt.stream()).0 as usize,
+            d_scale.device_ptr(self.cublaslt.stream()).0 as usize,
         ];
 
         for case in cases {
@@ -228,10 +222,7 @@ impl CublasLTBatchMatmulF8 {
                 .map_err(|e| candle_core::Error::Cuda(Box::new(e)))?;
         }
 
-        let out = match out {
-            OutSlice::BF16(s) => candle_core::CudaStorage::wrap_cuda_slice(s, dev.clone()),
-            OutSlice::F8(s) => candle_core::CudaStorage::wrap_cuda_slice(s, dev.clone()),
-        };
+        let out = candle_core::CudaStorage::wrap_cuda_slice(out, dev.clone());
 
         Ok((out, out_shape))
     }
@@ -267,10 +258,9 @@ pub fn fused_batch_matmul_f8(
     beta: Option<f32>,
     bias: Option<&Tensor>,
     act: Option<Activation>,
-    out_dtype: F8MatmulOutType,
     cublaslt: CublasLt,
 ) -> Result<Tensor> {
-    let op = CublasLTBatchMatmulF8 {
+    let op = CublasLTBatchMatmulF8Scalar {
         act,
         cublaslt: cublaslt.0,
         c: out.cloned(),
@@ -279,7 +269,6 @@ pub fn fused_batch_matmul_f8(
         a_scale: dequant_a_scale.clone(),
         b_scale: dequant_b_scale.clone(),
         d_scale: quantize_scale.clone(),
-        out_dtype,
     };
 
     if let Some(bias) = bias {
@@ -289,7 +278,7 @@ pub fn fused_batch_matmul_f8(
     }
 }
 
-impl candle_core::CustomOp2 for CublasLTBatchMatmulF8 {
+impl candle_core::CustomOp2 for CublasLTBatchMatmulF8Scalar {
     fn name(&self) -> &'static str {
         "cublaslt-batch-matmul-f8"
     }
@@ -312,7 +301,7 @@ impl candle_core::CustomOp2 for CublasLTBatchMatmulF8 {
         b_l: &Layout,
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         match a.dtype() {
-            candle_core::DType::F8E4M3 => self.fwd_f8e4m3(a, a_l, b, b_l, None, None),
+            candle_core::DType::F8E4M3 => self.fwd_f8e4m3_scalar(a, a_l, b, b_l, None, None),
             dt => {
                 candle_core::bail!("cublaslt-batch-matmul is only supported for f8e4m3 ({dt:?})")
             }
@@ -320,7 +309,7 @@ impl candle_core::CustomOp2 for CublasLTBatchMatmulF8 {
     }
 }
 
-impl candle_core::CustomOp3 for CublasLTBatchMatmulF8 {
+impl candle_core::CustomOp3 for CublasLTBatchMatmulF8Scalar {
     fn name(&self) -> &'static str {
         "cublaslt-batch-matmul-add-f8"
     }
@@ -347,7 +336,9 @@ impl candle_core::CustomOp3 for CublasLTBatchMatmulF8 {
         bias_l: &Layout,
     ) -> Result<(candle_core::CudaStorage, Shape)> {
         match a.dtype() {
-            candle_core::DType::F8E4M3 => self.fwd_f8e4m3(a, a_l, b, b_l, Some(bias), Some(bias_l)),
+            candle_core::DType::F8E4M3 => {
+                self.fwd_f8e4m3_scalar(a, a_l, b, b_l, Some(bias), Some(bias_l))
+            }
             dt => candle_core::bail!(
                 "cublaslt-batch-matmul-add is only supported for f8e4m3 ({dt:?})"
             ),
@@ -432,10 +423,7 @@ impl CublasLTBatchMatmul {
             (c.clone(), c_l.stride()[0])
         } else {
             // Allocate out tensor
-            (
-                unsafe { dev.alloc::<T>(out_shape.elem_count()).w()? },
-                (n * m),
-            )
+            (unsafe { dev.alloc::<T>(out_shape.elem_count())? }, (n * m))
         };
 
         let config = MatmulConfig {

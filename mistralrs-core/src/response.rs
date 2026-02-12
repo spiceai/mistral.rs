@@ -33,6 +33,10 @@ pub struct ResponseMessage {
     pub content: Option<String>,
     pub role: String,
     pub tool_calls: Option<Vec<ToolCallResponse>>,
+    /// Reasoning/analysis content from Harmony format (separate from final content).
+    /// This contains chain-of-thought reasoning that is not intended for end users.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 generate_repr!(ResponseMessage);
@@ -45,6 +49,10 @@ pub struct Delta {
     pub content: Option<String>,
     pub role: String,
     pub tool_calls: Option<Vec<ToolCallResponse>>,
+    /// Reasoning/analysis content delta from Harmony format.
+    /// This contains incremental chain-of-thought reasoning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 generate_repr!(Delta);
@@ -253,6 +261,11 @@ pub enum Response {
         logits_chunks: Vec<Tensor>,
         tokens: Vec<u32>,
     },
+    Embeddings {
+        embeddings: Vec<f32>,
+        prompt_tokens: usize,
+        total_tokens: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -275,6 +288,12 @@ pub enum ResponseOk {
     Raw {
         logits_chunks: Vec<Tensor>,
         tokens: Vec<u32>,
+    },
+    // Embeddings
+    Embeddings {
+        embeddings: Vec<f32>,
+        prompt_tokens: usize,
+        total_tokens: usize,
     },
 }
 
@@ -353,6 +372,15 @@ impl Response {
             } => Ok(ResponseOk::Raw {
                 logits_chunks,
                 tokens,
+            }),
+            Self::Embeddings {
+                embeddings,
+                prompt_tokens,
+                total_tokens,
+            } => Ok(ResponseOk::Embeddings {
+                embeddings,
+                prompt_tokens,
+                total_tokens,
             }),
         }
     }

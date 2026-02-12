@@ -306,7 +306,6 @@ impl Attention {
                     v,
                     attention_mask,
                     self.sliding_window,
-                    false,
                 )?;
 
                 Sdpa.run_attention(
@@ -536,6 +535,7 @@ impl Model {
                 sliding_window: cfg.sliding_window,
                 k_head_dim: cfg.head_dim(),
                 v_head_dim: cfg.head_dim(),
+                kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             mapper,
         })
@@ -609,10 +609,11 @@ impl Model {
         }
         xs = xs.to_device(&self.device)?;
         xs = xs.apply(&self.norm)?;
+        let mut xs = extract_logits(&xs, context_lens)?;
         if let Some(t) = self.lm_head.quantized_act_type() {
             xs = xs.to_dtype(t)?;
         }
-        extract_logits(&MatMul.qmethod_matmul(&xs, &*self.lm_head)?, context_lens)
+        MatMul.qmethod_matmul(&xs, &*self.lm_head)
     }
 }
 

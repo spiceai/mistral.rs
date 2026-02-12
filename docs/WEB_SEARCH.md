@@ -15,13 +15,13 @@ Besides tool calling and parsing of web content, we also use an embedding model 
 
 You can use the web search tool in all the APIs: Python, Rust, and server.
 
-## Specifying a custom embedding model
+## Selecting a search embedding model
 
-Internally, we use a BERT model (Snowflake/snowflake-arctic-embed-l-v2.0)[https://huggingface.co/Snowflake/snowflake-arctic-embed-l-v2.0] (0.6b parameters = ~2.3GB) to select the most relevant search results. You can specify a custom BERT model by providing a Hugging Face model ID in the various APIs:
+Internally, we now use [google/embeddinggemma-300m](https://huggingface.co/google/embeddinggemma-300m) to embed documents for ranking. You can pick from the built-in reranker variants (currently just `embedding_gemma`) in every API:
 
-- Rust: `with_search` in the builder
-- Python: `search_bert_model` in the Runner
-- Server: `search-bert-model` before the model type selector (`plain`/`vision-plain`)
+- Rust: `with_search(SearchEmbeddingModel::EmbeddingGemma300M)` in the builder
+- Python: `search_embedding_model="embedding_gemma"` in the Runner
+- Server: `--search-embedding-model embedding_gemma` flag
 
 ## Specifying a custom search callback
 
@@ -57,16 +57,16 @@ runner = Runner(
 
 Here are some examples using various models. Note that this works for both streaming and completion requests, so interactive mode is featured here!
 
-```
-./mistralrs-server --enable-search -i --isq 4 plain -m Qwen/Qwen3-4B
-```
-
-```
-./mistralrs-server --enable-search --port 1234 --isq 4 --jinja-explicit chat_templates/mistral_small_tool_call.jinja vision-plain -m mistralai/Mistral-Small-3.1-24B-Instruct-2503
+```bash
+mistralrs run --enable-search --isq 4 -m Qwen/Qwen3-4B
 ```
 
+```bash
+mistralrs serve --enable-search -p 1234 --isq 4 --jinja-explicit chat_templates/mistral_small_tool_call.jinja -m mistralai/Mistral-Small-3.1-24B-Instruct-2503
 ```
-./mistralrs-server --enable-search -i --isq 4 plain -m NousResearch/Hermes-3-Llama-3.1-8B
+
+```bash
+mistralrs run --enable-search --isq 4 -m NousResearch/Hermes-3-Llama-3.1-8B
 ```
 
 ```py
@@ -99,7 +99,7 @@ if completion.choices[0].message.tool_calls is not None:
 ```
 
 
-## Python API
+## Python SDK
 ```py
 from mistralrs import (
     Runner,
@@ -116,7 +116,7 @@ def my_search_callback(query: str) -> list[dict[str, str]]:
         {
             "title": "Mistral.rs GitHub",
             "description": "Official mistral.rs repository",
-            "url": "https://github.com/huggingface/mistral.rs",
+            "url": "https://github.com/EricLBuehler/mistral.rs",
             "content": "mistral.rs is a Rust binding for Mistral models...",
         },
     ]
@@ -152,11 +152,11 @@ print(res.choices[0].message.content)
 print(res.usage)
 ```
 
-## Rust API
+## Rust SDK
 ```rust
 use anyhow::Result;
 use mistralrs::{
-    BertEmbeddingModel, IsqType, RequestBuilder, TextMessageRole, TextMessages, TextModelBuilder,
+    SearchEmbeddingModel, IsqType, RequestBuilder, TextMessageRole, TextMessages, TextModelBuilder,
     WebSearchOptions,
 };
 
@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
     let model = TextModelBuilder::new("NousResearch/Hermes-3-Llama-3.1-8B")
         .with_isq(IsqType::Q4K)
         .with_logging()
-        .with_search(BertEmbeddingModel::default())
+        .with_search(SearchEmbeddingModel::default())
         .build()
         .await?;
 

@@ -12,10 +12,10 @@ use hyper::Uri;
 use include_dir::{include_dir, Dir};
 use indexmap::IndexMap;
 use mistralrs::{
-    best_device, parse_isq_value, BertEmbeddingModel, IsqType, SpeechLoaderType,
+    best_device, parse_isq_value, IsqType, SearchEmbeddingModel, SpeechLoaderType,
     SpeechModelBuilder, TextModelBuilder, VisionModelBuilder,
 };
-use std::{net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 use tokio::{fs, net::TcpListener};
 use tower_http::services::ServeDir;
 
@@ -27,7 +27,7 @@ mod utils;
 
 use handlers::{api::*, websocket::ws_handler};
 use models::LoadedModel;
-use types::{AppState, Cli};
+use types::{AppState, Cli, GenerationParams};
 
 static STATIC_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/static");
 
@@ -52,6 +52,8 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    eprintln!("⚠️  mistralrs-web-chat is deprecated. Please use `mistralrs serve --ui` from mistralrs-cli instead.");
+
     let cli = Cli::parse();
     if cli.text_models.is_empty() && cli.vision_models.is_empty() && cli.speech_models.is_empty() {
         eprintln!("At least one --text-model, --vision-model, or --speech-model is required");
@@ -72,11 +74,8 @@ async fn main() -> Result<()> {
         .and_then(|isq| parse_isq_value(isq, Some(&device)).ok());
 
     // Determine embedding model for web search if enabled
-    let search_embedding_model: Option<BertEmbeddingModel> = if cli.enable_search {
-        Some(match &cli.search_bert_model {
-            Some(model_id) => BertEmbeddingModel::Custom(model_id.clone()),
-            None => BertEmbeddingModel::default(),
-        })
+    let search_embedding_model: Option<SearchEmbeddingModel> = if cli.enable_search {
+        Some(cli.search_embedding_model.unwrap_or_default())
     } else {
         None
     };
@@ -94,8 +93,8 @@ async fn main() -> Result<()> {
             .with_isq(isq.unwrap_or(default_isq))
             .with_logging()
             .with_throughput_logging();
-        if let Some(ref bert_model) = search_embedding_model {
-            builder = builder.with_search(bert_model.clone());
+        if let Some(ref search_embedding_model) = search_embedding_model {
+            builder = builder.with_search(*search_embedding_model);
         }
         let m = builder.build().await?;
         models.insert(name, LoadedModel::Text(Arc::new(m)));
@@ -113,8 +112,8 @@ async fn main() -> Result<()> {
             .with_isq(isq.unwrap_or(default_isq))
             .with_logging()
             .with_throughput_logging();
-        if let Some(ref bert_model) = search_embedding_model {
-            builder = builder.with_search(bert_model.clone());
+        if let Some(ref search_embedding_model) = search_embedding_model {
+            builder = builder.with_search(*search_embedding_model);
         }
         let m = builder.build().await?;
         models.insert(name, LoadedModel::Vision(Arc::new(m)));
@@ -159,6 +158,16 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Build default generation parameters from CLI
+    let default_params = GenerationParams {
+        temperature: cli.temperature,
+        top_p: cli.top_p,
+        top_k: cli.top_k,
+        max_tokens: cli.max_tokens,
+        repetition_penalty: cli.repetition_penalty,
+        system_prompt: cli.system_prompt.clone(),
+    };
+
     let app_state = Arc::new(AppState {
         models,
         current: tokio::sync::RwLock::new(None),
@@ -166,6 +175,8 @@ async fn main() -> Result<()> {
         speech_dir: speech_dir.clone(),
         current_chat: tokio::sync::RwLock::new(None),
         next_chat_id: tokio::sync::RwLock::new(next_id),
+        default_params,
+        search_enabled: cli.enable_search,
     });
 
     let app = Router::new()
@@ -181,6 +192,8 @@ async fn main() -> Result<()> {
         .route("/api/load_chat", post(load_chat))
         .route("/api/rename_chat", post(rename_chat))
         .route("/api/append_message", post(append_message))
+        // Generation settings endpoints
+        .route("/api/settings", get(get_settings))
         // Text-to-speech generation endpoint
         .route("/api/generate_speech", post(generate_speech))
         // Serve generated speech files
@@ -191,9 +204,11 @@ async fn main() -> Result<()> {
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(app_state.clone());
 
-    let addr: SocketAddr = ([0, 0, 0, 0], cli.port.unwrap_or(8080)).into();
-    let listener = TcpListener::bind(addr).await?;
-    println!("🔌 listening on http://{addr}");
+    let host = cli.host.as_deref().unwrap_or("0.0.0.0");
+    let port = cli.port.unwrap_or(1234);
+    let bind_addr = format!("{}:{}", host, port);
+    let listener = TcpListener::bind(&bind_addr).await?;
+    println!("🔌 Listening on http://{}", bind_addr);
     axum::serve(listener, app).await?;
     Ok(())
 }

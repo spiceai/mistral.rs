@@ -2,13 +2,14 @@
 name = "mistralrs-mcp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "MCP (Model Context Protocol) client for mistral.rs"
 license.workspace = true
 homepage.workspace = true
-keywords = ["mcp", "model-context-protocol", "tools", "ai", "llm"]
+keywords = ["mcp", "tools", "ai", "llm"]
 categories = ["api-bindings", "development-tools"]
 repository.workspace = true
-readme = "README.md"
+readme = "../README.md"
 
 [dependencies]
 anyhow.workspace = true

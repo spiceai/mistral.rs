@@ -13,9 +13,14 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::{
     chat_completion::chatcompletions,
     completions::completions,
-    handlers::{health, models, re_isq},
+    embeddings::embeddings,
+    handlers::{
+        get_model_status, health, models, re_isq, reload_model, system_doctor, system_info,
+        tune_model, unload_model,
+    },
     image_generation::image_generation,
     openapi_doc::get_openapi_doc,
+    responses::{cancel_response, create_response, delete_response, get_response},
     speech_generation::speech_generation,
     types::SharedMistralRsState,
 };
@@ -195,12 +200,25 @@ fn init_router(
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chatcompletions))
         .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(models))
+        .route("/v1/models/unload", post(unload_model))
+        .route("/v1/models/reload", post(reload_model))
+        .route("/v1/models/status", post(get_model_status))
+        .route("/v1/models/tune", post(tune_model))
+        .route("/v1/system/info", get(system_info))
+        .route("/v1/system/doctor", post(system_doctor))
         .route("/health", get(health))
         .route("/", get(health))
         .route("/re_isq", post(re_isq))
         .route("/v1/images/generations", post(image_generation))
         .route("/v1/audio/speech", post(speech_generation))
+        .route("/v1/responses", post(create_response))
+        .route(
+            "/v1/responses/{response_id}",
+            get(get_response).delete(delete_response),
+        )
+        .route("/v1/responses/{response_id}/cancel", post(cancel_response))
         .layer(cors_layer)
         .layer(DefaultBodyLimit::max(router_max_body_limit))
         .with_state(state);

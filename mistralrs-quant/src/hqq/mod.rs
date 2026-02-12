@@ -3,9 +3,12 @@ use candle_core::{DType, Device, Result, Shape, Tensor};
 
 #[cfg(feature = "cuda")]
 use candle_core::{
-    cuda::{cudarc::driver::DevicePtr, CudaStorageSlice, WrapErr},
-    from_storage_no_op, CudaStorage, Storage,
+    cuda::{cudarc::driver::DevicePtr, CudaStorageSlice},
+    CudaStorage, Storage,
 };
+
+#[cfg(feature = "metal")]
+use candle_core::Storage;
 
 use candle_nn::Linear;
 #[cfg(feature = "cuda")]
@@ -27,13 +30,16 @@ use crate::{
 };
 
 #[cfg(feature = "cuda")]
-use crate::utils::{get_cuda_device, get_cuda_slice};
+use crate::utils::get_cuda_device;
 
 #[cfg(feature = "cuda")]
 use ffi::{eight_bit, four_bit, one_bit, three_bit, two_bit};
 
 #[cfg(feature = "cuda")]
 mod ffi;
+
+#[cfg(feature = "cuda")]
+mod bitpack_ffi;
 
 #[cfg(not(feature = "cuda"))]
 mod hqq_op;
@@ -49,26 +55,44 @@ pub(crate) const OPTIMIZER_HQQ_DEFAULT_STEPS: usize = 20;
 macro_rules! dequant_for_dtype {
     ($this:expr, w=$wq_t:ty, sz=$scale_t:ty, $dtype:ident, pack=$pack:expr, $dev:expr, $bit_thing:ident, $postfix:tt) => {{
         paste::paste! {
-            let w_slice = get_cuda_slice::<$wq_t>(&$this.w_q)?;
-            let scale_slice = get_cuda_slice::<$scale_t>(&$this.scales)?;
-            let zero_slice = get_cuda_slice::<$scale_t>(&$this.zeros)?;
+            let (wq, _) = $this.w_q.storage_and_layout();
+            let wq = match &*wq {
+                candle_core::Storage::Cuda(s) => s,
+                _ => candle_core::bail!("wq must be a cuda tensor"),
+            };
+            let (w_slice, _w_guard) = crate::utils::slice_ptr(wq.as_cuda_slice::<$wq_t>()?, $this.w_q.layout().start_offset());
+
+            let (scale, _) = $this.scales.storage_and_layout();
+            let scale = match &*scale {
+                candle_core::Storage::Cuda(s) => s,
+                _ => candle_core::bail!("scale must be a cuda tensor"),
+            };
+            let (scale_slice, _scale_guard) = crate::utils::slice_ptr(scale.as_cuda_slice::<$scale_t>()?, $this.scales.layout().start_offset());
+
+            let (zero, _) = $this.zeros.storage_and_layout();
+            let zero = match &*zero {
+                candle_core::Storage::Cuda(s) => s,
+                _ => candle_core::bail!("zero must be a cuda tensor"),
+            };
+            let (zero_slice, _zero_guard) = crate::utils::slice_ptr(zero.as_cuda_slice::<$scale_t>()?, $this.zeros.layout().start_offset());
 
             let (h, w) = $this.w_q.dims2()?;
             let num_packed_elems = $pack;
             let out_shape = Shape::from_dims(&[num_packed_elems * h, w]);
 
-            let out = unsafe { $dev.alloc::<$scale_t>(out_shape.elem_count()).w()? };
-            let out_ptr = *out.device_ptr() as *mut $scale_t;
+            let out = unsafe { $dev.alloc::<$scale_t>(out_shape.elem_count())? };
+            let (out_ptr, out_guard) = out.device_ptr(out.stream());
             unsafe {
                 $bit_thing::[< dequantize_ $postfix >](
-                    w_slice,
-                    scale_slice,
-                    zero_slice,
-                    out_ptr,
+                    w_slice as *const $wq_t,
+                    scale_slice as *const $scale_t,
+                    zero_slice as *const $scale_t,
+                    out_ptr as *mut $scale_t,
                     h as i32,
                     w as i32,
                 );
             }
+            drop(out_guard);
 
             let storage = CudaStorage {
                 slice: CudaStorageSlice::$dtype(out),
@@ -76,7 +100,7 @@ macro_rules! dequant_for_dtype {
             };
             let storage = Storage::Cuda(storage);
 
-            from_storage_no_op(storage, out_shape, false)
+            Tensor::from((storage, out_shape))
         }
     }};
 }
@@ -125,41 +149,308 @@ impl HqqBits {
     // https://github.com/mobiusml/hqq/blob/306e30d9400629523c8e0af70101d8d7073cb3d5/hqq/core/bitpack.py#L10
     pub(crate) fn bitpack_type(&self) -> impl Fn(Tensor) -> Result<Tensor> {
         match self {
-            Self::Eight => |wq: Tensor| wq.to_dtype(DType::U8),
-            Self::Four => |wq: Tensor| {
-                let wq = wq.to_dtype(DType::U8)?;
+            Self::Eight => |wq: Tensor| -> Result<Tensor> {
+                #[allow(unused_variables)]
+                let device = wq.device();
+
+                #[cfg(feature = "cuda")]
+                if device.is_cuda() {
+                    // Use CUDA kernel for 8-bit (which is essentially a copy)
+                    let dev = get_cuda_device(&wq)?;
+                    let wq = wq.to_dtype(DType::U8)?;
+                    let (wq_storage, _) = wq.storage_and_layout();
+                    let wq_storage = match &*wq_storage {
+                        Storage::Cuda(s) => s,
+                        _ => candle_core::bail!("Expected CUDA storage"),
+                    };
+
+                    let output_shape = wq.shape().clone();
+                    let output = unsafe { dev.alloc::<u8>(output_shape.elem_count())? };
+
+                    unsafe {
+                        let (output_ptr, output_guard) = output.device_ptr(output.stream());
+                        let (input_ptr, _input_guard) = crate::utils::slice_ptr(
+                            wq_storage.as_cuda_slice::<u8>()?,
+                            wq.layout().start_offset(),
+                        );
+
+                        bitpack_ffi::launch_pack_8bit_kernel(
+                            input_ptr as *const u8,
+                            output_ptr as *mut u8,
+                            output_shape.elem_count(),
+                            dev.cuda_stream().cu_stream(),
+                        );
+                        drop(output_guard);
+                    }
+
+                    let storage = CudaStorage::wrap_cuda_slice(output, dev.clone());
+                    let storage = Storage::Cuda(storage);
+                    return Ok(Tensor::from((storage, output_shape)));
+                }
+
+                #[cfg(feature = "metal")]
+                if device.is_metal() {
+                    use candle_core::MetalStorage;
+
+                    let dev = device.as_metal_device()?;
+                    let encoder = dev.command_encoder()?;
+                    encoder.set_label("hqq_pack_8bit");
+
+                    let (wq_storage, _wq_layout) = wq.storage_and_layout();
+                    let wq_storage = match &*wq_storage {
+                        Storage::Metal(s) => s,
+                        _ => candle_core::bail!("Expected Metal storage"),
+                    };
+
+                    let output_shape = wq.shape().clone();
+                    let output = dev.new_buffer(
+                        output_shape.elem_count(),
+                        DType::U8,
+                        "hqq_pack_8bit_output",
+                    )?;
+
+                    crate::metal_kernels::call_hqq_pack_8bit(
+                        dev.device(),
+                        &encoder,
+                        &crate::metal_kernels::Kernels::new(),
+                        wq_storage.buffer(),
+                        &output,
+                        output_shape.elem_count(),
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+
+                    let storage = MetalStorage::new(
+                        output,
+                        dev.clone(),
+                        output_shape.elem_count(),
+                        DType::U8,
+                    );
+                    let storage = Storage::Metal(storage);
+
+                    return Ok(Tensor::from((storage, output_shape)));
+                }
+
+                wq.to_dtype(DType::U8)
+            },
+            Self::Four => |wq_in: Tensor| -> Result<Tensor> {
+                #[allow(unused_variables)]
+                let device = wq_in.device();
+
+                #[cfg(feature = "cuda")]
+                if device.is_cuda() {
+                    // Use CUDA kernel for 4-bit packing
+                    let dev = get_cuda_device(&wq_in)?;
+                    let wq = wq_in.to_dtype(DType::U8)?;
+                    let (wq_storage, _) = wq.storage_and_layout();
+                    let wq_storage = match &*wq_storage {
+                        Storage::Cuda(s) => s,
+                        _ => candle_core::bail!("Expected CUDA storage"),
+                    };
+
+                    let output_height = wq.dims()[0] / 2;
+                    let output_shape = Shape::from_dims(&[output_height, wq.dims()[1]]);
+                    let output = unsafe { dev.alloc::<u8>(output_shape.elem_count())? };
+
+                    unsafe {
+                        let (output_ptr, output_guard) = output.device_ptr(output.stream());
+                        let (input_ptr, _input_guard) = crate::utils::slice_ptr(
+                            wq_storage.as_cuda_slice::<u8>()?,
+                            wq.layout().start_offset(),
+                        );
+
+                        bitpack_ffi::launch_pack_4bit_kernel(
+                            input_ptr as *const u8,
+                            output_ptr as *mut u8,
+                            wq.dims()[0],
+                            wq.dims()[1],
+                            dev.cuda_stream().cu_stream(),
+                        );
+                        drop(output_guard);
+                    }
+
+                    let storage = CudaStorage::wrap_cuda_slice(output, dev.clone());
+                    let storage = Storage::Cuda(storage);
+                    return Ok(Tensor::from((storage, output_shape)));
+                }
+
+                #[cfg(feature = "metal")]
+                if device.is_metal() {
+                    use candle_core::MetalStorage;
+
+                    let dev = device.as_metal_device()?;
+                    let encoder = dev.command_encoder()?;
+                    encoder.set_label("hqq_pack_4bit");
+
+                    let wq = wq_in.to_dtype(DType::U8)?;
+                    let (wq_storage, _wq_layout) = wq.storage_and_layout();
+                    let wq_storage = match &*wq_storage {
+                        Storage::Metal(s) => s,
+                        _ => candle_core::bail!("Expected Metal storage"),
+                    };
+
+                    let output_height = wq.dims()[0] / 2;
+                    let output_shape = Shape::from_dims(&[output_height, wq.dims()[1]]);
+                    let output = dev.new_buffer(
+                        output_shape.elem_count(),
+                        DType::U8,
+                        "hqq_pack_4bit_output",
+                    )?;
+
+                    crate::metal_kernels::call_hqq_pack_4bit(
+                        dev.device(),
+                        &encoder,
+                        &crate::metal_kernels::Kernels::new(),
+                        wq_storage.buffer(),
+                        &output,
+                        wq.dims()[0],
+                        wq.dims()[1],
+                    )
+                    .map_err(candle_core::Error::wrap)?;
+
+                    let storage = MetalStorage::new(
+                        output,
+                        dev.clone(),
+                        output_shape.elem_count(),
+                        DType::U8,
+                    );
+                    let storage = Storage::Metal(storage);
+
+                    return Ok(Tensor::from((storage, output_shape)));
+                }
+
+                // CPU fallback
+                let wq = wq_in.to_dtype(DType::U8)?;
                 let step = (wq.dims()[0] as f64 / 2.) as usize;
 
                 let a = wq.narrow(0, 0, step)?;
                 let b = wq.narrow(0, step, step)?;
                 a.leftshift(4)?.bitwise_or(&b)
             },
-            Self::Two => |wq: Tensor| {
-                let wq = wq.to_dtype(DType::U8)?;
-                let step = (wq.dims()[0] as f64 / 4.) as usize;
+            Self::Two => |wq_in: Tensor| -> Result<Tensor> {
+                #[allow(unused_variables)]
+                let device = wq_in.device();
 
-                let a = wq.narrow(0, 0, step)?;
-                let b = wq.narrow(0, step, step)?;
-                let c = wq.narrow(0, step * 2, step)?;
-                let d = wq.narrow(0, step * 3, step)?;
+                #[cfg(feature = "cuda")]
+                if device.is_cuda() {
+                    // Use CUDA kernel for 2-bit packing
+                    let dev = get_cuda_device(&wq_in)?;
+                    let wq = wq_in.to_dtype(DType::U8)?;
+                    let (wq_storage, _) = wq.storage_and_layout();
+                    let wq_storage = match &*wq_storage {
+                        Storage::Cuda(s) => s,
+                        _ => candle_core::bail!("Expected CUDA storage"),
+                    };
 
-                a.leftshift(6)?
-                    .bitwise_or(&b.leftshift(4)?)?
-                    .bitwise_or(&c.leftshift(2)?)?
-                    .bitwise_or(&d)
+                    let output_height = wq.dims()[0] / 4;
+                    let output_shape = Shape::from_dims(&[output_height, wq.dims()[1]]);
+                    let output = unsafe { dev.alloc::<u8>(output_shape.elem_count())? };
+
+                    unsafe {
+                        let (output_ptr, output_guard) = output.device_ptr(output.stream());
+                        let (input_ptr, _input_guard) = crate::utils::slice_ptr(
+                            wq_storage.as_cuda_slice::<u8>()?,
+                            wq.layout().start_offset(),
+                        );
+
+                        bitpack_ffi::launch_pack_2bit_kernel(
+                            input_ptr as *const u8,
+                            output_ptr as *mut u8,
+                            wq.dims()[0],
+                            wq.dims()[1],
+                            dev.cuda_stream().cu_stream(),
+                        );
+                        drop(output_guard);
+                    }
+
+                    let storage = CudaStorage::wrap_cuda_slice(output, dev.clone());
+                    let storage = Storage::Cuda(storage);
+                    Ok(Tensor::from((storage, output_shape)))
+                } else {
+                    // CPU fallback
+                    let wq = wq_in.to_dtype(DType::U8)?;
+                    let step = (wq.dims()[0] as f64 / 4.) as usize;
+
+                    let a = wq.narrow(0, 0, step)?;
+                    let b = wq.narrow(0, step, step)?;
+                    let c = wq.narrow(0, step * 2, step)?;
+                    let d = wq.narrow(0, step * 3, step)?;
+
+                    a.leftshift(6)?
+                        .bitwise_or(&b.leftshift(4)?)?
+                        .bitwise_or(&c.leftshift(2)?)?
+                        .bitwise_or(&d)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let wq = wq_in.to_dtype(DType::U8)?;
+                    let step = (wq.dims()[0] as f64 / 4.) as usize;
+
+                    let a = wq.narrow(0, 0, step)?;
+                    let b = wq.narrow(0, step, step)?;
+                    let c = wq.narrow(0, step * 2, step)?;
+                    let d = wq.narrow(0, step * 3, step)?;
+
+                    a.leftshift(6)?
+                        .bitwise_or(&b.leftshift(4)?)?
+                        .bitwise_or(&c.leftshift(2)?)?
+                        .bitwise_or(&d)
+                }
             },
-            Self::Three => |wq_in: Tensor| {
-                let wq = Tensor::zeros(
-                    (
-                        (10. * (wq_in.dims()[0] as f64 / 10.).ceil()) as usize,
-                        wq_in.dims()[1],
-                    ),
-                    DType::U32,
-                    wq_in.device(),
+            Self::Three => |wq_in: Tensor| -> Result<Tensor> {
+                let device = wq_in.device();
+
+                // Pad input to multiple of 10
+                let padded_height = (10. * (wq_in.dims()[0] as f64 / 10.).ceil()) as usize;
+                let wq = Tensor::zeros((padded_height, wq_in.dims()[1]), DType::U32, device)?;
+                let wq = wq.slice_assign(
+                    &[0..wq_in.dims()[0], 0..wq.dims()[1]],
+                    &wq_in.to_dtype(DType::U32)?,
                 )?;
-                let wq = wq
-                    .slice_assign(&[&(..wq_in.dims()[0]), &..], &wq_in.to_dtype(DType::U32)?)?
-                    .to_dtype(DType::I32)?;
+
+                #[cfg(feature = "cuda")]
+                if device.is_cuda() {
+                    // Use CUDA kernel for efficient 3-bit packing
+                    let dev = get_cuda_device(&wq)?;
+                    let (wq_storage, _) = wq.storage_and_layout();
+                    let wq_storage = match &*wq_storage {
+                        Storage::Cuda(s) => s,
+                        _ => candle_core::bail!("Expected CUDA storage"),
+                    };
+
+                    let output_height = padded_height / 10;
+                    let output_shape = Shape::from_dims(&[output_height, wq_in.dims()[1]]);
+                    let output = unsafe { dev.alloc::<i32>(output_shape.elem_count())? };
+
+                    unsafe {
+                        let (output_ptr, output_guard) = output.device_ptr(output.stream());
+                        let (input_ptr, _input_guard) = crate::utils::slice_ptr(
+                            wq_storage.as_cuda_slice::<u32>()?,
+                            wq.layout().start_offset(),
+                        );
+
+                        bitpack_ffi::launch_pack_3bit_kernel(
+                            input_ptr as *const u32,
+                            output_ptr as *mut i32,
+                            padded_height,
+                            wq_in.dims()[1],
+                            dev.cuda_stream().cu_stream(),
+                        );
+                        drop(output_guard);
+                    }
+
+                    let storage = CudaStorage::wrap_cuda_slice(output, dev.clone());
+                    let storage = Storage::Cuda(storage);
+                    return Ok(Tensor::from((storage, output_shape)));
+                }
+
+                // CPU fallback implementation
+                let wq = if wq.device().is_metal() {
+                    // Metal doesn't support direct U32 to I32 conversion, use CPU as intermediate
+                    let cpu_wq = wq.to_device(&Device::Cpu)?;
+                    cpu_wq.to_dtype(DType::I32)?.to_device(wq.device())?
+                } else {
+                    wq.to_dtype(DType::I32)?
+                };
                 let step = (wq.dims()[0] as f64 / 10.) as usize;
 
                 let a = wq.narrow(0, 0, step)?;
@@ -173,10 +464,8 @@ impl HqqBits {
                 let i = wq.narrow(0, step * 8, step)?;
                 let j = wq.narrow(0, step * 9, step)?;
 
-                a.leftshift(27)
-                    .unwrap()
-                    .bitwise_or(&b.leftshift(24).unwrap())
-                    .unwrap()
+                a.leftshift(27)?
+                    .bitwise_or(&b.leftshift(24)?)?
                     .bitwise_or(&c.leftshift(21)?)?
                     .bitwise_or(&d.leftshift(18)?)?
                     .bitwise_or(&e.leftshift(15)?)?
@@ -186,27 +475,91 @@ impl HqqBits {
                     .bitwise_or(&i.leftshift(3)?)?
                     .bitwise_or(&j)
             },
-            Self::One => |wq: Tensor| {
-                let wq = wq.to_dtype(DType::U8)?;
-                let step = (wq.dims()[0] as f64 / 8.) as usize;
+            Self::One => |wq_in: Tensor| -> Result<Tensor> {
+                #[allow(unused_variables)]
+                let device = wq_in.device();
 
-                let a = wq.narrow(0, 0, step)?;
-                let b = wq.narrow(0, step, step)?;
-                let c = wq.narrow(0, step * 2, step)?;
-                let d = wq.narrow(0, step * 3, step)?;
-                let e = wq.narrow(0, step * 4, step)?;
-                let f = wq.narrow(0, step * 5, step)?;
-                let g = wq.narrow(0, step * 6, step)?;
-                let h = wq.narrow(0, step * 7, step)?;
+                #[cfg(feature = "cuda")]
+                if device.is_cuda() {
+                    // Use CUDA kernel for 1-bit packing
+                    let dev = get_cuda_device(&wq_in)?;
+                    let wq = wq_in.to_dtype(DType::U8)?;
+                    let (wq_storage, _) = wq.storage_and_layout();
+                    let wq_storage = match &*wq_storage {
+                        Storage::Cuda(s) => s,
+                        _ => candle_core::bail!("Expected CUDA storage"),
+                    };
 
-                a.leftshift(7)?
-                    .bitwise_or(&b.leftshift(6)?)?
-                    .bitwise_or(&c.leftshift(5)?)?
-                    .bitwise_or(&d.leftshift(4)?)?
-                    .bitwise_or(&e.leftshift(3)?)?
-                    .bitwise_or(&f.leftshift(2)?)?
-                    .bitwise_or(&g.leftshift(1)?)?
-                    .bitwise_or(&h)
+                    let output_height = wq.dims()[0] / 8;
+                    let output_shape = Shape::from_dims(&[output_height, wq.dims()[1]]);
+                    let output = unsafe { dev.alloc::<u8>(output_shape.elem_count())? };
+
+                    unsafe {
+                        let (output_ptr, output_guard) = output.device_ptr(output.stream());
+                        let (input_ptr, _input_guard) = crate::utils::slice_ptr(
+                            wq_storage.as_cuda_slice::<u8>()?,
+                            wq.layout().start_offset(),
+                        );
+
+                        bitpack_ffi::launch_pack_1bit_kernel(
+                            input_ptr as *const u8,
+                            output_ptr as *mut u8,
+                            wq.dims()[0],
+                            wq.dims()[1],
+                            dev.cuda_stream().cu_stream(),
+                        );
+                        drop(output_guard);
+                    }
+
+                    let storage = CudaStorage::wrap_cuda_slice(output, dev.clone());
+                    let storage = Storage::Cuda(storage);
+                    Ok(Tensor::from((storage, output_shape)))
+                } else {
+                    // CPU fallback
+                    let wq = wq_in.to_dtype(DType::U8)?;
+                    let step = (wq.dims()[0] as f64 / 8.) as usize;
+
+                    let a = wq.narrow(0, 0, step)?;
+                    let b = wq.narrow(0, step, step)?;
+                    let c = wq.narrow(0, step * 2, step)?;
+                    let d = wq.narrow(0, step * 3, step)?;
+                    let e = wq.narrow(0, step * 4, step)?;
+                    let f = wq.narrow(0, step * 5, step)?;
+                    let g = wq.narrow(0, step * 6, step)?;
+                    let h = wq.narrow(0, step * 7, step)?;
+
+                    a.leftshift(7)?
+                        .bitwise_or(&b.leftshift(6)?)?
+                        .bitwise_or(&c.leftshift(5)?)?
+                        .bitwise_or(&d.leftshift(4)?)?
+                        .bitwise_or(&e.leftshift(3)?)?
+                        .bitwise_or(&f.leftshift(2)?)?
+                        .bitwise_or(&g.leftshift(1)?)?
+                        .bitwise_or(&h)
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let wq = wq_in.to_dtype(DType::U8)?;
+                    let step = (wq.dims()[0] as f64 / 8.) as usize;
+
+                    let a = wq.narrow(0, 0, step)?;
+                    let b = wq.narrow(0, step, step)?;
+                    let c = wq.narrow(0, step * 2, step)?;
+                    let d = wq.narrow(0, step * 3, step)?;
+                    let e = wq.narrow(0, step * 4, step)?;
+                    let f = wq.narrow(0, step * 5, step)?;
+                    let g = wq.narrow(0, step * 6, step)?;
+                    let h = wq.narrow(0, step * 7, step)?;
+
+                    a.leftshift(7)?
+                        .bitwise_or(&b.leftshift(6)?)?
+                        .bitwise_or(&c.leftshift(5)?)?
+                        .bitwise_or(&d.leftshift(4)?)?
+                        .bitwise_or(&e.leftshift(3)?)?
+                        .bitwise_or(&f.leftshift(2)?)?
+                        .bitwise_or(&g.leftshift(1)?)?
+                        .bitwise_or(&h)
+                }
             },
         }
     }
@@ -530,7 +883,9 @@ impl QuantMethod for HqqLayer {
             | QuantMethodConfig::FP8 { .. }
             | QuantMethodConfig::Bnb { .. }
             | QuantMethodConfig::BlockwiseFP8 { .. }
-            | QuantMethodConfig::Afq { .. } => {
+            | QuantMethodConfig::PerTensorFP8 { .. }
+            | QuantMethodConfig::Afq { .. }
+            | QuantMethodConfig::MXFP4 { .. } => {
                 unreachable!()
             }
             QuantMethodConfig::Hqq {
@@ -675,10 +1030,10 @@ impl QuantizedSerde for HqqLayer {
     fn name(&self) -> &'static str {
         "hqq"
     }
-    fn serialize(&self) -> Result<Cow<[u8]>> {
+    fn serialize(&self) -> Result<Cow<'_, [u8]>> {
         self.serialize_with_bias(self.bias.clone())
     }
-    fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<[u8]>> {
+    fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<'_, [u8]>> {
         let mut buffer = Vec::new();
 
         // Version is always first!
@@ -695,19 +1050,45 @@ impl QuantizedSerde for HqqLayer {
         serialize_tensor(&mut buffer, &self.zeros)?;
 
         let w_shape = self.w_shape.dims();
-        buffer.extend((w_shape.len() as u32).to_le_bytes());
+        let shape_len = w_shape.len();
+        if shape_len > u32::MAX as usize {
+            candle_core::bail!(
+                "Weight tensor has too many dimensions for UQFF format: {} exceeds u32::MAX",
+                shape_len
+            );
+        }
+        buffer.extend((shape_len as u32).to_le_bytes());
         for dim in w_shape {
+            if *dim > u32::MAX as usize {
+                candle_core::bail!(
+                    "Weight tensor dimension too large for UQFF format: {} exceeds u32::MAX",
+                    dim
+                );
+            }
             buffer.extend((*dim as u32).to_le_bytes());
         }
 
         // Config
         buffer.push(self.cfg.bits as u8);
-        buffer.extend(
-            &(<NonZeroUsize as Into<usize>>::into(self.cfg.group_size) as u32).to_le_bytes(),
-        );
+        let group_size = <NonZeroUsize as Into<usize>>::into(self.cfg.group_size);
+        if group_size > u32::MAX as usize {
+            candle_core::bail!(
+                "HQQ group size too large for UQFF format: {} exceeds u32::MAX",
+                group_size
+            );
+        }
+        buffer.extend(&(group_size as u32).to_le_bytes());
         buffer.push(self.cfg.axis as u8);
-        // FIXME: using 0 as a sentinel for None is OK because it really should be.
-        buffer.extend(&(self.cfg.optimization_steps.unwrap_or(0) as u32).to_le_bytes());
+        // NOTE: using 0 as a sentinel for None. This means legitimate 0 values cannot be distinguished from None.
+        // This is acceptable because 0 optimization steps would be functionally equivalent to None.
+        let opt_steps = self.cfg.optimization_steps.unwrap_or(0);
+        if opt_steps > u32::MAX as usize {
+            candle_core::bail!(
+                "HQQ optimization steps too large for UQFF format: {} exceeds u32::MAX",
+                opt_steps
+            );
+        }
+        buffer.extend(&(opt_steps as u32).to_le_bytes());
         buffer.push(self.cfg.round_zeros as u8);
         buffer.push(self.cfg.channel_wise as u8);
 

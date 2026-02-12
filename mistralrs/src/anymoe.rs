@@ -42,7 +42,6 @@ impl AnyMoeModelBuilder {
 
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = NormalSpecificConfig {
-            prompt_chunksize: self.base.prompt_chunksize,
             topology: self.base.topology,
             organization: self.base.organization,
             write_uqff: self.base.write_uqff,
@@ -117,7 +116,7 @@ impl AnyMoeModelBuilder {
             pipeline,
             scheduler_method,
             self.base.throughput_logging,
-            self.base.search_bert_model,
+            self.base.search_embedding_model,
         );
         if let Some(cb) = self.base.search_callback.clone() {
             runner = runner.with_search_callback(cb);

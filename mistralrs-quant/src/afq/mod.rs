@@ -16,7 +16,10 @@ use crate::{
     QuantizedSerde, QuantizedSerdeType, ShardedVarBuilder,
 };
 
-mod ops;
+pub(crate) mod ops;
+
+#[cfg(feature = "cuda")]
+pub(crate) mod ffi;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +29,7 @@ pub enum AfqBits {
     Four = 4,
     Six = 6,
     Eight = 8,
+    Mxfp4 = 40,
 }
 
 impl TryFrom<usize> for AfqBits {
@@ -37,6 +41,7 @@ impl TryFrom<usize> for AfqBits {
             4 => Ok(Self::Four),
             6 => Ok(Self::Six),
             8 => Ok(Self::Eight),
+            40 => Ok(Self::Mxfp4),
             x => candle_core::bail!("Invalid AFQ bits {x}."),
         }
     }
@@ -100,7 +105,9 @@ impl QuantMethod for AfqLayer {
             | QuantMethodConfig::FP8 { .. }
             | QuantMethodConfig::Bnb { .. }
             | QuantMethodConfig::BlockwiseFP8 { .. }
-            | QuantMethodConfig::Unquantized(_) => unreachable!(),
+            | QuantMethodConfig::PerTensorFP8 { .. }
+            | QuantMethodConfig::Unquantized(_)
+            | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
             QuantMethodConfig::Afq {
                 weight,
                 bias,
@@ -227,6 +234,7 @@ impl AfqLayer {
             AfqBits::Four => Ok(IsqType::AFQ4),
             AfqBits::Six => Ok(IsqType::AFQ6),
             AfqBits::Eight => Ok(IsqType::AFQ8),
+            AfqBits::Mxfp4 => candle_core::bail!("mxfp4 is not supported as an ISQ type"),
         }
     }
 
@@ -321,10 +329,10 @@ impl QuantizedSerde for AfqLayer {
     fn isq_serde_supported(&self) -> bool {
         true
     }
-    fn serialize(&self) -> Result<Cow<[u8]>> {
+    fn serialize(&self) -> Result<Cow<'_, [u8]>> {
         self.serialize_with_bias(self.bias.clone())
     }
-    fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<[u8]>> {
+    fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<'_, [u8]>> {
         let mut buffer = Vec::new();
 
         // Version is always first!
@@ -361,7 +369,7 @@ impl QuantizedSerde for AfqLayer {
     where
         Self: Sized,
     {
-        let mut buffer = Cursor::new(data.to_vec());
+        let mut buffer = Cursor::new(data);
 
         let version = buffer.read_u32::<LittleEndian>()?;
         if let Err(e) = version_is_compatible(version) {
@@ -411,7 +419,7 @@ impl QuantizedSerde for AfqLayer {
     where
         Self: Sized,
     {
-        let mut buffer = Cursor::new(data.to_vec());
+        let mut buffer = Cursor::new(data);
 
         let version = buffer.read_u32::<LittleEndian>()?;
         if let Err(e) = version_is_compatible(version) {

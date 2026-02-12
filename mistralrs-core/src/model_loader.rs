@@ -1,6 +1,5 @@
 use std::{
     fs::{self, File},
-    num::NonZeroUsize,
     path::PathBuf,
     str::FromStr,
 };
@@ -15,8 +14,9 @@ use crate::{
         VisionLoaderBuilder, VisionSpecificConfig,
     },
     toml_selector::get_toml_selected_model_device_map_params,
-    AutoDeviceMapParams, Loader, ModelDType, ModelSelected, SpeechLoader, TomlLoaderArgs,
-    TomlSelector, Topology, GGUF_MULTI_FILE_DELIMITER, UQFF_MULTI_FILE_DELIMITER,
+    AutoDeviceMapParams, EmbeddingLoaderBuilder, EmbeddingSpecificConfig, Loader, ModelDType,
+    ModelSelected, SpeechLoader, TomlLoaderArgs, TomlSelector, Topology, GGUF_MULTI_FILE_DELIMITER,
+    UQFF_MULTI_FILE_DELIMITER,
 };
 
 /// A builder for a loader using the selected model.
@@ -25,7 +25,6 @@ pub struct LoaderBuilder {
     no_kv_cache: bool,
     chat_template: Option<String>,
     jinja_explicit: Option<String>,
-    prompt_chunksize: Option<NonZeroUsize>,
 }
 
 impl LoaderBuilder {
@@ -34,7 +33,6 @@ impl LoaderBuilder {
             model,
             no_kv_cache: false,
             chat_template: None,
-            prompt_chunksize: None,
             jinja_explicit: None,
         }
     }
@@ -49,10 +47,6 @@ impl LoaderBuilder {
     }
     pub fn with_jinja_explicit(mut self, jinja_explicit: Option<String>) -> Self {
         self.jinja_explicit = jinja_explicit;
-        self
-    }
-    pub fn with_prompt_chunksize(mut self, prompt_chunksize: Option<NonZeroUsize>) -> Self {
-        self.prompt_chunksize = prompt_chunksize;
         self
     }
 
@@ -73,7 +67,8 @@ pub fn get_tgt_non_granular_index(model: &ModelSelected) -> Option<usize> {
         | ModelSelected::Toml { .. }
         | ModelSelected::VisionPlain { .. }
         | ModelSelected::DiffusionPlain { .. }
-        | ModelSelected::Speech { .. } => None,
+        | ModelSelected::Speech { .. }
+        | ModelSelected::Embedding { .. } => None,
         ModelSelected::XLora {
             tgt_non_granular_index,
             ..
@@ -106,7 +101,8 @@ pub fn get_model_dtype(model: &ModelSelected) -> anyhow::Result<ModelDType> {
         | ModelSelected::LoraGGUF { dtype, .. }
         | ModelSelected::LoraGGML { dtype, .. }
         | ModelSelected::Run { dtype, .. }
-        | ModelSelected::Speech { dtype, .. } => Ok(*dtype),
+        | ModelSelected::Speech { dtype, .. }
+        | ModelSelected::Embedding { dtype, .. } => Ok(*dtype),
         ModelSelected::Toml { file } => {
             let selector: TomlSelector = toml::from_str(
                 &fs::read_to_string(file.clone())
@@ -206,9 +202,9 @@ pub fn get_auto_device_map_params(model: &ModelSelected) -> anyhow::Result<AutoD
             max_image_shape: (*max_image_length, *max_image_length),
             max_num_images: *max_num_images,
         }),
-        ModelSelected::DiffusionPlain { .. } | ModelSelected::Speech { .. } => {
-            Ok(AutoDeviceMapParams::default_text())
-        }
+        ModelSelected::DiffusionPlain { .. }
+        | ModelSelected::Speech { .. }
+        | ModelSelected::Embedding { .. } => Ok(AutoDeviceMapParams::default_text()),
         ModelSelected::Toml { file } => {
             let selector: TomlSelector = toml::from_str(
                 &fs::read_to_string(file.clone())
@@ -232,7 +228,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             let args = TomlLoaderArgs {
                 chat_template: args.chat_template,
                 no_kv_cache: args.no_kv_cache,
-                prompt_chunksize: args.prompt_chunksize,
                 jinja_explicit: args.jinja_explicit,
             };
             (selector, args).try_into()?
@@ -255,7 +250,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             matformer_slice_name,
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: organization.unwrap_or_default(),
                 write_uqff,
@@ -299,7 +293,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
         } => {
             let builder = AutoLoaderBuilder::new(
                 NormalSpecificConfig {
-                    prompt_chunksize: args.prompt_chunksize,
                     topology: Topology::from_option_path(topology.clone())?,
                     organization: organization.unwrap_or_default(),
                     write_uqff: write_uqff.clone(),
@@ -316,10 +309,9 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                     matformer_slice_name: matformer_slice_name.clone(),
                 },
                 VisionSpecificConfig {
-                    prompt_chunksize: args.prompt_chunksize,
-                    topology: Topology::from_option_path(topology)?,
-                    write_uqff,
-                    from_uqff: from_uqff.map(|x| {
+                    topology: Topology::from_option_path(topology.clone())?,
+                    write_uqff: write_uqff.clone(),
+                    from_uqff: from_uqff.clone().map(|x| {
                         x.split(UQFF_MULTI_FILE_DELIMITER)
                             .map(PathBuf::from_str)
                             .map(|x| x.unwrap())
@@ -331,6 +323,17 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                     hf_cache_path: hf_cache_path.clone(),
                     matformer_config_path,
                     matformer_slice_name,
+                },
+                EmbeddingSpecificConfig {
+                    topology: Topology::from_option_path(topology)?,
+                    write_uqff,
+                    from_uqff: from_uqff.map(|x| {
+                        x.split(UQFF_MULTI_FILE_DELIMITER)
+                            .map(PathBuf::from_str)
+                            .map(|x| x.unwrap())
+                            .collect::<Vec<_>>()
+                    }),
+                    hf_cache_path: hf_cache_path.clone(),
                 },
                 args.chat_template,
                 tokenizer_json,
@@ -365,7 +368,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             matformer_slice_name,
         } => VisionLoaderBuilder::new(
             VisionSpecificConfig {
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 write_uqff,
                 from_uqff: from_uqff.map(|x| {
@@ -419,7 +421,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             hf_cache_path,
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
                 write_uqff,
@@ -465,7 +466,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             hf_cache_path,
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
                 write_uqff,
@@ -509,7 +509,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.no_kv_cache,
@@ -534,7 +533,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.no_kv_cache,
@@ -567,7 +565,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.no_kv_cache,
@@ -592,7 +589,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
         } => GGMLLoaderBuilder::new(
             GGMLSpecificConfig {
                 gqa,
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.chat_template,
@@ -618,7 +614,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
         } => GGMLLoaderBuilder::new(
             GGMLSpecificConfig {
                 gqa,
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.chat_template,
@@ -652,7 +647,6 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
         } => GGMLLoaderBuilder::new(
             GGMLSpecificConfig {
                 gqa,
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.chat_template,
@@ -671,6 +665,31 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             )?,
         )
         .build(),
+        ModelSelected::Embedding {
+            model_id,
+            tokenizer_json,
+            arch,
+            dtype: _,
+            topology,
+            write_uqff,
+            from_uqff,
+            hf_cache_path,
+        } => EmbeddingLoaderBuilder::new(
+            EmbeddingSpecificConfig {
+                topology: Topology::from_option_path(topology)?,
+                write_uqff,
+                from_uqff: from_uqff.map(|x| {
+                    x.split(UQFF_MULTI_FILE_DELIMITER)
+                        .map(PathBuf::from_str)
+                        .map(|x| x.unwrap())
+                        .collect::<Vec<_>>()
+                }),
+                hf_cache_path,
+            },
+            tokenizer_json,
+            Some(model_id),
+        )
+        .build(arch),
         ModelSelected::MultiModel { .. } => {
             anyhow::bail!("MultiModel variant should not be used in model loading functions")
         }

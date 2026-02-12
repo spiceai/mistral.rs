@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Module};
-use indicatif::MultiProgress;
 use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
 
 use crate::attention::SdpaParams;
@@ -18,7 +17,7 @@ use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
 use crate::pipeline::{extract_logits, EitherCache, KvCache, NormalCache};
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
-use crate::utils::progress::NiceProgressBar;
+use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
 
 struct Mlp {
@@ -31,8 +30,8 @@ impl Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let w1 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w1)?;
         let w3 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w3)?;
-        let y = &(candle_nn::ops::silu(&w1)? * w3)?;
-        MatMul.qmethod_matmul(y, &*self.feed_forward_w2)
+        let y = crate::ops::mul_and_act(&w1, &w3, crate::layers::Activation::Silu)?;
+        MatMul.qmethod_matmul(&y, &*self.feed_forward_w2)
     }
 }
 
@@ -88,18 +87,19 @@ impl LayerWeights {
             (q, k, v)
         };
 
-        let (q, k) = if self.q_norm.is_some() && self.k_norm.is_some() {
-            //Per‑head RMSNorm in qwen3
-            let q_flat = q.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
-            let k_flat = k.flatten(0, 2)?;
-            //q_norm and k_norm weights stored in f32 format in qwen3 gguf
-            let q_flat = self.q_norm.as_ref().unwrap().forward(&q_flat)?;
-            let k_flat = self.k_norm.as_ref().unwrap().forward(&k_flat)?;
-            let q = q_flat.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
-            let k = k_flat.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
-            (q, k)
-        } else {
-            (q, k)
+        let (q, k) = match (&self.q_norm, &self.k_norm) {
+            (Some(q_norm), Some(k_norm)) => {
+                //Per‑head RMSNorm in qwen3
+                let q_flat = q.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
+                let k_flat = k.flatten(0, 2)?;
+                //q_norm and k_norm weights stored in f32 format in qwen3 gguf
+                let q_flat = q_norm.forward(&q_flat)?;
+                let k_flat = k_norm.forward(&k_flat)?;
+                let q = q_flat.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
+                let k = k_flat.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
+                (q, k)
+            }
+            _ => (q, k),
         };
 
         let (q, k) = self.rotary.forward(&q, &k, start_offsets)?;
@@ -301,7 +301,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
         for layer_idx in NiceProgressBar::<_, 'b'>(
             0..block_count,
             "Loading repeating layers",
-            &MultiProgress::new(),
+            &new_multi_progress(),
         ) {
             let prefix = format!("blk.{layer_idx}");
             let device = mapper.device_for(layer_idx, false).unwrap_or(device);
@@ -318,20 +318,20 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let attention_bk = ct.tensor(&format!("{prefix}.attn_k.bias"), device);
             let attention_bv = ct.tensor(&format!("{prefix}.attn_v.bias"), device);
 
-            let attention_bq = if attention_bq.is_ok() {
-                Some(attention_bq.unwrap().dequantize(device)?)
+            let attention_bq = if let Ok(bq) = attention_bq {
+                Some(bq.dequantize(device)?)
             } else {
                 None
             };
 
-            let attention_bk = if attention_bk.is_ok() {
-                Some(attention_bk.unwrap().dequantize(device)?)
+            let attention_bk = if let Ok(bk) = attention_bk {
+                Some(bk.dequantize(device)?)
             } else {
                 None
             };
 
-            let attention_bv = if attention_bv.is_ok() {
-                Some(attention_bv.unwrap().dequantize(device)?)
+            let attention_bv = if let Ok(bv) = attention_bv {
+                Some(bv.dequantize(device)?)
             } else {
                 None
             };
@@ -359,12 +359,13 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let q_norm = ct.tensor(&format!("{prefix}.attn_q_norm.weight"), device);
             let k_norm = ct.tensor(&format!("{prefix}.attn_k_norm.weight"), device);
 
-            let (q_norm, k_norm) = if q_norm.is_ok() && k_norm.is_ok() {
-                let q_norm = QRmsNorm::new(q_norm.unwrap(), rms_norm_eps)?;
-                let k_norm = QRmsNorm::new(k_norm.unwrap(), rms_norm_eps)?;
-                (Some(q_norm), Some(k_norm))
-            } else {
-                (None, None)
+            let (q_norm, k_norm) = match (q_norm, k_norm) {
+                (Ok(q), Ok(k)) => {
+                    let q_norm = QRmsNorm::new(q, rms_norm_eps)?;
+                    let k_norm = QRmsNorm::new(k, rms_norm_eps)?;
+                    (Some(q_norm), Some(k_norm))
+                }
+                _ => (None, None),
             };
 
             let attention_norm = ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
@@ -481,9 +482,7 @@ impl ModelWeights {
             layer_in = x;
         }
         let x = self.norm.forward(&layer_in)?;
-        extract_logits(
-            &MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?,
-            context_lens,
-        )
+        let x = extract_logits(&x, context_lens)?;
+        MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)
     }
 }

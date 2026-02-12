@@ -186,10 +186,10 @@ impl Attention {
         )?;
 
         assert!(cfg.num_attention_heads >= comm.world_size());
-        assert!(cfg.num_attention_heads % comm.world_size() == 0);
+        assert!(cfg.num_attention_heads.is_multiple_of(comm.world_size()));
 
         assert!(cfg.num_key_value_heads >= comm.world_size());
-        assert!(cfg.num_key_value_heads % comm.world_size() == 0);
+        assert!(cfg.num_key_value_heads.is_multiple_of(comm.world_size()));
 
         Ok(Self {
             q_proj,
@@ -588,6 +588,7 @@ impl Model {
                 sliding_window: cfg.sliding_window,
                 k_head_dim: cfg.head_dim(),
                 v_head_dim: cfg.head_dim(),
+                kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             mapper,
         })
@@ -657,11 +658,12 @@ impl Model {
             )?;
         }
         let xs = xs.to_device(&self.device)?;
-        let mut xs = xs.apply(&self.norm)?;
+        let xs = xs.apply(&self.norm)?;
+        let mut xs = extract_logits(&xs, context_lens)?;
         if let Some(t) = self.lm_head.quantized_act_type() {
             xs = xs.to_dtype(t)?;
         }
-        extract_logits(&MatMul.qmethod_matmul(&xs, &*self.lm_head)?, context_lens)
+        MatMul.qmethod_matmul(&xs, &*self.lm_head)
     }
 }
 

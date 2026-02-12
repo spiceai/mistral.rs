@@ -1,26 +1,28 @@
 //! ## mistral.rs instance for server builder.
 
-use std::{num::NonZeroUsize, sync::Arc};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use candle_core::Device;
 use mistralrs_core::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, paged_attn_supported,
-    parse_isq_value, AutoDeviceMapParams, BertEmbeddingModel, DefaultSchedulerMethod,
-    DeviceLayerMapMetadata, DeviceMapMetadata, DeviceMapSetting, Loader, LoaderBuilder,
-    McpClientConfig, MemoryGpuConfig, MistralRsBuilder, ModelSelected, PagedAttentionConfig,
-    PagedCacheType, SchedulerConfig, SearchCallback, TokenSource,
+    parse_isq_value, AutoDeviceMapParams, DefaultSchedulerMethod, DeviceLayerMapMetadata,
+    DeviceMapMetadata, DeviceMapSetting, Loader, LoaderBuilder, McpClientConfig, MemoryGpuConfig,
+    MistralRsBuilder, ModelLoaderConfig, ModelSelected, PagedAttentionConfig, PagedCacheType,
+    SchedulerConfig, SearchCallback, SearchEmbeddingModel, TokenSource,
 };
 use tracing::{info, warn};
 
 use crate::types::{LoadedPipeline, SharedMistralRsState};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Configuration for a single model in a multi-model setup
 #[derive(Clone, serde::Deserialize)]
 pub struct ModelConfig {
-    /// Model identifier (used in API requests)
+    /// Configuration key for this model (human-friendly label)
     pub model_id: String,
+    /// Optional alias used as the API model ID
+    pub alias: Option<String>,
     /// Model selector
     pub model: ModelSelected,
     /// Model-specific chat template
@@ -37,6 +39,7 @@ impl ModelConfig {
     pub fn new(model_id: String, model: ModelSelected) -> Self {
         Self {
             model_id,
+            alias: None,
             model,
             chat_template: None,
             jinja_explicit: None,
@@ -47,6 +50,11 @@ impl ModelConfig {
 
     pub fn with_chat_template(mut self, chat_template: String) -> Self {
         self.chat_template = Some(chat_template);
+        self
+    }
+
+    pub fn with_alias(mut self, alias: String) -> Self {
+        self.alias = Some(alias);
         self
     }
 
@@ -67,8 +75,9 @@ impl ModelConfig {
 }
 
 pub mod defaults {
-    //! Provides the default values used for the mistral.rs instance for server.
-    //! These defaults can be used for CLI argument fallbacks, config loading, or general initialization.
+    use super::SearchEmbeddingModel;
+    // Provides the default values used for the mistral.rs instance for server.
+    // These defaults can be used for CLI argument fallbacks, config loading, or general initialization.
 
     use std::sync::Arc;
 
@@ -77,7 +86,6 @@ pub mod defaults {
     pub const DEVICE: Option<candle_core::Device> = None;
     pub const SEED: Option<u64> = None;
     pub const LOG: Option<String> = None;
-    pub const TRUNCATE_SEQUENCE: bool = false;
     pub const MODEL: Option<mistralrs_core::ModelSelected> = None;
     pub const MAX_SEQS: usize = 16;
     pub const NO_KV_CACHE: bool = false;
@@ -95,10 +103,9 @@ pub mod defaults {
     pub const PAGED_ATTN_CPU: bool = false;
     pub const PAGED_ATTN_CUDA: bool = true;
     pub const PAGED_ATTN_METAL: bool = false;
-    pub const PROMPT_CHUNKSIZE: Option<usize> = None;
     pub const CPU: bool = false;
     pub const ENABLE_SEARCH: bool = false;
-    pub const SEARCH_BERT_MODEL: Option<String> = None;
+    pub const SEARCH_EMBEDDING_MODEL: Option<SearchEmbeddingModel> = None;
     pub const TOKEN_SOURCE: mistralrs_core::TokenSource = mistralrs_core::TokenSource::CacheToken;
     pub const SEARCH_CALLBACK: Option<Arc<mistralrs_core::SearchCallback>> = None;
     pub const PAGED_CACHE_TYPE: PagedCacheType = PagedCacheType::Auto;
@@ -115,7 +122,6 @@ pub mod defaults {
 /// let args = Args::parse();
 ///
 /// let mistralrs = MistralRsForServerBuilder::new()
-///        .with_truncate_sequence(args.truncate_sequence)
 ///        .with_model(args.model)
 ///        .with_max_seqs(args.max_seqs)
 ///        .with_no_kv_cache(args.no_kv_cache)
@@ -135,7 +141,6 @@ pub mod defaults {
 ///        .with_paged_attn_gpu_mem_usage_optional(args.paged_attn_gpu_mem_usage)
 ///        .with_paged_ctxt_len_optional(args.paged_ctxt_len)
 ///        .with_paged_attn_block_size_optional(args.paged_attn_block_size)
-///        .with_prompt_chunksize_optional(args.prompt_chunksize)
 ///        .build()
 ///        .await?;
 /// ```
@@ -148,11 +153,6 @@ pub struct MistralRsForServerBuilder {
 
     /// Log all responses and requests to this file
     log: Option<String>,
-
-    /// If a sequence is larger than the maximum model length, truncate the number
-    /// of tokens such that the sequence will fit at most the maximum length.
-    /// If `max_tokens` is not specified in the request, space for 10 tokens will be reserved instead.
-    truncate_sequence: bool,
 
     /// Model selector (for single-model mode, deprecated in favor of models)
     model: Option<ModelSelected>,
@@ -220,17 +220,14 @@ pub struct MistralRsForServerBuilder {
     /// Enables or disables PagedAttention. By default, PagedAttention will be enabled for CUDA and disabled for Metal (and is not supported for CPU). Use this to override the default behavior.
     paged_attn: Option<bool>,
 
-    /// Number of tokens to batch the prompt step into. This can help with OOM errors when in the prompt step, but reduces performance.
-    prompt_chunksize: Option<usize>,
-
     /// Use CPU only
     cpu: bool,
 
-    /// Enable searching compatible with the OpenAI `web_search_options` setting. This uses the BERT model specified below or the default.
+    /// Enable searching compatible with the OpenAI `web_search_options` setting. This loads the selected search embedding reranker (EmbeddingGemma by default).
     enable_search: bool,
 
-    /// Specify a Hugging Face model ID for a BERT model to assist web searching. Defaults to Snowflake Arctic Embed L.
-    search_bert_model: Option<String>,
+    /// Specify which built-in search embedding model to load.
+    search_embedding_model: Option<SearchEmbeddingModel>,
 
     /// Optional override search callback
     search_callback: Option<Arc<SearchCallback>>,
@@ -249,7 +246,6 @@ impl Default for MistralRsForServerBuilder {
             device: defaults::DEVICE,
             seed: defaults::SEED,
             log: defaults::LOG,
-            truncate_sequence: defaults::TRUNCATE_SEQUENCE,
             model: defaults::MODEL,
             models: Vec::new(),
             default_model_id: None,
@@ -267,10 +263,9 @@ impl Default for MistralRsForServerBuilder {
             paged_ctxt_len: defaults::PAGED_CTXT_LEN,
             paged_attn_block_size: defaults::PAGED_ATTN_BLOCK_SIZE,
             paged_attn: defaults::PAGED_ATTN,
-            prompt_chunksize: defaults::PROMPT_CHUNKSIZE,
             cpu: defaults::CPU,
             enable_search: defaults::ENABLE_SEARCH,
-            search_bert_model: defaults::SEARCH_BERT_MODEL,
+            search_embedding_model: defaults::SEARCH_EMBEDDING_MODEL,
             search_callback: defaults::SEARCH_CALLBACK,
             mcp_client_config: None,
             paged_cache_type: defaults::PAGED_CACHE_TYPE,
@@ -328,12 +323,6 @@ impl MistralRsForServerBuilder {
         self
     }
 
-    /// Sets whether to truncate sequences that exceed the maximum model length.
-    pub fn with_truncate_sequence(mut self, truncate_sequence: bool) -> Self {
-        self.truncate_sequence = truncate_sequence;
-        self
-    }
-
     /// Sets the model to be used.
     pub fn with_model(mut self, model: ModelSelected) -> Self {
         self.model = Some(model);
@@ -367,6 +356,18 @@ impl MistralRsForServerBuilder {
     /// Add a model with just an ID and ModelSelected (convenience method).
     pub fn add_model(mut self, model_id: String, model: ModelSelected) -> Self {
         self.models.push(ModelConfig::new(model_id, model));
+        self
+    }
+
+    /// Add a model with a custom alias used for API requests.
+    pub fn add_model_with_alias(
+        mut self,
+        model_id: String,
+        alias: String,
+        model: ModelSelected,
+    ) -> Self {
+        self.models
+            .push(ModelConfig::new(model_id, model).with_alias(alias));
         self
     }
 
@@ -541,20 +542,6 @@ impl MistralRsForServerBuilder {
         self
     }
 
-    /// Sets the prompt chunking size.
-    pub fn with_prompt_chunksize(mut self, prompt_chunksize: usize) -> Self {
-        self.prompt_chunksize = Some(prompt_chunksize);
-        self
-    }
-
-    /// Sets the prompt chunking size if provided.
-    pub fn with_prompt_chunksize_optional(mut self, prompt_chunksize: Option<usize>) -> Self {
-        if let Some(prompt_chunksize) = prompt_chunksize {
-            self = self.with_prompt_chunksize(prompt_chunksize);
-        }
-        self
-    }
-
     /// Sets whether to force CPU-only execution.
     pub fn with_cpu(mut self, cpu: bool) -> Self {
         self.cpu = cpu;
@@ -567,9 +554,12 @@ impl MistralRsForServerBuilder {
         self
     }
 
-    /// Sets the BERT model for web search assistance.
-    pub fn with_search_bert_model(mut self, search_bert_model: String) -> Self {
-        self.search_bert_model = Some(search_bert_model);
+    /// Sets the embedding model used for web search assistance.
+    pub fn with_search_embedding_model(
+        mut self,
+        search_embedding_model: SearchEmbeddingModel,
+    ) -> Self {
+        self.search_embedding_model = Some(search_embedding_model);
         self
     }
 
@@ -628,16 +618,6 @@ impl MistralRsForServerBuilder {
             self.max_seqs = 1;
         }
 
-        let prompt_chunksize = match self.prompt_chunksize {
-            Some(0) => {
-                anyhow::bail!("`prompt_chunksize` must be a strictly positive integer, got 0.",)
-            }
-            Some(x) => Some(NonZeroUsize::new(x).unwrap()),
-            None => None,
-        };
-
-        let max_seq_len = auto_device_map_params.max_seq_len();
-
         let device = if let Some(device) = self.device {
             device
         } else {
@@ -647,8 +627,6 @@ impl MistralRsForServerBuilder {
         let mapper = init_mapper(&self.num_device_layers, &auto_device_map_params);
         let paged_attn = configure_paged_attn(&device, self.paged_attn);
 
-        // Allocate 0.5 GB of CPU memory just as a placeholder.
-        // Nothing happens here as we have no `swap_out`, see `_preempt_by_swap`.
         let cache_config = init_cache_config(
             self.paged_attn_block_size,
             self.paged_attn_gpu_mem,
@@ -656,14 +634,19 @@ impl MistralRsForServerBuilder {
             self.paged_ctxt_len,
             self.paged_cache_type,
             !paged_attn,
-            max_seq_len,
         )?;
+
+        // Clone values needed for loader config before they're moved
+        let model_for_config = model.clone();
+        let token_source_for_config = self.token_source.clone();
+        let mapper_for_config = mapper.clone();
+        let chat_template_for_config = self.chat_template.clone();
+        let jinja_explicit_for_config = self.jinja_explicit.clone();
 
         // Configure this last to prevent arg moves
         let loader: Box<dyn Loader> = LoaderBuilder::new(model)
             .with_no_kv_cache(self.no_kv_cache)
             .with_chat_template(self.chat_template)
-            .with_prompt_chunksize(prompt_chunksize)
             .with_jinja_explicit(self.jinja_explicit)
             .build()?;
 
@@ -688,18 +671,34 @@ impl MistralRsForServerBuilder {
 
         let scheduler_config = init_scheduler_config(&cache_config, &pipeline, self.max_seqs).await;
 
-        let bert_model = get_bert_model(self.enable_search, self.search_bert_model);
+        let search_embedding_model =
+            get_search_embedding_model(self.enable_search, self.search_embedding_model);
+
+        // Create loader config for unload/reload support
+        let loader_config = ModelLoaderConfig {
+            model_selected: model_for_config,
+            token_source: token_source_for_config,
+            hf_revision: None,
+            dtype,
+            device: device.clone(),
+            device_map_setting: mapper_for_config,
+            isq,
+            paged_attn_config: cache_config,
+            silent: false,
+            chat_template: chat_template_for_config,
+            jinja_explicit: jinja_explicit_for_config,
+        };
 
         let mut builder = MistralRsBuilder::new(
             pipeline,
             scheduler_config,
             !self.interactive_mode,
-            bert_model,
+            search_embedding_model,
         )
         .with_opt_log(self.log)
-        .with_truncate_sequence(self.truncate_sequence)
         .with_no_kv_cache(self.no_kv_cache)
-        .with_prefix_cache_n(self.prefix_cache_n);
+        .with_prefix_cache_n(self.prefix_cache_n)
+        .with_loader_config(loader_config);
 
         // Add MCP client configuration if provided
         if let Some(mcp_config) = self.mcp_client_config {
@@ -729,16 +728,6 @@ impl MistralRsForServerBuilder {
             self.max_seqs = 1;
         }
 
-        let prompt_chunksize = match self.prompt_chunksize {
-            Some(0) => {
-                anyhow::bail!("`prompt_chunksize` must be a strictly positive integer, got 0.",)
-            }
-            Some(x) => Some(NonZeroUsize::new(x).unwrap()),
-            None => None,
-        };
-
-        let max_seq_len = auto_device_map_params.max_seq_len();
-
         let device = if let Some(device) = self.device {
             device
         } else {
@@ -754,7 +743,6 @@ impl MistralRsForServerBuilder {
                     .clone()
                     .or(self.chat_template.clone()),
             )
-            .with_prompt_chunksize(prompt_chunksize)
             .with_jinja_explicit(
                 first_model
                     .jinja_explicit
@@ -781,7 +769,6 @@ impl MistralRsForServerBuilder {
             self.paged_ctxt_len,
             self.paged_cache_type,
             !paged_attn,
-            max_seq_len,
         )?;
 
         let isq = first_model
@@ -790,7 +777,8 @@ impl MistralRsForServerBuilder {
             .or(self.in_situ_quant.as_ref())
             .and_then(|isq| parse_isq_value(isq, Some(&device)).ok());
 
-        let mut pipeline_names = Vec::new();
+        let mut loaded_model_ids = Vec::new();
+        let mut registered_ids = HashSet::new();
 
         let pipeline: LoadedPipeline = loader.load_model_from_hf(
             None,
@@ -803,26 +791,49 @@ impl MistralRsForServerBuilder {
             cache_config,
         )?;
         let first_pipeline_name = pipeline.lock().await.name();
-        info!(
-            "First model loaded: `{first_pipeline_name}` (from config key: {})",
-            first_model.model_id
-        );
-        pipeline_names.push(first_pipeline_name);
+        let first_primary_id = first_model
+            .alias
+            .clone()
+            .unwrap_or_else(|| first_pipeline_name.clone());
+
+        if !registered_ids.insert(first_primary_id.clone()) {
+            anyhow::bail!(
+                "Model ID conflict: '{}' is already registered (config key: {}).",
+                first_primary_id,
+                first_model.model_id
+            );
+        }
+
+        if first_primary_id == first_pipeline_name {
+            info!(
+                "First model loaded: `{}` (from config key: {})",
+                first_primary_id, first_model.model_id
+            );
+        } else {
+            info!(
+                "First model loaded: `{}` (pipeline: `{}`; config key: {})",
+                first_primary_id, first_pipeline_name, first_model.model_id
+            );
+        }
+        loaded_model_ids.push(first_primary_id.clone());
 
         let scheduler_config = init_scheduler_config(&cache_config, &pipeline, self.max_seqs).await;
-        let bert_model = get_bert_model(self.enable_search, self.search_bert_model);
+        let search_embedding_model =
+            get_search_embedding_model(self.enable_search, self.search_embedding_model);
 
         // Create the first MistralRs instance with the first model
         let mut builder = MistralRsBuilder::new(
             pipeline,
             scheduler_config.clone(),
             !self.interactive_mode,
-            bert_model.clone(),
+            search_embedding_model,
         )
         .with_opt_log(self.log.clone())
-        .with_truncate_sequence(self.truncate_sequence)
         .with_no_kv_cache(self.no_kv_cache)
         .with_prefix_cache_n(self.prefix_cache_n);
+        if first_primary_id != first_pipeline_name {
+            builder = builder.with_model_id(first_primary_id.clone());
+        }
 
         // Add MCP client configuration if provided
         if let Some(mcp_config) = self.mcp_client_config.clone() {
@@ -830,6 +841,14 @@ impl MistralRsForServerBuilder {
         }
 
         let mistralrs = builder.build().await;
+
+        if let Some(alias) = first_model.alias.as_ref() {
+            if alias != &first_pipeline_name {
+                mistralrs
+                    .register_model_alias(first_pipeline_name.clone(), &first_primary_id)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            }
+        }
 
         // Load additional models
         for model_config in self.models.iter().skip(1) {
@@ -850,7 +869,6 @@ impl MistralRsForServerBuilder {
                         .clone()
                         .or(self.chat_template.clone()),
                 )
-                .with_prompt_chunksize(prompt_chunksize)
                 .with_jinja_explicit(
                     model_config
                         .jinja_explicit
@@ -884,27 +902,29 @@ impl MistralRsForServerBuilder {
                 cache_config,
             )?;
 
-            // Use the pipeline's name() as the model ID
+            // Use the pipeline's name() as the canonical ID, but allow an alias.
             let pipeline_name = pipeline.lock().await.name();
+            let primary_id = model_config
+                .alias
+                .clone()
+                .unwrap_or_else(|| pipeline_name.clone());
 
-            // Check for model ID conflicts
-            if pipeline_names.contains(&pipeline_name) {
+            if !registered_ids.insert(primary_id.clone()) {
                 anyhow::bail!(
-                    "Model ID conflict: '{}' is already registered. Models from config keys '{}' and previous models have the same pipeline identifier.",
-                    pipeline_name,
+                    "Model ID conflict: '{}' is already registered (config key: {}).",
+                    primary_id,
                     model_config.model_id
                 );
             }
 
             // Add the model to the MistralRs instance
             let engine_config = mistralrs_core::EngineConfig {
-                truncate_sequence: self.truncate_sequence,
                 no_kv_cache: self.no_kv_cache,
                 no_prefix_cache: false,
                 prefix_cache_n: self.prefix_cache_n,
                 disable_eos_stop: false,
                 throughput_logging_enabled: !self.interactive_mode,
-                search_embedding_model: bert_model.clone(),
+                search_embedding_model,
                 search_callback: self.search_callback.clone(),
                 tool_callbacks: HashMap::new(),
                 tool_callbacks_with_tools: HashMap::new(),
@@ -917,19 +937,34 @@ impl MistralRsForServerBuilder {
 
             mistralrs
                 .add_model(
-                    pipeline_name.clone(),
+                    primary_id.clone(),
                     pipeline,
                     scheduler_config.clone(),
                     add_model_config,
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to add model {}: {}", pipeline_name, e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to add model {}: {}", primary_id, e))?;
 
-            info!(
-                "Model `{pipeline_name}` registered successfully (from config key: {})",
-                model_config.model_id
-            );
-            pipeline_names.push(pipeline_name);
+            if let Some(alias) = model_config.alias.as_ref() {
+                if alias != &pipeline_name {
+                    mistralrs
+                        .register_model_alias(pipeline_name.clone(), &primary_id)
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
+            }
+
+            if primary_id == pipeline_name {
+                info!(
+                    "Model `{}` registered successfully (from config key: {})",
+                    primary_id, model_config.model_id
+                );
+            } else {
+                info!(
+                    "Model `{}` registered successfully (pipeline: `{}`; config key: {})",
+                    primary_id, pipeline_name, model_config.model_id
+                );
+            }
+            loaded_model_ids.push(primary_id);
         }
 
         // Set the default model if specified
@@ -940,7 +975,7 @@ impl MistralRsForServerBuilder {
         }
 
         // Log all models loaded
-        info!("All models loaded: `{}`", pipeline_names.join("`, `"));
+        info!("All models loaded: `{}`", loaded_model_ids.join("`, `"));
 
         // Log default model
         if let Some(ref default_id) = self.default_model_id {
@@ -948,7 +983,7 @@ impl MistralRsForServerBuilder {
         } else {
             info!(
                 "Default model: {} (first model, from config key: {})",
-                pipeline_names[0], self.models[0].model_id
+                loaded_model_ids[0], self.models[0].model_id
             );
         }
         Ok(mistralrs)
@@ -1062,7 +1097,6 @@ fn init_cache_config(
     paged_ctxt_len: Option<usize>,
     cache_type: PagedCacheType,
     no_paged_attn: bool,
-    max_seq_len: usize,
 ) -> Result<Option<PagedAttentionConfig>> {
     match (
         paged_attn_block_size,
@@ -1074,25 +1108,21 @@ fn init_cache_config(
     ) {
         (block_size, None, None, None, true, false) => Ok(Some(PagedAttentionConfig::new(
             block_size,
-            512,
-            MemoryGpuConfig::ContextSize(max_seq_len),
+            MemoryGpuConfig::Utilization(0.9),
             cache_type,
         )?)),
         (block_size, None, None, Some(ctxt), true, false) => Ok(Some(PagedAttentionConfig::new(
             block_size,
-            512,
             MemoryGpuConfig::ContextSize(ctxt),
             cache_type,
         )?)),
         (block_size, None, Some(f), None, true, false) => Ok(Some(PagedAttentionConfig::new(
             block_size,
-            512,
             MemoryGpuConfig::Utilization(f),
             cache_type,
         )?)),
         (block_size, Some(m), None, None, true, false) => Ok(Some(PagedAttentionConfig::new(
             block_size,
-            512,
             MemoryGpuConfig::MbAmount(m),
             cache_type,
         )?)),
@@ -1100,7 +1130,6 @@ fn init_cache_config(
             info!("Both memory size, and usage were specified, defaulting to the usage value.");
             Ok(Some(PagedAttentionConfig::new(
                 block_size,
-                512,
                 MemoryGpuConfig::Utilization(f),
                 cache_type,
             )?))
@@ -1109,7 +1138,6 @@ fn init_cache_config(
             info!("All memory size and ctxt len, defaulting to the context len value.");
             Ok(Some(PagedAttentionConfig::new(
                 block_size,
-                512,
                 MemoryGpuConfig::ContextSize(ctxt),
                 cache_type,
             )?))
@@ -1118,7 +1146,6 @@ fn init_cache_config(
             info!("Both ctxt len and usage were specified, defaulting to the usage value.");
             Ok(Some(PagedAttentionConfig::new(
                 block_size,
-                512,
                 MemoryGpuConfig::Utilization(f),
                 cache_type,
             )?))
@@ -1170,17 +1197,13 @@ pub fn configure_paged_attn_from_flags(
     }
 }
 
-/// Creates a BERT embedding model configuration for search functionality.
-pub fn get_bert_model(
+/// Creates a search embedding model configuration for agentic search reranking.
+pub fn get_search_embedding_model(
     enable_search: bool,
-    search_bert_model: Option<String>,
-) -> Option<BertEmbeddingModel> {
+    search_embedding_model: Option<SearchEmbeddingModel>,
+) -> Option<SearchEmbeddingModel> {
     if enable_search {
-        Some(
-            search_bert_model
-                .map(BertEmbeddingModel::Custom)
-                .unwrap_or_default(),
-        )
+        Some(search_embedding_model.unwrap_or_default())
     } else {
         None
     }

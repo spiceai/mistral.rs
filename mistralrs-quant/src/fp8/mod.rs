@@ -12,7 +12,7 @@ use quantize::QuantizationResult;
 mod quantize;
 
 use crate::{
-    cublaslt::{maybe_init_cublas_lt_wrapper, F8MatmulOutType, CUBLASLT_CONTROLLER},
+    cublaslt::{maybe_init_cublas_lt_wrapper, CUBLASLT_CONTROLLER},
     utils::{
         deserialize_tensor, read_dtype, serialize_tensor, version_is_compatible, write_dtype,
         UQFF_VERSION,
@@ -43,7 +43,9 @@ impl QuantMethod for FP8Linear {
             | QuantMethodConfig::Unquantized(_)
             | QuantMethodConfig::Bnb { .. }
             | QuantMethodConfig::BlockwiseFP8 { .. }
-            | QuantMethodConfig::Afq { .. } => unreachable!(),
+            | QuantMethodConfig::PerTensorFP8 { .. }
+            | QuantMethodConfig::Afq { .. }
+            | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
             QuantMethodConfig::FP8 { lin, dtype } => {
                 let QuantizationResult {
                     qw,
@@ -68,7 +70,7 @@ impl QuantMethod for FP8Linear {
         // Batch matrix multiplication
         maybe_init_cublas_lt_wrapper(x.device().clone());
 
-        match CUBLASLT_CONTROLLER.get() {
+        match CUBLASLT_CONTROLLER.get_for_device(x.device()) {
             Some(handle) => {
                 let n_dims = x.dims().len();
                 if n_dims < 3 {
@@ -117,7 +119,6 @@ impl QuantMethod for FP8Linear {
                         beta,
                         None,
                         None,
-                        F8MatmulOutType::BF16, // Output in bf16 to avoid manual dequant
                     )?
                     .reshape(tgt_shape)
             }
@@ -188,10 +189,10 @@ impl QuantizedSerde for FP8Linear {
     fn name(&self) -> &'static str {
         "fp8-linear"
     }
-    fn serialize(&self) -> Result<Cow<[u8]>> {
+    fn serialize(&self) -> Result<Cow<'_, [u8]>> {
         self.serialize_with_bias(self.lin.bias().cloned())
     }
-    fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<[u8]>> {
+    fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<'_, [u8]>> {
         let mut buffer = Vec::new();
 
         // Version is always first!

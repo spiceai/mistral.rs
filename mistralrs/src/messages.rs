@@ -19,6 +19,9 @@ pub trait RequestLike {
     fn take_tools(&mut self) -> Option<(Vec<Tool>, ToolChoice)>;
     fn take_sampling_params(&mut self) -> SamplingParams;
     fn take_web_search_options(&mut self) -> Option<WebSearchOptions>;
+    fn truncate_sequence(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +109,7 @@ impl RequestLike for TextMessages {
         RequestMessage::Chat {
             messages: other,
             enable_thinking: self.enable_thinking,
+            reasoning_effort: None,
         }
     }
     fn enable_search(&self) -> Option<bool> {
@@ -202,48 +206,60 @@ impl VisionMessages {
         let config = model.config().unwrap();
         let prefixer = match &config.category {
             ModelCategory::Vision { prefixer } => prefixer,
-            ModelCategory::Text
-            | ModelCategory::Diffusion
-            | ModelCategory::Speech
-            | ModelCategory::Audio => {
+            _ => {
                 anyhow::bail!("`add_image_message` expects a vision model.")
             }
         };
 
         // Images
         let n_added_images = images.len();
-        let prefixed = prefixer.prefix_image(
-            (self.images.len()..self.images.len() + n_added_images).collect(),
-            &text.to_string(),
-        );
+        let image_indexes: Vec<usize> =
+            (self.images.len()..self.images.len() + n_added_images).collect();
         self.images.extend(images);
 
         // Audios
         let n_added_audios = audios.len();
-        let prefixed = prefixer.prefix_audio(
-            (self.audios.len()..self.audios.len() + n_added_audios).collect(),
-            &prefixed,
-        );
+        let audio_indexes: Vec<usize> =
+            (self.audios.len()..self.audios.len() + n_added_audios).collect();
         self.audios.extend(audios);
 
-        if n_added_images > 0 {
+        if n_added_images > 0 || n_added_audios > 0 {
+            // Build mixed content parts
+            let mut content_vec: Vec<IndexMap<String, Value>> = Vec::new();
+            for _ in 0..n_added_images {
+                content_vec.push(IndexMap::from([(
+                    "type".to_string(),
+                    Value::String("image".to_string()),
+                )]));
+            }
+            for _ in 0..n_added_audios {
+                content_vec.push(IndexMap::from([(
+                    "type".to_string(),
+                    Value::String("audio".to_string()),
+                )]));
+            }
+            // Prefix the text with any media context
+            let mut prefixed_text = text.to_string();
+            if !image_indexes.is_empty() {
+                prefixed_text = prefixer.prefix_image(image_indexes, &prefixed_text);
+            }
+            if !audio_indexes.is_empty() {
+                prefixed_text = prefixer.prefix_audio(audio_indexes, &prefixed_text);
+            }
+            // Add the final text part
+            content_vec.push(IndexMap::from([
+                ("type".to_string(), Value::String("text".to_string())),
+                ("text".to_string(), Value::String(prefixed_text)),
+            ]));
+
             self.messages.push(IndexMap::from([
                 ("role".to_string(), Either::Left(role.to_string())),
-                (
-                    "content".to_string(),
-                    Either::Right(vec![
-                        IndexMap::from([("type".to_string(), Value::String("image".to_string()))]),
-                        IndexMap::from([
-                            ("type".to_string(), Value::String("text".to_string())),
-                            ("text".to_string(), Value::String(prefixed)),
-                        ]),
-                    ]),
-                ),
+                ("content".to_string(), Either::Right(content_vec)),
             ]));
         } else {
             self.messages.push(IndexMap::from([
                 ("role".to_string(), Either::Left(role.to_string())),
-                ("content".to_string(), Either::Left(prefixed)),
+                ("content".to_string(), Either::Left(text.to_string())),
             ]));
         }
         Ok(self)
@@ -252,6 +268,7 @@ impl VisionMessages {
     pub fn clear(mut self) -> Self {
         self.messages.clear();
         self.images.clear();
+        self.audios.clear();
 
         self
     }
@@ -281,6 +298,7 @@ impl RequestLike for VisionMessages {
             messages: other_messages,
             audios: other_audios,
             enable_thinking: self.enable_thinking,
+            reasoning_effort: None,
         }
     }
     fn enable_search(&self) -> Option<bool> {
@@ -332,6 +350,7 @@ pub struct RequestBuilder {
     sampling_params: SamplingParams,
     web_search_options: Option<WebSearchOptions>,
     enable_thinking: Option<bool>,
+    truncate_sequence: bool,
 }
 
 impl Default for RequestBuilder {
@@ -355,6 +374,7 @@ impl From<TextMessages> for RequestBuilder {
             sampling_params: SamplingParams::deterministic(),
             web_search_options: None,
             enable_thinking: None,
+            truncate_sequence: false,
         }
     }
 }
@@ -374,6 +394,7 @@ impl From<VisionMessages> for RequestBuilder {
             sampling_params: SamplingParams::deterministic(),
             web_search_options: None,
             enable_thinking: None,
+            truncate_sequence: false,
         }
     }
 }
@@ -393,6 +414,7 @@ impl RequestBuilder {
             sampling_params: SamplingParams::deterministic(),
             web_search_options: None,
             enable_thinking: None,
+            truncate_sequence: false,
         }
     }
 
@@ -482,6 +504,7 @@ impl RequestBuilder {
         self.add_multimodal_message(role, text, vec![], audios, model)
     }
 
+    /// By convention, all images are added before all audios.
     pub fn add_multimodal_message(
         mut self,
         role: TextMessageRole,
@@ -493,48 +516,60 @@ impl RequestBuilder {
         let config = model.config().unwrap();
         let prefixer = match &config.category {
             ModelCategory::Vision { prefixer } => prefixer,
-            ModelCategory::Text
-            | ModelCategory::Diffusion
-            | ModelCategory::Speech
-            | ModelCategory::Audio => {
+            _ => {
                 anyhow::bail!("`add_image_message` expects a vision model.")
             }
         };
 
         // Images
         let n_added_images = images.len();
-        let prefixed = prefixer.prefix_image(
-            (self.images.len()..self.images.len() + n_added_images).collect(),
-            &text.to_string(),
-        );
+        let image_indexes: Vec<usize> =
+            (self.images.len()..self.images.len() + n_added_images).collect();
         self.images.extend(images);
 
         // Audios
         let n_added_audios = audios.len();
-        let prefixed = prefixer.prefix_audio(
-            (self.audios.len()..self.audios.len() + n_added_audios).collect(),
-            &prefixed,
-        );
+        let audio_indexes: Vec<usize> =
+            (self.audios.len()..self.audios.len() + n_added_audios).collect();
         self.audios.extend(audios);
 
-        if n_added_images > 0 {
+        if n_added_images > 0 || n_added_audios > 0 {
+            // Build mixed content parts
+            let mut content_vec: Vec<IndexMap<String, Value>> = Vec::new();
+            for _ in 0..n_added_images {
+                content_vec.push(IndexMap::from([(
+                    "type".to_string(),
+                    Value::String("image".to_string()),
+                )]));
+            }
+            for _ in 0..n_added_audios {
+                content_vec.push(IndexMap::from([(
+                    "type".to_string(),
+                    Value::String("audio".to_string()),
+                )]));
+            }
+            // Prefix the text with any media context
+            let mut prefixed_text = text.to_string();
+            if !image_indexes.is_empty() {
+                prefixed_text = prefixer.prefix_image(image_indexes, &prefixed_text);
+            }
+            if !audio_indexes.is_empty() {
+                prefixed_text = prefixer.prefix_audio(audio_indexes, &prefixed_text);
+            }
+            // Add the final text part
+            content_vec.push(IndexMap::from([
+                ("type".to_string(), Value::String("text".to_string())),
+                ("text".to_string(), Value::String(prefixed_text)),
+            ]));
+
             self.messages.push(IndexMap::from([
                 ("role".to_string(), Either::Left(role.to_string())),
-                (
-                    "content".to_string(),
-                    Either::Right(vec![
-                        IndexMap::from([("type".to_string(), Value::String("image".to_string()))]),
-                        IndexMap::from([
-                            ("type".to_string(), Value::String("text".to_string())),
-                            ("text".to_string(), Value::String(prefixed)),
-                        ]),
-                    ]),
-                ),
+                ("content".to_string(), Either::Right(content_vec)),
             ]));
         } else {
             self.messages.push(IndexMap::from([
                 ("role".to_string(), Either::Left(role.to_string())),
-                ("content".to_string(), Either::Left(prefixed)),
+                ("content".to_string(), Either::Left(text.to_string())),
             ]));
         }
         Ok(self)
@@ -651,6 +686,12 @@ impl RequestBuilder {
         self.enable_thinking = Some(enable_thinking);
         self
     }
+
+    /// Truncate prompts that exceed the model's maximum context length.
+    pub fn with_truncate_sequence(mut self, truncate_sequence: bool) -> Self {
+        self.truncate_sequence = truncate_sequence;
+        self
+    }
 }
 
 impl RequestLike for RequestBuilder {
@@ -669,6 +710,7 @@ impl RequestLike for RequestBuilder {
             RequestMessage::Chat {
                 messages: other,
                 enable_thinking: self.enable_thinking,
+                reasoning_effort: None,
             }
         } else {
             let mut other_messages = Vec::new();
@@ -682,12 +724,13 @@ impl RequestLike for RequestBuilder {
                 messages: other_messages,
                 audios: other_audios,
                 enable_thinking: self.enable_thinking,
+                reasoning_effort: None,
             }
         }
     }
 
     fn enable_search(&self) -> Option<bool> {
-        self.enable_thinking
+        self.web_search_options.as_ref().map(|_| true)
     }
 
     fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>> {
@@ -742,5 +785,110 @@ impl RequestLike for RequestBuilder {
         let mut other = None;
         std::mem::swap(&mut other, &mut self.web_search_options);
         other
+    }
+
+    fn truncate_sequence(&self) -> bool {
+        self.truncate_sequence
+    }
+}
+
+#[derive(Clone, Debug)]
+/// An individual embedding input.
+pub enum EmbeddingRequestInput {
+    /// Raw text prompt that will be tokenized.
+    Prompt(String),
+    /// Pre-tokenized input.
+    Tokens(Vec<u32>),
+}
+
+impl EmbeddingRequestInput {
+    pub fn into_request_message(self) -> RequestMessage {
+        match self {
+            Self::Prompt(prompt) => RequestMessage::Embedding { prompt },
+            Self::Tokens(prompt) => RequestMessage::EmbeddingTokens { prompt },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+/// A validated embedding request constructed via [`EmbeddingRequestBuilder`].
+pub struct EmbeddingRequest {
+    pub inputs: Vec<EmbeddingRequestInput>,
+    pub truncate_sequence: bool,
+}
+
+impl EmbeddingRequest {
+    /// Create a new builder for an embedding request.
+    pub fn builder() -> EmbeddingRequestBuilder {
+        EmbeddingRequestBuilder::new()
+    }
+}
+
+/// Builder for configuring embedding requests.
+#[derive(Clone, Debug, Default)]
+pub struct EmbeddingRequestBuilder {
+    inputs: Vec<EmbeddingRequestInput>,
+    truncate_sequence: bool,
+}
+
+impl EmbeddingRequestBuilder {
+    /// Create an empty builder. You must add at least one input before using it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a single text prompt.
+    pub fn add_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.inputs
+            .push(EmbeddingRequestInput::Prompt(prompt.into()));
+        self
+    }
+
+    /// Add multiple text prompts at once.
+    pub fn add_prompts<I, S>(mut self, prompts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.inputs.extend(
+            prompts
+                .into_iter()
+                .map(|prompt| EmbeddingRequestInput::Prompt(prompt.into())),
+        );
+        self
+    }
+
+    /// Add a single pre-tokenized prompt.
+    pub fn add_tokens(mut self, tokens: impl Into<Vec<u32>>) -> Self {
+        self.inputs
+            .push(EmbeddingRequestInput::Tokens(tokens.into()));
+        self
+    }
+
+    /// Add multiple pre-tokenized prompts.
+    pub fn add_tokens_batch<I>(mut self, batches: I) -> Self
+    where
+        I: IntoIterator<Item = Vec<u32>>,
+    {
+        self.inputs
+            .extend(batches.into_iter().map(EmbeddingRequestInput::Tokens));
+        self
+    }
+
+    /// Control whether prompts longer than the model context are truncated.
+    pub fn with_truncate_sequence(mut self, truncate: bool) -> Self {
+        self.truncate_sequence = truncate;
+        self
+    }
+
+    pub fn build(self) -> anyhow::Result<EmbeddingRequest> {
+        if self.inputs.is_empty() {
+            anyhow::bail!("Embedding request must contain at least one input.");
+        }
+
+        Ok(EmbeddingRequest {
+            inputs: self.inputs,
+            truncate_sequence: self.truncate_sequence,
+        })
     }
 }

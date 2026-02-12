@@ -10,6 +10,7 @@ use candle_core::{
     quantized::{GgmlDType, QMatMul, QTensor},
     DType, Device, Result, Tensor,
 };
+use pertensor_fp8::pertensor_fp8_linear_b;
 
 #[cfg(feature = "metal")]
 mod metal_kernels;
@@ -21,15 +22,20 @@ pub mod cublaslt;
 pub mod distributed;
 mod dummy;
 mod fp8;
+pub mod gemv;
 mod gguf;
 mod gptq;
 mod hqq;
 mod imatrix;
 mod lora;
+mod mxfp4;
+mod pertensor_fp8;
 pub mod rotary;
 pub mod safetensors;
+mod scalar_fp8;
 mod unquantized;
 mod utils;
+mod vector_fp8;
 
 use gptq::gptq_linear;
 use lora::merge_lora_weights;
@@ -37,7 +43,10 @@ use regex::Regex;
 pub use safetensors::{Shard, ShardedSafeTensors, ShardedVarBuilder};
 
 pub use afq::{AfqBits, AfqGroupSize, AfqLayer};
-pub use bitsandbytes::{BnbLinear, BnbQuantParmas, BnbQuantType};
+pub use bitsandbytes::{BnbLinear, BnbQuantParams, BnbQuantType};
+pub use blockwise_fp8::{
+    blockwise_fp8_moe, fp8_blockwise_dequantize, fp8_blockwise_quantize, BlockwiseFP8Linear,
+};
 pub use distributed::{
     layers::{
         compute_kv_shard, compute_n_kv_groups, ColumnParallelLayer, FusedExperts, PackedExperts,
@@ -48,6 +57,9 @@ pub use distributed::{
 };
 pub use dummy::DummyLayer;
 pub use fp8::FP8Linear;
+#[cfg(feature = "cuda")]
+pub use gemv::gemv;
+pub use gemv::{should_use_gemv, GEMV_CONTROLLER};
 pub use gguf::GgufMatMul;
 pub use gptq::GptqLayer;
 pub use hqq::{HqqAxis, HqqBits, HqqConfig, HqqLayer};
@@ -56,11 +68,21 @@ pub use lora::{
     clear_applied_loras, get_applied_loras, linear_no_bias_static_lora, push_applied_lora,
     LoraAdapter, LoraConfig, StaticLoraConfig, MULTI_LORA_DELIMITER,
 };
+pub use mxfp4::MXFP4Layer;
+pub use pertensor_fp8::PerTensorFP8Linear;
 pub use unquantized::UnquantLinear;
+#[cfg(feature = "cuda")]
+pub use utils::gptoss_swiglu_fused;
+#[cfg(feature = "cuda")]
+pub use utils::gptoss_swiglu_interleaved;
 pub use utils::isq::apply_immediate_isq;
+#[cfg(feature = "cuda")]
+pub use utils::softmax_with_sinks;
+pub use utils::{fused_glu, GluActivationType};
 pub use utils::{log, BitWiseOp, CumSumOp, LeftshiftOp, NonZeroOp, SortOp, UQFF_QUANT_TYPE_OFFSET};
+pub use vector_fp8::{fp8_vector_dequantize, fp8_vector_quantize};
 
-use candle_nn::{Linear, Module};
+use candle_nn::{Conv1d, Conv2d, Linear, Module};
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Clone, Debug)]
@@ -68,6 +90,20 @@ pub struct ImmediateIsqParams {
     pub guard: QuantizeOntoGuard,
     pub ty: Option<IsqType>,
     pub predicates: Vec<Regex>,
+    pub overrides: Vec<ImmediateIsqOverride>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImmediateIsqOverride {
+    pub predicate: Regex,
+    pub ty: Option<IsqType>,
+    pub device: Option<Device>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImmediateIsqMatch {
+    pub ty: IsqType,
+    pub device: Option<Device>,
 }
 
 thread_local! {
@@ -75,11 +111,20 @@ thread_local! {
 }
 
 pub fn set_immediate_isq(isq: Option<IsqType>, predicates: Vec<Regex>) {
+    set_immediate_isq_with_overrides(isq, predicates, Vec::new());
+}
+
+pub fn set_immediate_isq_with_overrides(
+    isq: Option<IsqType>,
+    predicates: Vec<Regex>,
+    overrides: Vec<ImmediateIsqOverride>,
+) {
     ENGINE_IMMEDIATE_ISQ.with(|cell| {
         *cell.borrow_mut() = Some(ImmediateIsqParams {
             guard: QuantizeOntoGuard::new(),
             ty: isq,
             predicates,
+            overrides,
         });
     });
 }
@@ -95,16 +140,42 @@ pub fn clear_immediate_isq() {
 }
 
 pub fn should_apply_immediate_isq(vb: &ShardedVarBuilder) -> bool {
-    let Some(immediate_isq) = get_immediate_isq() else {
-        return false;
-    };
+    immediate_isq_match(vb).is_some()
+}
+
+pub fn immediate_isq_match(vb: &ShardedVarBuilder) -> Option<ImmediateIsqMatch> {
+    let immediate_isq = get_immediate_isq()?;
     // Add a .weight to match the ISQ regexes!
     let prefix = format!("{}.weight", vb.prefix());
-    immediate_isq.ty.is_some()
-        && immediate_isq
+    resolve_immediate_isq(&immediate_isq, &prefix)
+}
+
+fn resolve_immediate_isq(params: &ImmediateIsqParams, prefix: &str) -> Option<ImmediateIsqMatch> {
+    if let Some(override_hit) = params
+        .overrides
+        .iter()
+        .find(|override_pred| override_pred.predicate.is_match(prefix))
+    {
+        if let Some(ty) = override_hit.ty.or(params.ty) {
+            return Some(ImmediateIsqMatch {
+                ty,
+                device: override_hit.device.clone(),
+            });
+        }
+        return None;
+    }
+
+    if let Some(ty) = params.ty {
+        if params
             .predicates
             .iter()
-            .any(|predicate| predicate.is_match(&prefix))
+            .any(|predicate| predicate.is_match(prefix))
+        {
+            return Some(ImmediateIsqMatch { ty, device: None });
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -117,7 +188,7 @@ pub enum QuantizedConfig {
         is_awq: bool,
     },
     Fp8 {
-        weight_block_size: Vec<usize>,
+        weight_block_size: Option<Vec<usize>>,
     },
     Bitsandbytes {
         bnb_4bit_quant_type: Option<String>,
@@ -126,6 +197,7 @@ pub enum QuantizedConfig {
         bits: usize,
         group_size: usize,
     },
+    MXFP4 {},
 }
 
 // Common fields for all variants
@@ -163,10 +235,10 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
                 })
             }
             Some(m) if m == "fp8" => {
-                let weight_block_size = raw
-                    .weight_block_size
-                    .ok_or_else(|| serde::de::Error::missing_field("weight_block_size"))?;
-                Ok(QuantizedConfig::Fp8 { weight_block_size })
+                // weight_block_size is optional - None means per-tensor quantization
+                Ok(QuantizedConfig::Fp8 {
+                    weight_block_size: raw.weight_block_size,
+                })
             }
             Some(m) if m == "bitsandbytes" => Ok(QuantizedConfig::Bitsandbytes {
                 bnb_4bit_quant_type: raw.bnb_4bit_quant_type,
@@ -179,6 +251,9 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
                     .group_size
                     .ok_or_else(|| serde::de::Error::missing_field("group_size"))?;
                 Ok(QuantizedConfig::Afq { bits, group_size })
+            }
+            Some(m) if m == "mxfp4" => {
+                Ok(QuantizedConfig::MXFP4 {  })
             }
             None => {
                 let bits = raw
@@ -205,6 +280,7 @@ impl QuantizedConfig {
             Self::Fp8 { .. } => "fp8",
             Self::Bitsandbytes { .. } => "bitsandbytes",
             Self::Afq { .. } => "afq",
+            Self::MXFP4 { .. } => "mxfp4",
         }
     }
 
@@ -219,6 +295,7 @@ impl QuantizedConfig {
                 bnb_4bit_quant_type: None,
             } => "8 bits".to_string(),
             Self::Afq { bits, .. } => format!("{bits} bits"),
+            Self::MXFP4 {} => format!("{} bits", mxfp4::N_BITS),
         }
     }
 
@@ -231,6 +308,7 @@ impl QuantizedConfig {
                 5 => IsqType::Q5K.pack_factor(dtype),
                 6 => IsqType::Q6K.pack_factor(dtype),
                 8 => IsqType::Q8_0.pack_factor(dtype),
+                40 => 4, // mxfp4: 2 FP4 values per byte = factor of 4
                 other => panic!("Unexpected bits in `pack_factor` {other}"),
             },
             Self::Fp8 { .. } => IsqType::Q8_0.pack_factor(dtype),
@@ -240,6 +318,7 @@ impl QuantizedConfig {
             | Self::Bitsandbytes {
                 bnb_4bit_quant_type: None,
             } => IsqType::Q4K.pack_factor(dtype),
+            Self::MXFP4 {} => IsqType::Q4_0.pack_factor(dtype),
         }
     }
 }
@@ -281,7 +360,7 @@ pub enum QuantMethodConfig {
     Bnb {
         weight: Tensor,
         bias: Option<Tensor>,
-        params: BnbQuantParmas,
+        params: BnbQuantParams,
         quant_ty: BnbQuantType,
     },
     BlockwiseFP8 {
@@ -291,11 +370,23 @@ pub enum QuantMethodConfig {
         dequant_dtype: DType,
         weight_block_size: Vec<usize>,
     },
+    PerTensorFP8 {
+        weight: Tensor,
+        weight_scale_inv: Tensor,
+        activation_scale: Option<Tensor>,
+        bias: Option<Tensor>,
+        dequant_dtype: DType,
+    },
     Afq {
         weight: Tensor,
         bias: Option<Tensor>,
         bits: AfqBits,
         group_size: AfqGroupSize,
+    },
+    MXFP4 {
+        blocks: Tensor,
+        scales: Tensor,
+        bias: Option<Tensor>,
     },
 }
 
@@ -348,6 +439,42 @@ impl MatMul {
     /// Compute quantized matrix-matrix product.
     pub fn qmethod_matmul(&self, x: &Tensor, matmul: &dyn QuantMethod) -> Result<Tensor> {
         matmul.forward(x)
+    }
+}
+
+/// Device/configurable intelligent convolution
+/// - Handles limitation of cpu which requires f32
+pub struct Convolution;
+
+impl Convolution {
+    pub fn forward_1d(&self, layer: &Conv1d, x: &Tensor) -> Result<Tensor> {
+        if x.device().is_cpu() {
+            let original_dtype = x.dtype();
+            Conv1d::new(
+                layer.weight().to_dtype(DType::F32)?,
+                layer.bias().map(|b| b.to_dtype(DType::F32)).transpose()?,
+                *layer.config(),
+            )
+            .forward(&x.to_dtype(DType::F32)?)?
+            .to_dtype(original_dtype)
+        } else {
+            layer.forward(x)
+        }
+    }
+
+    pub fn forward_2d(&self, layer: &Conv2d, x: &Tensor) -> Result<Tensor> {
+        if x.device().is_cpu() {
+            let original_dtype = x.dtype();
+            Conv2d::new(
+                layer.weight().to_dtype(DType::F32)?,
+                layer.bias().map(|b| b.to_dtype(DType::F32)).transpose()?,
+                *layer.config(),
+            )
+            .forward(&x.to_dtype(DType::F32)?)?
+            .to_dtype(original_dtype)
+        } else {
+            layer.forward(x)
+        }
     }
 }
 
@@ -537,7 +664,7 @@ pub trait QuantizedSerde {
     fn isq_serde_supported(&self) -> bool {
         false
     }
-    fn serialize(&self) -> Result<Cow<[u8]>> {
+    fn serialize(&self) -> Result<Cow<'_, [u8]>> {
         candle_core::bail!("`QuantizedSerde::serialize` is not supported.")
     }
     fn deserialize(
@@ -562,7 +689,7 @@ pub trait QuantizedSerde {
         candle_core::bail!("`QuantizedSerde::deserialize_ext_bias` is not supported.")
     }
     /// NOT meant for external calling
-    fn serialize_with_bias(&self, _bias: Option<Tensor>) -> Result<Cow<[u8]>> {
+    fn serialize_with_bias(&self, _bias: Option<Tensor>) -> Result<Cow<'_, [u8]>> {
         candle_core::bail!("`QuantizedSerde::serialize_with_bias` is not supported.")
     }
 }
@@ -595,7 +722,7 @@ impl QuantizeOntoGuard {
 
     /// Acquire the quantize drop guard to protect the critical section.
     ///
-    /// On metal, this flushes the command buffer to avoid "A command encoder is already encoding to this command buffer"
+    /// On metal, this waits for outstanding work to finish to avoid "A command encoder is already encoding to this command buffer"
     pub fn acquire(&self, device: &Device) -> QuantizeOntoDropGuard<'_> {
         #[cfg(feature = "cuda")]
         {
@@ -608,7 +735,7 @@ impl QuantizeOntoGuard {
             #[cfg(feature = "metal")]
             if let Device::Metal(dev) = device {
                 // This is necessary to avoid the errors of "A command encoder is already encoding to this command buffer"
-                dev.flush_command_buffer()
+                dev.wait_until_completed()
                     .expect("Failed to flush command buffer.");
             }
             #[cfg(not(feature = "metal"))]
@@ -734,14 +861,35 @@ pub fn linear_no_bias(
     let layer = if let Some(quant_conf) = &config {
         match quant_conf {
             QuantizedConfig::GptqAwq { .. } => gptq_linear(in_dim, out_dim, quant_conf, vb)?,
-            QuantizedConfig::Fp8 { .. } => {
-                blockwise_fp8_linear_b(in_dim, out_dim, quant_conf, false, Default::default(), vb)?
+            QuantizedConfig::Fp8 { weight_block_size } => {
+                if weight_block_size.is_some() {
+                    blockwise_fp8_linear_b(
+                        in_dim,
+                        out_dim,
+                        quant_conf,
+                        false,
+                        Default::default(),
+                        vb,
+                    )?
+                } else {
+                    pertensor_fp8_linear_b(
+                        in_dim,
+                        out_dim,
+                        quant_conf,
+                        false,
+                        Default::default(),
+                        vb,
+                    )?
+                }
             }
             QuantizedConfig::Bitsandbytes { .. } => {
                 Arc::new(BnbLinear::linear_b(in_dim, out_dim, false, vb)?) as Arc<_>
             }
             QuantizedConfig::Afq { .. } => {
                 AfqLayer::afq_linear_b(in_dim, out_dim, quant_conf, false, vb)?
+            }
+            QuantizedConfig::MXFP4 {} => {
+                MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, false, vb)?
             }
         }
     } else {
@@ -778,14 +926,35 @@ pub fn linear(
     let layer = if let Some(quant_conf) = &config {
         match quant_conf {
             QuantizedConfig::GptqAwq { .. } => gptq_linear(in_dim, out_dim, quant_conf, vb)?,
-            QuantizedConfig::Fp8 { .. } => {
-                blockwise_fp8_linear_b(in_dim, out_dim, quant_conf, true, Default::default(), vb)?
+            QuantizedConfig::Fp8 { weight_block_size } => {
+                if weight_block_size.is_some() {
+                    blockwise_fp8_linear_b(
+                        in_dim,
+                        out_dim,
+                        quant_conf,
+                        true,
+                        Default::default(),
+                        vb,
+                    )?
+                } else {
+                    pertensor_fp8_linear_b(
+                        in_dim,
+                        out_dim,
+                        quant_conf,
+                        true,
+                        Default::default(),
+                        vb,
+                    )?
+                }
             }
             QuantizedConfig::Bitsandbytes { .. } => {
                 Arc::new(BnbLinear::linear_b(in_dim, out_dim, true, vb)?) as Arc<_>
             }
             QuantizedConfig::Afq { .. } => {
                 AfqLayer::afq_linear_b(in_dim, out_dim, quant_conf, true, vb)?
+            }
+            QuantizedConfig::MXFP4 {} => {
+                MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, true, vb)?
             }
         }
     } else {

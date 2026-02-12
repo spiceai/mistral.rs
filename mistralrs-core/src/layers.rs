@@ -13,7 +13,7 @@ use candle_nn::{
 use float8::F8E4M3;
 use half::{bf16, f16};
 use mistralrs_quant::{
-    AfqLayer, ColumnParallelLayer, QuantMethod, QuantizedConfig, RowParallelLayer,
+    AfqLayer, ColumnParallelLayer, Convolution, QuantMethod, QuantizedConfig, RowParallelLayer,
     ShardedVarBuilder,
 };
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ pub use crate::layers_masker::CausalMasker;
 pub use crate::layers_utils::repeat_kv;
 use crate::{
     amoe::{AnyMoeTrainableLayer, MlpLayer},
+    embedding_models::embedding_gemma::EmbeddingGemmaConfig,
     gguf::Content,
     models::{llama, smollm3},
     ops::SplitOp,
@@ -1274,6 +1275,82 @@ impl Qwen2_5VLRotaryEmbedding {
 }
 
 #[derive(Debug, Clone)]
+pub struct Qwen3VLRotaryEmbedding {
+    inv_freq: Tensor,
+    mrope_section: Vec<usize>,
+}
+
+impl Qwen3VLRotaryEmbedding {
+    pub fn new(
+        base: f32,
+        head_dim: usize,
+        device: &Device,
+        mrope_section: Vec<usize>,
+    ) -> Result<Self> {
+        let inv_freq: Vec<_> = (0..head_dim)
+            .step_by(2)
+            .map(|i| 1f32 / base.powf(i as f32 / head_dim as f32))
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (inv_freq_len,), device)?.to_dtype(DType::F32)?;
+        Ok(Self {
+            inv_freq,
+            mrope_section,
+        })
+    }
+
+    /// (cos, sin)
+    pub fn compute_cos_sin(&self, position_ids: &Tensor, dtype: DType) -> Result<(Tensor, Tensor)> {
+        let inv_freq_expanded =
+            self.inv_freq
+                .reshape((1, 1, (), 1))?
+                .repeat((3, position_ids.dim(1)?, 1, 1))?;
+        let position_ids_expanded = position_ids.unsqueeze(2)?;
+        let freqs = inv_freq_expanded
+            .matmul(&position_ids_expanded.to_dtype(inv_freq_expanded.dtype())?)?
+            .transpose(2, 3)?;
+        let cos = freqs.cos()?;
+        let sin = freqs.sin()?;
+
+        let cos = Tensor::cat(
+            &cos.split(&self.mrope_section, D::Minus1)?
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| m.i(i % 3))
+                .collect::<Result<Vec<_>>>()?,
+            D::Minus1,
+        )?
+        .squeeze(0)?
+        .to_dtype(dtype)?
+        .contiguous()?;
+        let sin = Tensor::cat(
+            &sin.split(&self.mrope_section, D::Minus1)?
+                .into_iter()
+                .enumerate()
+                .map(|(i, m)| m.i(i % 3))
+                .collect::<Result<Vec<_>>>()?,
+            D::Minus1,
+        )?
+        .squeeze(0)?
+        .to_dtype(dtype)?
+        .contiguous()?;
+
+        Ok((cos, sin))
+    }
+
+    pub fn forward(
+        &self,
+        (cos, sin): &(Tensor, Tensor),
+        q: &mut Tensor,
+        k: &mut Tensor,
+    ) -> Result<()> {
+        *q = candle_nn::rotary_emb::rope(&q.contiguous()?, cos, sin)?;
+        *k = candle_nn::rotary_emb::rope(&k.contiguous()?, cos, sin)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct DeepSeekV2RotaryEmbedding {
     sin: Tensor,
     cos: Tensor,
@@ -1825,6 +1902,53 @@ impl Gemma3RotaryEmbedding {
         }
     }
 
+    fn new_linear_embedding_gemma(
+        cfg: &EmbeddingGemmaConfig,
+        factor: f64,
+        is_gpt_neox: bool,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Self> {
+        let max_seq_len = cfg.max_position_embeddings;
+        let dim = cfg.head_dim;
+
+        let inv_freq: Vec<_> = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
+        let inv_freq = (inv_freq / factor)?;
+
+        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let cos = freqs.cos()?.to_dtype(dtype)?;
+        Ok(Self(RotaryEmbedding {
+            cos,
+            sin,
+            is_gpt_neox,
+        }))
+    }
+
+    pub fn new_embedding_gemma(
+        is_gpt_neox: bool,
+        dtype: DType,
+        cfg: &EmbeddingGemmaConfig,
+        dev: &Device,
+    ) -> Result<Self> {
+        match &cfg.rope_scaling {
+            Some(Gemma3RopeScalingConfig {
+                rope_type: Gemma3ScaledRopeType::Linear,
+                factor,
+            }) => Self::new_linear_embedding_gemma(cfg, *factor, is_gpt_neox, dtype, dev),
+
+            _ => Self::new_linear_embedding_gemma(cfg, 1.0, is_gpt_neox, dtype, dev),
+        }
+    }
+
     pub fn forward(
         &self,
         q: &Tensor,
@@ -2122,6 +2246,192 @@ impl RotaryEmbedding {
     }
 }
 
+/// GPT-OSS style rotary embedding with YARN scaling support.
+/// Uses chunked/GPT-NeoX style rotation and applies attention scaling.
+#[derive(Debug, Clone)]
+pub struct GptOssRotaryEmbedding {
+    cos: Tensor,
+    sin: Tensor,
+    #[allow(dead_code)]
+    attention_scale: f32,
+}
+
+impl GptOssRotaryEmbedding {
+    /// Create a new GPT-OSS rotary embedding with YARN scaling.
+    ///
+    /// # Arguments
+    /// * `base` - Base frequency for RoPE
+    /// * `head_dim` - Dimension of each attention head
+    /// * `max_position_embeddings` - Maximum sequence length
+    /// * `factor` - YARN scaling factor
+    /// * `original_max_position_embeddings` - Original max positions before scaling
+    /// * `beta_fast` - YARN beta_fast parameter
+    /// * `beta_slow` - YARN beta_slow parameter
+    /// * `truncate` - Whether to truncate correction dimensions
+    /// * `device` - Device to create tensors on
+    /// * `dtype` - Data type for the embeddings
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        base: f64,
+        head_dim: usize,
+        max_position_embeddings: usize,
+        factor: f64,
+        original_max_position_embeddings: usize,
+        beta_fast: f64,
+        beta_slow: f64,
+        truncate: bool,
+        device: &Device,
+        dtype: DType,
+    ) -> Result<Self> {
+        let dim = head_dim;
+
+        // Compute attention scale: 0.1 * ln(factor) + 1.0 for YARN
+        let attention_scale = (0.1 * factor.ln() + 1.0) as f32;
+
+        // Helper: find correction dimension based on number of rotations
+        // HF: (dim * log(max_pos / (num_rotations * 2 * pi))) / (2 * log(base))
+        let find_correction_dim = |num_rotations: f64| -> f64 {
+            (dim as f64
+                * (original_max_position_embeddings as f64
+                    / (num_rotations * 2.0 * std::f64::consts::PI))
+                    .ln())
+                / (2.0 * base.ln())
+        };
+
+        // Find correction range based on beta_fast and beta_slow
+        let mut low = find_correction_dim(beta_fast);
+        let mut high = find_correction_dim(beta_slow);
+        if truncate {
+            low = low.floor();
+            high = high.ceil();
+        }
+        low = low.max(0.0);
+        high = high.min((dim - 1) as f64);
+
+        // Compute base inverse frequencies
+        let half_dim = dim / 2;
+        let inv_freq_extrapolation: Vec<f64> = (0..dim)
+            .step_by(2)
+            .map(|i| 1.0 / base.powf(i as f64 / dim as f64))
+            .collect();
+        let inv_freq_interpolation: Vec<f64> =
+            inv_freq_extrapolation.iter().map(|f| f / factor).collect();
+
+        // Linear ramp factor over dimension indices
+        let inv_freq: Vec<f64> = (0..half_dim)
+            .map(|i| {
+                let range = if (high - low).abs() < 0.001 {
+                    0.001
+                } else {
+                    high - low
+                };
+                let linear = (i as f64 - low) / range;
+                let ramp = linear.clamp(0.0, 1.0);
+                inv_freq_interpolation[i] * ramp + inv_freq_extrapolation[i] * (1.0 - ramp)
+            })
+            .collect();
+
+        let inv_freq_len = inv_freq.len();
+        let inv_freq_tensor = Tensor::from_vec(
+            inv_freq.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+            (1, inv_freq_len),
+            device,
+        )?;
+
+        let t = Tensor::arange(0u32, max_position_embeddings as u32, device)?
+            .to_dtype(DType::F32)?
+            .reshape((max_position_embeddings, 1))?;
+
+        let freqs = t.matmul(&inv_freq_tensor)?;
+
+        // Apply attention scale to sin/cos (matches HF transformers behavior)
+        let sin = (freqs.sin()? * attention_scale as f64)?.to_dtype(dtype)?;
+        let cos = (freqs.cos()? * attention_scale as f64)?.to_dtype(dtype)?;
+
+        Ok(Self {
+            cos,
+            sin,
+            attention_scale,
+        })
+    }
+
+    pub fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        #[allow(unused_variables)]
+        let (b_sz, qh, seq_len, n_embd) = q.dims4()?;
+        #[allow(unused_variables)]
+        let (_b_sz, kh, _seq_len, _n_embd) = k.dims4()?;
+
+        // Use CUDA optimized kernel when available and q/k have same number of heads
+        // The CUDA kernel uses is_neox=true for chunked/GPT-NeoX style rotary
+        #[cfg(feature = "cuda")]
+        if q.device().is_cuda() && qh == k.dim(1)? {
+            let (cos, sin) = if seqlen_offsets.len() == 1 {
+                (
+                    self.cos.narrow(0, seqlen_offsets[0], seq_len)?,
+                    self.sin.narrow(0, seqlen_offsets[0], seq_len)?,
+                )
+            } else {
+                let mut cos_s = Vec::new();
+                let mut sin_s = Vec::new();
+                for offset in seqlen_offsets {
+                    cos_s.push(self.cos.narrow(0, *offset, seq_len)?);
+                    sin_s.push(self.sin.narrow(0, *offset, seq_len)?);
+                }
+                (Tensor::cat(&cos_s, 0)?, Tensor::cat(&sin_s, 0)?)
+            };
+
+            // Reshape for CUDA kernel: [b, h, seq, dim] -> [b*seq, h, dim]
+            let q_embed = q.transpose(1, 2)?.flatten(0, 1)?;
+            let k_embed = k.transpose(1, 2)?.flatten(0, 1)?;
+
+            // Apply rotary with is_neox=true for chunked style
+            mistralrs_quant::rotary::apply_rotary_inplace(&q_embed, &k_embed, &cos, &sin, true)?;
+
+            // Reshape back: [b*seq, h, dim] -> [b, h, seq, dim]
+            let mut q = q_embed
+                .reshape((b_sz, seq_len, qh, n_embd))?
+                .transpose(1, 2)?;
+            let mut k = k_embed
+                .reshape((b_sz, seq_len, kh, n_embd))?
+                .transpose(1, 2)?;
+
+            if !(cfg!(feature = "flash-attn") || cfg!(feature = "flash-attn-v3")) {
+                q = q.contiguous()?;
+                k = k.contiguous()?;
+            }
+            return Ok((q, k));
+        }
+
+        // CPU fallback using candle_nn's rope (GPT-NeoX/chunked style)
+        if seqlen_offsets.len() == 1 {
+            let cos = self.cos.narrow(0, seqlen_offsets[0], seq_len)?;
+            let sin = self.sin.narrow(0, seqlen_offsets[0], seq_len)?;
+            let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+            let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+            Ok((q_embed, k_embed))
+        } else {
+            let mut q_embeds = Vec::new();
+            let mut k_embeds = Vec::new();
+            for (i, offset) in seqlen_offsets.iter().enumerate() {
+                let cos = self.cos.narrow(0, *offset, seq_len)?;
+                let sin = self.sin.narrow(0, *offset, seq_len)?;
+                let q_embed =
+                    candle_nn::rotary_emb::rope(&q.i(i)?.unsqueeze(0)?.contiguous()?, &cos, &sin)?;
+                let k_embed =
+                    candle_nn::rotary_emb::rope(&k.i(i)?.unsqueeze(0)?.contiguous()?, &cos, &sin)?;
+                q_embeds.push(q_embed);
+                k_embeds.push(k_embed);
+            }
+            Ok((Tensor::cat(&q_embeds, 0)?, Tensor::cat(&k_embeds, 0)?))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Activation {
@@ -2225,16 +2535,35 @@ impl Conv3dNoBias {
         cfg: Conv3dConfig,
         vb: ShardedVarBuilder,
     ) -> Result<Self> {
-        let ws = vb.get(
-            (
-                out_channels,
-                in_channels / cfg.groups,
-                kernel_sizes[0],
-                kernel_sizes[1],
-                kernel_sizes[2],
-            ),
-            "weight",
-        )?;
+        let expected_shape = (
+            out_channels,
+            in_channels / cfg.groups,
+            kernel_sizes[0],
+            kernel_sizes[1],
+            kernel_sizes[2],
+        );
+        // MLX format has channels-last: (out, temporal, h, w, in)
+        // PyTorch format has channels-first: (out, in, temporal, h, w)
+        let mlx_shape = (
+            out_channels,
+            kernel_sizes[0],
+            kernel_sizes[1],
+            kernel_sizes[2],
+            in_channels / cfg.groups,
+        );
+        let ws = if vb.contains_tensor("weight") {
+            // Try to load with expected shape first, if it fails try MLX shape and permute
+            match vb.get(expected_shape, "weight") {
+                Ok(ws) => ws,
+                Err(_) => {
+                    // Try MLX format and permute from (out, t, h, w, in) to (out, in, t, h, w)
+                    let ws = vb.get(mlx_shape, "weight")?;
+                    ws.permute((0, 4, 1, 2, 3))?
+                }
+            }
+        } else {
+            vb.get(expected_shape, "weight")?
+        };
 
         // Split on temporal dimension
         // https://github.com/pytorch/pytorch/issues/139066
@@ -2247,12 +2576,19 @@ impl Conv3dNoBias {
             stride: cfg.stride,
             dilation: cfg.dilation,
             groups: cfg.groups,
+            cudnn_fwd_algo: None,
         };
 
         Ok(Self {
             conv2d_1: Conv2d::new(w1.contiguous()?, None, cfg),
             conv2d_2: Conv2d::new(w2.contiguous()?, None, cfg),
         })
+    }
+
+    pub fn weight(&self) -> Result<Tensor> {
+        let w1 = self.conv2d_1.weight().clone().unsqueeze(2)?;
+        let w2 = self.conv2d_2.weight().clone().unsqueeze(2)?;
+        Tensor::cat(&[w1, w2], 2)
     }
 }
 
@@ -2261,7 +2597,9 @@ impl Module for Conv3dNoBias {
         let xs1 = xs.i((.., .., 0, .., ..))?;
         let xs2 = xs.i((.., .., 1, .., ..))?;
 
-        (self.conv2d_1.forward(&xs1)? + self.conv2d_2.forward(&xs2)?)?.unsqueeze(2)
+        (Convolution.forward_2d(&self.conv2d_1, &xs1)?
+            + Convolution.forward_2d(&self.conv2d_2, &xs2)?)?
+        .unsqueeze(2)
     }
 }
 
@@ -2290,6 +2628,9 @@ impl TensorInfExtend for Tensor {
             DType::F32 => Ok(sum.to_scalar::<f32>()? == 0.),
             DType::F64 => Ok(sum.to_scalar::<f64>()? == 0.),
             DType::F8E4M3 => Ok(sum.to_scalar::<F8E4M3>()? == F8E4M3::ZERO),
+            DType::F4 | DType::F6E3M2 | DType::F6E2M3 | DType::F8E8M0 => {
+                candle_core::bail!("f4/f6e3m2/f6e2m3/f8e8m0 tensors are not supported with .any")
+            }
         }
     }
 }
@@ -2306,6 +2647,9 @@ pub fn clamp_for_f16(xs: &Tensor) -> Result<Tensor> {
         DType::F32 => f32::MAX - 1000.,
         DType::F64 => f64::MAX as f32 - 1000.,
         DType::F8E4M3 => F8E4M3::MAX.to_f32() - 1000.,
+        DType::F4 | DType::F6E3M2 | DType::F6E2M3 | DType::F8E8M0 => {
+            candle_core::bail!("f4/f6e3m2/f6e2m3/f8e8m0 tensors are not supported with .any")
+        }
     };
     if xs.is_inf()?.any()? {
         max -= 1000.;
@@ -2469,11 +2813,9 @@ impl Mlp {
         }
         let lhs = self.gate.forward(&xs)?;
         let rhs = self.up.forward(&xs)?;
-        let mut res = self.down.forward(&candle_nn::ops::mul_and_act(
-            &lhs,
-            &rhs,
-            self.act.try_into()?,
-        )?)?;
+        let mut res = self
+            .down
+            .forward(&crate::ops::mul_and_act(&lhs, &rhs, self.act)?)?;
         if self.gate.quantized_act_type().is_some() {
             res = res.to_dtype(original_dtype)?;
         }
@@ -2492,17 +2834,8 @@ impl MlpLayer for Mlp {
         }
         let lhs = MatMul.qmethod_matmul(&xs, &*self.gate)?;
         let rhs = MatMul.qmethod_matmul(&xs, &*self.up)?;
-        let mut res = if matches!(
-            self.act,
-            Activation::Gelu | Activation::Silu | Activation::Relu
-        ) {
-            MatMul.qmethod_matmul(
-                &candle_nn::ops::mul_and_act(&lhs, &rhs, self.act.try_into()?)?,
-                &*self.down,
-            )?
-        } else {
-            MatMul.qmethod_matmul(&(&lhs.apply(&self.act)? * &rhs)?, &*self.down)?
-        };
+        let mut res =
+            MatMul.qmethod_matmul(&crate::ops::mul_and_act(&lhs, &rhs, self.act)?, &*self.down)?;
         if self.gate.quantized_act_type().is_some() {
             res = res.to_dtype(original_dtype)?;
         }

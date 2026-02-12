@@ -1,303 +1,333 @@
-use signal_hook::consts::TERM_SIGNALS;
-
 use std::{
+    env, fs,
+    io::Read,
     path::{Path, PathBuf},
-    str::FromStr,
     sync::{
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
     thread,
     time::Duration,
 };
 
-use hf_hub::{
-    api::sync::{ApiBuilder, ApiError as HFHubApiError, ApiRepo},
-    Repo, RepoType,
-};
-use thiserror::Error;
-use tracing::info;
+use anyhow::{anyhow, Result};
+use hf_hub::api::sync::{ApiError, ApiRepo};
+use signal_hook::consts::TERM_SIGNALS;
+use tracing::{info, warn};
 
-use crate::{
-    pipeline::{get_model_paths, get_xlora_paths, AdapterPaths},
-    utils::tokens::{get_token, TokenRetrievalError},
-    LocalModelPaths, Ordering,
-};
+use super::FileListCache;
 
-use super::{ModelPaths, TokenSource};
-
-#[derive(Error, Debug)]
-pub enum HFError {
-    #[error("Unable to load {path} file from {model_id} repo.")]
-    FileNotFound { model_id: String, path: String },
-
-    #[error("Not authorized to access {model_id} repo.")]
-    AuthorizationError { model_id: String },
-
-    #[error("HF API error occurred: {0:?}")]
-    HFHubApiError(#[from] HFHubApiError),
-
-    #[error("HF API download cancelled.")]
-    HFDownloadFileCancelled {},
-
-    #[error("Could not retrieve HF API token: {0:?}")]
-    HFTokenError(#[from] TokenRetrievalError),
-
-    #[error("IoError: {0:?}")]
-    IoError(#[from] std::io::Error),
-
-    #[error("Json Error. Reason {1:?}. Error: {0:?}")]
-    JsonError(serde_json::Error, String),
-
-    #[error("HF repo has invalid structure: {0:?}")]
-    InvalidRepoStructure(String),
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteAccessIssue {
+    pub status_code: Option<u16>,
+    pub message: String,
 }
 
-/// Attempts to retrieve a file from a HF repo. Will check if the file exists locally first.
+/// Resolve the Hugging Face home directory.
 ///
-/// # Returns
-/// * `Result<PathBuf, String>` - The path to the file (if found, or downloaded), error message if not.
-pub(crate) fn api_get_file(
-    api: &Arc<ApiRepo>,
-    file: &str,
-    model_id: impl AsRef<Path>,
-) -> Result<PathBuf, HFError> {
-    let model_id = model_id.as_ref();
+/// Precedence:
+/// 1. HF_HOME
+/// 2. ~/.cache/huggingface
+pub fn hf_home_dir() -> Option<PathBuf> {
+    let dir = env::var("HF_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".cache").join("huggingface")));
 
+    if let Some(ref dir) = dir {
+        if let Err(err) = fs::create_dir_all(dir) {
+            warn!(
+                "Could not create Hugging Face home directory `{}`: {err}",
+                dir.display()
+            );
+        }
+    }
+
+    dir
+}
+
+/// Resolve the Hugging Face Hub cache directory.
+///
+/// Precedence:
+/// 1. HF_HUB_CACHE
+/// 2. HF_HOME/hub
+/// 3. ~/.cache/huggingface/hub
+pub fn hf_hub_cache_dir() -> Option<PathBuf> {
+    let dir = env::var("HF_HUB_CACHE")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| hf_home_dir().map(|home| home.join("hub")));
+
+    if let Some(ref dir) = dir {
+        if let Err(err) = fs::create_dir_all(dir) {
+            warn!(
+                "Could not create Hugging Face hub cache directory `{}`: {err}",
+                dir.display()
+            );
+        }
+    }
+
+    dir
+}
+
+/// Resolve the Hugging Face token file path.
+pub fn hf_token_path() -> Option<PathBuf> {
+    hf_home_dir().map(|home| home.join("token"))
+}
+
+fn cache_dir() -> PathBuf {
+    hf_hub_cache_dir().unwrap_or_else(|| PathBuf::from("./"))
+}
+
+fn cache_file_for_model(model_id: &Path) -> PathBuf {
+    let sanitized_id = model_id.display().to_string().replace('/', "-");
+    cache_dir().join(format!("{sanitized_id}_repo_list.json"))
+}
+
+fn read_cached_repo_files(cache_file: &Path) -> Option<Vec<String>> {
+    if !cache_file.exists() {
+        return None;
+    }
+
+    let mut file = match fs::File::open(cache_file) {
+        Ok(file) => file,
+        Err(err) => {
+            warn!(
+                "Could not open Hugging Face repo cache file `{}`: {err}",
+                cache_file.display()
+            );
+            return None;
+        }
+    };
+
+    let mut contents = String::new();
+    if let Err(err) = file.read_to_string(&mut contents) {
+        warn!(
+            "Could not read Hugging Face repo cache file `{}`: {err}",
+            cache_file.display()
+        );
+        return None;
+    }
+
+    match serde_json::from_str::<FileListCache>(&contents) {
+        Ok(cache) => {
+            info!("Read from cache file `{}`", cache_file.display());
+            Some(cache.files)
+        }
+        Err(err) => {
+            warn!(
+                "Could not parse Hugging Face repo cache file `{}`: {err}",
+                cache_file.display()
+            );
+            None
+        }
+    }
+}
+
+fn write_cached_repo_files(cache_file: &Path, files: &[String]) {
+    let cache = FileListCache {
+        files: files.to_vec(),
+    };
+    match serde_json::to_string_pretty(&cache) {
+        Ok(json) => {
+            if let Err(err) = fs::write(cache_file, json) {
+                warn!(
+                    "Could not write Hugging Face repo cache file `{}`: {err}",
+                    cache_file.display()
+                );
+            } else {
+                info!("Write to cache file `{}`", cache_file.display());
+            }
+        }
+        Err(err) => warn!(
+            "Could not serialize Hugging Face repo cache for `{}`: {err}",
+            cache_file.display()
+        ),
+    }
+}
+
+pub(crate) fn parse_status_code(message: &str) -> Option<u16> {
+    let marker = "status code ";
+    let (_, tail) = message.split_once(marker)?;
+    let digits = tail
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+pub(crate) fn api_error_status_code(err: &ApiError) -> Option<u16> {
+    match err {
+        ApiError::TooManyRetries(inner) => api_error_status_code(inner),
+        _ => parse_status_code(&err.to_string()),
+    }
+}
+
+pub(crate) fn should_propagate_api_error(err: &ApiError) -> bool {
+    matches!(api_error_status_code(err), Some(401 | 403 | 404))
+}
+
+pub(crate) fn remote_issue_from_api_error(
+    model_id: &Path,
+    file: Option<&str>,
+    err: &ApiError,
+) -> RemoteAccessIssue {
+    let target = match file {
+        Some(file) => format!("`{file}` for `{}`", model_id.display()),
+        None => format!("`{}`", model_id.display()),
+    };
+    RemoteAccessIssue {
+        status_code: api_error_status_code(err),
+        message: format!("Failed to access {target}: {err}"),
+    }
+}
+
+pub(crate) fn hf_access_error(model_id: &Path, issue: &RemoteAccessIssue) -> anyhow::Error {
+    match issue.status_code {
+        Some(code @ (401 | 403)) => anyhow!(
+            "Could not access `{}` on Hugging Face (HTTP {code}). You may need to run `mistralrs login` or set HF_TOKEN.",
+            model_id.display()
+        ),
+        Some(404) => anyhow!(
+            "Model `{}` was not found or is not accessible on Hugging Face (HTTP 404). Check the model ID and your access token.",
+            model_id.display()
+        ),
+        Some(code) => anyhow!(
+            "Failed to access `{}` on Hugging Face (HTTP {code}): {}",
+            model_id.display(),
+            issue.message
+        ),
+        None => anyhow!(
+            "Failed to access `{}` on Hugging Face: {}",
+            model_id.display(),
+            issue.message
+        ),
+    }
+}
+
+pub(crate) fn hf_api_error(model_id: &Path, file: Option<&str>, err: &ApiError) -> anyhow::Error {
+    let status_code = api_error_status_code(err);
+    let file_context = file
+        .map(|f| format!(" while fetching `{f}`"))
+        .unwrap_or_default();
+    match status_code {
+        Some(code @ (401 | 403)) => anyhow!(
+            "Could not access `{}` on Hugging Face (HTTP {code}){file_context}. You may need to run `mistralrs login` or set HF_TOKEN.",
+            model_id.display()
+        ),
+        Some(404) => anyhow!(
+            "Model `{}` was not found or is not accessible on Hugging Face (HTTP 404){file_context}. Check the model ID and your access token.",
+            model_id.display()
+        ),
+        Some(code) => anyhow!(
+            "Failed to access `{}` on Hugging Face (HTTP {code}){file_context}: {err}",
+            model_id.display()
+        ),
+        None => anyhow!(
+            "Failed to access `{}` on Hugging Face{file_context}: {err}",
+            model_id.display()
+        ),
+    }
+}
+
+pub(crate) fn local_file_missing_error(model_id: &Path, file: &str) -> anyhow::Error {
+    anyhow!(
+        "File `{file}` was not found at local model path `{}`.",
+        model_id.display()
+    )
+}
+
+pub(crate) fn list_repo_files(
+    api: &ApiRepo,
+    model_id: &Path,
+    should_error: bool,
+) -> Result<Vec<String>> {
+    if model_id.exists() {
+        let listing = fs::read_dir(model_id).map_err(|err| {
+            anyhow!(
+                "Cannot list local model directory `{}`: {err}",
+                model_id.display()
+            )
+        })?;
+        let files = listing
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(std::string::ToString::to_string)
+            })
+            .collect::<Vec<_>>();
+        return Ok(files);
+    }
+
+    let cache_file = cache_file_for_model(model_id);
+    if let Some(files) = read_cached_repo_files(&cache_file) {
+        return Ok(files);
+    }
+
+    match api.info() {
+        Ok(repo) => {
+            let files = repo
+                .siblings
+                .iter()
+                .map(|x| x.rfilename.clone())
+                .collect::<Vec<_>>();
+            write_cached_repo_files(&cache_file, &files);
+            Ok(files)
+        }
+        Err(err) => {
+            if should_error || should_propagate_api_error(&err) {
+                Err(hf_api_error(model_id, None, &err))
+            } else {
+                warn!(
+                    "Could not get directory listing from Hugging Face for `{}`: {err}",
+                    model_id.display()
+                );
+                Ok(Vec::new())
+            }
+        }
+    }
+}
+
+pub(crate) fn get_file(api: &ApiRepo, model_id: &Path, file: &str) -> Result<PathBuf> {
     if model_id.exists() {
         let path = model_id.join(file);
         if !path.exists() {
-            return Err(HFError::FileNotFound {
-                model_id: model_id.display().to_string(),
-                path: file.to_string(),
-            });
+            return Err(local_file_missing_error(model_id, file));
         }
         info!("Loading `{file}` locally at `{}`", path.display());
-        Ok(path)
-    } else {
-        let should_terminate = Arc::new(AtomicBool::new(false));
-        for sig in TERM_SIGNALS {
-            let _ = signal_hook::flag::register(*sig, Arc::clone(&should_terminate))
-                .expect("Failed to set signal handler");
+        return Ok(path);
+    }
+
+    // Set up SIGTERM handling to allow graceful cancellation of downloads
+    let should_terminate = Arc::new(AtomicBool::new(false));
+    for sig in TERM_SIGNALS {
+        if let Err(e) = signal_hook::flag::register(*sig, Arc::clone(&should_terminate)) {
+            warn!("Failed to register signal handler for signal {sig}: {e}");
         }
+    }
 
-        // **Start download but abort if SIGTERM is received**
-        let mut download_result = Some(thread::spawn({
-            let api = Arc::clone(api);
-            let file = file.to_string();
-            move || api.get(&file)
-        }));
+    // Use scoped threads to allow borrowing api into the download thread
+    let download_result = thread::scope(|s| {
+        let handle = s.spawn(|| api.get(file));
 
-        while !should_terminate.load(AtomicOrdering::SeqCst) {
-            if download_result.as_ref().is_some_and(|r| r.is_finished()) {
-                if let Some(Ok(result)) = download_result.take().map(|r| r.join()) {
-                    return result.map_err(|e| match e {
-                        HFHubApiError::RequestError(err)
-                            if matches!(*err, ureq::Error::Status(403, _)) =>
-                        {
-                            HFError::AuthorizationError {
-                                model_id: model_id.display().to_string(),
-                            }
-                        }
-                        ee => HFError::HFHubApiError(ee),
-                    });
-                }
+        // Poll for completion while checking for termination signal
+        loop {
+            if handle.is_finished() {
+                return handle.join().expect("Download thread panicked");
             }
-            thread::sleep(Duration::from_millis(100)); // Polling loop to check SIGTERM
+            if should_terminate.load(Ordering::SeqCst) {
+                // We can't actually cancel the download, but we can return early
+                // The download will continue in the background but we'll report cancellation
+                return Err(hf_hub::api::sync::ApiError::InvalidHeader(
+                    "Download cancelled due to termination signal".into(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
         }
-        Err(HFError::HFDownloadFileCancelled {})
-    }
-}
+    });
 
-pub fn get_uqff_paths(
-    from_uqff: &[impl AsRef<Path>],
-    token_source: &TokenSource,
-    revision: String,
-    model_id: &str,
-    silent: bool,
-) -> Result<Vec<PathBuf>, HFError> {
-    let api = {
-        let mut api = ApiBuilder::new()
-            .with_progress(!silent)
-            .with_token(get_token(token_source).map_err(HFError::HFTokenError)?);
-        if let Ok(x) = std::env::var("HF_HUB_CACHE") {
-            api = api.with_cache_dir(x.into());
-        }
-        api.build().map_err(HFError::HFHubApiError)?
-    };
-
-    let api = Arc::new(api.repo(Repo::with_revision(
-        model_id.to_string(),
-        RepoType::Model,
-        revision,
-    )));
-
-    let mut files = Vec::new();
-    for file in from_uqff {
-        let file = file.as_ref().display().to_string();
-
-        files.push(api_get_file(&api, file.as_str(), Path::new(model_id))?);
-    }
-    Ok(files)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn get_paths(
-    model_id: String,
-    tokenizer_json: Option<&str>,
-    xlora_model_id: Option<&str>,
-    xlora_order: Option<&Ordering>,
-    chat_template: Option<&str>,
-    token_source: &TokenSource,
-    revision: Option<String>,
-    quantized_model_id: Option<&str>,
-    quantized_filenames: Option<Vec<String>>,
-    silent: bool,
-    loading_uqff: bool,
-) -> Result<Box<dyn ModelPaths>, HFError> {
-    let token = get_token(token_source).map_err(HFError::HFTokenError)?;
-    let api = {
-        let mut api = ApiBuilder::new().with_progress(!silent).with_token(token);
-        if let Ok(x) = std::env::var("HF_HUB_CACHE") {
-            api = api.with_cache_dir(x.into());
-        }
-        api.build()?
-    };
-
-    let revision = revision.unwrap_or_else(|| "main".to_string());
-    let api = Arc::new(api.repo(Repo::with_revision(
-        model_id.clone(),
-        RepoType::Model,
-        revision.clone(),
-    )));
-
-    // Get tokenizer path
-    let tokenizer_filename = if let Some(p) = tokenizer_json {
-        info!("Using tokenizer.json at `{p}`");
-        PathBuf::from_str(p).map_err(|_| HFError::FileNotFound {
-            model_id: model_id.clone(),
-            path: p.to_string(),
-        })?
-    } else {
-        info!("Loading `tokenizer.json` at `{:?}`", model_id);
-        api_get_file(&api, "tokenizer.json", &model_id)?
-    };
-
-    // Get config path
-    info!("Loading `config.json` at `{:?}`", model_id);
-    let config_filename = api_get_file(&api, "config.json", &model_id)?;
-
-    // Get model paths
-    let filenames = get_model_paths(
-        revision.clone(),
-        token_source,
-        quantized_model_id,
-        quantized_filenames,
-        Arc::clone(&api),
-        Path::new(&model_id),
-        loading_uqff,
-    )?;
-
-    // Get XLora paths
-    let xlora_paths = get_xlora_paths(
-        model_id.clone(),
-        &xlora_model_id.map(ToString::to_string),
-        &xlora_order.and_then(|o| o.adapters.clone()),
-        token_source,
-        revision.clone(),
-        &xlora_order.cloned(),
-    )
-    .ok()
-    .unwrap_or(AdapterPaths::None);
-
-    // Get optional configs by checking directory contents
-    let dir_contents: Vec<String> = api_dir_list(&api, Path::new(&model_id))?;
-
-    let gen_conf = if dir_contents.contains(&"generation_config.json".to_string()) {
-        info!("Loading `generation_config.json` at `{}`", model_id);
-        Some(api_get_file(&api, "generation_config.json", &model_id)?)
-    } else {
-        None
-    };
-
-    let preprocessor_config = if dir_contents.contains(&"preprocessor_config.json".to_string()) {
-        info!("Loading `preprocessor_config.json` at `{}`", model_id);
-        Some(api_get_file(&api, "preprocessor_config.json", &model_id)?)
-    } else {
-        None
-    };
-
-    let processor_config = if dir_contents.contains(&"processor_config.json".to_string()) {
-        info!("Loading `processor_config.json` at `{}`", model_id);
-        Some(api_get_file(&api, "processor_config.json", &model_id)?)
-    } else {
-        None
-    };
-
-    let template_filename = if let Some(ref p) = chat_template {
-        info!("Using chat template file at `{p}`");
-        Some(PathBuf::from_str(p).map_err(|_| HFError::FileNotFound {
-            model_id: model_id.clone(),
-            path: p.to_string(),
-        })?)
-    } else {
-        info!("Loading `tokenizer_config.json` at `{}`", model_id);
-        Some(api_get_file(&api, "tokenizer_config.json", &model_id)?)
-    };
-
-    Ok(Box::new(LocalModelPaths::new(
-        tokenizer_filename,
-        config_filename,
-        template_filename,
-        filenames,
-        xlora_paths,
-        gen_conf,
-        preprocessor_config,
-        processor_config,
-        None,
-    )))
-}
-
-/// List contents of a directory, either from local filesystem or API
-///
-/// # Arguments
-/// * `api` - The API instance to use when model isn't found locally
-/// * `model_id` - Path to check locally before falling back to API
-///
-/// # Returns
-/// * `Result<Vec<String>>` - List of filenames in the directory
-pub fn api_dir_list(
-    api: &Arc<ApiRepo>,
-    model_id: impl AsRef<Path>,
-) -> Result<Vec<String>, HFError> {
-    let model_id = model_id.as_ref();
-
-    if model_id.exists() {
-        std::fs::read_dir(model_id)
-            .map_err(HFError::IoError)?
-            .map(|entry| {
-                let entry = entry.map_err(HFError::IoError)?;
-
-                let filename = entry
-                    .path()
-                    .file_name()
-                    .ok_or_else(|| HFError::FileNotFound {
-                        model_id: model_id.display().to_string(),
-                        path: entry.path().display().to_string(),
-                    })?
-                    .to_str()
-                    .ok_or_else(|| HFError::FileNotFound {
-                        model_id: model_id.display().to_string(),
-                        path: entry.path().display().to_string(),
-                    })?
-                    .to_string();
-
-                Ok(filename)
-            })
-            .collect()
-    } else {
-        // Get listing from API
-        let repo = api.info()?;
-        Ok(repo.siblings.iter().map(|x| x.rfilename.clone()).collect())
-    }
+    download_result.map_err(|err| hf_api_error(model_id, Some(file), &err))
 }

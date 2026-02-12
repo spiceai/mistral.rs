@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use anyhow::Result;
@@ -11,11 +10,12 @@ use hf_hub::{
     api::sync::{ApiBuilder, ApiRepo},
     Repo, RepoType,
 };
-use regex_automata::meta::{BuildError, Regex};
+use regex_automata::meta::Regex;
 use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::{
+    api_dir_list, api_get_file,
     lora::LoraConfig,
     pipeline::{
         chat_template::{ChatTemplate, ChatTemplateValue},
@@ -25,8 +25,6 @@ use crate::{
     xlora_models::XLoraConfig,
     ModelPaths, Ordering, TokenSource, GLOBAL_HF_CACHE,
 };
-
-use super::hf::{api_dir_list, api_get_file, HFError};
 
 // Match files against these, avoids situations like `consolidated.safetensors`
 const SAFETENSOR_MATCH: &str = r"model-\d+-of-\d+\.safetensors\b";
@@ -56,11 +54,11 @@ pub enum AdapterPaths {
 
 pub fn get_xlora_paths(
     base_model_id: String,
-    xlora_model_id: &Option<String>,
-    lora_adapter_ids: &Option<Vec<String>>,
+    xlora_model_id: Option<&String>,
+    lora_adapter_ids: Option<&Vec<String>>,
     token_source: &TokenSource,
     revision: String,
-    xlora_order: &Option<Ordering>,
+    xlora_order: Option<&Ordering>,
 ) -> Result<AdapterPaths> {
     match (lora_adapter_ids, xlora_model_id, xlora_order) {
         (None, Some(xlora_id), Some(xlora_order)) => {
@@ -69,21 +67,22 @@ pub fn get_xlora_paths(
                 let mut api = ApiBuilder::from_cache(cache)
                     .with_progress(true)
                     .with_token(get_token(token_source)?);
-                if let Ok(x) = std::env::var("HF_HUB_CACHE") {
-                    api = api.with_cache_dir(x.into());
+                if let Some(cache_dir) = crate::hf_hub_cache_dir() {
+                    api = api.with_cache_dir(cache_dir);
                 }
                 api.build().map_err(candle_core::Error::msg)?
             };
-            let api = Arc::new(api.repo(Repo::with_revision(
+            let api = api.repo(Repo::with_revision(
                 xlora_id.clone(),
                 RepoType::Model,
                 revision,
-            )));
+            ));
             let model_id = Path::new(&xlora_id);
+            let dir_list = api_dir_list!(api, model_id, true).collect::<Vec<_>>();
             // Get the path for the xlora classifier
-            let files = api_dir_list(&api, model_id)?;
-            let xlora_classifier = files
-                .iter()
+            let xlora_classifier = &dir_list
+                .clone()
+                .into_iter()
                 .filter(|x| x.contains("xlora_classifier.safetensors"))
                 .collect::<Vec<_>>();
             if xlora_classifier.len() > 1 {
@@ -93,15 +92,17 @@ pub fn get_xlora_paths(
             let xlora_classifier = xlora_classifier.first();
 
             let classifier_path = xlora_classifier
-                .map(|xlora_classifier| api_get_file(&api, xlora_classifier, model_id))
+                .map(|xlora_classifier| -> candle_core::Result<_> {
+                    Ok(api_get_file!(api, xlora_classifier, model_id))
+                })
                 .transpose()?;
 
             // Get the path for the xlora config by checking all for valid versions.
             // NOTE(EricLBuehler): Remove this functionality because all configs should be deserializable
-            let xlora_configs = &api_dir_list(&api, model_id)?
-                .iter()
+            let xlora_configs = &dir_list
+                .clone()
+                .into_iter()
                 .filter(|x| x.contains("xlora_config.json"))
-                .cloned()
                 .collect::<Vec<_>>();
             if xlora_configs.len() > 1 {
                 warn!("Detected multiple X-LoRA configs: {xlora_configs:?}");
@@ -113,7 +114,7 @@ pub fn get_xlora_paths(
                 if xlora_configs.len() != 1 {
                     warn!("Selecting config: `{}`", config_path);
                 }
-                let config_path = api_get_file(&api, config_path, model_id)?;
+                let config_path = api_get_file!(api, config_path, model_id);
                 let conf = fs::read_to_string(config_path)?;
                 let deser: Result<XLoraConfig, serde_json::Error> = serde_json::from_str(&conf);
                 match deser {
@@ -138,9 +139,8 @@ pub fn get_xlora_paths(
             });
 
             // If there are adapters in the ordering file, get their names and remote paths
-            let files = api_dir_list(&api, model_id)?;
-            let adapter_files = files
-                .iter()
+            let adapter_files = dir_list
+                .into_iter()
                 .filter_map(|name| {
                     if let Some(ref adapters) = xlora_order.adapters {
                         for adapter_name in adapters {
@@ -160,9 +160,9 @@ pub fn get_xlora_paths(
             let mut adapters_paths: HashMap<String, Vec<PathBuf>> = HashMap::new();
             for (file, name) in adapter_files {
                 if let Some(paths) = adapters_paths.get_mut(&name) {
-                    paths.push(api_get_file(&api, &file, model_id)?);
+                    paths.push(api_get_file!(api, &file, model_id));
                 } else {
-                    adapters_paths.insert(name, vec![api_get_file(&api, &file, model_id)?]);
+                    adapters_paths.insert(name, vec![api_get_file!(api, &file, model_id)]);
                 }
             }
 
@@ -213,9 +213,7 @@ pub fn get_xlora_paths(
                     let mut output = HashMap::new();
                     for adapter in preload_adapters {
                         // Get the names and remote paths of the files associated with this adapter
-                        let files = api_dir_list(&api, &adapter.adapter_model_id)?;
-                        let adapter_files = files
-                            .iter()
+                        let adapter_files = api_dir_list!(api, &adapter.adapter_model_id, true)
                             .filter_map(|f| {
                                 if f.contains(&adapter.name) {
                                     Some((f, adapter.name.clone()))
@@ -231,10 +229,10 @@ pub fn get_xlora_paths(
                         let mut adapters_paths: HashMap<String, Vec<PathBuf>> = HashMap::new();
                         for (file, name) in adapter_files {
                             if let Some(paths) = adapters_paths.get_mut(&name) {
-                                paths.push(api_get_file(&api, &file, model_id)?);
+                                paths.push(api_get_file!(api, &file, model_id));
                             } else {
                                 adapters_paths
-                                    .insert(name, vec![api_get_file(&api, &file, model_id)?]);
+                                    .insert(name, vec![api_get_file!(api, &file, model_id)]);
                             }
                         }
 
@@ -282,8 +280,8 @@ pub fn get_xlora_paths(
                     let mut api = ApiBuilder::from_cache(cache)
                         .with_progress(true)
                         .with_token(get_token(token_source)?);
-                    if let Ok(x) = std::env::var("HF_HUB_CACHE") {
-                        api = api.with_cache_dir(x.into());
+                    if let Some(cache_dir) = crate::hf_hub_cache_dir() {
+                        api = api.with_cache_dir(cache_dir);
                     }
                     api.build().map_err(candle_core::Error::msg)?
                 };
@@ -313,128 +311,16 @@ pub fn get_xlora_paths(
     }
 }
 
-pub type XloraAdapterConfig = ((String, String), LoraConfig);
-pub type XloraAdapterSafetensors = (String, PathBuf);
-// Sort local paths for the adapter configs and safetensors files
-//
-// Returns a tuple of the adapter configs and safetensors files
-pub fn xlora_adapters_config_and_safetensors(
-    xlora_order: Option<&Ordering>,
-    adapter_paths: HashMap<String, Vec<PathBuf>>,
-) -> Result<(Vec<XloraAdapterConfig>, Vec<XloraAdapterSafetensors>), HFError> {
-    let Some(xlora_order) = xlora_order else {
-        return Ok((Vec::new(), Vec::new()));
-    };
-    let Some(ref adapters) = xlora_order.adapters else {
-        return Ok((Vec::new(), Vec::new()));
-    };
-    let mut adapters_configs = Vec::new();
-    let mut adapters_safetensors = Vec::new();
-    for (i, name) in adapters.iter().enumerate() {
-        let paths = adapter_paths
-            .get(name)
-            .unwrap_or_else(|| panic!("Adapter {name} not found."));
-        for path in paths {
-            if path.extension().unwrap() == "safetensors" {
-                adapters_safetensors.push((name.clone(), path.to_owned()));
-            } else {
-                let conf = fs::read_to_string(path).map_err(HFError::IoError)?;
-                let lora_config: LoraConfig = serde_json::from_str(&conf).map_err(|e| {
-                    HFError::JsonError(e, "failed to parse LORA config file".to_string())
-                })?;
-                adapters_configs.push((((i + 1).to_string(), name.clone()), lora_config));
-            }
-        }
-    }
-    Ok((adapters_configs, adapters_safetensors))
-}
-
-pub type LoraAdapterInfo = HashMap<String, (PathBuf, LoraConfig)>;
-// If preload adapters are specified
-pub fn lora_preload_adapter_info(
-    api: Arc<ApiRepo>,
-    model_id: &Path,
-    xlora_order: Option<&Ordering>,
-) -> Result<Option<LoraAdapterInfo>, HFError> {
-    let Some(xlora_order) = xlora_order else {
-        return Ok(None);
-    };
-    let Some(ref preload_adapters) = xlora_order.preload_adapters else {
-        return Ok(None);
-    };
-    let mut output = HashMap::new();
-    for adapter in preload_adapters {
-        // Get the names and remote paths of the files associated with this adapter
-        let files = api_dir_list(&api, &adapter.adapter_model_id)?;
-        let adapter_files = files
-            .iter()
-            .filter_map(|f| {
-                if f.contains(&adapter.name) {
-                    Some((f, adapter.name.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        if adapter_files.is_empty() {
-            return Err(HFError::InvalidRepoStructure("Adapter files are empty. Perhaps the ordering file adapters does not match the actual adapters?".to_string()));
-        }
-        // Get local paths for this adapter
-        let mut adapters_paths: HashMap<String, Vec<PathBuf>> = HashMap::new();
-        for (file, name) in adapter_files {
-            let path = api_get_file(&api, file, model_id)?;
-            if let Some(paths) = adapters_paths.get_mut(&name) {
-                paths.push(path);
-            } else {
-                adapters_paths.insert(name, vec![path]);
-            }
-        }
-
-        let mut config = None;
-        let mut safetensor = None;
-
-        // Sort local paths for the adapter configs and safetensors files
-        let paths = adapters_paths
-            .get(&adapter.name)
-            .unwrap_or_else(|| panic!("Adapter {} not found.", adapter.name));
-        for path in paths {
-            if path.extension().unwrap() == "safetensors" {
-                safetensor = Some(path.to_owned());
-            } else {
-                let conf = fs::read_to_string(path)?;
-                let lora_config: LoraConfig = serde_json::from_str(&conf).map_err(|e| {
-                    HFError::JsonError(e, "failed to parse LORA config file".to_string())
-                })?;
-                config = Some(lora_config);
-            }
-        }
-
-        let (Some(config), Some(safetensor)) = (config, safetensor) else {
-            return Err(HFError::InvalidRepoStructure("Adapter files are empty. Perhaps the ordering file adapters does not match the actual adapters?".to_string()));
-        };
-        output.insert(adapter.name.clone(), (safetensor, config));
-    }
-    Ok(Some(output))
-}
-
-#[allow(clippy::result_large_err)]
-fn compile_patterns() -> Result<(Regex, Regex, Regex), BuildError> {
-    let safetensor_match = Regex::new(SAFETENSOR_MATCH)?;
-    let quant_safetensor_match = Regex::new(QUANT_SAFETENSOR_MATCH)?;
-    let pickle_match = Regex::new(PICKLE_MATCH)?;
-    Ok((safetensor_match, quant_safetensor_match, pickle_match))
-}
-
 pub fn get_model_paths(
     revision: String,
     token_source: &TokenSource,
-    quantized_model_id: Option<&str>,
-    quantized_filename: Option<Vec<String>>,
-    api: Arc<ApiRepo>,
+    quantized_model_id: Option<&String>,
+    quantized_filename: Option<&Vec<String>>,
+    api: &ApiRepo,
     model_id: &Path,
     loading_from_uqff: bool,
-) -> Result<Vec<PathBuf>, HFError> {
-    match &quantized_filename {
+) -> Result<Vec<PathBuf>> {
+    match quantized_filename {
         Some(names) => {
             let id = quantized_model_id.unwrap();
             let mut files = Vec::new();
@@ -445,31 +331,29 @@ pub fn get_model_paths(
                     let mut api = ApiBuilder::from_cache(cache)
                         .with_progress(true)
                         .with_token(get_token(token_source)?);
-                    if let Ok(x) = std::env::var("HF_HUB_CACHE") {
-                        api = api.with_cache_dir(x.into());
+                    if let Some(cache_dir) = crate::hf_hub_cache_dir() {
+                        api = api.with_cache_dir(cache_dir);
                     }
-                    api.build().map_err(HFError::HFHubApiError)?
+                    api.build().map_err(candle_core::Error::msg)?
                 };
-                let qapi = Arc::new(qapi.repo(Repo::with_revision(
+                let qapi = qapi.repo(Repo::with_revision(
                     id.to_string(),
                     RepoType::Model,
                     revision.clone(),
-                )));
+                ));
                 let model_id = Path::new(&id);
-                files.push(api_get_file(&qapi, name, model_id)?);
+                files.push(api_get_file!(qapi, name, model_id));
             }
             Ok(files)
         }
         None => {
             // We only match these patterns for model names
-            let (safetensor_match, quant_safetensor_match, pickle_match) = compile_patterns()
-                .map_err(|_| {
-                    HFError::InvalidRepoStructure("Invalid model pattern(s)".to_string())
-                })?;
+            let safetensor_match = Regex::new(SAFETENSOR_MATCH)?;
+            let quant_safetensor_match = Regex::new(QUANT_SAFETENSOR_MATCH)?;
+            let pickle_match = Regex::new(PICKLE_MATCH)?;
 
             let mut filenames = vec![];
-            let all_listing = api_dir_list(&api, model_id)?;
-            let listing = all_listing.iter().filter(|&x| {
+            let listing = api_dir_list!(api, model_id, true).filter(|x| {
                 safetensor_match.is_match(x)
                     || pickle_match.is_match(x)
                     || quant_safetensor_match.is_match(x)
@@ -478,18 +362,15 @@ pub fn get_model_paths(
             let safetensors = listing
                 .clone()
                 .filter(|x| x.ends_with(".safetensors"))
-                .cloned()
-                .collect::<Vec<String>>();
+                .collect::<Vec<_>>();
             let pickles = listing
                 .clone()
                 .filter(|x| x.ends_with(".pth") || x.ends_with(".pt") || x.ends_with(".bin"))
-                .cloned()
-                .collect::<Vec<String>>();
+                .collect::<Vec<_>>();
             let uqff_residual = listing
                 .clone()
-                .filter(|&x| x == UQFF_RESIDUAL_SAFETENSORS)
-                .cloned()
-                .collect::<Vec<String>>();
+                .filter(|x| x == UQFF_RESIDUAL_SAFETENSORS)
+                .collect::<Vec<_>>();
             let files = if !safetensors.is_empty() {
                 // Always prefer safetensors
                 safetensors
@@ -499,20 +380,17 @@ pub fn get_model_paths(
             } else if !uqff_residual.is_empty() && loading_from_uqff {
                 uqff_residual
             } else {
-                return Err(HFError::InvalidRepoStructure(
-                    "Expected file with extension one of .safetensors, .pth, .pt, .bin."
-                        .to_string(),
-                ));
+                anyhow::bail!("Expected file with extension one of .safetensors, .pth, .pt, .bin.");
             };
             info!(
                 "Found model weight filenames {:?}",
                 files
                     .iter()
-                    .map(|x| x.split('/').last().unwrap())
+                    .map(|x| x.split('/').next_back().unwrap())
                     .collect::<Vec<_>>()
             );
             for rfilename in files {
-                filenames.push(api_get_file(&api, &rfilename, model_id)?);
+                filenames.push(api_get_file!(api, &rfilename, model_id));
             }
             Ok(filenames)
         }
@@ -660,23 +538,14 @@ pub(crate) fn get_chat_template(
                         "chat_template".to_string(),
                         Value::String(templ.chat_template),
                     );
-                    if templ.bos_token.is_some() {
-                        deser.insert(
-                            "bos_token".to_string(),
-                            Value::String(templ.bos_token.unwrap()),
-                        );
+                    if let Some(bos_token) = templ.bos_token {
+                        deser.insert("bos_token".to_string(), Value::String(bos_token));
                     }
-                    if templ.eos_token.is_some() {
-                        deser.insert(
-                            "eos_token".to_string(),
-                            Value::String(templ.eos_token.unwrap()),
-                        );
+                    if let Some(eos_token) = templ.eos_token {
+                        deser.insert("eos_token".to_string(), Value::String(eos_token));
                     }
-                    if templ.unk_token.is_some() {
-                        deser.insert(
-                            "unk_token".to_string(),
-                            Value::String(templ.unk_token.unwrap()),
-                        );
+                    if let Some(unk_token) = templ.unk_token {
+                        deser.insert("unk_token".to_string(), Value::String(unk_token));
                     }
                 }
                 None => {

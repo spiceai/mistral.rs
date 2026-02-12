@@ -6,10 +6,10 @@ use crate::{
 use candle_core::{DType, Device, DeviceLocation, Result, Tensor};
 use mistralrs_quant::log::once_log_info;
 use mistralrs_quant::ShardedVarBuilder;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
-#[derive(Debug, Default, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Serialize, Clone)]
 pub struct DeviceLayerMapMetadata {
     pub ordinal: usize,
     pub layers: usize,
@@ -51,6 +51,28 @@ impl DeviceMapMetadata {
             host_layers: None,
         }
     }
+
+    pub fn device_layers(&self) -> Option<&[DeviceLayerMapMetadata]> {
+        self.device_layers.as_deref()
+    }
+
+    pub fn host_layers(&self) -> Option<usize> {
+        self.host_layers
+    }
+
+    pub fn to_cli_spec(&self) -> Option<String> {
+        let layers = self.device_layers.as_ref()?;
+        if layers.is_empty() {
+            return None;
+        }
+        Some(
+            layers
+                .iter()
+                .map(|l| format!("{}:{}", l.ordinal, l.layers))
+                .collect::<Vec<_>>()
+                .join(";"),
+        )
+    }
 }
 
 impl DeviceMapSetting {
@@ -63,6 +85,7 @@ impl DeviceMapSetting {
         model_layers: usize,
         device: &Device,
         topology: Option<&Topology>,
+        all_devices: &[Device],
     ) -> Result<Box<dyn DeviceMapper + Send + Sync>> {
         match self {
             Self::Nccl { nm_device, comm } => {
@@ -88,13 +111,13 @@ impl DeviceMapSetting {
                 host_layers,
             }) => {
                 if let Some(topology) = topology {
-                    if topology.0.iter().all(|x| x.is_none()) {
+                    if topology.layers.iter().all(|x| x.is_none()) {
                         return Ok(Box::new(DummyDeviceMapper {
                             nm_device: device.clone(),
                         }));
                     } else {
                         let layers = topology
-                            .0
+                            .layers
                             .iter()
                             .map(|layer| {
                                 layer
@@ -160,7 +183,30 @@ impl DeviceMapSetting {
                                 if device_ord == *ordinal {
                                     device.clone()
                                 } else {
-                                    Device::new_cuda(*ordinal)?
+                                    let cuda_device = all_devices
+                                        .iter()
+                                        .filter(|d| d.is_cuda())
+                                        .map(|d| {
+                                            // should implement this in candle and get the ordinal back from the device location directly
+                                            let ordinal = match d.location() {
+                                                DeviceLocation::Cpu => 0,
+                                                DeviceLocation::Cuda { gpu_id } => gpu_id,
+                                                DeviceLocation::Metal { gpu_id } => gpu_id,
+                                            };
+                                            (d.clone(), ordinal)
+                                        })
+                                        .find(|(_, other_device_ordinal)| {
+                                            other_device_ordinal == ordinal
+                                        });
+
+                                    if let Some((device, _)) = cuda_device {
+                                        device
+                                    } else {
+                                        candle_core::bail!(
+                                            "Could not find cuda device with ordinal {}",
+                                            ordinal
+                                        )
+                                    }
                                 }
                             }
                             DeviceLocation::Metal { gpu_id: device_ord } => {
@@ -470,6 +516,7 @@ impl DeviceMapper for NcclDeviceMapper {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 /// A device mapper which does device mapping per hidden layer.
 pub struct NcclPipelineParallelMapper {
     mappings: Vec<(Arc<mistralrs_quant::Comm>, Device)>,
@@ -569,7 +616,10 @@ pub fn get_all_similar_devices(base: &Device) -> Result<Vec<Device>> {
         }
         #[cfg(feature = "metal")]
         Device::Metal(_) => {
-            let total_ords = metal::Device::all().len();
+            #[cfg(feature = "metal")]
+            let total_ords = candle_metal_kernels::metal::Device::all().len();
+            #[cfg(not(feature = "metal"))]
+            let total_ords = 0;
             let mut ord = 0;
             let DeviceLocation::Metal { gpu_id: base_ord } = base.location() else {
                 candle_core::bail!("location and device do not match");

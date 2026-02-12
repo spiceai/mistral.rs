@@ -2,7 +2,6 @@ use std::{
     fmt::Debug,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
 };
 
 use anyhow::{Context, Result};
@@ -18,6 +17,7 @@ use serde::Deserialize;
 
 use super::{ModelPaths, NormalLoadingMetadata};
 use crate::{
+    api_dir_list, api_get_file,
     diffusion_models::{
         flux::{
             self,
@@ -26,10 +26,7 @@ use crate::{
         DiffusionGenerationParams,
     },
     paged_attention::AttentionImplementation,
-    pipeline::{
-        hf::{api_dir_list, api_get_file},
-        paths::AdapterPaths,
-    },
+    pipeline::{paths::AdapterPaths, EmbeddingModulePaths},
 };
 
 pub trait DiffusionModel {
@@ -45,9 +42,9 @@ pub trait DiffusionModel {
 
 pub trait DiffusionModelLoader: Send + Sync {
     /// If the model is being loaded with `load_model_from_hf` (so manual paths not provided), this will be called.
-    fn get_model_paths(&self, api: Arc<ApiRepo>, model_id: &Path) -> Result<Vec<PathBuf>>;
+    fn get_model_paths(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>>;
     /// If the model is being loaded with `load_model_from_hf` (so manual paths not provided), this will be called.
-    fn get_config_filenames(&self, api: Arc<ApiRepo>, model_id: &Path) -> Result<Vec<PathBuf>>;
+    fn get_config_filenames(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>>;
     fn force_cpu_vb(&self) -> Vec<bool>;
     // `configs` and `vbs` should be corresponding. It is up to the implementer to maintain this invaraint.
     fn load(
@@ -61,7 +58,7 @@ pub trait DiffusionModelLoader: Send + Sync {
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyclass(eq, eq_int))]
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
 /// The architecture to load the vision model as.
 pub enum DiffusionLoaderType {
     #[serde(rename = "flux")]
@@ -80,6 +77,33 @@ impl FromStr for DiffusionLoaderType {
                 "Unknown architecture `{a}`. Possible architectures: `flux`."
             )),
         }
+    }
+}
+
+impl DiffusionLoaderType {
+    /// Auto-detect diffusion loader type from a repo file listing.
+    /// Extend this when adding new diffusion pipelines.
+    pub fn auto_detect_from_files(files: &[String]) -> Option<Self> {
+        if Self::matches_flux(files) {
+            return Some(Self::Flux);
+        }
+        None
+    }
+
+    fn matches_flux(files: &[String]) -> bool {
+        let flux_regex = Regex::new(r"^flux\\d+-(schnell|dev)\\.safetensors$");
+        let Ok(flux_regex) = flux_regex else {
+            return false;
+        };
+        let has_transformer = files.iter().any(|f| f == "transformer/config.json");
+        let has_vae = files.iter().any(|f| f == "vae/config.json");
+        let has_ae = files.iter().any(|f| f == "ae.safetensors");
+        let has_flux = files.iter().any(|f| {
+            let name = f.rsplit('/').next().unwrap_or(f);
+            flux_regex.is_match(name)
+        });
+
+        has_transformer && has_vae && has_ae && has_flux
     }
 }
 
@@ -120,35 +144,36 @@ impl ModelPaths for DiffusionModelPaths {
     fn get_adapter_paths(&self) -> &AdapterPaths {
         unreachable!("Use `std::any::Any`.")
     }
+    fn get_modules(&self) -> Option<&[EmbeddingModulePaths]> {
+        unreachable!("Use `std::any::Any`.")
+    }
 }
 
 // ======================== Flux loader
 
 /// [`DiffusionLoader`] for a Flux Diffusion model.
 ///
-/// [`DiffusionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.DiffusionLoader.html
+/// [`DiffusionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.DiffusionLoader.html
 pub struct FluxLoader {
     pub(crate) offload: bool,
 }
 
 impl DiffusionModelLoader for FluxLoader {
-    fn get_model_paths(&self, api: Arc<ApiRepo>, model_id: &Path) -> Result<Vec<PathBuf>> {
+    fn get_model_paths(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>> {
         let regex = Regex::new(r"^flux\d+-(schnell|dev)\.safetensors$")?;
-        let dir_list = api_dir_list(&api, model_id)?;
-        let flux_name = dir_list
-            .iter()
+        let flux_name = api_dir_list!(api, model_id, true)
             .filter(|x| regex.is_match(x))
             .nth(0)
             .with_context(|| "Expected at least 1 .safetensors file matching the FLUX regex, please raise an issue.")?;
-        let flux_file = api_get_file(&api, flux_name, model_id)?;
-        let ae_file = api_get_file(&api, "ae.safetensors", model_id)?;
+        let flux_file = api_get_file!(api, &flux_name, model_id);
+        let ae_file = api_get_file!(api, "ae.safetensors", model_id);
 
         // NOTE(EricLBuehler): disgusting way of doing this but the 0th path is the flux, 1 is ae
         Ok(vec![flux_file, ae_file])
     }
-    fn get_config_filenames(&self, api: Arc<ApiRepo>, model_id: &Path) -> Result<Vec<PathBuf>> {
-        let flux_file = api_get_file(&api, "transformer/config.json", model_id)?;
-        let ae_file = api_get_file(&api, "vae/config.json", model_id)?;
+    fn get_config_filenames(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>> {
+        let flux_file = api_get_file!(api, "transformer/config.json", model_id);
+        let ae_file = api_get_file!(api, "vae/config.json", model_id);
 
         // NOTE(EricLBuehler): disgusting way of doing this but the 0th path is the flux, 1 is ae
         Ok(vec![flux_file, ae_file])

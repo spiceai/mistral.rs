@@ -24,7 +24,6 @@ impl GgufLoraModelBuilder {
 
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = GGUFSpecificConfig {
-            prompt_chunksize: self.gguf_model.prompt_chunksize,
             topology: self.gguf_model.topology,
         };
 
@@ -83,7 +82,7 @@ impl GgufLoraModelBuilder {
             pipeline,
             scheduler_method,
             self.gguf_model.throughput_logging,
-            self.gguf_model.search_bert_model,
+            self.gguf_model.search_embedding_model,
         );
         if let Some(cb) = self.gguf_model.search_callback.clone() {
             runner = runner.with_search_callback(cb);

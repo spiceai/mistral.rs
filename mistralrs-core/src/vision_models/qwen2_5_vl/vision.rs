@@ -448,7 +448,7 @@ impl Qwen2_5VLVisionModel {
             window_index.push(Tensor::new(
                 index_new
                     .iter()
-                    .map(|x| x + window_index_id)
+                    .map(|x| (x + window_index_id) as u32)
                     .collect::<Vec<_>>(),
                 device,
             )?);
@@ -458,7 +458,13 @@ impl Qwen2_5VLVisionModel {
                 .to_dtype(seqlens.dtype())?
                 * self.spatial_merge_unit as f64)?
                 + cu_window_seqlens[cu_window_seqlens.len() - 1] as f64)?;
-            cu_window_seqlens.extend(cu_seqlens_tmp.to_vec1::<i64>()?);
+            cu_window_seqlens.extend(
+                cu_seqlens_tmp
+                    .to_vec1::<i32>()?
+                    .into_iter()
+                    .map(|x| x as i64)
+                    .collect::<Vec<_>>(),
+            );
             window_index_id += (t * llm_grid_h * llm_grid_w) as i32;
         }
 
@@ -511,7 +517,7 @@ impl Qwen2_5VLVisionModel {
                     let a = cu_seqlens[i - 1] as usize;
                     let b = cu_seqlens[i] as usize;
                     attention_mask = attention_mask.slice_assign(
-                        &[&.., &(a..b), &(a..b)],
+                        &[0..attention_mask.dim(0)?, a..b, a..b],
                         &Tensor::zeros((1, b - a, b - a), xs.dtype(), xs.device())?,
                     )?;
                 }
@@ -528,7 +534,7 @@ impl Qwen2_5VLVisionModel {
                     let a = cu_seqlens[i - 1] as usize;
                     let b = cu_seqlens[i] as usize;
                     attention_mask = attention_mask.slice_assign(
-                        &[&.., &(a..b), &(a..b)],
+                        &[0..attention_mask.dim(0)?, a..b, a..b],
                         &Tensor::zeros((1, b - a, b - a), xs.dtype(), xs.device())?,
                     )?;
                 }

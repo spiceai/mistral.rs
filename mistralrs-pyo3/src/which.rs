@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use either::Either;
 use mistralrs_core::{
-    AutoDeviceMapParams, DiffusionLoaderType, ModelDType, NormalLoaderType, VisionLoaderType,
+    AutoDeviceMapParams, DiffusionLoaderType, EmbeddingLoaderType, ModelDType, NormalLoaderType,
+    VisionLoaderType,
 };
 use pyo3::{pyclass, pymethods};
 
@@ -23,8 +24,12 @@ pub enum Architecture {
     DeepseekV3,
     Qwen3,
     GLM4,
+    GLM4MoeLite,
+    GLM4Moe,
     Qwen3Moe,
     SmolLm3,
+    GraniteMoeHybrid,
+    GptOss,
 }
 
 impl From<Architecture> for NormalLoaderType {
@@ -44,8 +49,28 @@ impl From<Architecture> for NormalLoaderType {
             Architecture::DeepseekV3 => Self::DeepSeekV3,
             Architecture::Qwen3 => Self::Qwen3,
             Architecture::GLM4 => Self::GLM4,
+            Architecture::GLM4MoeLite => Self::GLM4MoeLite,
+            Architecture::GLM4Moe => Self::GLM4Moe,
             Architecture::Qwen3Moe => Self::Qwen3Moe,
             Architecture::SmolLm3 => Self::SmolLm3,
+            Architecture::GraniteMoeHybrid => Self::GraniteMoeHybrid,
+            Architecture::GptOss => Self::GptOss,
+        }
+    }
+}
+
+#[pyclass(eq, eq_int)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbeddingArchitecture {
+    EmbeddingGemma,
+    Qwen3Embedding,
+}
+
+impl From<EmbeddingArchitecture> for EmbeddingLoaderType {
+    fn from(value: EmbeddingArchitecture) -> Self {
+        match value {
+            EmbeddingArchitecture::EmbeddingGemma => EmbeddingLoaderType::EmbeddingGemma,
+            EmbeddingArchitecture::Qwen3Embedding => EmbeddingLoaderType::Qwen3Embedding,
         }
     }
 }
@@ -67,6 +92,7 @@ pub enum VisionArchitecture {
     Mistral3,
     Llama4,
     Gemma3n,
+    Qwen3VL,
 }
 
 impl From<VisionArchitecture> for VisionLoaderType {
@@ -86,6 +112,7 @@ impl From<VisionArchitecture> for VisionLoaderType {
             VisionArchitecture::Mistral3 => VisionLoaderType::Mistral3,
             VisionArchitecture::Llama4 => VisionLoaderType::Llama4,
             VisionArchitecture::Gemma3n => VisionLoaderType::Gemma3n,
+            VisionArchitecture::Qwen3VL => VisionLoaderType::Qwen3VL,
         }
     }
 }
@@ -227,6 +254,27 @@ pub enum Which {
         hf_cache_path: Option<PathBuf>,
         matformer_config_path: Option<PathBuf>,
         matformer_slice_name: Option<String>,
+    },
+
+    #[pyo3(constructor = (
+        model_id,
+        arch = None,
+        tokenizer_json = None,
+        topology = None,
+        write_uqff = None,
+        from_uqff = None,
+        dtype = ModelDType::Auto,
+        hf_cache_path = None,
+    ))]
+    Embedding {
+        model_id: String,
+        arch: Option<EmbeddingArchitecture>,
+        tokenizer_json: Option<String>,
+        topology: Option<String>,
+        write_uqff: Option<PathBuf>,
+        from_uqff: Option<Either<String, Vec<String>>>,
+        dtype: ModelDType,
+        hf_cache_path: Option<PathBuf>,
     },
 
     #[pyo3(constructor = (

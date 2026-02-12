@@ -18,7 +18,7 @@ pub struct NemoConvSubsampling {
 
 impl NemoConvSubsampling {
     pub fn new(cfg: &NemoConvConfig, vb: ShardedVarBuilder) -> Result<Self> {
-        if cfg.subsampling_factor % 2 != 0 {
+        if !cfg.subsampling_factor.is_multiple_of(2) {
             candle_core::bail!("Sampling factor should be a multiple of 2!");
         }
 
@@ -55,6 +55,7 @@ impl NemoConvSubsampling {
                     stride,
                     dilation: 1,
                     groups: 1,
+                    cudnn_fwd_algo: None,
                 },
                 vb_layers.pp(idx),
             )?));
@@ -74,6 +75,7 @@ impl NemoConvSubsampling {
                         stride,
                         dilation: 1,
                         groups: in_channels,
+                        cudnn_fwd_algo: None,
                     },
                     vb_layers.pp(idx),
                 )?));
@@ -88,6 +90,7 @@ impl NemoConvSubsampling {
                         stride: 1,
                         dilation: 1,
                         groups: 1,
+                        cudnn_fwd_algo: None,
                     },
                     vb_layers.pp(idx),
                 )?));

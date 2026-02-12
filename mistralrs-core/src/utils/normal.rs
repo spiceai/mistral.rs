@@ -1,12 +1,13 @@
-#[allow(dead_code)]
+#![allow(dead_code, unused)]
+
 use std::{fmt::Display, str::FromStr};
 
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
-#[derive(Clone, Copy, Default, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Default, Debug, Deserialize, Serialize, PartialEq)]
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
 /// DType for the model.
 ///

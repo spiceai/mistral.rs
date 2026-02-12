@@ -8,10 +8,10 @@ use mistralrs_core::{
     MistralRsBuilder, ModelSelected, NormalRequest, PagedAttentionConfig, PagedCacheType, Request,
     RequestMessage, Response, SamplingParams, SchedulerConfig, TokenSource, Usage,
 };
+use std::fmt::Display;
 use std::sync::Arc;
-use std::{fmt::Display, num::NonZeroUsize};
 use tokio::sync::mpsc::channel;
-use tracing::info;
+use tracing::{info, warn};
 
 enum TestName {
     Prompt(usize),
@@ -45,7 +45,7 @@ impl Display for UncertainTokSec {
     }
 }
 
-fn run_bench(
+async fn run_bench(
     mistralrs: Arc<MistralRs>,
     prompt: RequestMessage,
     n_gen: usize,
@@ -61,6 +61,7 @@ fn run_bench(
         top_n_logprobs: 0,
         frequency_penalty: Some(0.1),
         presence_penalty: Some(0.1),
+        repetition_penalty: None,
         max_len: Some(n_gen),
         stop_toks: None,
         logits_bias: None,
@@ -85,18 +86,19 @@ fn run_bench(
         return_raw_logits: false,
         web_search_options: None,
         model_id: None,
+        truncate_sequence: false,
     }));
 
     let mut usages = Vec::new();
 
     for _ in 0..repetitions {
         for _ in 0..concurrency {
-            if sender.blocking_send(req.clone()).is_err() {
+            if sender.send(req.clone()).await.is_err() {
                 eprintln!("Receiver disconnected");
             }
         }
         for _ in 0..concurrency {
-            match rx.blocking_recv() {
+            match rx.recv().await {
                 Some(r) => match r {
                     Response::InternalError(e) => {
                         unreachable!("Got an internal error: {e:?}");
@@ -119,6 +121,7 @@ fn run_bench(
                     Response::ImageGeneration(_) => unreachable!(),
                     Response::Speech { .. } => unreachable!(),
                     Response::Raw { .. } => unreachable!(),
+                    Response::Embeddings { .. } => unreachable!(),
                 },
                 None => unreachable!("Expected a Done response, got None",),
             }
@@ -221,20 +224,10 @@ fn print_usage(model: &str, device: &Device, results: Vec<BenchResult>) {
     print_stdout(table).expect("print table");
 }
 
-fn warmup_run(mistralrs: Arc<MistralRs>) {
+async fn warmup_run(mistralrs: Arc<MistralRs>) {
     let sampling_params = SamplingParams {
-        temperature: Some(0.1),
-        top_k: Some(32),
-        top_p: Some(0.1),
-        min_p: Some(0.05),
-        top_n_logprobs: 0,
-        frequency_penalty: Some(0.1),
-        presence_penalty: Some(0.1),
-        max_len: Some(5),
-        stop_toks: None,
-        logits_bias: None,
-        n_choices: 1,
-        dry_params: Some(DrySamplingParams::default()),
+        max_len: Some(1),
+        ..SamplingParams::deterministic()
     };
     let sender = mistralrs.get_sender(None).unwrap();
     let (tx, mut rx) = channel(10_000);
@@ -258,13 +251,14 @@ fn warmup_run(mistralrs: Arc<MistralRs>) {
         return_raw_logits: false,
         web_search_options: None,
         model_id: None,
+        truncate_sequence: false,
     }));
 
-    if sender.blocking_send(req.clone()).is_err() {
+    if sender.send(req.clone()).await.is_err() {
         eprintln!("Receiver disconnected");
     }
 
-    let _ = rx.blocking_recv();
+    let _ = rx.recv().await;
 }
 
 fn parse_cache_type(s: &str) -> Result<PagedCacheType, String> {
@@ -346,10 +340,6 @@ struct Args {
     /// Enable PagedAttention on Metal. Because PagedAttention is already enabled on CUDA, this is only applicable on Metal.
     #[arg(long = "paged-attn", default_value_t = false)]
     paged_attn: bool,
-
-    /// Number of tokens to batch the prompt step into. This can help with OOM errors when in the prompt step, but reduces performance.
-    #[arg(long = "prompt-batchsize")]
-    prompt_chunksize: Option<usize>,
 }
 
 #[tokio::main]
@@ -357,24 +347,18 @@ async fn main() -> anyhow::Result<()> {
     let mut args = Args::parse();
     initialize_logging();
 
-    args.concurrency = Some(args.concurrency.unwrap_or(vec![1]));
+    warn!(
+        "mistralrs-bench is deprecated. Please use `mistralrs bench` from mistralrs-cli instead."
+    );
 
-    let prompt_chunksize = match args.prompt_chunksize {
-        Some(0) => {
-            anyhow::bail!("`prompt_chunksize` must be a strictly positive integer, got 0.",)
-        }
-        Some(x) => Some(NonZeroUsize::new(x).unwrap()),
-        None => None,
-    };
+    args.concurrency = Some(args.concurrency.unwrap_or(vec![1]));
 
     let dtype = get_model_dtype(&args.model)?;
     let auto_device_map_params = get_auto_device_map_params(&args.model)?;
 
     let max_seq_len = auto_device_map_params.max_seq_len();
 
-    let loader: Box<dyn Loader> = LoaderBuilder::new(args.model)
-        .with_prompt_chunksize(prompt_chunksize)
-        .build()?;
+    let loader: Box<dyn Loader> = LoaderBuilder::new(args.model).build()?;
     let model_name = loader.get_id();
 
     #[cfg(feature = "metal")]
@@ -445,8 +429,6 @@ async fn main() -> anyhow::Result<()> {
         true
     };
 
-    // Allocate 0.5 GB of CPU memory just as a placeholder.
-    // Nothing happens here as we have no `swap_out`, see `_preempt_by_swap`.
     let cache_config = match (
         args.paged_attn_block_size,
         args.paged_attn_gpu_mem,
@@ -457,25 +439,21 @@ async fn main() -> anyhow::Result<()> {
     ) {
         (block_size, None, None, None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
-            512,
             MemoryGpuConfig::ContextSize(max_seq_len),
             args.cache_type.unwrap_or_default(),
         )?),
         (block_size, None, None, Some(ctxt), true, false) => Some(PagedAttentionConfig::new(
             block_size,
-            512,
             MemoryGpuConfig::ContextSize(ctxt),
             args.cache_type.unwrap_or_default(),
         )?),
         (block_size, None, Some(f), None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
-            512,
             MemoryGpuConfig::Utilization(f),
             args.cache_type.unwrap_or_default(),
         )?),
         (block_size, Some(m), None, None, true, false) => Some(PagedAttentionConfig::new(
             block_size,
-            512,
             MemoryGpuConfig::MbAmount(m),
             args.cache_type.unwrap_or_default(),
         )?),
@@ -483,7 +461,6 @@ async fn main() -> anyhow::Result<()> {
             info!("Both memory size, and usage were specified, defaulting to the usage value.");
             Some(PagedAttentionConfig::new(
                 block_size,
-                512,
                 MemoryGpuConfig::Utilization(f),
                 args.cache_type.unwrap_or_default(),
             )?)
@@ -492,7 +469,6 @@ async fn main() -> anyhow::Result<()> {
             info!("All memory size and ctxt len, defaulting to the context len value.");
             Some(PagedAttentionConfig::new(
                 block_size,
-                512,
                 MemoryGpuConfig::ContextSize(ctxt),
                 args.cache_type.unwrap_or_default(),
             )?)
@@ -501,7 +477,6 @@ async fn main() -> anyhow::Result<()> {
             info!("Both ctxt len and usage were specified, defaulting to the usage value.");
             Some(PagedAttentionConfig::new(
                 block_size,
-                512,
                 MemoryGpuConfig::Utilization(f),
                 args.cache_type.unwrap_or_default(),
             )?)
@@ -528,7 +503,7 @@ async fn main() -> anyhow::Result<()> {
 
     let scheduler_config = if cache_config.is_some() {
         // Handle case where we may have device mapping
-        if let Some(ref cache_config) = pipeline.blocking_lock().get_metadata().cache_config {
+        if let Some(ref cache_config) = pipeline.lock().await.get_metadata().cache_config {
             SchedulerConfig::PagedAttentionMeta {
                 max_num_seqs: *args.concurrency.as_ref().unwrap().iter().max().unwrap(),
                 config: cache_config.clone(),
@@ -558,7 +533,7 @@ async fn main() -> anyhow::Result<()> {
         .await;
 
     info!("Starting warmup run.");
-    warmup_run(mistralrs.clone());
+    warmup_run(mistralrs.clone()).await;
     info!("Finished warmup run.");
     info!("Starting benchmarks.");
 
@@ -576,7 +551,8 @@ async fn main() -> anyhow::Result<()> {
                 *concurrency,
                 args.repetitions,
                 TestName::Gen(args.n_gen),
-            )?;
+            )
+            .await?;
             results.push(r);
         }
 
@@ -589,7 +565,8 @@ async fn main() -> anyhow::Result<()> {
                 *concurrency,
                 args.repetitions,
                 TestName::Prompt(args.n_prompt),
-            )?;
+            )
+            .await?;
 
             results.push(r);
         }

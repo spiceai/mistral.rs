@@ -47,10 +47,15 @@ impl Qwen2VLModel {
             // TODO!
             candle_core::bail!("Sliding window is unsupported for now!");
         }
+        // Support both HuggingFace naming (visual.*) and MLX naming (vision_tower.*)
+        let vision_vb = if vb.contains_tensor("vision_tower.patch_embed.proj.weight") {
+            vb.pp("vision_tower")
+        } else {
+            vb.pp("visual")
+        };
         let vision = Qwen2VLVisionModel::new(
             &cfg.vision_config,
-            vb.pp("visual")
-                .set_device(normal_loading_metadata.real_device.clone()),
+            vision_vb.set_device(normal_loading_metadata.real_device.clone()),
             &normal_loading_metadata.mapper.get_comm_for(0)?,
         )?;
         let text = Qwen2VLTextModel::new(
@@ -221,7 +226,7 @@ impl Qwen2VLModel {
                     .repeat((3, 1))?;
 
                 position_ids = position_ids.slice_assign(
-                    &[&.., &i, &..],
+                    &[0..position_ids.dim(0)?, i..i + 1, 0..position_ids.dim(2)?],
                     &positions_mask
                         .where_cond(&llm_positions, &position_ids.i((.., i, ..))?)?
                         .unsqueeze(1)?,
@@ -306,7 +311,7 @@ impl Qwen2VLModel {
                     let mut last_end = 0;
                     for (start, end) in batch_ids {
                         xs = xs.slice_assign(
-                            &[&batch, &(start..end), &..],
+                            &[batch..batch + 1, start..end, 0..xs.dim(2)?],
                             &image_embeds
                                 .i((last_end..last_end + (end - start), ..))?
                                 .unsqueeze(0)?,
@@ -328,7 +333,7 @@ impl Qwen2VLModel {
                     let mut last_end = 0;
                     for (start, end) in batch_ids {
                         xs = xs.slice_assign(
-                            &[&batch, &(start..end), &..],
+                            &[batch..batch + 1, start..end, 0..xs.dim(2)?],
                             &video_embeds
                                 .i((last_end..last_end + (end - start), ..))?
                                 .unsqueeze(0)?,

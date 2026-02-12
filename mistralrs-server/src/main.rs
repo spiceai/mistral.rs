@@ -1,17 +1,18 @@
 use anyhow::Result;
 use clap::Parser;
 use mistralrs_core::{
-    initialize_logging, McpClientConfig, ModelSelected, PagedCacheType, TokenSource,
+    initialize_logging, McpClientConfig, ModelSelected, PagedCacheType, SearchEmbeddingModel,
+    TokenSource,
 };
 use rust_mcp_sdk::schema::LATEST_PROTOCOL_VERSION;
 use std::collections::HashMap;
 use tokio::join;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use mistralrs_server_core::{
     mistralrs_for_server_builder::{
-        configure_paged_attn_from_flags, defaults, get_bert_model, MistralRsForServerBuilder,
-        ModelConfig,
+        configure_paged_attn_from_flags, defaults, get_search_embedding_model,
+        MistralRsForServerBuilder, ModelConfig,
     },
     mistralrs_server_router_builder::MistralRsServerRouterBuilder,
 };
@@ -38,12 +39,6 @@ struct Args {
     /// Log all responses and requests to this file
     #[clap(long, short)]
     log: Option<String>,
-
-    /// If a sequence is larger than the maximum model length, truncate the number
-    /// of tokens such that the sequence will fit at most the maximum length.
-    /// If `max_tokens` is not specified in the request, space for 10 tokens will be reserved instead.
-    #[clap(long, short, action)]
-    truncate_sequence: bool,
 
     /// Model selector
     #[clap(subcommand)]
@@ -137,21 +132,17 @@ struct Args {
     )]
     paged_attn: bool,
 
-    /// Number of tokens to batch the prompt step into. This can help with OOM errors when in the prompt step, but reduces performance.
-    #[arg(long = "prompt-batchsize")]
-    prompt_chunksize: Option<usize>,
-
     /// Use CPU only
     #[arg(long)]
     cpu: bool,
 
-    /// Enable searching compatible with the OpenAI `web_search_options` setting. This uses the BERT model specified below or the default.
+    /// Enable searching compatible with the OpenAI `web_search_options` setting. This loads the selected search embedding model for reranking web results.
     #[arg(long = "enable-search")]
     enable_search: bool,
 
-    /// Specify a Hugging Face model ID for a BERT model to assist web searching. Defaults to Snowflake Arctic Embed L.
-    #[arg(long = "search-bert-model")]
-    search_bert_model: Option<String>,
+    /// Select which built-in search embedding model to load (e.g., `embedding_gemma`).
+    #[arg(long = "search-embedding-model")]
+    search_embedding_model: Option<SearchEmbeddingModel>,
 
     /// Enable thinking for interactive mode and models that support it.
     #[arg(long = "enable-thinking")]
@@ -285,6 +276,8 @@ struct ModelConfigParsed {
     /// Model selector
     #[serde(flatten)]
     model: ModelSelected,
+    /// Optional alias used as the API model ID
+    alias: Option<String>,
     /// Model-specific chat template
     chat_template: Option<String>,
     /// Model-specific JINJA template
@@ -316,6 +309,7 @@ fn load_multi_model_config(config_path: &str) -> Result<Vec<ModelConfig>> {
     for (model_id, parsed_config) in configs_parsed {
         let config = ModelConfig {
             model_id,
+            alias: parsed_config.alias,
             model: parsed_config.model,
             chat_template: parsed_config.chat_template,
             jinja_explicit: parsed_config.jinja_explicit,
@@ -338,6 +332,10 @@ async fn main() -> Result<()> {
 
     initialize_logging();
 
+    warn!(
+        "mistralrs-server is deprecated. Please use `mistralrs serve` from mistralrs-cli instead."
+    );
+
     // Load MCP configuration if provided
     let mcp_config = load_mcp_config(args.mcp_config.as_deref())?;
 
@@ -352,7 +350,6 @@ async fn main() -> Result<()> {
             let model_configs = load_multi_model_config(&config)?;
 
             let mut builder = MistralRsForServerBuilder::new()
-                .with_truncate_sequence(args.truncate_sequence)
                 .with_max_seqs(args.max_seqs)
                 .with_no_kv_cache(args.no_kv_cache)
                 .with_token_source(args.token_source)
@@ -363,7 +360,6 @@ async fn main() -> Result<()> {
                 .with_enable_search(args.enable_search)
                 .with_seed_optional(args.seed)
                 .with_log_optional(args.log)
-                .with_prompt_chunksize_optional(args.prompt_chunksize)
                 .with_mcp_config_optional(mcp_config)
                 .with_paged_attn_cache_type(args.cache_type.unwrap_or_default());
 
@@ -377,12 +373,15 @@ async fn main() -> Result<()> {
                 builder = builder.with_default_model_id(default_id);
             }
 
+            if let Some(model) = args.search_embedding_model {
+                builder = builder.with_search_embedding_model(model);
+            }
+
             builder.build_multi_model().await?
         }
         model => {
             // Single-model mode
-            MistralRsForServerBuilder::new()
-                .with_truncate_sequence(args.truncate_sequence)
+            let mut builder = MistralRsForServerBuilder::new()
                 .with_model(model)
                 .with_max_seqs(args.max_seqs)
                 .with_no_kv_cache(args.no_kv_cache)
@@ -402,21 +401,25 @@ async fn main() -> Result<()> {
                 .with_paged_attn_gpu_mem_usage_optional(args.paged_attn_gpu_mem_usage)
                 .with_paged_ctxt_len_optional(args.paged_ctxt_len)
                 .with_paged_attn_block_size_optional(args.paged_attn_block_size)
-                .with_prompt_chunksize_optional(args.prompt_chunksize)
                 .with_mcp_config_optional(mcp_config)
-                .with_paged_attn_cache_type(args.cache_type.unwrap_or_default())
-                .build()
-                .await?
+                .with_paged_attn_cache_type(args.cache_type.unwrap_or_default());
+
+            if let Some(model) = args.search_embedding_model {
+                builder = builder.with_search_embedding_model(model);
+            }
+
+            builder.build().await?
         }
     };
 
     // TODO: refactor this
-    let bert_model = get_bert_model(args.enable_search, args.search_bert_model);
+    let search_embedding_model =
+        get_search_embedding_model(args.enable_search, args.search_embedding_model);
 
     if args.interactive_mode {
         interactive_mode(
             mistralrs,
-            bert_model.is_some(),
+            search_embedding_model.is_some(),
             args.enable_thinking.then_some(true),
         )
         .await;
