@@ -180,11 +180,11 @@ impl Loader for SpeechLoader {
                     .with_token(get_token(&token_source)?)
                     .build()?;
                 let revision = revision.clone().unwrap_or("main".to_string());
-                let api = api.repo(Repo::with_revision(
+                let api = std::sync::Arc::new(api.repo(Repo::with_revision(
                     self.model_id.to_string(),
                     RepoType::Model,
                     revision.clone(),
-                ));
+                )));
                 let model_id = std::path::Path::new(&self.model_id);
 
                 let weight = api_get_file!(api, "model.safetensors", &model_id);
@@ -209,11 +209,11 @@ impl Loader for SpeechLoader {
                         SpeechLoaderType::Dia => "EricB/dac_44khz".to_string(),
                     });
 
-                let api = api.repo(Repo::with_revision(
+                let api = std::sync::Arc::new(api.repo(Repo::with_revision(
                     dac_model.clone(),
                     RepoType::Model,
                     revision.clone(),
-                ));
+                )));
                 let model_id = std::path::Path::new(&dac_model);
 
                 let weight = api_get_file!(api, "model.safetensors", &model_id);

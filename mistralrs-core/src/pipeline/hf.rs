@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc,
         Arc,
     },
     thread,
@@ -16,6 +17,14 @@ use signal_hook::consts::TERM_SIGNALS;
 use tracing::{info, warn};
 
 use super::FileListCache;
+
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum HFError {
+    #[error("HF download file cancelled")]
+    HFDownloadFileCancelled,
+    #[error(transparent)]
+    ApiError(#[from] ApiError),
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteAccessIssue {
@@ -291,7 +300,7 @@ pub(crate) fn list_repo_files(
     }
 }
 
-pub(crate) fn get_file(api: &ApiRepo, model_id: &Path, file: &str) -> Result<PathBuf> {
+pub(crate) fn get_file(api: &Arc<ApiRepo>, model_id: &Path, file: &str) -> Result<PathBuf> {
     if model_id.exists() {
         let path = model_id.join(file);
         if !path.exists() {
@@ -309,25 +318,29 @@ pub(crate) fn get_file(api: &ApiRepo, model_id: &Path, file: &str) -> Result<Pat
         }
     }
 
-    // Use scoped threads to allow borrowing api into the download thread
-    let download_result = thread::scope(|s| {
-        let handle = s.spawn(|| api.get(file));
+    let api = Arc::clone(api);
+    let file_owned = file.to_string();
+    let (tx, rx) = mpsc::channel();
 
-        // Poll for completion while checking for termination signal
-        loop {
-            if handle.is_finished() {
-                return handle.join().expect("Download thread panicked");
-            }
-            if should_terminate.load(Ordering::SeqCst) {
-                // We can't actually cancel the download, but we can return early
-                // The download will continue in the background but we'll report cancellation
-                return Err(hf_hub::api::sync::ApiError::InvalidHeader(
-                    "Download cancelled due to termination signal".into(),
-                ));
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
+    // Spawn the download on a separate thread so that we can return immediately
+    // on SIGTERM without blocking until the download finishes.
+    thread::spawn(move || {
+        let _ = tx.send(api.get(&file_owned));
     });
 
-    download_result.map_err(|err| hf_api_error(model_id, Some(file), &err))
+    loop {
+        match rx.try_recv() {
+            Ok(result) => {
+                return result.map_err(|err| hf_api_error(model_id, Some(file), &err));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow::anyhow!("Download thread terminated unexpectedly"));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if should_terminate.load(Ordering::SeqCst) {
+            return Err(anyhow!(HFError::HFDownloadFileCancelled));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
