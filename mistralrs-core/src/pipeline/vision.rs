@@ -1069,11 +1069,11 @@ impl AnyMoePipelineMixin for VisionPipeline {
                 api.build().map_err(candle_core::Error::msg)?
             };
             let revision = revision.clone().unwrap_or("main".to_string());
-            let api = api.repo(Repo::with_revision(
+            let api = std::sync::Arc::new(api.repo(Repo::with_revision(
                 model_id_str.clone(),
                 RepoType::Model,
                 revision.clone(),
-            ));
+            )));
 
             let mut filenames = vec![];
             for rfilename in
@@ -1127,11 +1127,11 @@ impl AnyMoePipelineMixin for VisionPipeline {
                 api.build().map_err(candle_core::Error::msg)?
             };
             let revision = revision.clone().unwrap_or("main".to_string());
-            let api = api.repo(Repo::with_revision(
+            let api = std::sync::Arc::new(api.repo(Repo::with_revision(
                 model_id_str.clone(),
                 RepoType::Model,
                 revision.clone(),
-            ));
+            )));
 
             let mut gate_filenames = vec![];
             for rfilename in

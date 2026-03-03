@@ -43,11 +43,11 @@ macro_rules! get_paths {
             api.build()?
         };
         let revision = $revision.unwrap_or("main".to_string());
-        let api = api.repo(Repo::with_revision(
+        let api = std::sync::Arc::new(api.repo(Repo::with_revision(
             $this.model_id.clone(),
             RepoType::Model,
             revision.clone(),
-        ));
+        )));
         let model_id = std::path::Path::new(&$this.model_id);
         let tokenizer_filename = if let Some(ref p) = $this.tokenizer_json {
             info!("Using tokenizer.json at `{p}`");
@@ -166,11 +166,11 @@ macro_rules! get_embedding_paths {
             api.build()?
         };
         let revision = $revision.unwrap_or("main".to_string());
-        let api = api.repo(Repo::with_revision(
+        let api = std::sync::Arc::new(api.repo(Repo::with_revision(
             $this.model_id.clone(),
             RepoType::Model,
             revision.clone(),
-        ));
+        )));
         let model_id = std::path::Path::new(&$this.model_id);
         let tokenizer_filename = if let Some(ref p) = $this.tokenizer_json {
             info!("Using tokenizer.json at `{p}`");
@@ -289,11 +289,11 @@ macro_rules! get_uqff_paths {
             .expect("Failed to read revision")
             .clone()
             .unwrap_or("main".to_string());
-        let api = api.repo(Repo::with_revision(
+        let api = std::sync::Arc::new(api.repo(Repo::with_revision(
             $this.model_id.to_string(),
             RepoType::Model,
             revision.clone(),
-        ));
+        )));
 
         let mut files = Vec::new();
         for file in $from_uqff {
@@ -330,11 +330,11 @@ macro_rules! get_paths_gguf {
         };
         let revision = $revision.unwrap_or("main".to_string());
         let this_model_id = $this.model_id.clone().unwrap_or($this.quantized_model_id.clone());
-        let api = api.repo(Repo::with_revision(
+        let api = std::sync::Arc::new(api.repo(Repo::with_revision(
             this_model_id.clone(),
             RepoType::Model,
             revision.clone(),
-        ));
+        )));
         let model_id = std::path::Path::new(&this_model_id);
 
         let dir_list = $crate::api_dir_list!(api, model_id, false)
