@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::matformer::MatformerSliceConfig;
+use crate::{attention::ATTENTION_CHUNK_SIZE, matformer::MatformerSliceConfig};
 
 use crate::{
     amoe::AnyMoeBaseModelMixin,
@@ -140,7 +140,7 @@ pub trait NormalModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoa
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyclass(eq, eq_int))]
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
 /// The architecture to load the normal model as.
 pub enum NormalLoaderType {
     #[serde(rename = "mistral")]
@@ -171,10 +171,18 @@ pub enum NormalLoaderType {
     Qwen3,
     #[serde(rename = "glm4")]
     GLM4,
+    #[serde(rename = "glm4moelite")]
+    GLM4MoeLite,
+    #[serde(rename = "glm4moe")]
+    GLM4Moe,
     #[serde(rename = "qwen3moe")]
     Qwen3Moe,
     #[serde(rename = "smollm3")]
     SmolLm3,
+    #[serde(rename = "granitemoehybrid")]
+    GraniteMoeHybrid,
+    #[serde(rename = "gpt_oss")]
+    GptOss,
 }
 
 // https://github.com/huggingface/transformers/blob/cff06aac6fad28019930be03f5d467055bf62177/src/transformers/models/auto/modeling_auto.py#L448
@@ -195,8 +203,12 @@ impl NormalLoaderType {
             "DeepseekV3ForCausalLM" => Ok(Self::DeepSeekV3),
             "Qwen3ForCausalLM" => Ok(Self::Qwen3),
             "Glm4ForCausalLM" => Ok(Self::GLM4),
+            "Glm4MoeLiteForCausalLM" => Ok(Self::GLM4MoeLite),
+            "Glm4MoeForCausalLM" => Ok(Self::GLM4Moe),
             "Qwen3MoeForCausalLM" => Ok(Self::Qwen3Moe),
             "SmolLM3ForCausalLM" => Ok(Self::SmolLm3),
+            "GraniteMoeHybridForCausalLM" => Ok(Self::GraniteMoeHybrid),
+            "GptOssForCausalLM" => Ok(Self::GptOss),
             other => anyhow::bail!(
                 "Unsupported Hugging Face Transformers -CausalLM model class `{other}`. Please raise an issue."
             ),
@@ -222,9 +234,13 @@ impl FromStr for NormalLoaderType {
             "deepseekv3" => Ok(Self::DeepSeekV3),
             "qwen3" => Ok(Self::Qwen3),
             "glm4" => Ok(Self::GLM4),
+            "glm4moelite" => Ok(Self::GLM4MoeLite),
+            "glm4moe" => Ok(Self::GLM4Moe),
             "qwen3moe" => Ok(Self::Qwen3Moe),
             "smollm3" => Ok(Self::SmolLm3),
-            a => Err(format!("Unknown architecture `{a}`. Possible architectures: `mistral`, `gemma`, `mixtral`, `llama`, `phi2`, `phi3`, `qwen2`, `gemma2`, `starcoder2`, `phi3.5moe`, `deepseekv2`, `deepseekv3`, `qwen3`, `glm4`, `qwen3moe`, `smollm3`.")),
+            "granitemoehybrid" => Ok(Self::GraniteMoeHybrid),
+            "gpt_oss" => Ok(Self::GptOss),
+            a => Err(format!("Unknown architecture `{a}`. Possible architectures: `mistral`, `gemma`, `mixtral`, `llama`, `phi2`, `phi3`, `qwen2`, `gemma2`, `starcoder2`, `phi3.5moe`, `deepseekv2`, `deepseekv3`, `qwen3`, `glm4`, `glm4moelite`, `glm4moe`, `qwen3moe`, `smollm3`, `granitemoehybrid`, `gpt_oss`.")),
         }
     }
 }
@@ -246,8 +262,12 @@ impl Display for NormalLoaderType {
             Self::DeepSeekV3 => write!(f, "deepseekv3"),
             Self::Qwen3 => write!(f, "qwen3"),
             Self::GLM4 => write!(f, "glm4"),
+            Self::GLM4MoeLite => write!(f, "glm4moelite"),
+            Self::GLM4Moe => write!(f, "glm4moe"),
             Self::Qwen3Moe => write!(f, "qwen3moe"),
             Self::SmolLm3 => write!(f, "smollm3"),
+            Self::GraniteMoeHybrid => write!(f, "granitemoehybrid"),
+            Self::GptOss => write!(f, "gpt_oss"),
         }
     }
 }
@@ -298,8 +318,12 @@ impl AutoNormalLoader {
             NormalLoaderType::DeepSeekV3 => Ok(Box::new(DeepSeekV3Loader)),
             NormalLoaderType::Qwen3 => Ok(Box::new(Qwen3Loader)),
             NormalLoaderType::GLM4 => Ok(Box::new(GLM4Loader)),
+            NormalLoaderType::GLM4MoeLite => Ok(Box::new(GLM4MoeLiteLoader)),
+            NormalLoaderType::GLM4Moe => Ok(Box::new(GLM4MoeLoader)),
             NormalLoaderType::Qwen3Moe => Ok(Box::new(Qwen3MoELoader)),
             NormalLoaderType::SmolLm3 => Ok(Box::new(SmolLm3Loader)),
+            NormalLoaderType::GraniteMoeHybrid => Ok(Box::new(GraniteMoeHybridLoader)),
+            NormalLoaderType::GptOss => Ok(Box::new(GptOssLoader)),
         }
     }
 }
@@ -396,9 +420,8 @@ impl DeviceMappedModelLoader for AutoNormalLoader {
         &self,
         config: &str,
         params: &super::AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
-        Self::get_loader(config)?.mapped_max_act_size_elems(config, params, prompt_chunksize)
+        Self::get_loader(config)?.mapped_max_act_size_elems(config, params)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -489,10 +512,9 @@ impl DeviceMappedModelLoader for MistralLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -501,7 +523,11 @@ impl DeviceMappedModelLoader for MistralLoader {
 
         let cfg: crate::models::mistral::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -594,6 +620,7 @@ impl DeviceMappedModelLoader for MistralLoader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.head_dim(),
             v_head_dim: cfg.head_dim(),
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -604,7 +631,7 @@ impl DeviceMappedModelLoader for MistralLoader {
 
 /// [`NormalLoader`] for a Gemma model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct GemmaLoader;
 
 impl NormalModelLoader for GemmaLoader {
@@ -682,10 +709,9 @@ impl DeviceMappedModelLoader for GemmaLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -694,7 +720,11 @@ impl DeviceMappedModelLoader for GemmaLoader {
 
         let cfg: crate::models::gemma::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -791,6 +821,7 @@ impl DeviceMappedModelLoader for GemmaLoader {
             sliding_window: None,
             k_head_dim: cfg.head_dim,
             v_head_dim: cfg.head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -801,7 +832,7 @@ impl DeviceMappedModelLoader for GemmaLoader {
 
 /// [`NormalLoader`] for a Llama model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct LlamaLoader;
 
 impl NormalModelLoader for LlamaLoader {
@@ -879,10 +910,9 @@ impl DeviceMappedModelLoader for LlamaLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -891,7 +921,11 @@ impl DeviceMappedModelLoader for LlamaLoader {
 
         let cfg: crate::models::llama::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -984,6 +1018,7 @@ impl DeviceMappedModelLoader for LlamaLoader {
             sliding_window: None,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -1071,10 +1106,9 @@ impl DeviceMappedModelLoader for MixtralLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -1083,7 +1117,11 @@ impl DeviceMappedModelLoader for MixtralLoader {
 
         let cfg: crate::models::mixtral::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -1180,6 +1218,7 @@ impl DeviceMappedModelLoader for MixtralLoader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -1190,7 +1229,7 @@ impl DeviceMappedModelLoader for MixtralLoader {
 
 /// [`NormalLoader`] for a Phi 2 model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct Phi2Loader;
 
 impl NormalModelLoader for Phi2Loader {
@@ -1268,10 +1307,9 @@ impl DeviceMappedModelLoader for Phi2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -1280,7 +1318,11 @@ impl DeviceMappedModelLoader for Phi2Loader {
 
         let cfg: crate::models::phi2::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -1369,6 +1411,7 @@ impl DeviceMappedModelLoader for Phi2Loader {
             sliding_window: None,
             k_head_dim: cfg.head_dim(),
             v_head_dim: cfg.head_dim(),
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -1379,7 +1422,7 @@ impl DeviceMappedModelLoader for Phi2Loader {
 
 /// [`NormalLoader`] for a Phi 3 model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct Phi3Loader;
 
 impl NormalModelLoader for Phi3Loader {
@@ -1456,10 +1499,9 @@ impl DeviceMappedModelLoader for Phi3Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -1468,7 +1510,11 @@ impl DeviceMappedModelLoader for Phi3Loader {
 
         let cfg: crate::models::phi3::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -1558,6 +1604,7 @@ impl DeviceMappedModelLoader for Phi3Loader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.head_dim(),
             v_head_dim: cfg.head_dim(),
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -1568,7 +1615,7 @@ impl DeviceMappedModelLoader for Phi3Loader {
 
 /// [`NormalLoader`] for a Qwen 2 model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct Qwen2Loader;
 
 impl NormalModelLoader for Qwen2Loader {
@@ -1636,10 +1683,9 @@ impl DeviceMappedModelLoader for Qwen2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -1648,7 +1694,11 @@ impl DeviceMappedModelLoader for Qwen2Loader {
 
         let cfg: crate::models::qwen2::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -1742,6 +1792,7 @@ impl DeviceMappedModelLoader for Qwen2Loader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -1752,7 +1803,7 @@ impl DeviceMappedModelLoader for Qwen2Loader {
 
 /// [`NormalLoader`] for a Gemma2 model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct Gemma2Loader;
 
 impl NormalModelLoader for Gemma2Loader {
@@ -1831,10 +1882,9 @@ impl DeviceMappedModelLoader for Gemma2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -1843,7 +1893,11 @@ impl DeviceMappedModelLoader for Gemma2Loader {
 
         let cfg: crate::models::gemma2::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -1940,6 +1994,7 @@ impl DeviceMappedModelLoader for Gemma2Loader {
             sliding_window: None, // None to be more forgiving, some do not
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -1950,7 +2005,7 @@ impl DeviceMappedModelLoader for Gemma2Loader {
 
 /// [`NormalLoader`] for a Starcoder2 model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct Starcoder2Loader;
 
 impl NormalModelLoader for Starcoder2Loader {
@@ -2028,10 +2083,9 @@ impl DeviceMappedModelLoader for Starcoder2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -2040,7 +2094,11 @@ impl DeviceMappedModelLoader for Starcoder2Loader {
 
         let cfg: crate::models::starcoder2::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -2132,6 +2190,7 @@ impl DeviceMappedModelLoader for Starcoder2Loader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -2142,7 +2201,7 @@ impl DeviceMappedModelLoader for Starcoder2Loader {
 
 /// [`NormalLoader`] for a Phi 3.5 MoE model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct Phi3_5MoELoader;
 
 impl NormalModelLoader for Phi3_5MoELoader {
@@ -2234,10 +2293,9 @@ impl DeviceMappedModelLoader for Phi3_5MoELoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -2246,7 +2304,11 @@ impl DeviceMappedModelLoader for Phi3_5MoELoader {
 
         let cfg: crate::models::phi3_5_moe::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -2347,6 +2409,7 @@ impl DeviceMappedModelLoader for Phi3_5MoELoader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.head_dim(),
             v_head_dim: cfg.head_dim(),
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -2355,7 +2418,7 @@ impl DeviceMappedModelLoader for Phi3_5MoELoader {
 
 /// [`NormalLoader`] for a DeepSeekV2 model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct DeepSeekV2Loader;
 
 impl NormalModelLoader for DeepSeekV2Loader {
@@ -2418,11 +2481,10 @@ impl IsqModelLoader for DeepSeekV2Loader {
             )?);
         }
         for layer_idx in 0..cfg.num_hidden_layers {
-            if cfg.n_routed_experts.is_some()
-                && layer_idx >= cfg.first_k_dense_replace
-                && layer_idx % cfg.moe_layer_freq == 0
-            {
-                for i in 0..cfg.n_routed_experts.unwrap() {
+            if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
+                layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0
+            }) {
+                for i in 0..n_routed_experts {
                     data.extend(vec![
                         Regex::new(&format!(
                             r"layers\.{layer_idx}\.mlp\.experts\.{i}\.gate_proj\.(weight|bias)$"
@@ -2470,11 +2532,10 @@ impl IsqModelLoader for DeepSeekV2Loader {
         let mut data = vec![Regex::new(r"lm_head\.(weight|bias)$")?];
         let cfg: crate::models::deepseek2::DeepSeekV2Config = serde_json::from_str(config)?;
         for layer_idx in 0..cfg.num_hidden_layers {
-            if cfg.n_routed_experts.is_some()
-                && layer_idx >= cfg.first_k_dense_replace
-                && layer_idx % cfg.moe_layer_freq == 0
-            {
-                for i in 0..cfg.n_routed_experts.unwrap() {
+            if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
+                layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0
+            }) {
+                for i in 0..n_routed_experts {
                     data.extend(vec![
                         Regex::new(&format!(
                             r"layers\.{layer_idx}\.mlp\.experts\.{i}\.gate_proj\.(weight|bias)$"
@@ -2524,10 +2585,9 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -2536,7 +2596,11 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
 
         let cfg: crate::models::deepseek2::DeepSeekV2Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -2605,17 +2669,16 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
 
             let moe_block = {
                 let mut sum = 0;
-                if cfg.n_routed_experts.is_some()
-                    && layer_idx >= cfg.first_k_dense_replace
-                    && layer_idx % cfg.moe_layer_freq == 0
-                {
+                if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
+                    layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0
+                }) {
                     let h_size = cfg.hidden_size;
-                    let gate_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
-                        * cfg.n_routed_experts.unwrap();
-                    let up_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
-                        * cfg.n_routed_experts.unwrap();
-                    let down_proj = cfg.moe_intermediate_size * h_size / weight_pack_factor
-                        * cfg.n_routed_experts.unwrap();
+                    let gate_proj =
+                        h_size * cfg.moe_intermediate_size / weight_pack_factor * n_routed_experts;
+                    let up_proj =
+                        h_size * cfg.moe_intermediate_size / weight_pack_factor * n_routed_experts;
+                    let down_proj =
+                        cfg.moe_intermediate_size * h_size / weight_pack_factor * n_routed_experts;
                     let shared_experts = if let Some(n_shared_experts) = cfg.n_shared_experts {
                         let gate_proj = h_size * (cfg.intermediate_size * n_shared_experts)
                             / weight_pack_factor;
@@ -2627,7 +2690,7 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
                     } else {
                         0
                     };
-                    let gate_weight = cfg.n_routed_experts.unwrap() * cfg.hidden_size;
+                    let gate_weight = n_routed_experts * cfg.hidden_size;
                     sum += gate_proj + up_proj + down_proj + shared_experts + gate_weight;
                 } else {
                     let h_size = cfg.hidden_size;
@@ -2675,6 +2738,7 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
             sliding_window: None,
             k_head_dim: cfg.qk_rope_head_dim + cfg.qk_nope_head_dim,
             v_head_dim: cfg.v_head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -2683,7 +2747,7 @@ impl DeviceMappedModelLoader for DeepSeekV2Loader {
 
 /// [`NormalLoader`] for a DeepSeekV3 model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct DeepSeekV3Loader;
 
 impl NormalModelLoader for DeepSeekV3Loader {
@@ -2745,11 +2809,10 @@ impl IsqModelLoader for DeepSeekV3Loader {
             )?);
         }
         for layer_idx in 0..cfg.num_hidden_layers {
-            if cfg.n_routed_experts.is_some()
-                && layer_idx >= cfg.first_k_dense_replace
-                && layer_idx % cfg.moe_layer_freq == 0
-            {
-                for i in 0..cfg.n_routed_experts.unwrap() {
+            if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
+                layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0
+            }) {
+                for i in 0..n_routed_experts {
                     data.extend(vec![
                         Regex::new(&format!(
                             r"layers\.{layer_idx}\.mlp\.experts\.{i}\.gate_proj\.(weight|bias)$"
@@ -2797,11 +2860,10 @@ impl IsqModelLoader for DeepSeekV3Loader {
         let mut data = vec![Regex::new(r"lm_head\.(weight|bias)$")?];
         let cfg: crate::models::deepseek3::DeepSeekV3Config = serde_json::from_str(config)?;
         for layer_idx in 0..cfg.num_hidden_layers {
-            if cfg.n_routed_experts.is_some()
-                && layer_idx >= cfg.first_k_dense_replace
-                && layer_idx % cfg.moe_layer_freq == 0
-            {
-                for i in 0..cfg.n_routed_experts.unwrap() {
+            if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
+                layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0
+            }) {
+                for i in 0..n_routed_experts {
                     data.extend(vec![
                         Regex::new(&format!(
                             r"layers\.{layer_idx}\.mlp\.experts\.{i}\.gate_proj\.(weight|bias)$"
@@ -2851,10 +2913,9 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -2863,7 +2924,11 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
 
         let cfg: crate::models::deepseek3::DeepSeekV3Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -2932,17 +2997,16 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
 
             let moe_block = {
                 let mut sum = 0;
-                if cfg.n_routed_experts.is_some()
-                    && layer_idx >= cfg.first_k_dense_replace
-                    && layer_idx % cfg.moe_layer_freq == 0
-                {
+                if let Some(n_routed_experts) = cfg.n_routed_experts.filter(|_| {
+                    layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0
+                }) {
                     let h_size = cfg.hidden_size;
-                    let gate_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
-                        * cfg.n_routed_experts.unwrap();
-                    let up_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
-                        * cfg.n_routed_experts.unwrap();
-                    let down_proj = cfg.moe_intermediate_size * h_size / weight_pack_factor
-                        * cfg.n_routed_experts.unwrap();
+                    let gate_proj =
+                        h_size * cfg.moe_intermediate_size / weight_pack_factor * n_routed_experts;
+                    let up_proj =
+                        h_size * cfg.moe_intermediate_size / weight_pack_factor * n_routed_experts;
+                    let down_proj =
+                        cfg.moe_intermediate_size * h_size / weight_pack_factor * n_routed_experts;
                     let shared_experts = if let Some(n_shared_experts) = cfg.n_shared_experts {
                         let gate_proj = h_size * (cfg.intermediate_size * n_shared_experts)
                             / weight_pack_factor;
@@ -2954,7 +3018,7 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
                     } else {
                         0
                     };
-                    let gate_weight = cfg.n_routed_experts.unwrap() * cfg.hidden_size;
+                    let gate_weight = n_routed_experts * cfg.hidden_size;
                     sum += gate_proj + up_proj + down_proj + shared_experts + gate_weight;
                 } else {
                     let h_size = cfg.hidden_size;
@@ -3002,6 +3066,7 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
             sliding_window: None,
             k_head_dim: cfg.qk_rope_head_dim + cfg.qk_nope_head_dim,
             v_head_dim: cfg.v_head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -3010,7 +3075,7 @@ impl DeviceMappedModelLoader for DeepSeekV3Loader {
 
 /// [`NormalLoader`] for a Qwen 3 model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct Qwen3Loader;
 
 impl NormalModelLoader for Qwen3Loader {
@@ -3078,10 +3143,9 @@ impl DeviceMappedModelLoader for Qwen3Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -3090,7 +3154,11 @@ impl DeviceMappedModelLoader for Qwen3Loader {
 
         let cfg: models::qwen3::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -3186,6 +3254,7 @@ impl DeviceMappedModelLoader for Qwen3Loader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -3194,7 +3263,7 @@ impl DeviceMappedModelLoader for Qwen3Loader {
 
 /// [`NormalLoader`] for a GLM 4 model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct GLM4Loader;
 
 impl NormalModelLoader for GLM4Loader {
@@ -3262,10 +3331,9 @@ impl DeviceMappedModelLoader for GLM4Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -3274,7 +3342,11 @@ impl DeviceMappedModelLoader for GLM4Loader {
 
         let cfg: models::glm4::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -3365,6 +3437,654 @@ impl DeviceMappedModelLoader for GLM4Loader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
+        };
+
+        Ok(Box::new(cfg))
+    }
+}
+
+/// [`NormalLoader`] for a GLM 4 MoE Lite model (GLM-4.7-Flash).
+///
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
+pub struct GLM4MoeLiteLoader;
+
+impl NormalModelLoader for GLM4MoeLiteLoader {
+    fn load(
+        &self,
+        config: &str,
+        vb: ShardedVarBuilder,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        let cfg: crate::models::glm4_moe_lite::Glm4MoeLiteConfig = serde_json::from_str(config)?;
+        Ok(Box::new(models::glm4_moe_lite::Glm4MoeLite::new(
+            &cfg,
+            vb,
+            self.is_gptx(config)?,
+            normal_loading_metadata,
+            attention_mechanism,
+        )?))
+    }
+    fn load_xlora(
+        &self,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _lora_config: &[((String, String), LoraConfig)],
+        _xlora_config: Option<XLoraConfig>,
+        _xlora_ordering: Ordering,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        todo!()
+    }
+    fn is_gptx(&self, _: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
+        let cfg: crate::models::glm4_moe_lite::Glm4MoeLiteConfig = serde_json::from_str(config)?;
+        Ok(Box::new(cfg))
+    }
+}
+
+impl IsqModelLoader for GLM4MoeLiteLoader {
+    fn isq_layer_regexes(&self, config: &str) -> Result<Vec<Regex>> {
+        let mut data = vec![
+            Regex::new(r"lm_head\.(weight|bias)$")?,
+            // Attention (MLA)
+            Regex::new(r"layers\.(\d+)\.self_attn\.kv_a_proj_with_mqa\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.kv_b_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$")?,
+            // Q LoRA projections
+            Regex::new(r"layers\.(\d+)\.self_attn\.q_a_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.q_b_proj\.(weight|bias)$")?,
+        ];
+        let cfg: crate::models::glm4_moe_lite::Glm4MoeLiteConfig = serde_json::from_str(config)?;
+        for layer_idx in 0..cfg.num_hidden_layers {
+            if layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0 {
+                // MoE layer
+                for i in 0..cfg.n_routed_experts {
+                    data.extend(vec![
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.gate_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.up_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.down_proj\.(weight|bias)$"
+                        ))?,
+                    ]);
+                }
+                if cfg.n_shared_experts > 0 {
+                    data.extend(vec![
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.gate_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.up_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.down_proj\.(weight|bias)$"
+                        ))?,
+                    ]);
+                }
+            } else {
+                // Dense MLP layer
+                data.extend(vec![
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.gate_proj\.(weight|bias)$"
+                    ))?,
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.up_proj\.(weight|bias)$"
+                    ))?,
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.down_proj\.(weight|bias)$"
+                    ))?,
+                ]);
+            };
+        }
+        Ok(data)
+    }
+    fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+
+    fn isq_layer_regexes_moqe(&self, config: &str) -> Result<Vec<Regex>> {
+        let mut data = vec![Regex::new(r"lm_head\.(weight|bias)$")?];
+        let cfg: crate::models::glm4_moe_lite::Glm4MoeLiteConfig = serde_json::from_str(config)?;
+        for layer_idx in 0..cfg.num_hidden_layers {
+            if layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0 {
+                // MoE layer
+                for i in 0..cfg.n_routed_experts {
+                    data.extend(vec![
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.gate_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.up_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.down_proj\.(weight|bias)$"
+                        ))?,
+                    ]);
+                }
+                if cfg.n_shared_experts > 0 {
+                    data.extend(vec![
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.gate_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.up_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.down_proj\.(weight|bias)$"
+                        ))?,
+                    ]);
+                }
+            } else {
+                // Dense MLP layer
+                data.extend(vec![
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.gate_proj\.(weight|bias)$"
+                    ))?,
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.up_proj\.(weight|bias)$"
+                    ))?,
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.down_proj\.(weight|bias)$"
+                    ))?,
+                ]);
+            };
+        }
+        Ok(data)
+    }
+    fn immediate_isq_predicates_moqe(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes_moqe(config)
+    }
+}
+
+impl DeviceMappedModelLoader for GLM4MoeLiteLoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Text {
+            max_seq_len,
+            max_batch_size,
+        } = params
+        else {
+            anyhow::bail!("Expected text AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: crate::models::glm4_moe_lite::Glm4MoeLiteConfig = serde_json::from_str(config)?;
+
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
+    }
+    fn non_mapped_max_act_size_elems(
+        &self,
+        _config: &str,
+        _params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn non_mapped_size_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<usize> {
+        let cfg: crate::models::glm4_moe_lite::Glm4MoeLiteConfig = serde_json::from_str(config)?;
+        let elems = {
+            let embed_tokens = cfg.hidden_size * cfg.vocab_size / weight_pack_factor;
+            // If embeddings are tied and no packing, reuse weights -> no separate lm_head needed
+            let lm_head = if !cfg.tie_word_embeddings || weight_pack_factor != 1 {
+                cfg.hidden_size * cfg.vocab_size / weight_pack_factor
+            } else {
+                0
+            };
+            let norm = cfg.hidden_size;
+            embed_tokens + lm_head + norm
+        };
+        Ok(elems * dtype.size_in_bytes())
+    }
+
+    fn layer_sizes_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<Vec<usize>> {
+        let cfg: crate::models::glm4_moe_lite::Glm4MoeLiteConfig = serde_json::from_str(config)?;
+        let mut per_layer_elems = Vec::new();
+
+        for layer_idx in 0..cfg.num_hidden_layers {
+            let input_layernorm = cfg.hidden_size;
+            let post_attention_layernorm = cfg.hidden_size;
+
+            // Q LoRA projection
+            let q_proj = {
+                let a = cfg.hidden_size * cfg.q_lora_rank / weight_pack_factor;
+                let norm = cfg.q_lora_rank;
+                let b = (cfg.num_attention_heads * cfg.q_head_dim()) * cfg.q_lora_rank
+                    / weight_pack_factor;
+                a + norm + b
+            };
+            let kv_a_proj_with_mqa =
+                cfg.hidden_size * (cfg.kv_lora_rank + cfg.qk_rope_head_dim) / weight_pack_factor;
+            let kv_a_layernorm = cfg.kv_lora_rank;
+            let kv_b_proj = cfg.kv_lora_rank
+                * cfg.num_attention_heads
+                * (cfg.q_head_dim() - cfg.qk_rope_head_dim + cfg.v_head_dim)
+                / weight_pack_factor;
+            let o_proj =
+                cfg.num_attention_heads * cfg.v_head_dim * cfg.hidden_size / weight_pack_factor;
+
+            let moe_block = {
+                let mut sum = 0;
+                if layer_idx >= cfg.first_k_dense_replace && layer_idx % cfg.moe_layer_freq == 0 {
+                    // MoE layer
+                    let h_size = cfg.hidden_size;
+                    let gate_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
+                        * cfg.n_routed_experts;
+                    let up_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
+                        * cfg.n_routed_experts;
+                    let down_proj = cfg.moe_intermediate_size * h_size / weight_pack_factor
+                        * cfg.n_routed_experts;
+                    let shared_experts = if cfg.n_shared_experts > 0 {
+                        let gate_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor;
+                        let up_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor;
+                        let down_proj = cfg.moe_intermediate_size * h_size / weight_pack_factor;
+                        gate_proj + up_proj + down_proj
+                    } else {
+                        0
+                    };
+                    let gate_weight = cfg.n_routed_experts * cfg.hidden_size;
+                    let e_score_correction_bias = cfg.n_routed_experts;
+                    sum += gate_proj
+                        + up_proj
+                        + down_proj
+                        + shared_experts
+                        + gate_weight
+                        + e_score_correction_bias;
+                } else {
+                    // Dense MLP layer
+                    let h_size = cfg.hidden_size;
+                    let i_size = cfg.intermediate_size;
+                    let gate_proj = h_size * i_size / weight_pack_factor;
+                    let up_proj = h_size * i_size / weight_pack_factor;
+                    let down_proj = i_size * h_size / weight_pack_factor;
+                    sum += gate_proj + up_proj + down_proj;
+                }
+                sum
+            };
+
+            per_layer_elems.push(
+                input_layernorm
+                    + post_attention_layernorm
+                    + q_proj
+                    + kv_a_layernorm
+                    + kv_a_proj_with_mqa
+                    + kv_b_proj
+                    + o_proj
+                    + moe_block,
+            );
+        }
+
+        Ok(per_layer_elems
+            .into_iter()
+            .map(|x| x * dtype.size_in_bytes())
+            .collect())
+    }
+
+    fn num_layers(&self, config: &str) -> Result<usize> {
+        let cfg: crate::models::glm4_moe_lite::Glm4MoeLiteConfig = serde_json::from_str(config)?;
+        Ok(cfg.num_hidden_layers)
+    }
+
+    fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
+        let cfg: crate::models::glm4_moe_lite::Glm4MoeLiteConfig = serde_json::from_str(config)?;
+
+        let cfg = ModelConfigMetadata {
+            max_seq_len: cfg.max_position_embeddings,
+            num_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            num_kv_heads: cfg.num_attention_heads,
+            num_attn_heads: cfg.num_attention_heads,
+            sliding_window: None,
+            k_head_dim: cfg.qk_rope_head_dim + cfg.qk_nope_head_dim,
+            v_head_dim: cfg.v_head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
+        };
+
+        Ok(Box::new(cfg))
+    }
+}
+
+/// [`NormalLoader`] for a GLM 4 MoE model (GLM-4.5).
+///
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
+pub struct GLM4MoeLoader;
+
+impl NormalModelLoader for GLM4MoeLoader {
+    fn load(
+        &self,
+        config: &str,
+        vb: ShardedVarBuilder,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        let cfg: crate::models::glm4_moe::Glm4MoeConfig = serde_json::from_str(config)?;
+        Ok(Box::new(models::glm4_moe::Glm4Moe::new(
+            &cfg,
+            vb,
+            self.is_gptx(config)?,
+            normal_loading_metadata,
+            attention_mechanism,
+        )?))
+    }
+    fn load_xlora(
+        &self,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _lora_config: &[((String, String), LoraConfig)],
+        _xlora_config: Option<XLoraConfig>,
+        _xlora_ordering: Ordering,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        todo!()
+    }
+    fn is_gptx(&self, _: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
+        let cfg: crate::models::glm4_moe::Glm4MoeConfig = serde_json::from_str(config)?;
+        Ok(Box::new(cfg))
+    }
+}
+
+impl IsqModelLoader for GLM4MoeLoader {
+    fn isq_layer_regexes(&self, config: &str) -> Result<Vec<Regex>> {
+        let mut data = vec![
+            Regex::new(r"lm_head\.(weight|bias)$")?,
+            // Attention (standard GQA)
+            Regex::new(r"layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$")?,
+        ];
+        let cfg: crate::models::glm4_moe::Glm4MoeConfig = serde_json::from_str(config)?;
+        for layer_idx in 0..cfg.num_hidden_layers {
+            if layer_idx >= cfg.first_k_dense_replace {
+                // MoE layer
+                for i in 0..cfg.n_routed_experts {
+                    data.extend(vec![
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.gate_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.up_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.down_proj\.(weight|bias)$"
+                        ))?,
+                    ]);
+                }
+                if cfg.n_shared_experts > 0 {
+                    data.extend(vec![
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.gate_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.up_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.down_proj\.(weight|bias)$"
+                        ))?,
+                    ]);
+                }
+            } else {
+                // Dense MLP layer
+                data.extend(vec![
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.gate_proj\.(weight|bias)$"
+                    ))?,
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.up_proj\.(weight|bias)$"
+                    ))?,
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.down_proj\.(weight|bias)$"
+                    ))?,
+                ]);
+            };
+        }
+        Ok(data)
+    }
+    fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+
+    fn isq_layer_regexes_moqe(&self, config: &str) -> Result<Vec<Regex>> {
+        let mut data = vec![Regex::new(r"lm_head\.(weight|bias)$")?];
+        let cfg: crate::models::glm4_moe::Glm4MoeConfig = serde_json::from_str(config)?;
+        for layer_idx in 0..cfg.num_hidden_layers {
+            if layer_idx >= cfg.first_k_dense_replace {
+                // MoE layer
+                for i in 0..cfg.n_routed_experts {
+                    data.extend(vec![
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.gate_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.up_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.experts\.{i}\.down_proj\.(weight|bias)$"
+                        ))?,
+                    ]);
+                }
+                if cfg.n_shared_experts > 0 {
+                    data.extend(vec![
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.gate_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.up_proj\.(weight|bias)$"
+                        ))?,
+                        Regex::new(&format!(
+                            r"layers\.{layer_idx}\.mlp\.shared_experts\.down_proj\.(weight|bias)$"
+                        ))?,
+                    ]);
+                }
+            } else {
+                // Dense MLP layer
+                data.extend(vec![
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.gate_proj\.(weight|bias)$"
+                    ))?,
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.up_proj\.(weight|bias)$"
+                    ))?,
+                    Regex::new(&format!(
+                        r"layers\.{layer_idx}\.mlp\.down_proj\.(weight|bias)$"
+                    ))?,
+                ]);
+            };
+        }
+        Ok(data)
+    }
+    fn immediate_isq_predicates_moqe(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes_moqe(config)
+    }
+}
+
+impl DeviceMappedModelLoader for GLM4MoeLoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Text {
+            max_seq_len,
+            max_batch_size,
+        } = params
+        else {
+            anyhow::bail!("Expected text AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: crate::models::glm4_moe::Glm4MoeConfig = serde_json::from_str(config)?;
+
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
+    }
+    fn non_mapped_max_act_size_elems(
+        &self,
+        _config: &str,
+        _params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn non_mapped_size_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<usize> {
+        let cfg: crate::models::glm4_moe::Glm4MoeConfig = serde_json::from_str(config)?;
+        let elems = {
+            let embed_tokens = cfg.hidden_size * cfg.vocab_size / weight_pack_factor;
+            let lm_head = if !cfg.tie_word_embeddings || weight_pack_factor != 1 {
+                cfg.hidden_size * cfg.vocab_size / weight_pack_factor
+            } else {
+                0
+            };
+            let norm = cfg.hidden_size;
+            embed_tokens + lm_head + norm
+        };
+        Ok(elems * dtype.size_in_bytes())
+    }
+
+    fn layer_sizes_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<Vec<usize>> {
+        let cfg: crate::models::glm4_moe::Glm4MoeConfig = serde_json::from_str(config)?;
+        let mut per_layer_elems = Vec::new();
+
+        let head_dim = cfg.head_dim();
+        for layer_idx in 0..cfg.num_hidden_layers {
+            let input_layernorm = cfg.hidden_size;
+            let post_attention_layernorm = cfg.hidden_size;
+
+            // Standard GQA attention
+            let q_proj = cfg.hidden_size * cfg.num_attention_heads * head_dim / weight_pack_factor
+                + bias_if!(cfg.attention_bias, cfg.num_attention_heads * head_dim);
+            let k_proj = cfg.hidden_size * cfg.num_key_value_heads * head_dim / weight_pack_factor
+                + bias_if!(cfg.attention_bias, cfg.num_key_value_heads * head_dim);
+            let v_proj = cfg.hidden_size * cfg.num_key_value_heads * head_dim / weight_pack_factor
+                + bias_if!(cfg.attention_bias, cfg.num_key_value_heads * head_dim);
+            let o_proj = cfg.num_attention_heads * head_dim * cfg.hidden_size / weight_pack_factor;
+
+            // QK norm if enabled
+            let qk_norm = if cfg.use_qk_norm {
+                head_dim * 2 // q_norm + k_norm
+            } else {
+                0
+            };
+
+            let moe_block = {
+                let mut sum = 0;
+                if layer_idx >= cfg.first_k_dense_replace {
+                    // MoE layer
+                    let h_size = cfg.hidden_size;
+                    let gate_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
+                        * cfg.n_routed_experts;
+                    let up_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor
+                        * cfg.n_routed_experts;
+                    let down_proj = cfg.moe_intermediate_size * h_size / weight_pack_factor
+                        * cfg.n_routed_experts;
+                    let shared_experts = if cfg.n_shared_experts > 0 {
+                        let gate_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor;
+                        let up_proj = h_size * cfg.moe_intermediate_size / weight_pack_factor;
+                        let down_proj = cfg.moe_intermediate_size * h_size / weight_pack_factor;
+                        gate_proj + up_proj + down_proj
+                    } else {
+                        0
+                    };
+                    let gate_weight = cfg.n_routed_experts * cfg.hidden_size;
+                    let e_score_correction_bias = cfg.n_routed_experts;
+                    sum += gate_proj
+                        + up_proj
+                        + down_proj
+                        + shared_experts
+                        + gate_weight
+                        + e_score_correction_bias;
+                } else {
+                    // Dense MLP layer
+                    let h_size = cfg.hidden_size;
+                    let i_size = cfg.intermediate_size;
+                    let gate_proj = h_size * i_size / weight_pack_factor;
+                    let up_proj = h_size * i_size / weight_pack_factor;
+                    let down_proj = i_size * h_size / weight_pack_factor;
+                    sum += gate_proj + up_proj + down_proj;
+                }
+                sum
+            };
+
+            per_layer_elems.push(
+                input_layernorm
+                    + post_attention_layernorm
+                    + q_proj
+                    + k_proj
+                    + v_proj
+                    + o_proj
+                    + qk_norm
+                    + moe_block,
+            );
+        }
+
+        Ok(per_layer_elems
+            .into_iter()
+            .map(|x| x * dtype.size_in_bytes())
+            .collect())
+    }
+
+    fn num_layers(&self, config: &str) -> Result<usize> {
+        let cfg: crate::models::glm4_moe::Glm4MoeConfig = serde_json::from_str(config)?;
+        Ok(cfg.num_hidden_layers)
+    }
+
+    fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
+        let cfg: crate::models::glm4_moe::Glm4MoeConfig = serde_json::from_str(config)?;
+
+        let head_dim = cfg.head_dim();
+        let cfg = ModelConfigMetadata {
+            max_seq_len: cfg.max_position_embeddings,
+            num_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            num_kv_heads: cfg.num_key_value_heads,
+            num_attn_heads: cfg.num_attention_heads,
+            sliding_window: None,
+            k_head_dim: head_dim,
+            v_head_dim: head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -3373,7 +4093,7 @@ impl DeviceMappedModelLoader for GLM4Loader {
 
 /// [`NormalLoader`] for a Qwen 3 MoE model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct Qwen3MoELoader;
 
 impl NormalModelLoader for Qwen3MoELoader {
@@ -3448,10 +4168,9 @@ impl DeviceMappedModelLoader for Qwen3MoELoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -3460,7 +4179,11 @@ impl DeviceMappedModelLoader for Qwen3MoELoader {
 
         let cfg: models::qwen3_moe::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -3573,6 +4296,7 @@ impl DeviceMappedModelLoader for Qwen3MoELoader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -3583,7 +4307,7 @@ impl DeviceMappedModelLoader for Qwen3MoELoader {
 
 /// [`NormalLoader`] for a SmolLm3 model.
 ///
-/// [`NormalLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.NormalLoader.html
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
 pub struct SmolLm3Loader;
 
 impl NormalModelLoader for SmolLm3Loader {
@@ -3650,10 +4374,9 @@ impl DeviceMappedModelLoader for SmolLm3Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -3662,7 +4385,11 @@ impl DeviceMappedModelLoader for SmolLm3Loader {
 
         let cfg: crate::models::smollm3::Config = serde_json::from_str(config)?;
 
-        Ok(max_batch_size * cfg.num_attention_heads * prompt_chunksize * prompt_chunksize)
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -3755,6 +4482,402 @@ impl DeviceMappedModelLoader for SmolLm3Loader {
             sliding_window: None,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
+        };
+
+        Ok(Box::new(cfg))
+    }
+}
+
+// ======================== GraniteMoeHybrid loader
+
+/// [`NormalLoader`] for a GraniteMoeHybrid model (IBM Granite 4.0).
+///
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
+pub struct GraniteMoeHybridLoader;
+
+impl NormalModelLoader for GraniteMoeHybridLoader {
+    fn load(
+        &self,
+        config: &str,
+        vb: ShardedVarBuilder,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        let cfg: crate::models::granite::Config = serde_json::from_str(config)?;
+
+        Ok(Box::new(models::granite::GraniteMoeHybrid::new(
+            &cfg,
+            vb,
+            self.is_gptx(config)?,
+            normal_loading_metadata,
+            attention_mechanism,
+        )?))
+    }
+    fn load_xlora(
+        &self,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _lora_config: &[((String, String), LoraConfig)],
+        _xlora_config: Option<XLoraConfig>,
+        _xlora_ordering: Ordering,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        todo!()
+    }
+    fn is_gptx(&self, _: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
+        let cfg: crate::models::granite::Config = serde_json::from_str(config)?;
+        Ok(Box::new(cfg))
+    }
+}
+
+impl IsqModelLoader for GraniteMoeHybridLoader {
+    fn isq_layer_regexes(&self, _config: &str) -> Result<Vec<Regex>> {
+        Ok(vec![
+            Regex::new(r"lm_head\.(weight|bias)$")?,
+            // Attention
+            Regex::new(r"layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$")?,
+            // MLP (GraniteMLP uses shared_mlp.input_linear and shared_mlp.output_linear)
+            Regex::new(r"layers\.(\d+)\.shared_mlp\.input_linear\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.shared_mlp\.output_linear\.(weight|bias)$")?,
+        ])
+    }
+    fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+}
+
+impl DeviceMappedModelLoader for GraniteMoeHybridLoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Text {
+            max_seq_len,
+            max_batch_size,
+        } = params
+        else {
+            anyhow::bail!("Expected text AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: crate::models::granite::Config = serde_json::from_str(config)?;
+
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
+    }
+    fn non_mapped_max_act_size_elems(
+        &self,
+        _config: &str,
+        _params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn non_mapped_size_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<usize> {
+        let cfg: crate::models::granite::Config = serde_json::from_str(config)?;
+
+        let elems = {
+            let embed_tokens = cfg.hidden_size * cfg.vocab_size / weight_pack_factor;
+            // If embeddings are tied and no packing, reuse weights -> no separate lm_head needed
+            let lm_head = if !cfg.tie_word_embeddings || weight_pack_factor != 1 {
+                cfg.hidden_size * cfg.vocab_size / weight_pack_factor
+            } else {
+                0
+            };
+            let norm = cfg.hidden_size;
+            embed_tokens + lm_head + norm
+        };
+        Ok(elems * dtype.size_in_bytes())
+    }
+
+    fn layer_sizes_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<Vec<usize>> {
+        let cfg: crate::models::granite::Config = serde_json::from_str(config)?;
+
+        let per_layer_elems = {
+            let input_layernorm = cfg.hidden_size;
+            let post_attention_layernorm = cfg.hidden_size;
+
+            let size_in = cfg.hidden_size;
+            let size_q = cfg.head_dim() * cfg.num_attention_heads;
+            let size_kv = cfg.head_dim() * cfg.num_key_value_heads();
+            let q_proj = size_in * size_q / weight_pack_factor;
+            let k_proj = size_in * size_kv / weight_pack_factor;
+            let v_proj = size_in * size_kv / weight_pack_factor;
+            let o_proj = size_q * size_in / weight_pack_factor;
+
+            let h_size = cfg.hidden_size;
+            let shared_i_size = cfg.shared_intermediate_size();
+            // GraniteMLP: input_linear (h_size -> shared_i_size * 2), output_linear (shared_i_size -> h_size)
+            let input_linear = h_size * shared_i_size * 2 / weight_pack_factor;
+            let output_linear = shared_i_size * h_size / weight_pack_factor;
+
+            input_layernorm
+                + post_attention_layernorm
+                + q_proj
+                + k_proj
+                + v_proj
+                + o_proj
+                + input_linear
+                + output_linear
+        };
+        Ok(vec![
+            per_layer_elems * dtype.size_in_bytes();
+            cfg.num_hidden_layers
+        ])
+    }
+
+    fn num_layers(&self, config: &str) -> Result<usize> {
+        let cfg: crate::models::granite::Config = serde_json::from_str(config)?;
+
+        Ok(cfg.num_hidden_layers)
+    }
+    fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
+        let cfg: crate::models::granite::Config = serde_json::from_str(config)?;
+
+        let cfg = ModelConfigMetadata {
+            max_seq_len: cfg.max_position_embeddings,
+            num_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            num_kv_heads: cfg.num_key_value_heads(),
+            num_attn_heads: cfg.num_attention_heads,
+            sliding_window: None,
+            k_head_dim: cfg.head_dim(),
+            v_head_dim: cfg.head_dim(),
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
+        };
+
+        Ok(Box::new(cfg))
+    }
+}
+
+// ======================== GPT-OSS loader
+
+/// [`NormalLoader`] for a GPT-OSS model.
+///
+/// [`NormalLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.NormalLoader.html
+pub struct GptOssLoader;
+
+impl NormalModelLoader for GptOssLoader {
+    fn load(
+        &self,
+        config: &str,
+        vb: ShardedVarBuilder,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        let cfg: crate::models::gpt_oss::Config = serde_json::from_str(config)?;
+
+        Ok(Box::new(models::gpt_oss::Model::new(
+            &cfg,
+            vb,
+            self.is_gptx(config)?,
+            normal_loading_metadata,
+            attention_mechanism,
+        )?))
+    }
+    fn load_xlora(
+        &self,
+        _config: &str,
+        _vb: ShardedVarBuilder,
+        _lora_config: &[((String, String), LoraConfig)],
+        _xlora_config: Option<XLoraConfig>,
+        _xlora_ordering: Ordering,
+        _normal_loading_metadata: NormalLoadingMetadata,
+        _preload_adapters: &Option<HashMap<String, (ShardedVarBuilder, LoraConfig)>>,
+    ) -> Result<Box<dyn NormalModel + Send + Sync>> {
+        anyhow::bail!("GPT-OSS does not support X-LoRA")
+    }
+    fn is_gptx(&self, _: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
+        let cfg: crate::models::gpt_oss::Config = serde_json::from_str(config)?;
+        Ok(Box::new(cfg))
+    }
+    fn supports_paged_attention(&self, _config: &str) -> Result<bool> {
+        Ok(false)
+    }
+}
+
+impl IsqModelLoader for GptOssLoader {
+    fn isq_layer_regexes(&self, _config: &str) -> Result<Vec<Regex>> {
+        // Only attention layers are ISQ-able - MoE experts are already MXFP4 quantized
+        Ok(vec![
+            Regex::new(r"lm_head\.(weight|bias)$")?,
+            // Attention
+            Regex::new(r"layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$")?,
+            Regex::new(r"layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$")?,
+        ])
+    }
+    fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+}
+
+impl DeviceMappedModelLoader for GptOssLoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Text {
+            max_seq_len,
+            max_batch_size,
+        } = params
+        else {
+            anyhow::bail!("Expected text AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: crate::models::gpt_oss::Config = serde_json::from_str(config)?;
+
+        Ok(
+            max_batch_size
+                * cfg.num_attention_heads
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2),
+        )
+    }
+    fn non_mapped_max_act_size_elems(
+        &self,
+        _config: &str,
+        _params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        Ok(0)
+    }
+
+    fn non_mapped_size_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<usize> {
+        let cfg: crate::models::gpt_oss::Config = serde_json::from_str(config)?;
+
+        let elems = {
+            let embed_tokens = cfg.hidden_size * cfg.vocab_size / weight_pack_factor;
+            let lm_head = if !cfg.tie_word_embeddings || weight_pack_factor != 1 {
+                cfg.hidden_size * cfg.vocab_size / weight_pack_factor
+            } else {
+                0
+            };
+            let norm = cfg.hidden_size;
+            embed_tokens + lm_head + norm
+        };
+        Ok(elems * dtype.size_in_bytes())
+    }
+
+    fn layer_sizes_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<Vec<usize>> {
+        let cfg: crate::models::gpt_oss::Config = serde_json::from_str(config)?;
+
+        let per_layer_elems = {
+            let input_layernorm = cfg.hidden_size;
+            let post_attention_layernorm = cfg.hidden_size;
+
+            let size_in = cfg.hidden_size;
+            let head_dim = cfg.head_dim();
+            let size_q = head_dim * cfg.num_attention_heads;
+            let size_kv = head_dim * cfg.num_key_value_heads;
+            let q_proj =
+                size_in * size_q / weight_pack_factor + bias_if!(cfg.attention_bias, size_q);
+            let k_proj =
+                size_in * size_kv / weight_pack_factor + bias_if!(cfg.attention_bias, size_kv);
+            let v_proj =
+                size_in * size_kv / weight_pack_factor + bias_if!(cfg.attention_bias, size_kv);
+            let o_proj =
+                size_q * size_in / weight_pack_factor + bias_if!(cfg.attention_bias, size_in);
+
+            // MoE experts - MXFP4 quantized, so very compact
+            // gate_up_proj: [num_experts, intermediate_size * 2, hidden_size/2] packed
+            // down_proj: [num_experts, hidden_size, intermediate_size/2] packed
+            // At 4 bits per weight, packing factor is 2
+            let mxfp4_pack = 2;
+            let gate_up_proj_size =
+                cfg.num_local_experts * cfg.intermediate_size * 2 * cfg.hidden_size / mxfp4_pack;
+            let down_proj_size =
+                cfg.num_local_experts * cfg.hidden_size * cfg.intermediate_size / mxfp4_pack;
+            // Plus scales at 1 byte per 32 elements
+            let gate_up_scales =
+                cfg.num_local_experts * cfg.intermediate_size * 2 * cfg.hidden_size / 32;
+            let down_scales = cfg.num_local_experts * cfg.hidden_size * cfg.intermediate_size / 32;
+            // Plus biases
+            let gate_up_bias = cfg.num_local_experts * cfg.intermediate_size * 2;
+            let down_bias = cfg.num_local_experts * cfg.hidden_size;
+            // Router
+            let router = cfg.hidden_size * cfg.num_local_experts;
+            // Sinks per head
+            let sinks = cfg.num_attention_heads;
+
+            input_layernorm
+                + post_attention_layernorm
+                + q_proj
+                + k_proj
+                + v_proj
+                + o_proj
+                + gate_up_proj_size
+                + down_proj_size
+                + gate_up_scales
+                + down_scales
+                + gate_up_bias
+                + down_bias
+                + router
+                + sinks
+        };
+        Ok(vec![
+            per_layer_elems * dtype.size_in_bytes();
+            cfg.num_hidden_layers
+        ])
+    }
+
+    fn num_layers(&self, config: &str) -> Result<usize> {
+        let cfg: crate::models::gpt_oss::Config = serde_json::from_str(config)?;
+
+        Ok(cfg.num_hidden_layers)
+    }
+    fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
+        let cfg: crate::models::gpt_oss::Config = serde_json::from_str(config)?;
+
+        let head_dim = cfg.head_dim();
+        let cfg = ModelConfigMetadata {
+            max_seq_len: cfg.max_position_embeddings,
+            num_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            num_kv_heads: cfg.num_key_value_heads,
+            num_attn_heads: cfg.num_attention_heads,
+            sliding_window: cfg.sliding_window,
+            k_head_dim: head_dim,
+            v_head_dim: head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))

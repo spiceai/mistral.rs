@@ -8,7 +8,9 @@ use super::{
     AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
     MetadataMixin, ModelCategory, PreProcessingMixin,
 };
+use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
+use crate::distributed::WorkerTransferData;
 use crate::gguf::{
     get_gguf_chat_template, {convert_gguf_to_hf_tokenizer, GgufTokenizerConversion},
 };
@@ -19,7 +21,6 @@ use crate::paged_attention::{
     calculate_cache_config, AttentionImplementation, CacheEngine, ModelConfigLike,
 };
 use crate::pipeline::chat_template::{calculate_eos_tokens, BeginEndUnkPadTok, GenerationConfig};
-use crate::pipeline::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
 use crate::pipeline::loaders::DeviceMappedModelLoader;
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::ChatTemplate;
@@ -28,11 +29,12 @@ use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::gguf_metadata::{ContentConfig, GgufDeviceMapLoaderInner};
 use crate::utils::model_config as ModelConfig;
+use crate::utils::progress::ProgressScopeGuard;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::xlora_models::NonGranularState;
 use crate::{
-    get_mut_arcmutex, get_paths_gguf, DeviceMapSetting, LocalModelPaths, PagedAttentionConfig,
-    Pipeline, Topology, TryIntoDType,
+    distributed, get_mut_arcmutex, get_paths_gguf, DeviceMapSetting, LocalModelPaths,
+    PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
 };
 use crate::{
     models::quantized_llama::ModelWeights as QLlama,
@@ -40,6 +42,7 @@ use crate::{
     models::quantized_phi3::ModelWeights as QPhi3,
     models::quantized_qwen::ModelWeights as QQwen,
     models::quantized_qwen3::ModelWeights as QQwen3,
+    models::quantized_qwen3_moe::ModelWeights as QQwen3MoE,
     models::quantized_starcoder2::ModelWeights as QStarcoder2,
     utils::tokens::get_token,
     xlora_models::{XLoraQLlama, XLoraQPhi3},
@@ -51,11 +54,10 @@ use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
 use std::any::Any;
-use std::fs;
-use std::num::{NonZero, NonZeroUsize};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::{env, fs};
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -69,6 +71,7 @@ enum Model {
     Starcoder2(QStarcoder2),
     Qwen(QQwen),
     Qwen3(QQwen3),
+    Qwen3MoE(QQwen3MoE),
 }
 
 pub struct GGUFPipeline {
@@ -101,7 +104,6 @@ pub struct GGUFLoader {
 #[derive(Clone, Default)]
 /// Config for a GGUF loader.
 pub struct GGUFSpecificConfig {
-    pub prompt_chunksize: Option<NonZeroUsize>,
     pub topology: Option<Topology>,
 }
 
@@ -271,6 +273,7 @@ impl Loader for GGUFLoader {
         in_situ_quant: Option<IsqType>,
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
+        let _progress_guard = ProgressScopeGuard::new(silent);
         let paths: anyhow::Result<Box<dyn ModelPaths>> = get_paths_gguf!(
             LocalModelPaths,
             &token_source,
@@ -302,20 +305,14 @@ impl Loader for GGUFLoader {
         in_situ_quant: Option<IsqType>,
         mut paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
+        let _progress_guard = ProgressScopeGuard::new(silent);
         if in_situ_quant.is_some() {
             anyhow::bail!(
                 "You are trying to in-situ quantize a GGUF model. This will not do anything."
             );
         }
 
-        // Apply default prompt size here
-        let prompt_chunksize = self
-            .config
-            .prompt_chunksize
-            .unwrap_or(DEFAULT_PROMPT_CHUNK_SIZE.try_into().unwrap())
-            .get();
-
-        info!("Prompt chunk size is {prompt_chunksize}.",);
+        info!("Prompt chunk size is {ATTENTION_CHUNK_SIZE}.");
 
         let mut readers = Vec::new();
         for filename in paths.get_weight_filenames() {
@@ -357,15 +354,39 @@ impl Loader for GGUFLoader {
                 &devices,
                 dtype,
                 &params,
-                prompt_chunksize,
                 paged_attn_config.as_ref(),
             )?;
             mapper = DeviceMapSetting::Map(new);
         }
 
-        let pipeline_mapper =
-            mapper.into_mapper(num_layers, device, self.config.topology.as_ref())?;
-        let mapper = mapper.into_mapper(num_layers, device, self.config.topology.as_ref())?;
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(dev) = &device {
+            unsafe { dev.disable_event_tracking() };
+        }
+
+        let use_nccl = mistralrs_quant::distributed::use_nccl();
+        let available_devices = if let Ok(payload) = env::var(distributed::IS_DAEMON_FLAG) {
+            let payload: WorkerTransferData = serde_json::from_str(&payload)?;
+            let WorkerTransferData::Init { id: _, worker_rank } = payload;
+            vec![candle_core::Device::new_cuda(worker_rank + 1)?]
+        } else if use_nccl {
+            vec![candle_core::Device::new_cuda(0)?]
+        } else {
+            device_map::get_all_similar_devices(device)?
+        };
+
+        let pipeline_mapper = mapper.into_mapper(
+            num_layers,
+            device,
+            self.config.topology.as_ref(),
+            &available_devices,
+        )?;
+        let mapper = mapper.into_mapper(
+            num_layers,
+            device,
+            self.config.topology.as_ref(),
+            &available_devices,
+        )?;
         let mut layer_devices = Vec::new();
         for layer in 0..num_layers {
             let device = mapper.device_for(layer, false).cloned();
@@ -452,6 +473,7 @@ impl Loader for GGUFLoader {
                 }
                 GGUFArchitecture::Qwen2 => Model::Qwen(QQwen::try_from(model_config)?),
                 GGUFArchitecture::Qwen3 => Model::Qwen3(QQwen3::try_from(model_config)?),
+                GGUFArchitecture::Qwen3MoE => Model::Qwen3MoE(QQwen3MoE::try_from(model_config)?),
                 a => bail!("Unsupported architecture `{a:?}` for GGUF"),
             },
             ModelKind::GgufAdapter { adapter, .. } => match arch {
@@ -469,7 +491,6 @@ impl Loader for GGUFLoader {
             let model_config: &dyn ModelConfigLike = &model_config_metadata;
             let cache_config = calculate_cache_config(
                 paged_attn_config.mem_gpu,
-                paged_attn_config.mem_cpu,
                 paged_attn_config.block_size,
                 internal_dtype,
                 paged_attn_config.cache_type,
@@ -514,6 +535,7 @@ impl Loader for GGUFLoader {
             Model::Starcoder2(ref p) => p.max_seq_len,
             Model::Qwen(ref p) => p.max_seq_len,
             Model::Qwen3(ref p) => p.max_seq_len,
+            Model::Qwen3MoE(ref p) => p.max_seq_len,
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model {
@@ -525,16 +547,23 @@ impl Loader for GGUFLoader {
             Model::Starcoder2(ref model) => model.cache.normal().0.len(),
             Model::Qwen(ref model) => model.cache.normal().0.len(),
             Model::Qwen3(ref model) => model.cache.normal().0.len(),
+            Model::Qwen3MoE(ref model) => model.cache.normal().0.len(),
         };
 
-        if chat_template.bos_token.is_none() && bos.is_some() {
-            chat_template.bos_token = Some(BeginEndUnkPadTok(Either::Left(bos.unwrap())));
+        if chat_template.bos_token.is_none() {
+            if let Some(v) = bos {
+                chat_template.bos_token = Some(BeginEndUnkPadTok(Either::Left(v)));
+            }
         }
-        if chat_template.eos_token.is_none() && eos.is_some() {
-            chat_template.eos_token = Some(BeginEndUnkPadTok(Either::Left(eos.unwrap())));
+        if chat_template.eos_token.is_none() {
+            if let Some(v) = eos {
+                chat_template.eos_token = Some(BeginEndUnkPadTok(Either::Left(v)));
+            }
         }
-        if chat_template.unk_token.is_none() && unk.is_some() {
-            chat_template.unk_token = Some(BeginEndUnkPadTok(Either::Left(unk.unwrap())));
+        if chat_template.unk_token.is_none() {
+            if let Some(v) = unk {
+                chat_template.unk_token = Some(BeginEndUnkPadTok(Either::Left(v)));
+            }
         }
 
         let eos = calculate_eos_tokens(&chat_template, gen_conf, &tokenizer);
@@ -566,7 +595,6 @@ impl Loader for GGUFLoader {
                 sliding_window: None,
                 cache_config,
                 cache_engine,
-                prompt_chunksize: Some(NonZero::new(prompt_chunksize).unwrap()),
                 model_metadata: Some(Arc::new(model_config_metadata)),
                 modalities: Modalities {
                     input: vec![SupportedModality::Text],
@@ -652,6 +680,7 @@ impl CacheManagerMixin for GGUFPipeline {
             Model::Starcoder2(ref model) => &model.cache,
             Model::Qwen(ref model) => &model.cache,
             Model::Qwen3(ref model) => &model.cache,
+            Model::Qwen3MoE(ref model) => &model.cache,
         }
     }
 }
@@ -667,6 +696,7 @@ impl MetadataMixin for GGUFPipeline {
             Model::Starcoder2(ref model) => model.device.clone(),
             Model::Qwen(ref model) => model.device.clone(),
             Model::Qwen3(ref model) => model.device.clone(),
+            Model::Qwen3MoE(ref model) => model.device.clone(),
         }
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
@@ -759,6 +789,9 @@ impl Pipeline for GGUFPipeline {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
             Model::Qwen3(ref model) => {
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+            }
+            Model::Qwen3MoE(ref model) => {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
         };

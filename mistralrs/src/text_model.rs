@@ -3,20 +3,13 @@ use mistralrs_core::*;
 use mistralrs_core::{SearchCallback, Tool, ToolCallback};
 use std::collections::HashMap;
 use std::{
-    num::NonZeroUsize,
     ops::{Deref, DerefMut},
     path::PathBuf,
     sync::Arc,
 };
 
-use crate::{best_device, Model};
-
-/// A tool callback with its associated Tool definition.
-#[derive(Clone)]
-pub struct ToolCallbackWithTool {
-    pub callback: Arc<ToolCallback>,
-    pub tool: Tool,
-}
+use crate::model_builder_trait::{build_model_from_pipeline, build_text_pipeline};
+use crate::Model;
 
 #[derive(Clone)]
 /// Configure a text model with the various parameters for loading, running, and other inference behaviors.
@@ -34,7 +27,7 @@ pub struct TextModelBuilder {
     pub(crate) tokenizer_json: Option<String>,
     pub(crate) device_mapping: Option<DeviceMapSetting>,
     pub(crate) hf_cache_path: Option<PathBuf>,
-    pub(crate) search_bert_model: Option<BertEmbeddingModel>,
+    pub(crate) search_embedding_model: Option<SearchEmbeddingModel>,
     pub(crate) search_callback: Option<Arc<SearchCallback>>,
     pub(crate) tool_callbacks: HashMap<String, Arc<ToolCallback>>,
     pub(crate) tool_callbacks_with_tools: HashMap<String, ToolCallbackWithTool>,
@@ -44,8 +37,8 @@ pub struct TextModelBuilder {
     pub(crate) matformer_slice_name: Option<String>,
 
     // Model running
-    pub(crate) prompt_chunksize: Option<NonZeroUsize>,
     pub(crate) topology: Option<Topology>,
+    pub(crate) topology_path: Option<String>,
     pub(crate) organization: IsqOrganization,
     pub(crate) loader_type: Option<NormalLoaderType>,
     pub(crate) dtype: ModelDType,
@@ -64,7 +57,6 @@ pub struct TextModelBuilder {
 /// Builder for PagedAttention metadata.
 pub struct PagedAttentionMetaBuilder {
     block_size: Option<usize>,
-    mem_cpu: usize,
     mem_gpu: MemoryGpuConfig,
     cache_type: PagedCacheType,
 }
@@ -73,7 +65,6 @@ impl Default for PagedAttentionMetaBuilder {
     fn default() -> Self {
         Self {
             block_size: None,
-            mem_cpu: 64,
             mem_gpu: MemoryGpuConfig::ContextSize(4096),
             cache_type: PagedCacheType::Auto,
         }
@@ -97,7 +88,7 @@ impl PagedAttentionMetaBuilder {
     }
 
     pub fn build(self) -> anyhow::Result<PagedAttentionConfig> {
-        PagedAttentionConfig::new(self.block_size, self.mem_cpu, self.mem_gpu, self.cache_type)
+        PagedAttentionConfig::new(self.block_size, self.mem_gpu, self.cache_type)
     }
 }
 
@@ -112,8 +103,8 @@ impl TextModelBuilder {
     pub fn new(model_id: impl ToString) -> Self {
         Self {
             model_id: model_id.to_string(),
-            prompt_chunksize: None,
             topology: None,
+            topology_path: None,
             organization: IsqOrganization::Default,
             write_uqff: None,
             from_uqff: None,
@@ -136,7 +127,7 @@ impl TextModelBuilder {
             jinja_explicit: None,
             throughput_logging: false,
             hf_cache_path: None,
-            search_bert_model: None,
+            search_embedding_model: None,
             search_callback: None,
             tool_callbacks: HashMap::new(),
             tool_callbacks_with_tools: HashMap::new(),
@@ -147,9 +138,9 @@ impl TextModelBuilder {
         }
     }
 
-    /// Enable searching compatible with the OpenAI `web_search_options` setting. This uses the BERT model specified or the default.
-    pub fn with_search(mut self, search_bert_model: BertEmbeddingModel) -> Self {
-        self.search_bert_model = Some(search_bert_model);
+    /// Enable searching compatible with the OpenAI `web_search_options` setting. This loads the selected search embedding reranker (EmbeddingGemma by default).
+    pub fn with_search(mut self, search_embedding_model: SearchEmbeddingModel) -> Self {
+        self.search_embedding_model = Some(search_embedding_model);
         self
     }
 
@@ -202,16 +193,22 @@ impl TextModelBuilder {
         self
     }
 
-    /// Set the prompt batchsize to use for inference.
-    pub fn with_prompt_chunksize(mut self, prompt_chunksize: NonZeroUsize) -> Self {
-        self.prompt_chunksize = Some(prompt_chunksize);
-        self
-    }
-
     /// Set the model topology for use during loading. If there is an overlap, the topology type is used over the ISQ type.
     pub fn with_topology(mut self, topology: Topology) -> Self {
         self.topology = Some(topology);
         self
+    }
+
+    /// Set the model topology from a path. This preserves the path for unload/reload support.
+    /// If there is an overlap, the topology type is used over the ISQ type.
+    pub fn with_topology_from_path<P: AsRef<std::path::Path>>(
+        mut self,
+        path: P,
+    ) -> anyhow::Result<Self> {
+        let path_str = path.as_ref().to_string_lossy().to_string();
+        self.topology = Some(Topology::from_path(&path)?);
+        self.topology_path = Some(path_str);
+        Ok(self)
     }
 
     /// Organize ISQ to enable MoQE (Mixture of Quantized Experts, <https://arxiv.org/abs/2310.02410>)
@@ -327,20 +324,31 @@ impl TextModelBuilder {
         self
     }
 
-    /// Path to read a UQFF file from.
+    #[deprecated(
+        note = "Use `UqffTextModelBuilder` to load a UQFF model instead of the generic `from_uqff`"
+    )]
+    /// Path to read a `.uqff` file from. Other necessary configuration files must be present at this location.
+    ///
+    /// For example, these include:
+    /// - `residual.safetensors`
+    /// - `tokenizer.json`
+    /// - `config.json`
+    /// - More depending on the model
     pub fn from_uqff(mut self, path: Vec<PathBuf>) -> Self {
         self.from_uqff = Some(path);
         self
     }
 
-    /// Path to write a UQFF file to.
+    /// Path to write a `.uqff` file to and serialize the other necessary files.
     ///
     /// The parent (part of the path excluding the filename) will determine where any other files
-    /// generated are written to. These can be used to load UQFF models standalone, and may include:
+    /// serialized are written to.
+    ///
+    /// For example, these include:
     /// - `residual.safetensors`
     /// - `tokenizer.json`
     /// - `config.json`
-    /// - And others
+    /// - More depending on the model
     pub fn write_uqff(mut self, path: PathBuf) -> Self {
         self.write_uqff = Some(path);
         self
@@ -371,103 +379,8 @@ impl TextModelBuilder {
     }
 
     pub async fn build(self) -> anyhow::Result<Model> {
-        let config = NormalSpecificConfig {
-            prompt_chunksize: self.prompt_chunksize,
-            topology: self.topology,
-            organization: self.organization,
-            write_uqff: self.write_uqff,
-            from_uqff: self.from_uqff,
-            imatrix: self.imatrix,
-            calibration_file: self.calibration_file,
-            hf_cache_path: self.hf_cache_path,
-            matformer_config_path: self.matformer_config_path,
-            matformer_slice_name: self.matformer_slice_name,
-        };
-
-        if self.with_logging {
-            initialize_logging();
-        }
-
-        let loader = NormalLoaderBuilder::new(
-            config,
-            self.chat_template,
-            self.tokenizer_json,
-            Some(self.model_id),
-            self.no_kv_cache,
-            self.jinja_explicit,
-        )
-        .build(self.loader_type)?;
-
-        // Load, into a Pipeline
-        let pipeline = loader.load_model_from_hf(
-            self.hf_revision,
-            self.token_source,
-            &self.dtype,
-            &self.device.unwrap_or(best_device(self.force_cpu).unwrap()),
-            !self.with_logging,
-            self.device_mapping
-                .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
-            self.isq,
-            self.paged_attn_cfg,
-        )?;
-
-        let scheduler_method = match self.paged_attn_cfg {
-            Some(_) => {
-                let config = pipeline
-                    .lock()
-                    .await
-                    .get_metadata()
-                    .cache_config
-                    .as_ref()
-                    .cloned();
-
-                if let Some(config) = config {
-                    SchedulerConfig::PagedAttentionMeta {
-                        max_num_seqs: self.max_num_seqs,
-                        config,
-                    }
-                } else {
-                    SchedulerConfig::DefaultScheduler {
-                        method: DefaultSchedulerMethod::Fixed(self.max_num_seqs.try_into()?),
-                    }
-                }
-            }
-            None => SchedulerConfig::DefaultScheduler {
-                method: DefaultSchedulerMethod::Fixed(self.max_num_seqs.try_into()?),
-            },
-        };
-
-        let mut runner = MistralRsBuilder::new(
-            pipeline,
-            scheduler_method,
-            self.throughput_logging,
-            self.search_bert_model,
-        );
-        if let Some(cb) = self.search_callback.clone() {
-            runner = runner.with_search_callback(cb);
-        }
-        for (name, cb) in &self.tool_callbacks {
-            runner = runner.with_tool_callback(name.clone(), cb.clone());
-        }
-        for (name, callback_with_tool) in &self.tool_callbacks_with_tools {
-            runner = runner.with_tool_callback_and_tool(
-                name.clone(),
-                callback_with_tool.callback.clone(),
-                callback_with_tool.tool.clone(),
-            );
-        }
-        if let Some(mcp_config) = self.mcp_client_config {
-            runner = runner.with_mcp_client(mcp_config);
-        }
-        runner = runner
-            .with_no_kv_cache(self.no_kv_cache)
-            .with_no_prefix_cache(self.prefix_cache_n.is_none());
-
-        if let Some(n) = self.prefix_cache_n {
-            runner = runner.with_prefix_cache_n(n)
-        }
-
-        Ok(Model::new(runner.build().await))
+        let (pipeline, scheduler_config, add_model_config) = build_text_pipeline(self).await?;
+        Ok(build_model_from_pipeline(pipeline, scheduler_config, add_model_config).await)
     }
 }
 
@@ -485,7 +398,7 @@ impl UqffTextModelBuilder {
     /// - Automatic device mapping with model defaults according to `AutoDeviceMapParams`
     pub fn new(model_id: impl ToString, uqff_file: Vec<PathBuf>) -> Self {
         let mut inner = TextModelBuilder::new(model_id);
-        inner = inner.from_uqff(uqff_file);
+        inner.from_uqff = Some(uqff_file);
         Self(inner)
     }
 

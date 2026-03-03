@@ -141,6 +141,18 @@ impl Gemma3nModel {
                 .nonzero()?
                 .squeeze(1)?;
 
+            // Create mask specifically for the image soft tokens (not BOI/EOI)
+            let image_token_mask = input_ids
+                .to_dtype(DType::F32)?
+                .eq(inputs_processor::IMAGE_TOKEN_ID as f64)?
+                .unsqueeze(D::Minus1)?
+                .broadcast_as(input_embeds.shape())?
+                .to_dtype(DType::U32)?;
+
+            // Flatten tensors for scatter operation
+            let mask_flat = image_token_mask.flatten_all()?;
+            let indices = mask_flat.nonzero()?.squeeze(1)?;
+
             let vision_token_embeds = self
                 .embed_vision
                 .forward_text(&input_ids.flatten_all()?.index_select(&vision_mask_idx, 0)?)?
@@ -157,8 +169,6 @@ impl Gemma3nModel {
             input_embeds = x_flat.reshape(input_embeds.shape())?;
 
             // Process vision inputs through vision tower
-            // TODO: this is a hack necessary because the weights for Gemma 3n are broken and require the image to be rotated.
-            let pixel_values = pixel_values.t()?;
             let vision_features = self
                 .vision_tower
                 .forward(&pixel_values.to_dtype(self.vision_dtype)?)?
@@ -172,18 +182,6 @@ impl Gemma3nModel {
 
             // Convert vision features to embeddings using multimodal embedder
             let image_embeds = self.embed_vision.forward_vision(&vision_features)?;
-
-            // Create mask specifically for the image soft tokens (not BOI/EOI)
-            let image_token_mask = input_ids
-                .to_dtype(DType::F32)?
-                .eq(inputs_processor::IMAGE_TOKEN_ID as f64)?
-                .unsqueeze(D::Minus1)?
-                .broadcast_as(input_embeds.shape())?
-                .to_dtype(DType::U32)?;
-
-            // Flatten tensors for scatter operation
-            let mask_flat = image_token_mask.flatten_all()?;
-            let indices = mask_flat.nonzero()?.squeeze(1)?;
 
             // Only do the replacement if we have image tokens to replace
             if indices.dim(0)? > 0 {
@@ -209,6 +207,18 @@ impl Gemma3nModel {
                 .flatten_all()?
                 .nonzero()?
                 .squeeze(1)?;
+
+            // Create mask for audio soft tokens
+            let audio_token_mask = input_ids
+                .to_dtype(DType::F32)?
+                .eq(inputs_processor::AUDIO_TOKEN_ID as f64)?
+                .unsqueeze(D::Minus1)?
+                .broadcast_as(input_embeds.shape())?
+                .to_dtype(DType::U32)?;
+
+            // Flatten tensors for scatter operation
+            let mask_flat = audio_token_mask.flatten_all()?;
+            let indices = mask_flat.nonzero()?.squeeze(1)?;
 
             let audio_token_embeds = self
                 .embed_audio
@@ -258,18 +268,6 @@ impl Gemma3nModel {
                 // Concatenate original embeddings with padding
                 audio_embeds = Tensor::cat(&[&audio_embeds, &padding_embeds], 1)?;
             }
-
-            // Create mask for audio soft tokens
-            let audio_token_mask = input_ids
-                .to_dtype(DType::F32)?
-                .eq(inputs_processor::AUDIO_TOKEN_ID as f64)?
-                .unsqueeze(D::Minus1)?
-                .broadcast_as(input_embeds.shape())?
-                .to_dtype(DType::U32)?;
-
-            // Flatten tensors for scatter operation
-            let mask_flat = audio_token_mask.flatten_all()?;
-            let indices = mask_flat.nonzero()?.squeeze(1)?;
 
             // Only do the replacement if we have audio tokens to replace
             if indices.dim(0)? > 0 {

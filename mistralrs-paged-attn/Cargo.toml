@@ -1,9 +1,10 @@
 [package]
 name = "mistralrs-paged-attn"
-readme = "README.md"
+readme = "../README.md"
 authors = ["Eric Buehler"]
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -15,9 +16,10 @@ homepage.workspace = true
 candle-core.workspace = true
 half.workspace = true
 float8.workspace = true
-metal = { workspace = true, optional = true }
+objc2-metal = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }
+candle-metal-kernels = { workspace = true, optional = true }
 thiserror.workspace = true
-once_cell.workspace = true
 
 [build-dependencies]
 bindgen_cuda = { workspace = true, optional = true }
@@ -25,4 +27,4 @@ anyhow.workspace = true
 
 [features]
 cuda = ["dep:bindgen_cuda"]
-metal = ["dep:metal"]
+metal = ["dep:objc2-metal", "dep:objc2-foundation", "dep:candle-metal-kernels"]

@@ -1,9 +1,8 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use std::{
-    cmp::Ordering,
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use candle_core::{DType, Device, Error, Result, Tensor, D};
@@ -11,15 +10,14 @@ use mistralrs_quant::{CumSumOp, SortOp};
 #[cfg(feature = "pyo3_macros")]
 use pyo3::pyclass;
 
-use once_cell::sync::Lazy;
 use rand::distr::{weighted::WeightedIndex, Distribution};
 use rand_isaac::Isaac64Rng;
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
-static DRY_SEQUENCE_BREAKERS: Lazy<Vec<String>> =
-    Lazy::new(|| ["\n", ":", "\"", "*"].map(String::from).to_vec());
+static DRY_SEQUENCE_BREAKERS: LazyLock<Vec<String>> =
+    LazyLock::new(|| ["\n", ":", "\"", "*"].map(String::from).to_vec());
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Stop sequences or ids.
@@ -38,6 +36,7 @@ pub struct SamplingParams {
     pub top_n_logprobs: usize,
     pub frequency_penalty: Option<f32>,
     pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
     pub stop_toks: Option<StopTokens>,
     pub max_len: Option<usize>,
     pub logits_bias: Option<HashMap<u32, f32>>,
@@ -59,6 +58,7 @@ impl SamplingParams {
             top_n_logprobs: 0,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
             stop_toks: None,
             max_len: None,
             logits_bias: None,
@@ -132,9 +132,9 @@ impl DrySamplingParamsInner {
                             .map(|enc| {
                                 let ids = enc.get_ids();
                                 if !ids.is_empty() {
-                                    None
-                                } else {
                                     Some(ids[ids.len() - 1])
+                                } else {
+                                    None
                                 }
                             })
                     })
@@ -186,6 +186,7 @@ pub struct Sampler {
     tokenizer: Option<Arc<Tokenizer>>,
     frequency_penalty: Option<f32>,
     presence_penalty: Option<f32>,
+    repetition_penalty: Option<f32>,
     dry_params: Option<DrySamplingParamsInner>,
     top_k: i64,
     top_p: f64,
@@ -213,8 +214,70 @@ pub struct Logprobs {
     pub top_logprobs: Option<Vec<TopLogprob>>,
 }
 
-fn argmax_sample_last_dim(logits: &Tensor) -> Result<Tensor> {
-    logits.argmax(D::Minus1)
+/// Comparator for descending order by probability (second element of tuple).
+#[inline]
+fn cmp_desc_by_prob(a: &(u32, f32), b: &(u32, f32)) -> std::cmp::Ordering {
+    match (a.1.is_nan(), b.1.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => b.1.partial_cmp(&a.1).unwrap_or_else(|| {
+            panic!(
+                "Incomparable log probs at indices i={}, j={}. Cannot compare probs[i]={} & probs[j]={}",
+                a.0, b.0, a.1, b.1
+            )
+        }),
+    }
+}
+
+/// Returns the top-k (index, probability) pairs from `probs`, sorted in descending order.
+/// Uses partial sort (O(n) + O(k log k)) instead of full sort (O(n log n)).
+///
+/// If `k >= probs.len()`, returns all elements sorted.
+/// Also zeros out elements in `probs` beyond top-k if `zero_rest` is true.
+fn partial_sort_top_k(probs: &mut [f32], k: usize, zero_rest: bool) -> Vec<(u32, f32)> {
+    let n = probs.len();
+    if n == 0 || k == 0 {
+        return Vec::new();
+    }
+
+    // Build (index, probability) pairs
+    let mut idx_probs: Vec<(u32, f32)> = (0..n as u32).map(|i| (i, probs[i as usize])).collect();
+
+    let k = k.min(n);
+
+    if k < n {
+        // Partial sort: partition so top k elements are in first k positions
+        // select_nth_unstable_by places the k-1th largest at position k-1,
+        // with all larger elements before it (unsorted) and smaller after
+        idx_probs.select_nth_unstable_by(k - 1, cmp_desc_by_prob);
+
+        if zero_rest {
+            // Zero out elements beyond top-k
+            for (idx, _) in idx_probs[k..].iter() {
+                probs[*idx as usize] = 0.0;
+            }
+        }
+
+        // Truncate to top k
+        idx_probs.truncate(k);
+    }
+
+    // Sort just the top k elements (descending by probability)
+    idx_probs.sort_unstable_by(cmp_desc_by_prob);
+
+    idx_probs
+}
+
+/// Find the index of the maximum element in a slice. O(n) scan.
+#[inline]
+fn argmax_f32(values: &[f32]) -> u32 {
+    values
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(0)
 }
 
 impl Sampler {
@@ -225,6 +288,7 @@ impl Sampler {
         tokenizer: Option<Arc<Tokenizer>>,
         frequency_penalty: Option<f32>,
         presence_penalty: Option<f32>,
+        repetition_penalty: Option<f32>,
         dry_params: Option<DrySamplingParams>,
         top_k: i64,
         top_p: f64,
@@ -251,6 +315,7 @@ impl Sampler {
             tokenizer,
             frequency_penalty,
             presence_penalty,
+            repetition_penalty,
             dry_params,
             top_k,
             top_p,
@@ -260,23 +325,16 @@ impl Sampler {
         })
     }
 
-    fn get_top_logprobs(&self, probs: &[f32], _argsort_indices: &[u32]) -> Result<Vec<TopLogprob>> {
-        // Fast top-k selection without sorting the entire vocabulary
+    fn get_top_logprobs(&self, probs: &[f32]) -> Result<Vec<TopLogprob>> {
         let k = self.top_n_logprobs.min(probs.len());
         if k == 0 {
             return Ok(Vec::new());
         }
-        // Build (token, probability) pairs
-        let mut idx_probs: Vec<(u32, f32)> = (0..probs.len() as u32)
-            .map(|i| (i, probs[i as usize]))
-            .collect();
-        // Partition so that the top k probabilities are in the first k positions
-        let (top_k_slice, _, _) = idx_probs.select_nth_unstable_by(k, |a, b| {
-            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        // Copy and sort only the top k elements by descending probability
-        let mut top_k: Vec<(u32, f32)> = top_k_slice.to_vec();
-        top_k.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Use partial sort helper (doesn't modify probs since we pass a copy)
+        let mut probs_copy = probs.to_vec();
+        let top_k = partial_sort_top_k(&mut probs_copy, k, false);
+
         // Build the result vector with log10 of probabilities and optional decoding
         let mut result = Vec::with_capacity(k);
         if let Some(tokenizer) = &self.tokenizer {
@@ -303,15 +361,12 @@ impl Sampler {
     }
 
     fn sample_argmax(&self, logits: Tensor, return_logprobs: bool) -> Result<Logprobs> {
-        let next_token = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
-
         let probs: Vec<f32> = logits.to_vec1()?;
-
-        let argsort_indices = (0..probs.len() as u32).collect::<Vec<_>>();
+        let next_token = argmax_f32(&probs);
         let logprob = probs[next_token as usize].log(10.0);
 
         let top_logprobs = if return_logprobs {
-            Some(self.get_top_logprobs(&probs, &argsort_indices)?)
+            Some(self.get_top_logprobs(&probs)?)
         } else {
             None
         };
@@ -371,7 +426,20 @@ impl Sampler {
 
         match self.presence_penalty {
             Some(pres_penalty) if pres_penalty != 0. => {
-                probs = (probs - (pres_penalty as f64 * presence)?)?;
+                probs = (probs - (pres_penalty as f64 * &presence)?)?;
+            }
+            _ => (),
+        }
+
+        match self.repetition_penalty {
+            Some(rep_penalty) if rep_penalty != 1. => {
+                let pos_mask = probs.gt(0.)?;
+                let scaled_pos = (&probs / (rep_penalty as f64))?;
+                let scaled_neg = (&probs * (rep_penalty as f64))?;
+                let modified = pos_mask.where_cond(&scaled_pos, &scaled_neg)?;
+
+                let pres_mask = presence.gt(0.)?;
+                probs = pres_mask.where_cond(&modified, &probs)?;
             }
             _ => (),
         }
@@ -516,55 +584,53 @@ impl Sampler {
         min_p: f32,
     ) -> Result<Logprobs> {
         let mut probs: Vec<f32> = logits.to_vec1()?;
-        let argsort_indices: Vec<u32> = logits.arg_sort_last_dim(false)?.to_vec1()?;
 
-        if top_k > 0 {
-            // Clamp smaller probabilities to zero.
-            for (index, val) in argsort_indices.iter().enumerate() {
-                if index >= top_k as usize {
-                    probs[*val as usize] = 0.0;
-                }
-            }
-        }
+        // Determine how many elements we need for partial sort
+        let k = if top_k > 0 {
+            top_k as usize
+        } else {
+            probs.len()
+        };
+
+        // Get sorted top-k indices with partial sort, zeroing out rest
+        let idx_probs = partial_sort_top_k(&mut probs, k, true);
 
         // TOP P
-
         // top-p sampling (or "nucleus sampling") samples from the smallest set of
         // tokens that exceed probability top_p. This way we never sample tokens that
         // have very low probabilities and are less likely to go "off the rails".
 
         // Clamp smaller probabilities to zero.
         let mut cumsum = 0.;
-        for index in &argsort_indices {
+        for (index, prob) in &idx_probs {
             if cumsum >= top_p {
                 probs[*index as usize] = 0.0;
             } else {
-                cumsum += probs[*index as usize];
+                cumsum += prob;
             }
         }
 
-        let max_p = probs[argsort_indices[0] as usize];
+        // Get max_p from first sorted element
+        let max_p = idx_probs.first().map(|(_, p)| *p).unwrap_or(0.0);
 
         // MIN P
-
         // min-p sampling samples from the tokens whose prob are greater than
         // (max prob of token in dist) * min_p
 
         // Clamp smaller probabilities to zero.
-        for index in &argsort_indices {
-            if max_p * min_p >= probs[*index as usize] {
+        let min_p_threshold = max_p * min_p;
+        for (index, prob) in &idx_probs {
+            if min_p_threshold >= *prob {
                 probs[*index as usize] = 0.0;
             }
         }
 
-        let logits = Tensor::from_slice(&probs, logits.shape(), &Device::Cpu)?;
-
-        let next_token = argmax_sample_last_dim(&logits)?.to_scalar::<u32>()?;
-
+        // Find argmax directly on the Vec (O(n) scan, no Tensor creation)
+        let next_token = argmax_f32(&probs);
         let logprob = probs[next_token as usize].log(10.0);
 
         let top_logprobs = if return_logprobs {
-            Some(self.get_top_logprobs(&probs, &argsort_indices)?)
+            Some(self.get_top_logprobs(&probs)?)
         } else {
             None
         };
@@ -589,19 +655,18 @@ impl Sampler {
 
     fn sample_multinomial(
         &self,
-        probs: &mut Vec<f32>,
-        argsort_indices: Vec<u32>,
+        probs: &[f32],
         return_logprobs: bool,
         rng: Arc<Mutex<Isaac64Rng>>,
     ) -> Result<Logprobs> {
-        let distr = WeightedIndex::new(&*probs).map_err(Error::wrap)?;
+        let distr = WeightedIndex::new(probs).map_err(Error::wrap)?;
 
         let mut mut_ref_rng = &mut *rng.lock().expect("could not lock rng mutex");
         let next_token = distr.sample(&mut mut_ref_rng); // "Find the first item which has a weight *higher* than the chosen weight."
         let logprob = probs[next_token].log(10.0);
 
         let top_logprobs = if return_logprobs {
-            Some(self.get_top_logprobs(probs, &argsort_indices)?)
+            Some(self.get_top_logprobs(probs)?)
         } else {
             None
         };
@@ -627,39 +692,25 @@ impl Sampler {
     #[allow(clippy::too_many_arguments)]
     fn sample_top_kp_min_p(
         &self,
-        probs: &mut Vec<f32>,
-        logits: &Tensor,
+        probs: &mut [f32],
         top_k: i64,
         top_p: f32,
         min_p: f32,
         return_logprobs: bool,
         rng: Arc<Mutex<Isaac64Rng>>,
     ) -> Result<Logprobs> {
-        let mut argsort_indices: Vec<u32> = logits.arg_sort_last_dim(false)?.to_vec1()?;
+        // Determine how many elements we need for partial sort
+        let k = if top_k > 0 {
+            top_k as usize
+        } else {
+            probs.len()
+        };
 
-        // Sort by descending probability with NaN handling.
-        argsort_indices.sort_unstable_by(|&i, &j| {
-            let prob_j = probs[j as usize];
-            let prob_i = probs[i as usize];
-            match (prob_i.is_nan(), prob_j.is_nan()) {
-            (true, true) => Ordering::Equal,
-            (true, false) => Ordering::Greater,
-            (false, true) => Ordering::Less,
-            _ => prob_j.partial_cmp(&prob_j).unwrap_or_else(|| {
-                panic!("Incomparable log probs at indices i={}, j={}. Cannot compare probs[i]={} & probs[j]={}", i, j, prob_i, prob_j)
-            })
-        }});
-        if top_k > 0 {
-            // Clamp smaller probabilities to zero.
-            for (index, val) in argsort_indices.iter().enumerate() {
-                if index >= top_k as usize {
-                    probs[*val as usize] = 0.0;
-                }
-            }
-        }
+        // Get sorted top-k indices with partial sort, zeroing out rest
+        let idx_probs = partial_sort_top_k(probs, k, true);
 
         if top_p <= 0.0 || top_p >= 1.0 {
-            return self.sample_multinomial(probs, argsort_indices, return_logprobs, rng);
+            return self.sample_multinomial(probs, return_logprobs, rng);
         }
 
         // TOP P
@@ -670,19 +721,20 @@ impl Sampler {
 
         // Clamp smaller probabilities to zero.
         let mut cumsum = 0.;
-        for index in &argsort_indices {
+        for (index, prob) in &idx_probs {
             if cumsum >= top_p {
                 probs[*index as usize] = 0.0;
             } else {
-                cumsum += probs[*index as usize];
+                cumsum += prob;
             }
         }
 
         if min_p <= 0.0 || min_p >= 1.0 {
-            return self.sample_multinomial(probs, argsort_indices, return_logprobs, rng);
+            return self.sample_multinomial(probs, return_logprobs, rng);
         }
 
-        let max_p = probs[argsort_indices[0] as usize];
+        // Get max_p from first sorted element
+        let max_p = idx_probs.first().map(|(_, p)| *p).unwrap_or(0.0);
 
         // MIN P
 
@@ -690,14 +742,15 @@ impl Sampler {
         // (max prob of token in dist) * min_p
 
         // Clamp smaller probabilities to zero.
-        for index in &argsort_indices {
-            if max_p * min_p >= probs[*index as usize] {
+        let min_p_threshold = max_p * min_p;
+        for (index, prob) in &idx_probs {
+            if min_p_threshold >= *prob {
                 probs[*index as usize] = 0.0;
             }
         }
 
         // Sample with clamped probabilities.
-        self.sample_multinomial(probs, argsort_indices, return_logprobs, rng)
+        self.sample_multinomial(probs, return_logprobs, rng)
     }
 
     fn apply_penalties(&self, mut logits: Vec<f32>, context: &[u32]) -> Result<Tensor> {
@@ -708,17 +761,21 @@ impl Sampler {
         // Dry penalty
         self.apply_dry_penalty(&mut logits, context)?;
 
-        // Frequency and Presence penalty
-        self.apply_freq_presc_penalty(&mut logits, context)?;
+        // Frequency, presence, repetition penalty
+        self.apply_freq_pres_rep_penalty(&mut logits, context)?;
 
         let vocab_size = logits.len();
         Tensor::from_vec(logits, vocab_size, &Device::Cpu)
     }
 
-    fn apply_freq_presc_penalty(&self, logits: &mut [f32], context: &[u32]) -> Result<()> {
-        if self.frequency_penalty.is_some() || self.presence_penalty.is_some() {
+    fn apply_freq_pres_rep_penalty(&self, logits: &mut [f32], context: &[u32]) -> Result<()> {
+        if self.frequency_penalty.is_some()
+            || self.presence_penalty.is_some()
+            || self.repetition_penalty.is_some()
+        {
             let frequency_penalty = self.frequency_penalty.unwrap_or(0.);
             let presence_penalty = self.presence_penalty.unwrap_or(0.);
+            let repetition_penalty = self.repetition_penalty.unwrap_or(1.);
 
             //mu[j] -> mu[j] - c[j] * alpha_frequency - float(c[j] > 0) * alpha_presence
 
@@ -736,10 +793,22 @@ impl Sampler {
                 *logit = *logit
                     - count * frequency_penalty
                     - if count > 0.0 { 1. } else { 0. } * presence_penalty;
+
+                if repetition_penalty != 1.0 && count > 0.0 {
+                    if *logit > 0.0 {
+                        *logit /= repetition_penalty;
+                    } else {
+                        *logit *= repetition_penalty;
+                    }
+                }
             }
         }
         Ok(())
     }
+
+    /// Threshold for using parallel iteration in dry penalty.
+    /// Below this, sequential is faster due to parallel overhead.
+    const DRY_PENALTY_PAR_THRESHOLD: usize = 1024;
 
     fn apply_dry_penalty(&self, logits: &mut [f32], context: &[u32]) -> Result<()> {
         if let Some(ref params) = self.dry_params {
@@ -747,13 +816,26 @@ impl Sampler {
                 return Ok(());
             }
 
-            let match_indices = context
-                .par_iter()
-                .enumerate()
-                .take(context.len() - 1)
-                .filter(|(_i, x)| *context.last().unwrap() == **x)
-                .map(|(i, _)| i)
-                .collect::<Vec<_>>();
+            let last_token = *context.last().unwrap();
+
+            // Use parallel iteration only for large contexts
+            let match_indices: Vec<usize> = if context.len() > Self::DRY_PENALTY_PAR_THRESHOLD {
+                context
+                    .par_iter()
+                    .enumerate()
+                    .take(context.len() - 1)
+                    .filter(|(_i, x)| last_token == **x)
+                    .map(|(i, _)| i)
+                    .collect()
+            } else {
+                context
+                    .iter()
+                    .enumerate()
+                    .take(context.len() - 1)
+                    .filter(|(_i, x)| last_token == **x)
+                    .map(|(i, _)| i)
+                    .collect()
+            };
 
             let mut match_lengths = HashMap::new();
 
@@ -818,10 +900,6 @@ impl Sampler {
     ///
     /// If the temperature is `None`, argmax sampling is used. Otherwise, the selected sampling is used.
     /// With `top-p` sampling, if the `top-p` value is `<= 0.0` or `>= 1.0`, multinomial sampling is used.
-    /// Sample the provided tokens.
-    ///
-    /// If the temperature is `None`, argmax sampling is used. Otherwise, the selected sampling is used.
-    /// With `top-p` sampling, if the `top-p` value is `<= 0.0` or `>= 1.0`, multinomial sampling is used.
     pub fn sample(
         &self,
         logits: Tensor,
@@ -831,16 +909,16 @@ impl Sampler {
         sample_speculative: bool,
         multiple_sequences: bool,
     ) -> Result<Logprobs> {
-        if cfg!(feature = "metal") && !multiple_sequences {
-            return self.sample_fast(
-                logits,
-                context,
-                return_logprobs,
-                self.top_k,
-                self.top_p,
-                self.min_p,
-            );
-        }
+        // if cfg!(feature = "metal") && !multiple_sequences {
+        //     return self.sample_fast(
+        //         logits,
+        //         context,
+        //         return_logprobs,
+        //         self.top_k,
+        //         self.top_p,
+        //         self.min_p,
+        //     );
+        // }
 
         let logits = logits.to_vec1()?;
         let mut logits = self.apply_penalties(logits, context)?;
@@ -874,12 +952,11 @@ impl Sampler {
                 None => self.sample_argmax(logits, return_logprobs)?,
                 Some(temperature) => {
                     let logits = (&logits / temperature)?;
-                    let logits = candle_nn::ops::softmax_last_dim(&logits)?;
-                    let mut probs: Vec<f32> = logits.to_vec1()?;
+                    let probs = candle_nn::ops::softmax_last_dim(&logits)?;
+                    let mut probs: Vec<f32> = probs.to_vec1()?;
 
                     self.sample_top_kp_min_p(
                         &mut probs,
-                        &logits,
                         self.top_k,
                         self.top_p as f32,
                         self.min_p as f32,
@@ -903,8 +980,20 @@ mod tests {
         use std::sync::Arc;
         use std::sync::Mutex;
 
-        let sampler =
-            Sampler::new(None, 10, None, None, None, None, 32, 0.1, 0.05, vec![]).unwrap();
+        let sampler = Sampler::new(
+            None,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            32,
+            0.1,
+            0.05,
+            vec![],
+        )
+        .unwrap();
         let logits = Tensor::arange(0f32, 1024f32, &Device::Cpu).unwrap();
         let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(42)));
         let res = sampler
@@ -931,8 +1020,20 @@ mod tests {
         use std::sync::Arc;
         use std::sync::Mutex;
 
-        let sampler =
-            Sampler::new(None, 10, None, None, None, None, 32, 0.1, 0.05, vec![]).unwrap();
+        let sampler = Sampler::new(
+            None,
+            10,
+            None,
+            None,
+            None,
+            None,
+            None,
+            32,
+            0.1,
+            0.05,
+            vec![],
+        )
+        .unwrap();
         let logits = Tensor::arange(0f32, 1024f32, &Device::Cpu).unwrap();
         let rng = Arc::new(Mutex::new(Isaac64Rng::seed_from_u64(42)));
         let res = sampler

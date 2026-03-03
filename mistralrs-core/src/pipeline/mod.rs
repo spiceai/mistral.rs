@@ -2,6 +2,7 @@ mod amoe;
 mod auto;
 pub mod chat_template;
 mod diffusion;
+mod embedding;
 mod ggml;
 mod gguf;
 pub(crate) mod hf;
@@ -24,10 +25,12 @@ use crate::amoe::{AnyMoeConfig, AnyMoeExpertType, AnyMoeTrainingInputs, AnyMoeTr
 use crate::device_map::DeviceMapper;
 use crate::paged_attention::{CacheConfig, CacheEngine, ModelConfigLike};
 use crate::prefix_cacher::PrefixCacheManagerV2;
+use crate::PagedAttentionConfig;
 pub use amoe::{AnyMoeLoader, AnyMoePipeline};
 pub use auto::{AutoLoader, AutoLoaderBuilder};
 use chat_template::ChatTemplate;
 pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder};
+pub use embedding::{EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingSpecificConfig};
 pub use ggml::{GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig};
 pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
 use image::DynamicImage;
@@ -36,17 +39,47 @@ pub(crate) use isq::IsqModelLoader;
 pub use isq::{parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER};
 use llguidance::toktrie::TokEnv;
 pub use loaders::{
-    AdapterKind, AutoDeviceMapParams, AutoNormalLoader, AutoVisionLoader, DeepSeekV2Loader,
-    DeepSeekV3Loader, DeviceMappedModelLoader, DiffusionLoaderType, DiffusionModel,
-    DiffusionModelLoader, FluxLoader, GLM4Loader, Gemma2Loader, Gemma3Loader, Gemma3nLoader,
-    GemmaLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader, LlamaLoader, Loader,
-    LocalModelPaths, MiniCpmOLoader, Mistral3Loader, MistralLoader, MixtralLoader, ModelKind,
-    ModelPaths, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
-    Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader, PrettyName,
-    QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader, Qwen3Loader, Qwen3MoELoader,
+    AdapterKind, AutoDeviceMapParams, AutoEmbeddingLoader, AutoNormalLoader, AutoVisionLoader,
+    DeepSeekV2Loader, DeepSeekV3Loader, DeviceMappedModelLoader, DiffusionLoaderType,
+    DiffusionModel, DiffusionModelLoader, EmbeddingGemmaLoader, EmbeddingLoaderType,
+    EmbeddingModel, EmbeddingModelLoader, EmbeddingModelPaths, EmbeddingModule,
+    EmbeddingModulePaths, EmbeddingModuleType, FluxLoader, GLM4Loader, GLM4MoeLiteLoader,
+    GLM4MoeLoader, Gemma2Loader, Gemma3Loader, Gemma3nLoader, GemmaLoader, GptOssLoader,
+    GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader,
+    LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader, MistralLoader,
+    MixtralLoader, ModelKind, ModelPaths, NormalLoaderType, NormalLoadingMetadata, NormalModel,
+    NormalModelLoader, Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader,
+    PrettyName, QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader,
+    Qwen3EmbeddingLoader, Qwen3Loader, Qwen3MoELoader, Qwen3VLLoader, Qwen3VLMoELoader,
     SmolLm3Loader, Starcoder2Loader, TokenSource, VLlama4Loader, VLlamaLoader, VisionLoaderType,
     VisionModel, VisionModelLoader,
 };
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn get_device_layers_for_loader(
+    loader: &dyn loaders::DeviceMappedModelLoader,
+    config: &str,
+    num_layers: usize,
+    layer_sizes_in_bytes: Vec<usize>,
+    non_mapped_size_in_bytes: usize,
+    total_model_size_in_bytes: usize,
+    devices: &[Device],
+    dtype: DType,
+    params: &loaders::AutoDeviceMapParams,
+    paged_attn_config: Option<&PagedAttentionConfig>,
+) -> Result<crate::device_map::DeviceMapMetadata> {
+    loaders::auto_device_map::get_device_layers(
+        loader,
+        config,
+        num_layers,
+        layer_sizes_in_bytes,
+        non_mapped_size_in_bytes,
+        total_model_size_in_bytes,
+        devices,
+        dtype,
+        params,
+        paged_attn_config,
+    )
+}
 use mistralrs_quant::IsqType;
 pub use normal::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
 pub(crate) use paths::{get_chat_template, get_model_paths, get_xlora_paths};
@@ -60,7 +93,6 @@ pub use speech::{SpeechLoader, SpeechPipeline};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
@@ -84,6 +116,7 @@ pub enum SupportedModality {
     Text,
     Audio,
     Vision,
+    Embedding,
 }
 
 impl Debug for SupportedModality {
@@ -92,6 +125,7 @@ impl Debug for SupportedModality {
             Self::Text => write!(f, "📝 Text"),
             Self::Audio => write!(f, "🔊 Audio"),
             Self::Vision => write!(f, "🖼️ Vision"),
+            Self::Embedding => write!(f, "🔢 Embedding"),
         }
     }
 }
@@ -118,7 +152,6 @@ pub struct GeneralMetadata {
     // PagedAttention stuff
     pub cache_config: Option<CacheConfig>,
     pub cache_engine: Option<CacheEngine>,
-    pub prompt_chunksize: Option<NonZeroUsize>,
     pub model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>>,
     pub modalities: Modalities,
 }
@@ -251,6 +284,7 @@ pub enum ModelCategory {
     Diffusion,
     Audio,
     Speech,
+    Embedding,
 }
 
 impl std::fmt::Debug for ModelCategory {
@@ -261,6 +295,7 @@ impl std::fmt::Debug for ModelCategory {
             ModelCategory::Diffusion => write!(f, "ModelCategory::Diffusion"),
             ModelCategory::Audio => write!(f, "ModelCategory::Audio"),
             ModelCategory::Speech => write!(f, "ModelCategory::Speech"),
+            ModelCategory::Embedding => write!(f, "ModelCategory::Embedding"),
         }
     }
 }
@@ -273,8 +308,14 @@ impl PartialEq for ModelCategory {
             (Self::Audio, Self::Audio) => true,
             (Self::Speech, Self::Speech) => true,
             (Self::Diffusion, Self::Diffusion) => true,
+            (Self::Embedding, Self::Embedding) => true,
             (
-                Self::Text | Self::Vision { .. } | Self::Diffusion | Self::Audio | Self::Speech,
+                Self::Text
+                | Self::Vision { .. }
+                | Self::Diffusion
+                | Self::Audio
+                | Self::Speech
+                | Self::Embedding,
                 _,
             ) => false,
         }
@@ -300,8 +341,6 @@ pub enum CacheBackendMetadata {
     },
     PagedAttention {
         metadata: PagedAttentionMeta,
-        blocks_to_swap_in: HashMap<usize, usize>,
-        blocks_to_swap_out: HashMap<usize, usize>,
         blocks_to_copy: HashMap<usize, Vec<usize>>,
     },
 }
@@ -310,6 +349,9 @@ pub enum CacheBackendMetadata {
 pub enum ForwardInputsResult {
     RawLogits {
         logits: Tensor,
+    },
+    Embeddings {
+        embeddings: Tensor,
     },
     CausalGeneration {
         logits: Tensor,
@@ -329,6 +371,9 @@ impl ForwardInputsResult {
         match self {
             Self::CausalGeneration { logits } => Ok(Self::CausalGeneration {
                 logits: logits.i(bs_idx)?,
+            }),
+            Self::Embeddings { embeddings } => Ok(Self::Embeddings {
+                embeddings: embeddings.i(bs_idx)?,
             }),
             Self::RawLogits { logits } => Ok(Self::RawLogits {
                 logits: logits.i(bs_idx)?,
@@ -355,6 +400,9 @@ impl ForwardInputsResult {
             }),
             Self::RawLogits { logits } => Ok(Self::RawLogits {
                 logits: logits.to_device(device)?,
+            }),
+            Self::Embeddings { embeddings } => Ok(Self::Embeddings {
+                embeddings: embeddings.to_device(device)?,
             }),
             Self::Image { .. } => Ok(self.clone()),
             Self::Speech { .. } => Ok(self.clone()),
@@ -397,33 +445,25 @@ pub trait Pipeline:
     ) -> Result<Duration, candle_core::Error> {
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
-                let inputs_iter = self.get_processor().inputs_processor().process_inputs(
-                    self.tokenizer(),
-                    input_seqs,
-                    is_prompt,
-                    self.get_metadata().is_xlora,
-                    &self.device(),
-                    self.get_metadata().no_kv_cache,
-                    None,
-                    return_raw_logits,
-                    self.get_input_processor_config(),
-                    None,
-                    self.get_metadata().prompt_chunksize,
-                    self.device_mapper(),
-                );
+                let inputs_iter =
+                    std::iter::once(self.get_processor().inputs_processor().process_inputs(
+                        self.tokenizer(),
+                        input_seqs,
+                        is_prompt,
+                        self.get_metadata().is_xlora,
+                        &self.device(),
+                        self.get_metadata().no_kv_cache,
+                        None,
+                        return_raw_logits,
+                        self.get_input_processor_config(),
+                        None,
+                        self.device_mapper(),
+                    ));
 
                 let mut logits = vec![None; input_seqs.len()];
-                let prompt_chunksize = self
-                    .get_metadata()
-                    .prompt_chunksize
-                    .map(NonZeroUsize::get)
-                    .unwrap_or(1);
-                let len_inputs = input_seqs
-                    .iter()
-                    .map(|seq| seq.get_toks().len().div_ceil(prompt_chunksize))
-                    .max()
-                    .unwrap();
+                let len_inputs = 1;
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
+                let mut embedding_logits = vec![None; input_seqs.len()];
 
                 let mut exec_duration = Duration::ZERO;
                 for (i, inputs) in inputs_iter.into_iter().enumerate() {
@@ -457,6 +497,9 @@ pub trait Pipeline:
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
                             raw_out_logits[seq_idx][i] =
                                 Some(logits.i(logit_idx)?.to_device(&Device::Cpu)?);
+                        } else if let ForwardInputsResult::Embeddings { embeddings } = &raw_logits {
+                            embedding_logits[seq_idx] =
+                                Some(embeddings.i(logit_idx)?.to_device(&Device::Cpu)?);
                         } else {
                             logits[seq_idx] = Some(raw_logits.index_bs(logit_idx)?);
                         }
@@ -493,6 +536,27 @@ pub trait Pipeline:
 
                     return Ok(exec_duration);
                 }
+                if embedding_logits[0].is_some() {
+                    let start = Instant::now();
+                    response::send_embedding_responses(
+                        input_seqs,
+                        embedding_logits
+                            .into_iter()
+                            .map(|raw| {
+                                raw.unwrap()
+                                    .to_dtype(DType::F32)
+                                    .unwrap()
+                                    .to_vec1::<f32>()
+                                    .unwrap()
+                            })
+                            .collect(),
+                    )
+                    .await?;
+                    let end = Instant::now();
+                    exec_duration += end.duration_since(start);
+
+                    return Ok(exec_duration);
+                }
 
                 let start = Instant::now();
                 let logits_on_cpu = logits.len() > 1;
@@ -509,7 +573,8 @@ pub trait Pipeline:
                     .collect::<candle_core::Result<Vec<_>>>()?;
 
                 match &logits[0] {
-                    ForwardInputsResult::RawLogits { .. } => unreachable!(),
+                    ForwardInputsResult::RawLogits { .. }
+                    | ForwardInputsResult::Embeddings { .. } => unreachable!(),
                     ForwardInputsResult::CausalGeneration { .. } => {
                         self.sample_causal_gen(
                             input_seqs,
@@ -605,47 +670,33 @@ pub trait Pipeline:
             CacheBackendMetadata::PagedAttention {
                 metadata,
                 blocks_to_copy,
-                blocks_to_swap_in,
-                blocks_to_swap_out,
             } => {
                 // Cloning might be bad?
                 self.get_metadata()
                     .cache_engine
                     .as_ref()
                     .expect("PagedAttention must have cache engines.")
-                    .execute_scheduler_ops(
-                        &blocks_to_swap_in,
-                        &blocks_to_swap_out,
-                        &blocks_to_copy,
-                    )?;
+                    .execute_scheduler_ops(&blocks_to_copy)?;
 
-                let inputs_iter = self.get_processor().inputs_processor().process_inputs(
-                    self.tokenizer(),
-                    input_seqs,
-                    is_prompt,
-                    self.get_metadata().is_xlora,
-                    &self.device(),
-                    self.get_metadata().no_kv_cache,
-                    None,
-                    return_raw_logits,
-                    self.get_input_processor_config(),
-                    Some(metadata),
-                    self.get_metadata().prompt_chunksize,
-                    self.device_mapper(),
-                );
+                let inputs_iter =
+                    std::iter::once(self.get_processor().inputs_processor().process_inputs(
+                        self.tokenizer(),
+                        input_seqs,
+                        is_prompt,
+                        self.get_metadata().is_xlora,
+                        &self.device(),
+                        self.get_metadata().no_kv_cache,
+                        None,
+                        return_raw_logits,
+                        self.get_input_processor_config(),
+                        Some(metadata),
+                        self.device_mapper(),
+                    ));
 
                 let mut logits = vec![None; input_seqs.len()];
-                let prompt_chunksize = self
-                    .get_metadata()
-                    .prompt_chunksize
-                    .map(NonZeroUsize::get)
-                    .unwrap_or(1);
-                let len_inputs = input_seqs
-                    .iter()
-                    .map(|seq| seq.get_toks().len().div_ceil(prompt_chunksize))
-                    .max()
-                    .unwrap();
+                let len_inputs = 1;
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
+                let mut embedding_logits = vec![None; input_seqs.len()];
 
                 let mut exec_duration = Duration::ZERO;
                 for (i, inputs) in inputs_iter.into_iter().enumerate() {
@@ -663,6 +714,9 @@ pub trait Pipeline:
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
                             raw_out_logits[seq_idx][i] =
                                 Some(logits.i(logit_idx)?.to_device(&Device::Cpu)?);
+                        } else if let ForwardInputsResult::Embeddings { embeddings } = &raw_logits {
+                            embedding_logits[seq_idx] =
+                                Some(embeddings.i(logit_idx)?.to_device(&Device::Cpu)?);
                         } else {
                             logits[seq_idx] = Some(raw_logits.index_bs(logit_idx)?);
                         }
@@ -676,6 +730,27 @@ pub trait Pipeline:
                         raw_out_logits
                             .into_iter()
                             .map(|raw| raw.into_iter().flatten().collect::<Vec<_>>())
+                            .collect(),
+                    )
+                    .await?;
+                    let end = Instant::now();
+                    exec_duration += end.duration_since(start);
+
+                    return Ok(exec_duration);
+                }
+                if embedding_logits[0].is_some() {
+                    let start = Instant::now();
+                    response::send_embedding_responses(
+                        input_seqs,
+                        embedding_logits
+                            .into_iter()
+                            .map(|raw| {
+                                raw.unwrap()
+                                    .to_dtype(DType::F32)
+                                    .unwrap()
+                                    .to_vec1::<f32>()
+                                    .unwrap()
+                            })
                             .collect(),
                     )
                     .await?;
@@ -700,7 +775,8 @@ pub trait Pipeline:
                     .collect::<candle_core::Result<Vec<_>>>()?;
 
                 match &logits[0] {
-                    ForwardInputsResult::RawLogits { .. } => unreachable!(),
+                    ForwardInputsResult::RawLogits { .. }
+                    | ForwardInputsResult::Embeddings { .. } => unreachable!(),
                     ForwardInputsResult::CausalGeneration { .. } => {
                         self.sample_causal_gen(
                             input_seqs,
@@ -864,6 +940,7 @@ mod tests {
                 },
                 true,
                 None,
+                None, // reasoning_effort
                 &ChatTemplateValue(Either::Left(template.to_string())),
                 Some(bos.to_string()),
                 Some(eos.to_string()),

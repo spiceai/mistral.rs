@@ -1,15 +1,20 @@
 #[cfg(feature = "cuda")]
 const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 
-const SUPPORTS_ATTN_SOFTMAX_FILE: &str = "src/utils/supports_attn_softmax.rs";
-
 fn main() {
+    set_git_revision();
+
     #[cfg(feature = "cuda")]
     {
         use std::{path::PathBuf, vec};
         println!("cargo:rerun-if-changed=build.rs");
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-        let lib_files = vec!["src/cuda/sort.cu"];
+        let lib_files = vec![
+            "src/cuda/sort.cu",
+            "src/cuda/moe_gemm.cu",
+            "src/cuda/moe_gemm_wmma.cu",
+            "src/cuda/moe_gemv.cu",
+        ];
         for lib_file in lib_files.iter() {
             println!("cargo:rerun-if-changed={lib_file}");
         }
@@ -28,6 +33,16 @@ fn main() {
             .arg("--verbose")
             .arg("--compiler-options")
             .arg("-fPIC");
+
+        // Check if CUDA_COMPUTE_CAP < 80 and disable bf16 kernels if so.
+        // bf16 WMMA operations and certain bf16 intrinsics are only available on sm_80+.
+        if let Ok(compute_cap) = std::env::var("CUDA_COMPUTE_CAP") {
+            if let Ok(cap) = compute_cap.parse::<u32>() {
+                if cap < 80 {
+                    builder = builder.arg("-DNO_BF16_KERNEL");
+                }
+            }
+        }
 
         // https://github.com/EricLBuehler/mistral.rs/issues/286
         if let Some(cuda_nvcc_flags_env) = CUDA_NVCC_FLAGS {
@@ -63,90 +78,32 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=stdc++");
         }
     }
+}
 
-    #[cfg(feature = "metal")]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::process::{Command, Stdio};
+fn set_git_revision() {
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
 
-        // echo "__METAL_VERSION__" | xcrun -sdk macosx metal -E -x metal -P -
-
-        // Create the `echo` command and pipe its output into `xcrun`
-        let mut echo = Command::new("echo")
-            .arg("__METAL_VERSION__")
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("Failed to start echo command");
-
-        echo.wait().unwrap();
-
-        // Run the `xcrun` command, taking input from the `echo` command's output
-        let output = Command::new("xcrun")
-            .arg("-sdk")
-            .arg("macosx")
-            .arg("metal")
-            .arg("-E")
-            .arg("-x")
-            .arg("metal")
-            .arg("-P")
-            .arg("-")
-            .stdin(echo.stdout.unwrap())
-            .output()
-            .expect("Failed to run xcrun command");
-
-        // Handle the output
-        let supports_attn_softmax = if output.status.success() {
-            let version = String::from_utf8_lossy(&output.stdout)
-                .split('\n')
-                .nth(1)
-                .unwrap()
-                .trim()
-                .to_string()
-                .parse::<usize>()
-                .unwrap();
-            // Attn softmax is only supported for metal >= 310 because of the vectorized bfloat types
-            version >= 310
-        } else {
-            // Default to false if anything goes wrong
-            false
-        };
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(SUPPORTS_ATTN_SOFTMAX_FILE)
-            .unwrap();
-
-        // Add the other stuff back
-        if let Err(e) = writeln!(
-            file,
-            "pub(crate) const SUPPORTS_ATTN_SOFTMAX: bool = {supports_attn_softmax};"
-        ) {
-            panic!(
-                "Error writing src/utils/supports_attn_softmax.rs: {:?}\n",
-                e
-            )
-        }
-    }
-
-    #[cfg(not(feature = "metal"))]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(SUPPORTS_ATTN_SOFTMAX_FILE)
-            .unwrap();
-
-        // Add the other stuff back
-        if let Err(e) = writeln!(
-            file,
-            "pub(crate) const SUPPORTS_ATTN_SOFTMAX: bool = false;"
-        ) {
-            panic!(
-                "Error writing src/utils/supports_attn_softmax.rs: {:?}\n",
-                e
-            )
+    println!("cargo:rustc-env=MISTRALRS_GIT_REVISION={commit}");
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    if let Ok(head) = std::fs::read_to_string(".git/HEAD") {
+        if let Some(ref_path) = head.strip_prefix("ref:") {
+            let ref_path = ref_path.trim();
+            if !ref_path.is_empty() {
+                println!("cargo:rerun-if-changed=.git/{}", ref_path);
+            }
         }
     }
 }

@@ -1,3 +1,10 @@
+#[cfg(not(feature = "cuda"))]
+mod cpu;
+#[cfg(feature = "cuda")]
+mod cuda;
+#[cfg(feature = "cuda")]
+mod ffi;
+
 use std::{
     borrow::Cow,
     io::{Cursor, Read},
@@ -9,13 +16,12 @@ use candle_core::{
     quantized::{ggml_file::qtensor_from_ggml, GgmlDType, QMatMul, QTensor},
     DType, Device, Result, Tensor,
 };
-use candle_nn::{Linear, Module};
+use candle_nn::Module;
 
 use crate::{
     generate_isq, generate_isq_imatrix,
     utils::{deserialize_tensor, serialize_tensor, version_is_compatible, UQFF_VERSION},
     IsqType, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedSerde, QuantizedSerdeType,
-    UnquantLinear,
 };
 
 #[derive(Debug)]
@@ -41,7 +47,9 @@ impl QuantMethod for GgufMatMul {
             | QuantMethodConfig::FP8 { .. }
             | QuantMethodConfig::Bnb { .. }
             | QuantMethodConfig::BlockwiseFP8 { .. }
-            | QuantMethodConfig::Afq { .. } => unreachable!(),
+            | QuantMethodConfig::PerTensorFP8 { .. }
+            | QuantMethodConfig::Afq { .. }
+            | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
         }
     }
 
@@ -60,18 +68,26 @@ impl QuantMethod for GgufMatMul {
 
     /// Compute matmul of `self` and `a`. `self` should contain the weights.
     ///
-    /// If `a` is (n_tokens, n_experts, cols), `self` weights are (n_experts, rows, cols),
-    /// then the indices are (n_tokens, n_experts).
+    /// If `a` is (n_tokens, 1, cols), `self` weights are (n_experts, rows, cols),
+    /// then the indices are (n_tokens, n_experts_per_tok).
     fn gather_forward(&self, x: &Tensor, indices: &Tensor) -> Result<Tensor> {
-        // Dequantize matmul always.
-        // TODO: add a specific kernel?
-        let weight = self.dequantize_w()?;
-        // Dispatch to unquant. This uses some cublaslt for bias & on cuda always, so it is better
-        let unquant = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(
-            weight,
-            self.b.clone(),
-        )))?;
-        unquant.gather_forward(x, indices)
+        // Use indexed_moe_forward for efficient indexed matmul
+        // Expected shapes:
+        // - x: (n_tokens, 1, hidden_dim) or (n_tokens, n_experts_per_tok, hidden_dim)
+        // - indices: (n_tokens, n_experts_per_tok)
+        // - weights (self): (n_experts, out_features, in_features)
+        #[cfg(feature = "cuda")]
+        let res = cuda::qmatmul_indexed_moe_forward(&self.w, x, indices)?;
+
+        // For CPU and Metal: use dequantize-then-matmul approach
+        #[cfg(not(feature = "cuda"))]
+        let res = cpu::cpu_indexed_moe_forward(&self.w, x, indices)?;
+
+        if let Some(ref b) = self.b {
+            res.broadcast_add(b)
+        } else {
+            Ok(res)
+        }
     }
 
     fn quantized_act_type(&self) -> Option<DType> {
@@ -189,10 +205,10 @@ impl QuantizedSerde for GgufMatMul {
     fn name(&self) -> &'static str {
         "gguf"
     }
-    fn serialize(&self) -> Result<Cow<[u8]>> {
+    fn serialize(&self) -> Result<Cow<'_, [u8]>> {
         self.serialize_with_bias(self.b.clone())
     }
-    fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<[u8]>> {
+    fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<'_, [u8]>> {
         let mut buffer = match &self.w {
             QMatMul::QTensor(qw) => {
                 let w = qw.data()?.to_vec();

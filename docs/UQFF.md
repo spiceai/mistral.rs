@@ -10,12 +10,17 @@ The uniquely powerful quantized file format.
 3) **Customizable** 🛠️: Make and publish your own UQFF files in minutes.
 
 # ToC
-- [Motivation](#motivation)
-- [Support](#support)
-- [Loading a UQFF model](#loading-a-uqff-model)
-- [Creating a UQFF model](#creating-a-uqff-model)
-- [List of models](#list-of-models)
-- [Memory layout (*for developers*)](UQFF/LAYOUT.md)
+- [Universal Quantized File Format: UQFF](#universal-quantized-file-format-uqff)
+- [ToC](#toc)
+  - [Motivation](#motivation)
+  - [Support](#support)
+  - [Loading a UQFF model](#loading-a-uqff-model)
+    - [Running with the CLI](#running-with-the-cli)
+    - [Using with the Rust SDK](#using-with-the-rust-api)
+    - [Using the Python SDK](#using-the-python-api)
+  - [Creating a UQFF model](#creating-a-uqff-model)
+    - [Upload with Git](#upload-with-git)
+  - [List of models](#list-of-models)
 
 ## Motivation
 
@@ -76,38 +81,17 @@ command to get started.
 
 ### Running with the CLI
 
-```
-./mistralrs-server -i plain -m EricB/Phi-3.5-mini-instruct-UQFF --from-uqff phi3.5-mini-instruct-f8e4m3.uqff
-```
-
-### Using with the Rust API
-
-Modify the Normal or Vision config as follows and update the model ID to point to a UQFF model:
-
-```diff
-NormalSpecificConfig {
-    use_flash_attn: false,
-    prompt_batchsize: None,
-    topology: None,
-    organization: Default::default(),
-    write_uqff: None,
--   from_uqff: None,
-+   from_uqff: Some("phi3.5-mini-instruct-q4k.uqff".to_string()), // Pull from specified HF hub repo
-}
+```bash
+mistralrs run -m EricB/Phi-3.5-mini-instruct-UQFF --from-uqff phi3.5-mini-instruct-f8e4m3.uqff
 ```
 
-```diff
-VisionSpecificConfig {
-    use_flash_attn: false,
-    prompt_batchsize: None,
-    topology: None,
-    write_uqff: None,
--   from_uqff: None,
-+   from_uqff: Some("../phi3.5-mini-instruct-q4k.uqff".to_string()), // Local path
-}
-```
+### Using with the Rust SDK
 
-### Using the Python API
+Check out the following examples:
+- Normal: [uqff/main.rs](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/uqff/main.rs)
+- Vision: [uqff_vision/main.rs](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/uqff_vision/main.rs)
+
+### Using the Python SDK
 Modify the `Which` instantiation as follows:
 ```diff
 Which.Plain(
@@ -116,6 +100,53 @@ Which.Plain(
 ),
 ```
 
+### Using topology for device mapping with UQFF
+
+When loading a UQFF model, the quantization is already baked in, so ISQ settings in the topology are ignored. However, **device mapping** from a topology file still applies. This is useful for splitting a pre-quantized model across multiple GPUs or offloading layers to CPU.
+
+**CLI example:**
+```bash
+mistralrs run -m EricB/Phi-3.5-mini-instruct-UQFF --from-uqff phi3.5-mini-instruct-q4k.uqff --topology device_map.yml
+```
+
+**Topology file for device mapping only (`device_map.yml`):**
+```yaml
+0-16:
+  device: cuda[0]
+16-32:
+  device: cuda[1]
+```
+
+**Rust SDK example:**
+```rust
+use mistralrs::{UqffTextModelBuilder, Topology, LayerTopology, Device};
+
+let model = UqffTextModelBuilder::new(
+    "EricB/Phi-3.5-mini-instruct-UQFF",
+    vec!["phi3.5-mini-instruct-q4k.uqff".into()],
+)
+.into_inner()
+.with_topology(
+    Topology::empty()
+        .with_range(0..16, LayerTopology { isq: None, device: Some(Device::Cuda(0)) })
+        .with_range(16..32, LayerTopology { isq: None, device: Some(Device::Cuda(1)) })
+)
+.build()
+.await?;
+```
+
+**Python SDK example:**
+```python
+runner = Runner(
+    which=Which.Plain(
+        model_id="EricB/Phi-3.5-mini-instruct-UQFF",
+        from_uqff="phi3.5-mini-instruct-q4k.uqff",
+        topology="device_map.yml",
+    ),
+)
+```
+
+> Note: The `isq` field in topology entries is ignored when loading UQFF models since quantization is pre-applied.
 
 ## Creating a UQFF model
 
@@ -133,51 +164,13 @@ After creating the UQFF file, you can upload the model to Hugging Face. To do th
 2) Upload the UQFF file:
     - With the web interface: [guide here](https://huggingface.co/docs/hub/en/models-uploading#using-the-web-interface).
     - With Git: [steps here](#upload-with-git-lfs)
-3) Locally, generate the model card file with [this Python script](../scripts/generate_uqff_card.py)..
+3) Locally, generate the model card file with [this Python script](https://github.com/EricLBuehler/mistral.rs/blob/master/scripts/generate_uqff_card.py)..
 4) In the web interface, press the `Create Model Card` button and paste the generated model card.
-
-### Creating with the CLI
 
 **⭐ Check out [uqff_maker](https://github.com/EricLBuehler/uqff_maker) to make UQFF models with an easy CLI!**
 
-```
-./mistralrs-server --isq 4 -i plain -m microsoft/Phi-3.5-mini-instruct --write-uqff phi3.5-mini-instruct-q4k.uqff
-```
-
-### Creating with the Rust API
-
-Modify the Normal or Vision config as follows:
-
-```diff
-NormalSpecificConfig {
-    use_flash_attn: false,
-    prompt_batchsize: None,
-    topology: None,
-    organization: Default::default(),
-    from_uqff: None,
--   write_uqff: None,
-+   write_uqff: Some("phi3.5-mini-instruct-q4k.uqff".to_string()),
-}
-```
-
-```diff
-VisionSpecificConfig {
-    use_flash_attn: false,
-    prompt_batchsize: None,
-    topology: None,
-    from_uqff: None,
--   write_uqff: None,
-+   write_uqff: Some("../UQFF/phi3.5-mini-instruct-q4k.uqff".to_string()),
-}
-```
-
-### Creating with the Python API
-Modify the `Which` instantiation as follows. Be sure to add the `in_situ_quant`.
-```diff
-Which.Plain(
-    model_id="microsoft/Phi-3.5-mini-instruct",
-+   write_uqff="phi3.5-mini-instruct-q4k.uqff"
-),
+```bash
+mistralrs quantize -m microsoft/Phi-3.5-mini-instruct --isq 4 -o phi3.5-mini-instruct-q4k.uqff
 ```
 
 ### Upload with Git

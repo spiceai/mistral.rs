@@ -1,10 +1,11 @@
 use candle_core::{Result, Tensor};
 use candle_nn::{Activation, Conv2d, Conv2dConfig, Module};
-use mistralrs_quant::ShardedVarBuilder;
+use mistralrs_quant::{Convolution, ShardedVarBuilder};
+use tracing::warn;
 
 use crate::{
     attention::SdpaParams,
-    layers::{conv2d_no_bias, Sdpa},
+    layers::{conv2d, conv2d_no_bias, Sdpa},
     utils::unvarbuilder::UnVarBuilder,
 };
 
@@ -77,6 +78,7 @@ struct Conv2dSame {
 }
 
 impl Conv2dSame {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         in_channels: usize,
         out_channels: usize,
@@ -84,6 +86,7 @@ impl Conv2dSame {
         stride: usize,
         dilation: usize,
         groups: usize,
+        bias: bool,
         vb: ShardedVarBuilder,
     ) -> Result<Self> {
         let cfg = Conv2dConfig {
@@ -91,9 +94,14 @@ impl Conv2dSame {
             stride,
             dilation,
             groups,
+            cudnn_fwd_algo: None,
         };
 
-        let conv = conv2d_no_bias(in_channels, out_channels, kernel_size, cfg, vb)?;
+        let conv = if bias {
+            conv2d(in_channels, out_channels, kernel_size, cfg, vb)?
+        } else {
+            conv2d_no_bias(in_channels, out_channels, kernel_size, cfg, vb)?
+        };
 
         Ok(Self {
             conv,
@@ -107,7 +115,7 @@ impl Conv2dSame {
 impl Module for Conv2dSame {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let x = pad_same(x, self.kernel_size, self.stride, self.dilation)?;
-        self.conv.forward(&x)
+        Convolution.forward_2d(&self.conv, &x)
     }
 }
 
@@ -185,7 +193,7 @@ enum ConvType {
 impl Module for ConvType {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            ConvType::Regular(conv) => conv.forward(x),
+            ConvType::Regular(conv) => Convolution.forward_2d(conv, x),
             ConvType::Same(conv) => conv.forward(x),
         }
     }
@@ -208,6 +216,7 @@ impl ConvNormAct {
         groups: usize,
         apply_act: bool,
         eps: f64,
+        bias: bool,
         vb: ShardedVarBuilder,
     ) -> Result<Self> {
         // Use Conv2dSame for depthwise convolutions (groups == in_chs or groups == out_chs)
@@ -222,6 +231,7 @@ impl ConvNormAct {
                 stride,
                 1, // dilation
                 groups,
+                bias,
                 vb.pp("conv"),
             )?)
         } else {
@@ -231,13 +241,12 @@ impl ConvNormAct {
                 groups,
                 ..Default::default()
             };
-            ConvType::Regular(conv2d_no_bias(
-                in_chs,
-                out_chs,
-                kernel_size,
-                conv_cfg,
-                vb.pp("conv"),
-            )?)
+            let conv = if bias {
+                conv2d(in_chs, out_chs, kernel_size, conv_cfg, vb.pp("conv"))?
+            } else {
+                conv2d_no_bias(in_chs, out_chs, kernel_size, conv_cfg, vb.pp("conv"))?
+            };
+            ConvType::Regular(conv)
         };
 
         let norm = Some(RMSNormAct2d::new(out_chs, eps, apply_act, vb.pp("bn"))?);
@@ -288,6 +297,7 @@ impl EdgeResidual {
             stride,
             1, // dilation
             1, // groups
+            false,
             vb.pp("conv_exp"),
         )?;
 
@@ -314,7 +324,7 @@ impl EdgeResidual {
         let shortcut = x.clone();
         let mut x = self.conv_exp.forward(x)?;
         x = self.bn1.forward(&x)?;
-        x = self.conv_pwl.forward(&x)?;
+        x = Convolution.forward_2d(&self.conv_pwl, &x)?;
         x = self.bn2.forward(&x)?;
 
         if self.has_skip {
@@ -368,6 +378,7 @@ impl UniversalInvertedResidual {
                 in_chs, // Depthwise
                 false,
                 1e-5,
+                false,
                 vb.pp("dw_start"),
             )?)
         } else {
@@ -375,7 +386,18 @@ impl UniversalInvertedResidual {
         };
 
         // PW expansion
-        let pw_exp = ConvNormAct::new(in_chs, mid_chs, 1, 1, 0, 1, true, 1e-5, vb.pp("pw_exp"))?;
+        let pw_exp = ConvNormAct::new(
+            in_chs,
+            mid_chs,
+            1,
+            1,
+            0,
+            1,
+            true,
+            1e-5,
+            false,
+            vb.pp("pw_exp"),
+        )?;
 
         // DW mid (optional)
         let dw_mid = if dw_kernel_size_mid > 0 {
@@ -388,6 +410,7 @@ impl UniversalInvertedResidual {
                 mid_chs, // Depthwise
                 true,
                 1e-5,
+                false,
                 vb.pp("dw_mid"),
             )?)
         } else {
@@ -395,8 +418,18 @@ impl UniversalInvertedResidual {
         };
 
         // PW projection
-        let pw_proj =
-            ConvNormAct::new(mid_chs, out_chs, 1, 1, 0, 1, false, 1e-5, vb.pp("pw_proj"))?;
+        let pw_proj = ConvNormAct::new(
+            mid_chs,
+            out_chs,
+            1,
+            1,
+            0,
+            1,
+            false,
+            1e-5,
+            false,
+            vb.pp("pw_proj"),
+        )?;
 
         // Layer scale
         let layer_scale = if layer_scale_init_value.is_some() {
@@ -497,6 +530,7 @@ impl MultiQueryAttention2d {
                 kv_stride,
                 1,   // dilation
                 dim, // Depthwise
+                false,
                 vb.pp("key").pp("down_conv"),
             )?;
             let norm = RMSNormAct2d::new(dim, 1e-6, false, vb.pp("key").pp("norm"))?;
@@ -522,6 +556,7 @@ impl MultiQueryAttention2d {
                 kv_stride,
                 1,   // dilation
                 dim, // Depthwise
+                false,
                 vb.pp("value").pp("down_conv"),
             )?;
             let norm = RMSNormAct2d::new(dim, 1e-6, false, vb.pp("value").pp("norm"))?;
@@ -568,7 +603,7 @@ impl MultiQueryAttention2d {
 
         // Query projection and reshape
         // [B, H, W, C] -> [B, H, W, num_heads * key_dim] -> [B, H*W, num_heads, key_dim] -> [B, num_heads, H*W, key_dim]
-        let mut q = self.query_proj.forward(x)?;
+        let mut q = Convolution.forward_2d(&self.query_proj, x)?;
         q = q
             .permute((0, 2, 3, 1))? // NCHW -> NHWC
             .reshape((b, h * w, self.num_heads, self.key_dim))?
@@ -580,7 +615,7 @@ impl MultiQueryAttention2d {
             k = down_conv.forward(&k)?;
             k = norm.forward(&k)?;
         }
-        k = self.key_proj.forward(&k)?;
+        k = Convolution.forward_2d(&self.key_proj, &k)?;
         let (_, _, kh, kw) = k.dims4()?;
         // [B, C, H, W] -> [B, H, W, C] -> [B, H*W, C] -> [B, 1, H*W, C]
         k = k
@@ -594,7 +629,7 @@ impl MultiQueryAttention2d {
             v = down_conv.forward(&v)?;
             v = norm.forward(&v)?;
         }
-        v = self.value_proj.forward(&v)?;
+        v = Convolution.forward_2d(&self.value_proj, &v)?;
         let (_, _, vh, vw) = v.dims4()?;
         // [B, C, H, W] -> [B, H, W, C] -> [B, H*W, C] -> [B, 1, H*W, C]
         v = v
@@ -608,7 +643,7 @@ impl MultiQueryAttention2d {
             softmax_scale: self.scale as f32,
             sliding_window: None,
         };
-        let mut o = Sdpa.run_attention(&q, &k, &v, None, None, &sdpa_params)?;
+        let mut o = Sdpa.run_attention_noflash(&q, &k, &v, None, &sdpa_params)?;
 
         // Reshape output back
         // [B, num_heads, H*W, value_dim] -> [B, H*W, num_heads, value_dim] -> [B, H, W, num_heads * value_dim]
@@ -617,7 +652,7 @@ impl MultiQueryAttention2d {
             .reshape((b, h, w, self.num_heads * self.value_dim))?
             .permute((0, 3, 1, 2))?; // NHWC -> NCHW
 
-        o = self.output_proj.forward(&o)?;
+        o = Convolution.forward_2d(&self.output_proj, &o)?;
 
         Ok(o)
     }
@@ -1016,20 +1051,34 @@ pub struct VisionTower {
     blocks: Vec<Vec<Block>>,
     msfa: MobileNetV5MultiScaleFusionAdapter,
     msfa_indices: Vec<usize>,
+    old_vision_tower: bool,
 }
 
 impl VisionTower {
     pub fn new(vb: ShardedVarBuilder) -> Result<Self> {
+        // Some models have invalid vision tower weights from the old gemma 3n upload
+        // https://github.com/EricLBuehler/mistral.rs/issues/1592
+        let old_vision_tower = !vb.contains_tensor("conv_stem.conv.bias");
+        if old_vision_tower {
+            warn!(
+                "This model contains invalid vision tower weights from an old Gemma 3n upload.
+See: https://github.com/EricLBuehler/mistral.rs/issues/1592
+
+The vision tower for this model will still be loaded, but you might experience degraded quality."
+            );
+        }
+        let conv_stem_bias = !old_vision_tower;
         // Initial stem convolution
         let conv_stem = ConvNormAct::new(
-            3,    // in_chs
-            64,   // out_chs
-            3,    // kernel_size
-            2,    // stride
-            1,    // padding
-            1,    // groups
-            true, // apply_act
-            1e-5, // eps
+            3,              // in_chs
+            64,             // out_chs
+            3,              // kernel_size
+            2,              // stride
+            1,              // padding
+            1,              // groups
+            true,           // apply_act
+            1e-5,           // eps
+            conv_stem_bias, // bias
             vb.pp("conv_stem"),
         )?;
 
@@ -1125,12 +1174,23 @@ impl VisionTower {
             blocks,
             msfa,
             msfa_indices: vec![3, 4], // Indices for multi-scale features
+            old_vision_tower,
         })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut x = if self.old_vision_tower {
+            // Some models have invalid vision tower weights from the old gemma 3n upload
+            // https://github.com/EricLBuehler/mistral.rs/issues/1592
+
+            // This is a hack necessary because the weights for Gemma 3n are broken and require the image to be rotated.
+            x.t()?
+        } else {
+            x.clone()
+        };
+
         // Apply stem
-        let mut x = self.conv_stem.forward(x)?;
+        x = self.conv_stem.forward(&x)?;
 
         let mut intermediates = Vec::new();
 

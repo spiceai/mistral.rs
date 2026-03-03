@@ -5,45 +5,44 @@ pub struct MemoryUsage;
 
 impl MemoryUsage {
     /// Amount of available memory in bytes.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn get_memory_available(&self, device: &Device) -> Result<usize> {
         match device {
             Device::Cpu => {
                 let mut sys = System::new_all();
-                sys.refresh_cpu();
+                sys.refresh_cpu_all();
                 Ok(usize::try_from(sys.available_memory())?)
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(dev) => {
-                use candle_core::cuda::cudarc;
+                use candle_core::cuda::cudarc::driver::{result, sys};
                 use candle_core::cuda_backend::WrapErr;
-                use candle_core::{backend::BackendDevice, DeviceLocation};
 
-                let DeviceLocation::Cuda { gpu_id } = dev.location() else {
-                    candle_core::bail!("device and location do match")
+                dev.cuda_stream().context().bind_to_thread().w()?;
+
+                // Check if this is an integrated GPU (unified memory, e.g., NVIDIA GB10)
+                let ordinal = dev.cuda_stream().context().ordinal();
+                let cu_device = result::device::get(ordinal as i32).w()?;
+                let is_integrated = unsafe {
+                    result::device::get_attribute(
+                        cu_device,
+                        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED,
+                    )
+                    .map(|v| v != 0)
+                    .unwrap_or(false)
                 };
 
-                let original_ctx = dev.cu_primary_ctx();
-
-                let avail_mem = {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let cu_device = cudarc::driver::result::device::get(gpu_id as i32).w()?;
-
-                    // primary context initialization, can fail with OOM
-                    let cu_primary_ctx =
-                        unsafe { cudarc::driver::result::primary_ctx::retain(cu_device) }.w()?;
-
-                    unsafe { cudarc::driver::result::ctx::set_current(cu_primary_ctx) }.unwrap();
-
-                    let res = cudarc::driver::result::mem_get_info().w()?.0;
-
-                    unsafe { cudarc::driver::result::primary_ctx::release(cu_device) }.unwrap();
-
-                    res
-                };
-
-                unsafe { cudarc::driver::result::ctx::set_current(*original_ctx) }.unwrap();
-
-                Ok(avail_mem)
+                if is_integrated {
+                    // For integrated GPUs with unified memory, use system memory
+                    // Apply 3/4 fraction to leave room for OS and other processes
+                    let mut sys = System::new_all();
+                    sys.refresh_cpu_all();
+                    let avail = usize::try_from(sys.available_memory())?;
+                    Ok((avail * 3) / 4)
+                } else {
+                    let (free, _total) = result::mem_get_info().w()?;
+                    Ok(free)
+                }
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => {
@@ -51,12 +50,12 @@ impl MemoryUsage {
             }
             #[cfg(feature = "metal")]
             Device::Metal(dev) => {
-                let max = dev.recommended_max_working_set_size();
+                let max = dev.device().recommended_max_working_set_size();
                 let alloc = dev.current_allocated_size();
                 let avail = max.saturating_sub(alloc);
 
                 #[allow(clippy::cast_possible_truncation)]
-                Ok(avail as usize)
+                Ok(avail)
             }
             #[cfg(not(feature = "metal"))]
             Device::Metal(_) => {
@@ -66,45 +65,44 @@ impl MemoryUsage {
     }
 
     /// Amount of total memory in bytes.
+    #[allow(clippy::cast_possible_truncation)]
     pub fn get_total_memory(&self, device: &Device) -> Result<usize> {
         match device {
             Device::Cpu => {
                 let mut sys = System::new_all();
-                sys.refresh_cpu();
+                sys.refresh_cpu_all();
                 Ok(usize::try_from(sys.total_memory())?)
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(dev) => {
-                use candle_core::cuda::cudarc;
+                use candle_core::cuda::cudarc::driver::{result, sys};
                 use candle_core::cuda_backend::WrapErr;
-                use candle_core::{backend::BackendDevice, DeviceLocation};
 
-                let DeviceLocation::Cuda { gpu_id } = dev.location() else {
-                    candle_core::bail!("device and location do match")
+                dev.cuda_stream().context().bind_to_thread().w()?;
+
+                // Check if this is an integrated GPU (unified memory, e.g., NVIDIA GB10)
+                let ordinal = dev.cuda_stream().context().ordinal();
+                let cu_device = result::device::get(ordinal as i32).w()?;
+                let is_integrated = unsafe {
+                    result::device::get_attribute(
+                        cu_device,
+                        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED,
+                    )
+                    .map(|v| v != 0)
+                    .unwrap_or(false)
                 };
 
-                let original_ctx = dev.cu_primary_ctx();
-
-                let total_mem = {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let cu_device = cudarc::driver::result::device::get(gpu_id as i32).w()?;
-
-                    // primary context initialization, can fail with OOM
-                    let cu_primary_ctx =
-                        unsafe { cudarc::driver::result::primary_ctx::retain(cu_device) }.w()?;
-
-                    unsafe { cudarc::driver::result::ctx::set_current(cu_primary_ctx) }.unwrap();
-
-                    let res = cudarc::driver::result::mem_get_info().w()?.1;
-
-                    unsafe { cudarc::driver::result::primary_ctx::release(cu_device) }.unwrap();
-
-                    res
-                };
-
-                unsafe { cudarc::driver::result::ctx::set_current(*original_ctx) }.unwrap();
-
-                Ok(total_mem)
+                if is_integrated {
+                    // For integrated GPUs with unified memory, use system total memory
+                    // Apply 3/4 fraction similar to Metal's approach
+                    let mut sys = System::new_all();
+                    sys.refresh_cpu_all();
+                    let total = usize::try_from(sys.total_memory())?;
+                    Ok((total * 3) / 4)
+                } else {
+                    let (_free, total) = result::mem_get_info().w()?;
+                    Ok(total)
+                }
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => {
@@ -118,7 +116,7 @@ impl MemoryUsage {
                 // Get system RAM in MB
                 let system_ram_mb = {
                     let mut sys = System::new_all();
-                    sys.refresh_cpu();
+                    sys.refresh_cpu_all();
                     usize::try_from(sys.total_memory())? / SIZE_IN_MB
                 };
 
@@ -143,12 +141,12 @@ impl MemoryUsage {
                 };
 
                 let metal_cap_mb = match metal_cap_mb {
-                    Some(x) if x == 0 => default_cap,
+                    Some(0) => default_cap,
                     Some(x) => x,
                     None => default_cap,
                 };
 
-                let device_max = dev.recommended_max_working_set_size() as usize;
+                let device_max = dev.recommended_max_working_set_size();
                 let metal_cap_bytes = metal_cap_mb * SIZE_IN_MB;
 
                 Ok(device_max.min(metal_cap_bytes))

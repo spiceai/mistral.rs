@@ -4,8 +4,7 @@ pub(crate) mod memory_usage;
 pub(crate) mod model_config;
 pub(crate) mod normal;
 pub(crate) mod progress;
-#[allow(dead_code)]
-pub(crate) mod supports_attn_softmax;
+pub(crate) mod tiktoken;
 pub(crate) mod tokenizer;
 pub(crate) mod tokens;
 pub(crate) mod unvarbuilder;
@@ -19,6 +18,10 @@ macro_rules! get_mut_arcmutex {
             if let Ok(inner) = $thing.try_lock() {
                 break inner;
             }
+            // Yield to allow other threads to make progress and release the lock.
+            // This prevents deadlock when a spawned async task busy-loops while
+            // another task holds the lock across an await point.
+            std::thread::yield_now();
         }
     };
 }
@@ -117,6 +120,7 @@ macro_rules! handle_pipeline_forward_error {
                                 content: Some(res),
                                 role: "assistant".to_string(),
                                 tool_calls: None,
+                                reasoning_content: None,
                             },
                             logprobs: None,
                         };
@@ -146,14 +150,13 @@ macro_rules! handle_pipeline_forward_error {
                             usage: group.get_usage(),
                         };
 
-                        if let Err(e) = seq.responder()
+                        seq.responder()
                             .send(Response::ModelError(
                                 e.to_string(),
                                 partial_completion_response
                             ))
-                            .await {
-                                error!("{} - Failed to send partial chat response after error: {:?}", $stage, &e);
-                            };
+                            .await
+                            .unwrap();
                     } else {
                         let partial_completion_response = CompletionResponse {
                             id: seq.id().to_string(),
@@ -165,14 +168,13 @@ macro_rules! handle_pipeline_forward_error {
                             usage: group.get_usage(),
                         };
 
-                        if let Err(e) = seq.responder()
+                        seq.responder()
                             .send(Response::CompletionModelError(
                                 e.to_string(),
                                 partial_completion_response
                             ))
-                            .await {
-                                error!("{} - Failed to send partial completion response after error: {:?}", $stage, &e);
-                            };
+                            .await
+                            .unwrap();
                     }
                 }
                 for seq in $seq_slice.iter_mut() {
@@ -201,6 +203,8 @@ macro_rules! get_mut_group {
             if let Ok(inner) = $this.group.try_lock() {
                 break inner;
             }
+            // Yield to allow other threads to make progress and release the lock.
+            std::thread::yield_now();
         }
     };
 }

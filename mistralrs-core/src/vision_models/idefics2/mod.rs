@@ -4,7 +4,7 @@ pub(crate) mod idefics2_input_processor;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::{Conv2d, Conv2dConfig, Embedding, LayerNorm, Module};
-use mistralrs_quant::ShardedVarBuilder;
+use mistralrs_quant::{Convolution, ShardedVarBuilder};
 use serde::Deserialize;
 use std::{any::Any, ops::Mul};
 
@@ -143,7 +143,7 @@ pub struct VisionConfig {
     #[serde(default = "default_0_0")]
     pub attn_dropout: f32,
     #[serde(default = "default_0_02")]
-    pub initiailizer_range: f32,
+    pub initializer_range: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -187,6 +187,7 @@ impl From<TextConfig> for mistral::Config {
             max_position_embeddings: val.max_position_embeddings,
             rms_norm_eps: val.rms_norm_eps,
             rope_theta: val.rope_theta,
+            rope_parameters: None,
             sliding_window: val.sliding_window,
             head_dim: None,
             quantization_config: None,
@@ -277,7 +278,7 @@ impl VisionEmbeddings {
     fn forward(&self, pixel_values: &Tensor, patch_attention_mask: &Tensor) -> Result<Tensor> {
         let (bs, _, max_im_h, max_im_w) = pixel_values.dims4()?;
 
-        let patch_embeds = self.patch_embedding.forward(pixel_values)?;
+        let patch_embeds = Convolution.forward_2d(&self.patch_embedding, pixel_values)?;
 
         let embeddings = patch_embeds.flatten(2, D::Minus1)?.transpose(1, 2)?;
 
@@ -1065,7 +1066,11 @@ impl Idefics2 {
         for (i, v) in special_image_token_mask.iter().enumerate() {
             if *v != 0 {
                 new_inputs_embeds = new_inputs_embeds.slice_assign(
-                    &[&.., &i, &..],
+                    &[
+                        0..new_inputs_embeds.dim(0)?,
+                        i..i + 1,
+                        0..new_inputs_embeds.dim(2)?,
+                    ],
                     &reshaped_image_hidden_states
                         .i((.., image_hidden_state_i, ..))?
                         .unsqueeze(1)?,

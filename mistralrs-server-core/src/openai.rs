@@ -7,6 +7,7 @@ use mistralrs_core::{
     ImageGenerationResponseFormat, LlguidanceGrammar, Tool, ToolChoice, ToolType, WebSearchOptions,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use utoipa::{
     openapi::{schema::SchemaType, ArrayBuilder, ObjectBuilder, OneOfBuilder, RefOr, Schema, Type},
     PartialSchema, ToSchema,
@@ -98,6 +99,90 @@ impl ToSchema for MessageContent {
     }
 }
 
+impl MessageContent {
+    /// Create a new MessageContent from a string
+    pub fn from_text(text: String) -> Self {
+        MessageContent(Either::Left(text))
+    }
+
+    /// Create a new MessageContent from multimodal parts
+    pub fn from_parts(parts: Vec<HashMap<String, MessageInnerContent>>) -> Self {
+        MessageContent(Either::Right(parts))
+    }
+
+    /// Create a text content part for multimodal messages
+    pub fn text_part(text: String) -> HashMap<String, MessageInnerContent> {
+        let mut part = HashMap::new();
+        part.insert(
+            "type".to_string(),
+            MessageInnerContent(Either::Left("text".to_string())),
+        );
+        part.insert("text".to_string(), MessageInnerContent(Either::Left(text)));
+        part
+    }
+
+    /// Create an image URL content part for multimodal messages
+    pub fn image_url_part(url: String) -> HashMap<String, MessageInnerContent> {
+        let mut part = HashMap::new();
+        part.insert(
+            "type".to_string(),
+            MessageInnerContent(Either::Left("image_url".to_string())),
+        );
+        let mut image_url_obj = HashMap::new();
+        image_url_obj.insert("url".to_string(), url);
+        part.insert(
+            "image_url".to_string(),
+            MessageInnerContent(Either::Right(image_url_obj)),
+        );
+        part
+    }
+
+    /// Create an image URL content part with detail level
+    pub fn image_url_part_with_detail(
+        url: String,
+        detail: String,
+    ) -> HashMap<String, MessageInnerContent> {
+        let mut part = HashMap::new();
+        part.insert(
+            "type".to_string(),
+            MessageInnerContent(Either::Left("image_url".to_string())),
+        );
+        let mut image_url_obj = HashMap::new();
+        image_url_obj.insert("url".to_string(), url);
+        image_url_obj.insert("detail".to_string(), detail);
+        part.insert(
+            "image_url".to_string(),
+            MessageInnerContent(Either::Right(image_url_obj)),
+        );
+        part
+    }
+
+    /// Extract text from MessageContent
+    pub fn to_text(&self) -> Option<String> {
+        match &self.0 {
+            Either::Left(text) => Some(text.clone()),
+            Either::Right(parts) => {
+                // For complex content, try to extract text from parts
+                let mut text_parts = Vec::new();
+                for part in parts {
+                    for (key, value) in part {
+                        if key == "text" {
+                            if let Either::Left(text) = &**value {
+                                text_parts.push(text.clone());
+                            }
+                        }
+                    }
+                }
+                if text_parts.is_empty() {
+                    None
+                } else {
+                    Some(text_parts.join(" "))
+                }
+            }
+        }
+    }
+}
+
 impl Deref for MessageContent {
     type Target = Either<String, Vec<HashMap<String, MessageInnerContent>>>;
     fn deref(&self) -> &Self::Target {
@@ -138,9 +223,9 @@ fn message_content_schema() -> Schema {
 pub struct FunctionCalled {
     /// The name of the function to call
     pub name: String,
-    /// The function arguments
-    #[serde(alias = "arguments")]
-    pub parameters: String,
+    /// The function arguments (JSON string)
+    #[serde(alias = "parameters")]
+    pub arguments: String,
 }
 
 /// Represents a tool call made by the assistant
@@ -148,6 +233,9 @@ pub struct FunctionCalled {
 /// This structure wraps a function call with its type information.
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize, ToSchema)]
 pub struct ToolCall {
+    /// Unique identifier for this tool call
+    #[serde(default)]
+    pub id: Option<String>,
     /// The type of tool being called
     #[serde(rename = "type")]
     pub tp: ToolType,
@@ -186,8 +274,10 @@ pub struct Message {
     /// The role of the message sender ("user", "assistant", "system", "tool", etc.)
     pub role: String,
     pub name: Option<String>,
-    /// Optional list of tool calls
+    /// Optional list of tool calls (for assistant messages)
     pub tool_calls: Option<Vec<ToolCall>>,
+    /// Tool call ID this message is responding to (for tool messages)
+    pub tool_call_id: Option<String>,
 }
 
 /// Stop token configuration for generation
@@ -470,6 +560,8 @@ pub struct ChatCompletionRequest {
     pub presence_penalty: Option<f32>,
     #[schema(example = json!(Option::None::<f32>))]
     pub frequency_penalty: Option<f32>,
+    #[schema(example = json!(Option::None::<f32>))]
+    pub repetition_penalty: Option<f32>,
     #[serde(rename = "stop")]
     #[schema(example = json!(Option::None::<StopTokens>))]
     pub stop_seqs: Option<StopTokens>,
@@ -505,6 +597,13 @@ pub struct ChatCompletionRequest {
     pub dry_sequence_breakers: Option<Vec<String>>,
     #[schema(example = json!(Option::None::<bool>))]
     pub enable_thinking: Option<bool>,
+    /// Reasoning effort level for Harmony-format models (GPT-OSS).
+    /// Controls the depth of reasoning/analysis: "low", "medium", or "high".
+    #[schema(example = json!(Option::None::<String>))]
+    pub reasoning_effort: Option<String>,
+    #[schema(example = json!(Option::None::<bool>))]
+    #[serde(default)]
+    pub truncate_sequence: Option<bool>,
 }
 
 /// Function for ChatCompletionRequest.messages Schema generation to handle `Either`
@@ -534,6 +633,9 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    /// Model status: "loaded", "unloaded", or "reloading"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     /// Whether tools are available through MCP or tool callbacks
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools_available: Option<bool>,
@@ -606,6 +708,8 @@ pub struct CompletionRequest {
     #[schema(example = json!(Option::None::<f64>))]
     pub min_p: Option<f64>,
     #[schema(example = json!(Option::None::<f32>))]
+    pub repetition_penalty: Option<f32>,
+    #[schema(example = json!(Option::None::<f32>))]
     pub dry_multiplier: Option<f32>,
     #[schema(example = json!(Option::None::<f32>))]
     pub dry_base: Option<f32>,
@@ -613,6 +717,179 @@ pub struct CompletionRequest {
     pub dry_allowed_length: Option<usize>,
     #[schema(example = json!(Option::None::<String>))]
     pub dry_sequence_breakers: Option<Vec<String>>,
+    #[schema(example = json!(Option::None::<bool>))]
+    #[serde(default)]
+    pub truncate_sequence: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    Single(String),
+    Multiple(Vec<String>),
+    Tokens(Vec<u32>),
+    TokensBatch(Vec<Vec<u32>>),
+}
+
+impl PartialSchema for EmbeddingInput {
+    fn schema() -> RefOr<Schema> {
+        RefOr::T(embedding_input_schema())
+    }
+}
+
+impl ToSchema for EmbeddingInput {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        schemas.push((EmbeddingInput::name().into(), EmbeddingInput::schema()));
+    }
+}
+
+fn embedding_input_schema() -> Schema {
+    Schema::OneOf(
+        OneOfBuilder::new()
+            .item(Schema::Object(
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(Type::String))
+                    .description(Some("Single input string"))
+                    .build(),
+            ))
+            .item(Schema::Array(
+                ArrayBuilder::new()
+                    .items(RefOr::T(Schema::Object(
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::Type(Type::String))
+                            .build(),
+                    )))
+                    .description(Some("Multiple input strings"))
+                    .build(),
+            ))
+            .item(Schema::Array(
+                ArrayBuilder::new()
+                    .items(RefOr::T(Schema::Object(
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::Type(Type::Integer))
+                            .build(),
+                    )))
+                    .description(Some("Single token array"))
+                    .build(),
+            ))
+            .item(Schema::Array(
+                ArrayBuilder::new()
+                    .items(RefOr::T(Schema::Array(
+                        ArrayBuilder::new()
+                            .items(RefOr::T(Schema::Object(
+                                ObjectBuilder::new()
+                                    .schema_type(SchemaType::Type(Type::Integer))
+                                    .build(),
+                            )))
+                            .build(),
+                    )))
+                    .description(Some("Multiple token arrays"))
+                    .build(),
+            ))
+            .build(),
+    )
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingEncodingFormat {
+    #[default]
+    Float,
+    Base64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct EmbeddingRequest {
+    #[schema(example = "default")]
+    #[serde(default = "default_model")]
+    pub model: String,
+    pub input: EmbeddingInput,
+    #[schema(example = "float")]
+    #[serde(default)]
+    pub encoding_format: Option<EmbeddingEncodingFormat>,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub dimensions: Option<usize>,
+    #[schema(example = json!(Option::None::<String>))]
+    #[serde(rename = "user")]
+    pub _user: Option<String>,
+
+    // mistral.rs additional
+    #[schema(example = json!(Option::None::<bool>))]
+    #[serde(default)]
+    pub truncate_sequence: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: u32,
+    pub total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum EmbeddingVector {
+    Float(Vec<f32>),
+    Base64(String),
+}
+
+impl PartialSchema for EmbeddingVector {
+    fn schema() -> RefOr<Schema> {
+        RefOr::T(embedding_vector_schema())
+    }
+}
+
+impl ToSchema for EmbeddingVector {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        schemas.push((EmbeddingVector::name().into(), EmbeddingVector::schema()));
+    }
+}
+
+fn embedding_vector_schema() -> Schema {
+    Schema::OneOf(
+        OneOfBuilder::new()
+            .item(Schema::Array(
+                ArrayBuilder::new()
+                    .items(RefOr::T(Schema::Object(
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::Type(Type::Number))
+                            .build(),
+                    )))
+                    .description(Some("Embedding returned as an array of floats"))
+                    .build(),
+            ))
+            .item(Schema::Object(
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(Type::String))
+                    .description(Some("Embedding returned as a base64-encoded string"))
+                    .build(),
+            ))
+            .build(),
+    )
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EmbeddingData {
+    pub object: &'static str,
+    pub embedding: EmbeddingVector,
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct EmbeddingResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingData>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
 }
 
 /// Image generation request
@@ -693,4 +970,261 @@ pub struct SpeechGenerationRequest {
     /// The desired audio format for the generated speech.
     #[schema(example = "mp3")]
     pub response_format: AudioResponseFormat,
+}
+
+/// Helper type for messages field in ResponsesCreateRequest
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ResponsesMessages {
+    Messages(Vec<Message>),
+    String(String),
+}
+
+impl ResponsesMessages {
+    pub fn into_either(self) -> Either<Vec<Message>, String> {
+        match self {
+            ResponsesMessages::Messages(msgs) => Either::Left(msgs),
+            ResponsesMessages::String(s) => Either::Right(s),
+        }
+    }
+}
+
+impl PartialSchema for ResponsesMessages {
+    fn schema() -> RefOr<Schema> {
+        RefOr::T(messages_schema())
+    }
+}
+
+impl ToSchema for ResponsesMessages {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        schemas.push((
+            ResponsesMessages::name().into(),
+            ResponsesMessages::schema(),
+        ));
+    }
+}
+
+/// Response creation request
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct ResponsesCreateRequest {
+    #[schema(example = "mistral")]
+    #[serde(default = "default_model")]
+    pub model: String,
+    pub input: ResponsesMessages,
+    #[schema(example = json!(Option::None::<String>))]
+    pub instructions: Option<String>,
+    #[schema(example = json!(Option::None::<Vec<String>>))]
+    pub modalities: Option<Vec<String>>,
+    #[schema(example = json!(Option::None::<String>))]
+    pub previous_response_id: Option<String>,
+    #[schema(example = json!(Option::None::<HashMap<u32, f32>>))]
+    pub logit_bias: Option<HashMap<u32, f32>>,
+    #[serde(default = "default_false")]
+    #[schema(example = false)]
+    pub logprobs: bool,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub top_logprobs: Option<usize>,
+    #[schema(example = 256)]
+    #[serde(alias = "max_completion_tokens", alias = "max_output_tokens")]
+    pub max_tokens: Option<usize>,
+    #[serde(rename = "n")]
+    #[serde(default = "default_1usize")]
+    #[schema(example = 1)]
+    pub n_choices: usize,
+    #[schema(example = json!(Option::None::<f32>))]
+    pub presence_penalty: Option<f32>,
+    #[schema(example = json!(Option::None::<f32>))]
+    pub frequency_penalty: Option<f32>,
+    #[serde(rename = "stop")]
+    #[schema(example = json!(Option::None::<StopTokens>))]
+    pub stop_seqs: Option<StopTokens>,
+    #[schema(example = 0.7)]
+    pub temperature: Option<f64>,
+    #[schema(example = json!(Option::None::<f64>))]
+    pub top_p: Option<f64>,
+    #[schema(example = false)]
+    pub stream: Option<bool>,
+    #[schema(example = json!(Option::None::<Vec<Tool>>))]
+    pub tools: Option<Vec<Tool>>,
+    #[schema(example = json!(Option::None::<ToolChoice>))]
+    pub tool_choice: Option<ToolChoice>,
+    #[schema(example = json!(Option::None::<ResponseFormat>))]
+    pub response_format: Option<ResponseFormat>,
+    #[schema(example = json!(Option::None::<WebSearchOptions>))]
+    pub web_search_options: Option<WebSearchOptions>,
+    #[schema(example = json!(Option::None::<Value>))]
+    pub metadata: Option<Value>,
+    #[schema(example = json!(Option::None::<bool>))]
+    pub output_token_details: Option<bool>,
+    #[schema(example = json!(Option::None::<bool>))]
+    pub parallel_tool_calls: Option<bool>,
+    #[schema(example = json!(Option::None::<bool>))]
+    pub store: Option<bool>,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub max_tool_calls: Option<usize>,
+    #[schema(example = json!(Option::None::<bool>))]
+    pub reasoning_enabled: Option<bool>,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub reasoning_max_tokens: Option<usize>,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub reasoning_top_logprobs: Option<usize>,
+    #[schema(example = json!(Option::None::<Vec<String>>))]
+    pub truncation: Option<HashMap<String, Value>>,
+
+    // mistral.rs additional
+    #[schema(example = json!(Option::None::<usize>))]
+    pub top_k: Option<usize>,
+    #[schema(example = json!(Option::None::<Grammar>))]
+    pub grammar: Option<Grammar>,
+    #[schema(example = json!(Option::None::<f64>))]
+    pub min_p: Option<f64>,
+    #[schema(example = json!(Option::None::<f32>))]
+    pub repetition_penalty: Option<f32>,
+    #[schema(example = json!(Option::None::<f32>))]
+    pub dry_multiplier: Option<f32>,
+    #[schema(example = json!(Option::None::<f32>))]
+    pub dry_base: Option<f32>,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub dry_allowed_length: Option<usize>,
+    #[schema(example = json!(Option::None::<String>))]
+    pub dry_sequence_breakers: Option<Vec<String>>,
+    #[schema(example = json!(Option::None::<bool>))]
+    pub enable_thinking: Option<bool>,
+    #[schema(example = json!(Option::None::<bool>))]
+    #[serde(default)]
+    pub truncate_sequence: Option<bool>,
+    /// Reasoning effort level for models that support extended thinking.
+    /// Valid values: "low", "medium", "high"
+    #[schema(example = json!(Option::None::<String>))]
+    pub reasoning_effort: Option<String>,
+}
+
+/// Response object
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesObject {
+    pub id: String,
+    pub object: &'static str,
+    pub created_at: f64,
+    pub model: String,
+    pub status: String,
+    pub output: Vec<ResponsesOutput>,
+    pub output_text: Option<String>,
+    pub usage: Option<ResponsesUsage>,
+    pub error: Option<ResponsesError>,
+    pub metadata: Option<Value>,
+    pub instructions: Option<String>,
+    pub incomplete_details: Option<ResponsesIncompleteDetails>,
+}
+
+/// Response usage information
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesUsage {
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub total_tokens: usize,
+    pub input_tokens_details: Option<ResponsesInputTokensDetails>,
+    pub output_tokens_details: Option<ResponsesOutputTokensDetails>,
+}
+
+/// Input tokens details
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesInputTokensDetails {
+    pub audio_tokens: Option<usize>,
+    pub cached_tokens: Option<usize>,
+    pub image_tokens: Option<usize>,
+    pub text_tokens: Option<usize>,
+}
+
+/// Output tokens details
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesOutputTokensDetails {
+    pub audio_tokens: Option<usize>,
+    pub text_tokens: Option<usize>,
+    pub reasoning_tokens: Option<usize>,
+}
+
+/// Response error
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesError {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
+}
+
+/// Incomplete details for incomplete responses
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesIncompleteDetails {
+    pub reason: String,
+}
+
+/// Response output item
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesOutput {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub output_type: String,
+    pub role: String,
+    pub status: Option<String>,
+    pub content: Vec<ResponsesContent>,
+}
+
+/// Response content item
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    pub text: Option<String>,
+    pub annotations: Option<Vec<ResponsesAnnotation>>,
+}
+
+/// Response annotation
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesAnnotation {
+    #[serde(rename = "type")]
+    pub annotation_type: String,
+    pub text: String,
+    pub start_index: usize,
+    pub end_index: usize,
+}
+
+/// Response streaming chunk
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesChunk {
+    pub id: String,
+    pub object: &'static str,
+    pub created_at: f64,
+    pub model: String,
+    pub chunk_type: String,
+    pub delta: Option<ResponsesDelta>,
+    pub usage: Option<ResponsesUsage>,
+    pub metadata: Option<Value>,
+}
+
+/// Response delta for streaming
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesDelta {
+    pub output: Option<Vec<ResponsesDeltaOutput>>,
+    pub status: Option<String>,
+}
+
+/// Response delta output item
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesDeltaOutput {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub output_type: String,
+    pub content: Option<Vec<ResponsesDeltaContent>>,
+}
+
+/// Response delta content item
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesDeltaContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    pub text: Option<String>,
 }

@@ -58,9 +58,16 @@ pub trait Scheduler: Send + Sync {
     fn add_seq(&mut self, seq: Sequence);
     /// This may do nothing. It depends on the implementation
     fn free_finished_sequence_groups(&mut self);
+    /// Get Mamba state pool indices of finished sequences for freeing.
+    /// Called before free_finished_sequence_groups to allow cleanup of hybrid cache slots.
+    fn get_finished_mamba_indices(&self) -> Vec<usize>;
 
     // PagedAttention metadata
     fn block_tables(&self) -> Option<BlockTables>;
     fn block_size(&self) -> Option<usize>;
     fn block_engine(&self) -> Option<Arc<Mutex<BlockEngine>>>;
+
+    /// Set whether prefix caching is enabled. Called by Engine after creation
+    /// to synchronize with the global no_prefix_cache setting.
+    fn set_prefix_caching_enabled(&mut self, enabled: bool);
 }

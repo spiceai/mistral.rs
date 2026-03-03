@@ -37,7 +37,9 @@ impl QuantMethod for UnquantLinear {
             | QuantMethodConfig::FP8 { .. }
             | QuantMethodConfig::Bnb { .. }
             | QuantMethodConfig::BlockwiseFP8 { .. }
-            | QuantMethodConfig::Afq { .. } => unreachable!(),
+            | QuantMethodConfig::PerTensorFP8 { .. }
+            | QuantMethodConfig::Afq { .. }
+            | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
             QuantMethodConfig::Unquantized(l) => Ok(Self {
                 w: l.weight().clone(),
                 b: l.bias().cloned(),
@@ -53,6 +55,12 @@ impl QuantMethod for UnquantLinear {
     fn forward(&self, a: &Tensor) -> Result<Tensor> {
         // Batch matrix multiplication
         maybe_init_cublas_lt_wrapper(a.device().clone());
+
+        // Try custom GEMV for single-token decode (batch_size=1)
+        #[cfg(feature = "cuda")]
+        if crate::gemv::should_use_gemv(a, &self.w) {
+            return crate::gemv::gemv(a, &self.w, self.b.as_ref());
+        }
 
         let w = match *a.dims() {
             [b1, b2, _, _] => self.w.broadcast_left((b1, b2))?,
@@ -73,7 +81,7 @@ impl QuantMethod for UnquantLinear {
                 DeviceLocation::Cuda { .. } => {
                     // Try to use cublaslt, otherwise fallback to gemm
                     if let (Device::Cuda(_), Some(cublaslt)) =
-                        (a.device(), CUBLASLT_CONTROLLER.get())
+                        (a.device(), CUBLASLT_CONTROLLER.get_for_device(a.device()))
                     {
                         cublaslt
                             .batch_matmul(
@@ -87,50 +95,121 @@ impl QuantMethod for UnquantLinear {
                             )?
                             .t()
                     } else {
-                        let mut out = b.contiguous()?;
-                        a.matmul_with_alpha_beta(&w.t()?, &mut out, None)?;
-                        Ok(out)
+                        let matmul_result = a.matmul(&w.t()?)?;
+                        matmul_result.broadcast_add(&b)
                     }
                 }
                 DeviceLocation::Metal { .. } => {
-                    let mut out = b.contiguous()?;
-                    a.matmul_with_alpha_beta(&w.t()?, &mut out, None)?;
-                    Ok(out)
+                    let matmul_result = a.matmul(&w.t()?)?;
+                    matmul_result.broadcast_add(&b)
                 }
                 DeviceLocation::Cpu => {
                     #[cfg(feature = "accelerate")]
                     {
                         let original_dtype = a.dtype();
-                        let mut out = b.contiguous()?.to_dtype(DType::F32)?;
-                        a.to_dtype(DType::F32)?.matmul_with_alpha_beta(
-                            &w.t()?.to_dtype(DType::F32)?,
-                            &mut out,
-                            None,
-                        )?;
-                        out.to_dtype(original_dtype)
+                        let a_f32 = a.to_dtype(DType::F32)?;
+                        let w_f32 = w.t()?.to_dtype(DType::F32)?;
+                        let b_f32 = b.to_dtype(DType::F32)?;
+                        let matmul_result = a_f32.matmul(&w_f32)?;
+                        matmul_result
+                            .broadcast_add(&b_f32)?
+                            .to_dtype(original_dtype)
                     }
                     #[cfg(not(feature = "accelerate"))]
                     {
-                        let mut out = b.contiguous()?;
-                        a.matmul_with_alpha_beta(&w.t()?, &mut out, None)?;
-                        Ok(out)
+                        let matmul_result = a.matmul(&w.t()?)?;
+                        matmul_result.broadcast_add(&b)
                     }
                 }
             }
-        } else if let (Device::Cuda(_), Some(cublaslt)) = (a.device(), CUBLASLT_CONTROLLER.get()) {
-            cublaslt
-                .batch_matmul(a, &w, None, None, None, None, None)?
-                .t()
+        } else if let (Device::Cuda(_), Some(cublaslt)) =
+            (a.device(), CUBLASLT_CONTROLLER.get_for_device(a.device()))
+        {
+            // cuBLAS batch_matmul requires 3D tensors, fall back to regular matmul for 2D
+            if a.rank() >= 3 && w.rank() >= 3 {
+                cublaslt
+                    .batch_matmul(a, &w, None, None, None, None, None)?
+                    .t()
+            } else {
+                MatMul.matmul(a, &w.t()?)
+            }
         } else {
             MatMul.matmul(a, &w.t()?)
         }
     }
 
     fn gather_forward(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
-        // Assume only one expert used.
-        let w = self.w.index_select(indices, 0)?;
+        // Weights are [num_experts, out_features, in_features]
+        // For Metal path:
+        //   - a: (b_size, seq_len, 1, 1, hidden_dim) - 5D
+        //   - indices: (b_size, seq_len, num_experts_per_tok) - 3D
+        // For CUDA path:
+        //   - a: (num_tokens, 1, hidden_dim) - 3D
+        //   - indices: (num_tokens, num_experts_per_tok) - 2D
 
-        a.broadcast_matmul(&w.t()?)
+        let w = &self.w;
+        let (_num_experts, out_features, _in_features) = w.dims3()?;
+
+        match a.dims() {
+            // Metal path: 5D input (b_size, seq_len, 1, 1, hidden_dim)
+            &[b_size, seq_len, 1, 1, hidden_dim] => {
+                let (_b, _s, num_experts_per_tok) = indices.dims3()?;
+                // Flatten indices to select experts
+                let flat_indices = indices.reshape((b_size * seq_len * num_experts_per_tok,))?;
+
+                // Select expert weights: [b*s*k, out_features, in_features]
+                let selected_w = w.index_select(&flat_indices, 0)?;
+
+                // Reshape input: [b*s, hidden_dim]
+                let a_flat = a.reshape((b_size * seq_len, hidden_dim))?;
+
+                // For each token, we need to compute with each selected expert
+                // Broadcast a to match: [b*s, 1, hidden_dim] -> [b*s, k, hidden_dim]
+                let a_expanded = a_flat
+                    .unsqueeze(1)?
+                    .broadcast_as((b_size * seq_len, num_experts_per_tok, hidden_dim))?
+                    .reshape((b_size * seq_len * num_experts_per_tok, hidden_dim))?;
+
+                // Matmul: [b*s*k, hidden_dim] @ [b*s*k, hidden_dim, out_features] -> [b*s*k, out_features]
+                let result = a_expanded
+                    .unsqueeze(1)?
+                    .matmul(&selected_w.transpose(1, 2)?)?
+                    .squeeze(1)?;
+
+                // Reshape back to [b, s, k, out_features]
+                result.reshape((b_size, seq_len, num_experts_per_tok, out_features))
+            }
+            // CUDA path: 3D input (num_tokens, 1, hidden_dim)
+            &[num_tokens, 1, hidden_dim] => {
+                let (_, num_experts_per_tok) = indices.dims2()?;
+
+                // Flatten indices
+                let flat_indices = indices.reshape((num_tokens * num_experts_per_tok,))?;
+
+                // Select expert weights: [n*k, out_features, in_features]
+                let selected_w = w.index_select(&flat_indices, 0)?;
+
+                // Broadcast input: [n, 1, hidden] -> [n, k, hidden] -> [n*k, hidden]
+                let a_expanded = a
+                    .broadcast_as((num_tokens, num_experts_per_tok, hidden_dim))?
+                    .reshape((num_tokens * num_experts_per_tok, hidden_dim))?;
+
+                // Matmul: [n*k, hidden] @ [n*k, hidden, out] -> [n*k, out]
+                let result = a_expanded
+                    .unsqueeze(1)?
+                    .matmul(&selected_w.transpose(1, 2)?)?
+                    .squeeze(1)?;
+
+                // Reshape to [n, k, out]
+                result.reshape((num_tokens, num_experts_per_tok, out_features))
+            }
+            dims => {
+                candle_core::bail!(
+                    "UnquantLinear::gather_forward: unsupported input shape {:?}",
+                    dims
+                );
+            }
+        }
     }
 
     fn quantized_act_type(&self) -> Option<DType> {
@@ -321,10 +400,10 @@ impl QuantizedSerde for UnquantLinear {
     fn name(&self) -> &'static str {
         "unquant-linear"
     }
-    fn serialize(&self) -> Result<Cow<[u8]>> {
+    fn serialize(&self) -> Result<Cow<'_, [u8]>> {
         self.serialize_with_bias(self.b.clone())
     }
-    fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<[u8]>> {
+    fn serialize_with_bias(&self, bias: Option<Tensor>) -> Result<Cow<'_, [u8]>> {
         let mut buffer = Vec::new();
 
         // Version is always first!

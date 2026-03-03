@@ -5,25 +5,35 @@ const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 
 #[cfg(all(feature = "cuda", target_family = "unix"))]
 fn main() -> Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::prelude::*;
     use std::path::PathBuf;
     use std::process::Command;
 
-    const OTHER_CONTENT: &str = r#"
-pub const USE_FP8: bool = false;
-
-mod backend;
-mod ffi;
-
-pub use backend::{copy_blocks, paged_attention, reshape_and_cache, swap_blocks};
-    "#;
+    // Declare expected cfg values for check-cfg lint
+    println!("cargo::rustc-check-cfg=cfg(has_fp8)");
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/cuda/pagedattention.cuh");
     println!("cargo:rerun-if-changed=src/cuda/copy_blocks_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/reshape_and_cache_kernel.cu");
-
+    println!("cargo:rerun-if-changed=src/cuda/concat_and_cache_mla_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/gather_mla_cache_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer_mla_decode.cu");
+    println!("cargo:rerun-if-changed=src/cuda/update_kvscales.cu");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/cp_async.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/exception.h");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/fastdiv.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/layout.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/math.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/page.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/pos_enc.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/utils.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/vec_dtypes.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/cascade.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/decode.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/default_decode_params.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/state.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/variant_helper.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/variants.cuh");
     // Detect CUDA compute capability for FP8 support
     let compute_cap = {
         if let Ok(var) = std::env::var("CUDA_COMPUTE_CAP") {
@@ -97,34 +107,12 @@ pub use backend::{copy_blocks, paged_attention, reshape_and_cache, swap_blocks};
     };
     builder.build_lib(out_file);
 
-    let kernel_dir = PathBuf::from("../mistralrs-paged-attn");
-    let absolute_kernel_dir = std::fs::canonicalize(kernel_dir).unwrap();
-
-    println!(
-        "cargo:rustc-link-search=native={}",
-        absolute_kernel_dir.display()
-    );
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=mistralrspagedattention");
     println!("cargo:rustc-link-lib=dylib=cudart");
 
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open("src/cuda/mod.rs")
-        .unwrap();
-
-    // Build the new content
-    let new_ct = if using_fp8 {
-        &OTHER_CONTENT
-            .trim()
-            .replace("USE_FP8: bool = false", "USE_FP8: bool = true")
-    } else {
-        OTHER_CONTENT.trim()
-    };
-
-    // Add the other stuff back
-    if let Err(e) = writeln!(file, "{new_ct}") {
-        anyhow::bail!("Error while building dependencies: {:?}\n", e)
+    if using_fp8 {
+        println!("cargo:rustc-cfg=has_fp8");
     }
     Ok(())
 }
@@ -135,7 +123,15 @@ fn main() -> Result<(), String> {
     use std::process::Command;
     use std::{env, str};
 
-    const METAL_SOURCES: [&str; 3] = ["copy_blocks", "pagedattention", "reshape_and_cache"];
+    // Declare expected cfg values for check-cfg lint
+    println!("cargo::rustc-check-cfg=cfg(has_fp8)");
+
+    const METAL_SOURCES: [&str; 4] = [
+        "copy_blocks",
+        "pagedattention",
+        "reshape_and_cache",
+        "kv_scale_update",
+    ];
     for src in METAL_SOURCES {
         println!("cargo::rerun-if-changed=src/metal/kernels/{src}.metal");
     }
@@ -156,8 +152,8 @@ fn main() -> Result<(), String> {
         );
         // Write a dummy metallib file to satisfy the include_bytes! macro
         let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?);
-        std::fs::write(out_dir.join("mistralrs_paged_attention.metallib"), &[]).unwrap();
-        std::fs::write(out_dir.join("mistralrs_paged_attention_ios.metallib"), &[]).unwrap();
+        std::fs::write(out_dir.join("mistralrs_paged_attention.metallib"), []).unwrap();
+        std::fs::write(out_dir.join("mistralrs_paged_attention_ios.metallib"), []).unwrap();
         return Ok(());
     }
 
@@ -171,6 +167,15 @@ fn main() -> Result<(), String> {
             match self {
                 Platform::MacOS => "macosx",
                 Platform::Ios => "iphoneos",
+            }
+        }
+
+        fn metal_std(&self) -> &str {
+            // Use Metal 3.1 unified standard for both platforms
+            // This fixes Xcode 26+ where the default Metal standard may be too low
+            // https://github.com/EricLBuehler/mistral.rs/issues/1844
+            match self {
+                Platform::MacOS | Platform::Ios => "metal3.1",
             }
         }
     }
@@ -187,6 +192,7 @@ fn main() -> Result<(), String> {
             .arg("--sdk")
             .arg(platform.sdk())
             .arg("metal")
+            .arg(format!("-std={}", platform.metal_std()))
             .arg(format!("-working-directory={working_directory}"))
             .arg("-Wall")
             .arg("-Wextra")
@@ -209,10 +215,7 @@ fn main() -> Result<(), String> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    panic!(
-                        "Compiling metal -> air failed. Exit with status: {}",
-                        status
-                    )
+                    panic!("Compiling metal -> air failed. Exit with status: {status}")
                 }
             }
             Ok(None) => {
@@ -220,13 +223,10 @@ fn main() -> Result<(), String> {
                     .wait()
                     .expect("Compiling metal -> air failed while waiting for result");
                 if !status.success() {
-                    panic!(
-                        "Compiling metal -> air failed. Exit with status: {}",
-                        status
-                    )
+                    panic!("Compiling metal -> air failed. Exit with status: {status}")
                 }
             }
-            Err(e) => panic!("Compiling metal -> air failed: {:?}", e),
+            Err(e) => panic!("Compiling metal -> air failed: {e:?}"),
         }
 
         // Compile air to metallib
@@ -251,10 +251,7 @@ fn main() -> Result<(), String> {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
-                    panic!(
-                        "Compiling air -> metallib failed. Exit with status: {}",
-                        status
-                    )
+                    panic!("Compiling air -> metallib failed. Exit with status: {status}")
                 }
             }
             Ok(None) => {
@@ -262,13 +259,10 @@ fn main() -> Result<(), String> {
                     .wait()
                     .expect("Compiling air -> metallib failed while waiting for result");
                 if !status.success() {
-                    panic!(
-                        "Compiling air -> metallib failed. Exit with status: {}",
-                        status
-                    )
+                    panic!("Compiling air -> metallib failed. Exit with status: {status}")
                 }
             }
-            Err(e) => panic!("Compiling air -> metallib failed: {:?}", e),
+            Err(e) => panic!("Compiling air -> metallib failed: {e:?}"),
         }
 
         Ok(())
@@ -282,5 +276,7 @@ fn main() -> Result<(), String> {
 
 #[cfg(not(any(all(feature = "cuda", target_family = "unix"), feature = "metal")))]
 fn main() -> Result<()> {
+    // Declare expected cfg values for check-cfg lint
+    println!("cargo::rustc-check-cfg=cfg(has_fp8)");
     Ok(())
 }

@@ -1,8 +1,10 @@
 [package]
 name = "mistralrs-pyo3"
+publish = false
 authors = ["Eric Buehler"]
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -48,3 +50,7 @@ accelerate = ["mistralrs-core/accelerate"]
 mkl = ["mistralrs-core/mkl"]
 nccl = ["mistralrs-core/nccl"]
 ring = ["mistralrs-core/ring"]
+
+[package.metadata.maturin]
+include = ["mistralrs.pyi", "py.typed"]
+sdist-include = ["mistralrs.pyi", "py.typed"]

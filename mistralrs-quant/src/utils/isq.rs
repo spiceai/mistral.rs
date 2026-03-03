@@ -3,8 +3,7 @@ use std::sync::{atomic::AtomicUsize, Arc};
 use candle_core::{quantized::GgmlDType, Device, Result, Tensor};
 
 use crate::{
-    get_immediate_isq, should_apply_immediate_isq, ImmediateIsqParams, QuantMethod,
-    ShardedVarBuilder,
+    get_immediate_isq, ImmediateIsqMatch, ImmediateIsqParams, QuantMethod, ShardedVarBuilder,
 };
 
 pub enum QuantizationBehavior {
@@ -16,8 +15,19 @@ pub fn apply_immediate_isq(
     layer: Arc<dyn QuantMethod>,
     vb: ShardedVarBuilder,
 ) -> Result<Arc<dyn QuantMethod>> {
-    if should_apply_immediate_isq(&vb) {
-        apply_immediate_isq_always(layer, vb.device())
+    let Some(params) = get_immediate_isq() else {
+        return Ok(layer);
+    };
+    let prefix = format!("{}.weight", vb.prefix());
+    if let Some(ImmediateIsqMatch { ty, device }) = crate::resolve_immediate_isq(&params, &prefix) {
+        let device = device.unwrap_or_else(|| vb.device().clone());
+        layer.clone().apply_isq(
+            Some(ty),
+            device,
+            &AtomicUsize::new(0),
+            None,
+            params.guard.clone(),
+        )
     } else {
         Ok(layer)
     }
@@ -31,6 +41,7 @@ pub(crate) fn apply_immediate_isq_always(
         guard,
         ty: Some(immediate_isq),
         predicates: _,
+        ..
     }) = get_immediate_isq()
     {
         layer.clone().apply_isq(
@@ -65,7 +76,7 @@ fn get_fallback(dtype: GgmlDType) -> QuantizationBehavior {
 fn can_quantize(tensor: &Tensor, dtype: GgmlDType) -> bool {
     let dims = tensor.shape().dims();
     // The tensor must not be empty and the last dimension must be a multiple of the block size.
-    !(dims.is_empty() || (dims[dims.len() - 1] % dtype.block_size() != 0))
+    !dims.is_empty() && dims[dims.len() - 1].is_multiple_of(dtype.block_size())
 }
 
 /// Check if we should quantize the tensor and if so, with which dtype.

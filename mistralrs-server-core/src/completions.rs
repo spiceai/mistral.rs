@@ -12,7 +12,7 @@ use axum::{
     extract::{Json, State},
     http::{self},
     response::{
-        sse::{Event, KeepAlive},
+        sse::{Event, KeepAlive, KeepAliveStream},
         IntoResponse, Sse,
     },
 };
@@ -35,7 +35,7 @@ use crate::{
     openai::{CompletionRequest, Grammar},
     streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
-    util::validate_model_name,
+    util::{sanitize_error_message, validate_model_name},
 };
 
 /// A callback function that processes streaming response chunks before they are sent to the client.
@@ -119,12 +119,14 @@ impl futures::Stream for CompletionStreamer {
                     self.done_state = DoneState::SendingDone;
                     Poll::Ready(Some(Ok(Event::default().data(msg))))
                 }
-                Response::ValidationError(e) => {
-                    Poll::Ready(Some(Ok(Event::default().data(e.to_string()))))
-                }
+                Response::ValidationError(e) => Poll::Ready(Some(Ok(
+                    Event::default().data(sanitize_error_message(e.as_ref()))
+                ))),
                 Response::InternalError(e) => {
                     MistralRs::maybe_log_error(self.state.clone(), &*e);
-                    Poll::Ready(Some(Ok(Event::default().data(e.to_string()))))
+                    Poll::Ready(Some(Ok(
+                        Event::default().data(sanitize_error_message(e.as_ref()))
+                    )))
                 }
                 Response::CompletionChunk(mut response) => {
                     if response.choices.iter().all(|x| x.finish_reason.is_some()) {
@@ -150,6 +152,7 @@ impl futures::Stream for CompletionStreamer {
                 Response::ModelError(_, _) => unreachable!(),
                 Response::Speech { .. } => unreachable!(),
                 Response::Raw { .. } => unreachable!(),
+                Response::Embeddings { .. } => unreachable!(),
             },
             Poll::Pending | Poll::Ready(None) => Poll::Pending,
         }
@@ -157,7 +160,8 @@ impl futures::Stream for CompletionStreamer {
 }
 
 /// Represents different types of completion responses.
-pub type CompletionResponder = BaseCompletionResponder<CompletionResponse, CompletionStreamer>;
+pub type CompletionResponder =
+    BaseCompletionResponder<CompletionResponse, KeepAliveStream<CompletionStreamer>>;
 
 /// JSON error response structure for model errors.
 type JsonModelError = BaseJsonModelError<CompletionResponse>;
@@ -170,10 +174,12 @@ impl IntoResponse for CompletionResponder {
             CompletionResponder::Sse(s) => s.into_response(),
             CompletionResponder::Json(s) => Json(s).into_response(),
             CompletionResponder::InternalError(e) => {
-                JsonError::new(e.to_string()).to_response(http::StatusCode::INTERNAL_SERVER_ERROR)
+                JsonError::new(sanitize_error_message(e.as_ref()))
+                    .to_response(http::StatusCode::INTERNAL_SERVER_ERROR)
             }
             CompletionResponder::ValidationError(e) => {
-                JsonError::new(e.to_string()).to_response(http::StatusCode::UNPROCESSABLE_ENTITY)
+                JsonError::new(sanitize_error_message(e.as_ref()))
+                    .to_response(http::StatusCode::UNPROCESSABLE_ENTITY)
             }
             CompletionResponder::ModelError(msg, response) => JsonModelError::new(msg, response)
                 .to_response(http::StatusCode::INTERNAL_SERVER_ERROR),
@@ -227,6 +233,7 @@ pub fn parse_request(
                 top_n_logprobs: 1,
                 frequency_penalty: oairequest.frequency_penalty,
                 presence_penalty: oairequest.presence_penalty,
+                repetition_penalty: oairequest.repetition_penalty,
                 max_len: oairequest.max_tokens,
                 stop_toks,
                 logits_bias: oairequest.logit_bias,
@@ -254,6 +261,7 @@ pub fn parse_request(
             } else {
                 Some(oairequest.model.clone())
             },
+            truncate_sequence: oairequest.truncate_sequence.unwrap_or(false),
         })),
         is_streaming,
     ))
@@ -303,7 +311,7 @@ pub fn create_streamer(
     state: SharedMistralRsState,
     on_chunk: Option<CompletionOnChunkCallback>,
     on_done: Option<CompletionOnDoneCallback>,
-) -> Sse<CompletionStreamer> {
+) -> Sse<KeepAliveStream<CompletionStreamer>> {
     let streamer = base_create_streamer(rx, state, on_chunk, on_done);
     let keep_alive_interval = get_keep_alive_interval();
 
@@ -343,5 +351,6 @@ pub fn match_responses(state: SharedMistralRsState, response: Response) -> Compl
         Response::ImageGeneration(_) => unreachable!(),
         Response::Speech { .. } => unreachable!(),
         Response::Raw { .. } => unreachable!(),
+        Response::Embeddings { .. } => unreachable!(),
     }
 }

@@ -1,9 +1,10 @@
 [package]
 name = "mistralrs"
-readme = "README.md"
+readme = "../README.md"
 authors = ["Eric Buehler"]
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -13,12 +14,14 @@ homepage.workspace = true
 
 [dependencies]
 mistralrs-core.workspace = true
+mistralrs-macros.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 candle-core.workspace = true
 candle-nn.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+schemars.workspace = true
 image.workspace = true
 indexmap.workspace = true
 either.workspace = true
@@ -27,6 +30,8 @@ reqwest.workspace = true
 rand.workspace = true
 clap.workspace = true
 walkdir.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 cuda = ["mistralrs-core/cuda"]
@@ -37,4 +42,3 @@ accelerate = ["mistralrs-core/accelerate"]
 mkl = ["mistralrs-core/mkl"]
 nccl = ["mistralrs-core/nccl"]
 ring = ["mistralrs-core/ring"]
-

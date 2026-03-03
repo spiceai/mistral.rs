@@ -40,7 +40,6 @@ impl TextSpeculativeBuilder {
 
     fn build_pipeline(builder: TextModelBuilder) -> anyhow::Result<Arc<Mutex<dyn Pipeline>>> {
         let config = NormalSpecificConfig {
-            prompt_chunksize: builder.prompt_chunksize,
             topology: builder.topology,
             organization: builder.organization,
             write_uqff: builder.write_uqff,
@@ -100,7 +99,7 @@ impl TextSpeculativeBuilder {
             pipeline,
             scheduler_method,
             self.target.throughput_logging,
-            self.target.search_bert_model,
+            self.target.search_embedding_model,
         );
         if let Some(cb) = self.target.search_callback.clone() {
             runner = runner.with_search_callback(cb);

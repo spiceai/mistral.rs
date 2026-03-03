@@ -286,7 +286,7 @@ impl Attention {
 
         let (q, k) = self.rotary_emb.forward(&q, &k, seqlen_offsets)?;
 
-        let (k, v) = Cache::update_kv_cache(kv_cache, k, v, false)?;
+        let (k, v) = Cache::update_kv_cache(kv_cache, k, v)?;
 
         let attn_output =
             Sdpa.run_attention(&q, &k, &v, mask, Some(flash_params), &self.sdpa_params)?;
@@ -547,6 +547,7 @@ impl Model {
                 sliding_window: None,
                 k_head_dim: cfg.head_dim(),
                 v_head_dim: cfg.head_dim(),
+                kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
         })
     }
@@ -631,7 +632,7 @@ impl Model {
             )?;
 
             if no_kv_cache {
-                let mut res = self
+                let res = self
                     .inner_forward(
                         input_ids_full,
                         seqlen_offsets_full,
@@ -642,16 +643,14 @@ impl Model {
                         flash_params_full,
                     )?
                     .contiguous()?;
+                let mut res = extract_logits(&res, context_lens)?;
                 if let Some(t) = self.lm_head.quantized_act_type() {
                     res = res.to_dtype(t)?;
                 }
-                extract_logits(
-                    &self.lm_head.lora_forward(&res, None, 1.0, None)?,
-                    context_lens,
-                )
+                self.lm_head.lora_forward(&res, None, 1.0, None)
             } else {
                 // is_full_pass=true is ok because no_kv_cache=false
-                let mut res = self
+                let res = self
                     .inner_forward(
                         input_ids,
                         seqlen_offsets,
@@ -662,16 +661,14 @@ impl Model {
                         flash_params,
                     )?
                     .contiguous()?;
+                let mut res = extract_logits(&res, context_lens)?;
                 if let Some(t) = self.lm_head.quantized_act_type() {
                     res = res.to_dtype(t)?;
                 }
-                extract_logits(
-                    &self.lm_head.lora_forward(&res, None, 1.0, None)?,
-                    context_lens,
-                )
+                self.lm_head.lora_forward(&res, None, 1.0, None)
             }
         } else {
-            let mut res = self
+            let res = self
                 .inner_forward(
                     input_ids,
                     seqlen_offsets,
@@ -682,13 +679,11 @@ impl Model {
                     flash_params,
                 )?
                 .contiguous()?;
+            let mut res = extract_logits(&res, context_lens)?;
             if let Some(t) = self.lm_head.quantized_act_type() {
                 res = res.to_dtype(t)?;
             }
-            extract_logits(
-                &self.lm_head.lora_forward(&res, None, 1.0, None)?,
-                context_lens,
-            )
+            self.lm_head.lora_forward(&res, None, 1.0, None)
         }
     }
 }

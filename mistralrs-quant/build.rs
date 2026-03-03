@@ -1,9 +1,56 @@
+#[cfg(feature = "cuda")]
+#[allow(unused)]
+fn cuda_version_from_build_system() -> (usize, usize) {
+    let output = std::process::Command::new("nvcc")
+        .arg("--version")
+        .output()
+        .expect("Failed to execute `nvcc`");
+
+    if !output.status.success() {
+        panic!(
+            "`nvcc --version` failed.\nstdout:\n{}\n\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let version_line = stdout.lines().nth(3).unwrap();
+    let release_section = version_line.split(", ").nth(1).unwrap();
+    let version_number = release_section.split(' ').nth(1).unwrap();
+
+    match version_number {
+        "13.1" => (13, 1),
+        "13.0" => (13, 0),
+        "12.9" => (12, 9),
+        "12.8" => (12, 8),
+        "12.6" => (12, 6),
+        "12.5" => (12, 5),
+        "12.4" => (12, 4),
+        "12.3" => (12, 3),
+        "12.2" => (12, 2),
+        "12.1" => (12, 1),
+        "12.0" => (12, 0),
+        "11.8" => (11, 8),
+        "11.7" => (11, 7),
+        "11.6" => (11, 6),
+        "11.5" => (11, 5),
+        "11.4" => (11, 4),
+        v => panic!("Unsupported cuda toolkit version: `{v}`. Please raise a github issue."),
+    }
+}
+
 fn main() -> Result<(), String> {
+    // Declare expected cfg values for check-cfg lint
+    println!("cargo::rustc-check-cfg=cfg(has_marlin_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_blockwise_fp8_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_scalar_fp8_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_vector_fp8_kernels)");
+    println!("cargo::rustc-check-cfg=cfg(has_mxfp4_kernels)");
+
     #[cfg(feature = "cuda")]
     {
-        use std::{fs::read_to_string, path::PathBuf, process::Command, vec};
-        const MARLIN_FFI_PATH: &str = "src/gptq/marlin_ffi.rs";
-        const BLOCKWISE_FP8_FFI_PATH: &str = "src/blockwise_fp8/ffi.rs";
+        use std::{path::PathBuf, process::Command, vec};
         const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 
         println!("cargo:rerun-if-changed=build.rs");
@@ -37,55 +84,32 @@ fn main() -> Result<(), String> {
             }
         };
 
-        // ======== Handle optional marlin kernel compilation
+        // ======== Handle optional kernel compilation via rustc-cfg flags
         let cc_over_800 = compute_cap >= 800;
-        let cc_is_over_800 = match cc_over_800 {
-            true => "true",
-            false => "false",
-        };
 
-        let mut marlin_ffi_ct = read_to_string(MARLIN_FFI_PATH).unwrap();
-        if marlin_ffi_ct.contains("pub(crate) const HAVE_MARLIN_KERNELS: bool = true;") {
-            marlin_ffi_ct = marlin_ffi_ct.replace(
-                "pub(crate) const HAVE_MARLIN_KERNELS: bool = true;",
-                &format!("pub(crate) const HAVE_MARLIN_KERNELS: bool = {cc_is_over_800};"),
-            );
-        } else {
-            marlin_ffi_ct = marlin_ffi_ct.replace(
-                "pub(crate) const HAVE_MARLIN_KERNELS: bool = false;",
-                &format!("pub(crate) const HAVE_MARLIN_KERNELS: bool = {cc_is_over_800};"),
-            );
+        if cc_over_800 {
+            println!("cargo:rustc-cfg=has_marlin_kernels");
+            println!("cargo:rustc-cfg=has_blockwise_fp8_kernels");
+            println!("cargo:rustc-cfg=has_scalar_fp8_kernels");
+            println!("cargo:rustc-cfg=has_vector_fp8_kernels");
         }
-        std::fs::write(MARLIN_FFI_PATH, marlin_ffi_ct).unwrap();
-
-        let mut blockwise_fp8_ffi_ct = read_to_string(BLOCKWISE_FP8_FFI_PATH).unwrap();
-        if blockwise_fp8_ffi_ct
-            .contains("pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = true;")
-        {
-            blockwise_fp8_ffi_ct = blockwise_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = true;",
-                &format!(
-                    "pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = {cc_is_over_800};"
-                ),
-            );
-        } else {
-            blockwise_fp8_ffi_ct = blockwise_fp8_ffi_ct.replace(
-                "pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = false;",
-                &format!(
-                    "pub(crate) const HAVE_BLOCKWISE_DEQUANT_KERNELS: bool = {cc_is_over_800};"
-                ),
-            );
-        }
-        std::fs::write(BLOCKWISE_FP8_FFI_PATH, blockwise_fp8_ffi_ct).unwrap();
+        // MXFP4 is always enabled with CUDA (uses LUT-based dequantization)
+        println!("cargo:rustc-cfg=has_mxfp4_kernels");
         // ========
 
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
         let mut lib_files = vec![
             "kernels/gptq/q_gemm.cu",
             "kernels/hqq/hqq.cu",
+            "kernels/hqq/hqq_bitpack.cu",
             "kernels/ops/ops.cu",
             "kernels/bitsandbytes/dequant.cu",
             "kernels/rotary/rotary.cu",
+            "kernels/afq/afq.cu",
+            "kernels/afq/afq_gemm.cu",
+            "kernels/mxfp4/mxfp4_gemm.cu", // MXFP4 works on all compute caps
+            "kernels/gemv/gemv.cu",        // Custom GEMV for decode-phase inference
+            "kernels/indexed_moe/indexed_moe.cu", // Indexed MoE forward for GGUF quantized weights
         ];
         if cc_over_800 {
             lib_files.push("kernels/marlin/marlin_matmul_f16.cu");
@@ -94,9 +118,15 @@ fn main() -> Result<(), String> {
             lib_files.push("kernels/marlin/marlin_matmul_awq_bf16.cu");
             lib_files.push("kernels/marlin/marlin_repack.cu");
             lib_files.push("kernels/blockwise_fp8/blockwise_fp8.cu");
+            lib_files.push("kernels/blockwise_fp8/blockwise_fp8_gemm.cu");
+            lib_files.push("kernels/scalar_fp8/scalar_fp8.cu");
+            lib_files.push("kernels/vector_fp8/vector_fp8.cu");
         } else {
             lib_files.push("kernels/marlin/dummy_marlin_kernel.cu");
             lib_files.push("kernels/blockwise_fp8/blockwise_fp8_dummy.cu");
+            lib_files.push("kernels/blockwise_fp8/blockwise_fp8_gemm_dummy.cu");
+            lib_files.push("kernels/scalar_fp8/scalar_fp8_dummy.cu");
+            lib_files.push("kernels/vector_fp8/vector_fp8_dummy.cu");
         }
         for lib_file in lib_files.iter() {
             println!("cargo:rerun-if-changed={lib_file}");
@@ -150,6 +180,9 @@ fn main() -> Result<(), String> {
             println!("cargo:rustc-link-lib=dylib=stdc++");
         }
 
+        let (major, minor) = cuda_version_from_build_system();
+        println!("cargo:rustc-cfg=feature=\"cuda-{major}0{minor}0\"");
+
         Ok(())
     }
 
@@ -159,21 +192,30 @@ fn main() -> Result<(), String> {
         use std::process::Command;
         use std::{env, str};
 
-        const METAL_SOURCES: [&str; 8] = [
+        const METAL_SOURCES: [&str; 12] = [
             "bitwise",
             "blockwise_fp8",
             "bnb_dequantize",
+            "fused_glu",
             "hqq_dequantize",
+            "hqq_bitpack",
+            "mxfp4",
             "quantized",
+            "scalar_fp8",
             "scan",
             "sort",
             "copy",
         ];
         const HEADER_SOURCES: [&str; 5] = ["utils", "bf16", "scan_impl", "sort_impl", "copy_impl"];
+        // Include-only headers (not compiled directly, just tracked for changes)
+        const INCLUDE_ONLY: [&str; 2] = ["float8", "float4"];
         for src in METAL_SOURCES {
             println!("cargo::rerun-if-changed=src/metal_kernels/{src}.metal");
         }
         for src in HEADER_SOURCES {
+            println!("cargo::rerun-if-changed=src/metal_kernels/{src}.metal");
+        }
+        for src in INCLUDE_ONLY {
             println!("cargo::rerun-if-changed=src/metal_kernels/{src}.metal");
         }
         println!("cargo::rerun-if-changed=build.rs");
@@ -191,8 +233,8 @@ fn main() -> Result<(), String> {
             );
             // Write a dummy metallib file to satisfy the include_bytes! macro
             let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?);
-            std::fs::write(out_dir.join("mistralrs_quant.metallib"), &[]).unwrap();
-            std::fs::write(out_dir.join("mistralrs_quant_ios.metallib"), &[]).unwrap();
+            std::fs::write(out_dir.join("mistralrs_quant.metallib"), []).unwrap();
+            std::fs::write(out_dir.join("mistralrs_quant_ios.metallib"), []).unwrap();
             return Ok(());
         }
 
@@ -206,6 +248,15 @@ fn main() -> Result<(), String> {
                 match self {
                     Platform::MacOS => "macosx",
                     Platform::Ios => "iphoneos",
+                }
+            }
+
+            fn metal_std(&self) -> &str {
+                // Use Metal 3.1 unified standard for both platforms
+                // This fixes Xcode 26+ where the default Metal standard may be too low
+                // https://github.com/EricLBuehler/mistral.rs/issues/1844
+                match self {
+                    Platform::MacOS | Platform::Ios => "metal3.1",
                 }
             }
         }
@@ -222,6 +273,7 @@ fn main() -> Result<(), String> {
                 .arg("--sdk")
                 .arg(platform.sdk())
                 .arg("metal")
+                .arg(format!("-std={}", platform.metal_std()))
                 .arg(format!("-working-directory={working_directory}"))
                 .arg("-Wall")
                 .arg("-Wextra")
@@ -245,10 +297,7 @@ fn main() -> Result<(), String> {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     if !status.success() {
-                        panic!(
-                            "Compiling metal -> air failed. Exit with status: {}",
-                            status
-                        )
+                        panic!("Compiling metal -> air failed. Exit with status: {status}")
                     }
                 }
                 Ok(None) => {
@@ -256,13 +305,10 @@ fn main() -> Result<(), String> {
                         .wait()
                         .expect("Compiling metal -> air failed while waiting for result");
                     if !status.success() {
-                        panic!(
-                            "Compiling metal -> air failed. Exit with status: {}",
-                            status
-                        )
+                        panic!("Compiling metal -> air failed. Exit with status: {status}")
                     }
                 }
-                Err(e) => panic!("Compiling metal -> air failed: {:?}", e),
+                Err(e) => panic!("Compiling metal -> air failed: {e:?}"),
             }
 
             // Compile air to metallib
@@ -288,10 +334,7 @@ fn main() -> Result<(), String> {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     if !status.success() {
-                        panic!(
-                            "Compiling air -> metallib failed. Exit with status: {}",
-                            status
-                        )
+                        panic!("Compiling air -> metallib failed. Exit with status: {status}")
                     }
                 }
                 Ok(None) => {
@@ -299,13 +342,10 @@ fn main() -> Result<(), String> {
                         .wait()
                         .expect("Compiling air -> metallib failed while waiting for result");
                     if !status.success() {
-                        panic!(
-                            "Compiling air -> metallib failed. Exit with status: {}",
-                            status
-                        )
+                        panic!("Compiling air -> metallib failed. Exit with status: {status}")
                     }
                 }
-                Err(e) => panic!("Compiling air -> metallib failed: {:?}", e),
+                Err(e) => panic!("Compiling air -> metallib failed: {e:?}"),
             }
 
             Ok(())

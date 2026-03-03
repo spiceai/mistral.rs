@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::serde_default_fn;
 use candle_core::{Device, Module, Result, Tensor};
 use candle_nn::Linear;
 use mistralrs_quant::{
@@ -24,6 +25,8 @@ use crate::{
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
 
+serde_default_fn!(bool, word_emb_default, false);
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct Config {
     pub attention_bias: bool,
@@ -45,6 +48,7 @@ pub struct Config {
     pub query_pre_attn_scalar: usize,
     pub max_position_embeddings: usize,
     pub quantization_config: Option<QuantizedConfig>,
+    #[serde(default = "word_emb_default")]
     #[allow(dead_code)]
     pub tie_word_embeddings: bool,
 }
@@ -128,7 +132,7 @@ impl Attention {
             comm,
             vb.pp("o_proj"),
         )?;
-        let sliding_window = if layer_idx % 2 == 0 {
+        let sliding_window = if layer_idx.is_multiple_of(2) {
             // ^ Order is SWA, global, SWA
             Some(cfg.sliding_window)
         } else {
@@ -143,7 +147,7 @@ impl Attention {
             num_kv_heads: (num_kv_heads / comm.world_size()).max(1),
             head_dim,
             rotary_emb,
-            use_sliding_window: layer_idx % 2 == 0, // Order is SWA, global, SWA
+            use_sliding_window: layer_idx.is_multiple_of(2), // Order is SWA, global, SWA
             paged_attn,
             sdpa_params: SdpaParams {
                 n_kv_groups: mistralrs_quant::compute_n_kv_groups(
@@ -493,6 +497,7 @@ impl Model {
                 sliding_window: None,
                 k_head_dim: cfg.head_dim,
                 v_head_dim: cfg.head_dim,
+                kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             mapper,
         })
@@ -557,7 +562,8 @@ impl Model {
             )?;
         }
         let xs = xs.to_device(&self.device)?;
-        let mut xs = xs.apply(&self.norm)?;
+        let xs = xs.apply(&self.norm)?;
+        let mut xs = extract_logits(&xs, context_lens)?;
         if let Some(t) = self.lm_head.quantized_act_type() {
             xs = xs.to_dtype(t)?;
         }
@@ -570,7 +576,7 @@ impl Model {
             xs = (xs * final_logit_softcapping)?;
         }
 
-        extract_logits(&xs, context_lens)
+        Ok(xs)
     }
 }
 

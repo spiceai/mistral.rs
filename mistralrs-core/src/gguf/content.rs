@@ -9,7 +9,7 @@ use candle_core::{
     Device, Result,
 };
 use indexmap::IndexMap;
-use tracing::{event, info, Level};
+use tracing::info;
 
 use crate::DEBUG;
 
@@ -165,7 +165,7 @@ impl<'a, R: std::io::Seek + std::io::Read> Content<'a, R> {
             }
         }
 
-        event!(Level::DEBUG, "Model config:");
+        info!("Model config:");
         keys.sort();
         let mut output_keys = IndexMap::new();
         for name in keys {
@@ -178,7 +178,7 @@ impl<'a, R: std::io::Seek + std::io::Read> Content<'a, R> {
             }
         }
         for (name, val) in output_keys {
-            event!(Level::DEBUG, "{name}: {val}")
+            println!("{name}: {val}")
         }
 
         if DEBUG.load(std::sync::atomic::Ordering::Relaxed) {

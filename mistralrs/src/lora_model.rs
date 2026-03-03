@@ -24,7 +24,6 @@ impl LoraModelBuilder {
 
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = NormalSpecificConfig {
-            prompt_chunksize: self.text_model.prompt_chunksize,
             topology: self.text_model.topology,
             organization: self.text_model.organization,
             write_uqff: self.text_model.write_uqff,
@@ -90,7 +89,7 @@ impl LoraModelBuilder {
             pipeline,
             scheduler_method,
             self.text_model.throughput_logging,
-            self.text_model.search_bert_model,
+            self.text_model.search_embedding_model,
         );
         if let Some(cb) = self.text_model.search_callback.clone() {
             runner = runner.with_search_callback(cb);

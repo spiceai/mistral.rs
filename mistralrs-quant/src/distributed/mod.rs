@@ -57,20 +57,34 @@ impl BarrierLike for Barrier {
 }
 
 pub fn get_global_tp_size_from_devices() -> Result<usize> {
-    #[cfg(feature = "cuda")]
+    #[cfg(all(feature = "cuda", feature = "ring"))]
     {
         use candle_core::cuda::WrapErr;
         candle_core::cuda::cudarc::driver::result::device::get_count()
             .w()
             .map(|x| x as usize)
     }
-    #[cfg(feature = "ring")]
+    #[cfg(all(not(feature = "cuda"), feature = "ring"))]
     {
         let config = RingConfig::load();
         Ok(config.world_size)
     }
 
-    #[cfg(not(any(feature = "cuda", feature = "ring")))]
+    #[cfg(all(feature = "cuda", feature = "nccl"))]
+    {
+        // In case we have manual set of TP size
+        if let Ok(x) = std::env::var("MISTRALRS_MN_LOCAL_WORLD_SIZE") {
+            use std::str::FromStr;
+            Ok(usize::from_str(&x).expect("Not a number for MISTRALRS_MN_LOCAL_WORLD_SIZE!"))
+        } else {
+            use candle_core::cuda::WrapErr;
+            candle_core::cuda::cudarc::driver::result::device::get_count()
+                .w()
+                .map(|x| x as usize)
+        }
+    }
+
+    #[cfg(all(not(feature = "ring"), not(feature = "nccl")))]
     Ok(1)
 }
 
@@ -211,17 +225,29 @@ mod nccl {
                     world_size
                 );
             }
-            let device = dev.as_cuda_device()?.cuda_device();
-            assert_eq!(rank, device.ordinal());
+            let stream = dev.as_cuda_device()?.cuda_stream();
+            let device_ordinal = stream.context().ordinal();
+            if rank != device_ordinal {
+                candle_core::bail!(
+                    "NCCL rank {} must match device ordinal, but device ordinal is {}. \
+                     Ensure GPUs are visible in the correct order (check CUDA_VISIBLE_DEVICES).",
+                    rank,
+                    device_ordinal
+                );
+            }
             let nccl_id = match id {
                 super::Id::Nccl(id) => id,
-                _ => panic!("Expected NCCL Id variant"),
+                _ => candle_core::bail!("Expected NCCL Id variant for NCCL Comm initialization"),
             };
-            Ok(Self {
-                comm: cudarc::nccl::Comm::from_rank(device, rank, world_size, nccl_id)
-                    .map_err(|e| e.0)
-                    .expect("Failed to create `Comm`, error code"),
-            })
+            tracing::info!(
+                "Initializing NCCL communicator: rank={}, world_size={}, device={}",
+                rank,
+                world_size,
+                device_ordinal
+            );
+            let comm = cudarc::nccl::Comm::from_rank(stream, rank, world_size, nccl_id)
+                .map_err(|e| candle_core::Error::debug(e.0))?;
+            Ok(Self { comm })
         }
 
         pub fn rank(&self) -> usize {
@@ -440,8 +466,8 @@ mod nccl_ops {
     use std::{fmt::Debug, sync::Arc};
 
     use candle_core::{
-        backend::BackendStorage, cuda::cudarc, cuda_backend::WrapErr, CpuStorage, CustomOp1, DType,
-        Layout, Result, Shape, Tensor,
+        backend::BackendStorage, cuda::cudarc, CpuStorage, CustomOp1, DType, Layout, Result, Shape,
+        Tensor,
     };
 
     #[derive(Clone, Debug)]
@@ -475,7 +501,7 @@ mod nccl_ops {
             s: &candle_core::CudaStorage,
             l: &Layout,
         ) -> Result<(candle_core::CudaStorage, Shape)> {
-            use cudarc::{driver::DeviceSlice, nccl::ReduceOp};
+            use cudarc::nccl::ReduceOp;
             use half::{bf16, f16};
 
             let elem_count = l.shape().elem_count();
@@ -490,9 +516,25 @@ mod nccl_ops {
                                 Some((0, l)) if l == s.len() => s,
                                 Some(_) | None => candle_core::bail!("input has to be contiguous"),
                             };
-                            assert_eq!(dev.ordinal(), nccl_comm.rank());
-                            assert!(elem_count > 0);
-                            let mut dst = unsafe { dev.alloc::<bf16>(elem_count) }.w()?;
+                            if elem_count == 0 {
+                                candle_core::bail!("NCCL all_reduce: elem_count must be > 0");
+                            }
+                            let device_ordinal = dev.cuda_stream().context().ordinal();
+                            if device_ordinal != nccl_comm.rank() {
+                                candle_core::bail!(
+                                    "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
+                                     Ensure each rank uses the correct GPU.",
+                                    device_ordinal,
+                                    nccl_comm.rank()
+                                );
+                            }
+                            tracing::debug!(
+                                "NCCL all_reduce (BF16): rank={}, device={}, elem_count={}",
+                                nccl_comm.rank(),
+                                device_ordinal,
+                                elem_count
+                            );
+                            let mut dst = unsafe { dev.alloc::<bf16>(elem_count) }?;
                             nccl_comm
                                 .inner()
                                 .all_reduce(s, &mut dst, &ReduceOp::Sum)
@@ -505,7 +547,25 @@ mod nccl_ops {
                                 Some((0, l)) if l == s.len() => s,
                                 Some(_) | None => candle_core::bail!("input has to be contiguous"),
                             };
-                            let mut dst = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
+                            if elem_count == 0 {
+                                candle_core::bail!("NCCL all_reduce: elem_count must be > 0");
+                            }
+                            let device_ordinal = dev.cuda_stream().context().ordinal();
+                            if device_ordinal != nccl_comm.rank() {
+                                candle_core::bail!(
+                                    "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
+                                     Ensure each rank uses the correct GPU.",
+                                    device_ordinal,
+                                    nccl_comm.rank()
+                                );
+                            }
+                            tracing::debug!(
+                                "NCCL all_reduce (F16): rank={}, device={}, elem_count={}",
+                                nccl_comm.rank(),
+                                device_ordinal,
+                                elem_count
+                            );
+                            let mut dst = unsafe { dev.alloc::<f16>(elem_count) }?;
                             nccl_comm
                                 .inner()
                                 .all_reduce(s, &mut dst, &ReduceOp::Sum)
@@ -518,7 +578,25 @@ mod nccl_ops {
                                 Some((0, l)) if l == s.len() => s,
                                 Some(_) | None => candle_core::bail!("input has to be contiguous"),
                             };
-                            let mut dst = unsafe { dev.alloc::<f32>(elem_count) }.w()?;
+                            if elem_count == 0 {
+                                candle_core::bail!("NCCL all_reduce: elem_count must be > 0");
+                            }
+                            let device_ordinal = dev.cuda_stream().context().ordinal();
+                            if device_ordinal != nccl_comm.rank() {
+                                candle_core::bail!(
+                                    "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
+                                     Ensure each rank uses the correct GPU.",
+                                    device_ordinal,
+                                    nccl_comm.rank()
+                                );
+                            }
+                            tracing::debug!(
+                                "NCCL all_reduce (F32): rank={}, device={}, elem_count={}",
+                                nccl_comm.rank(),
+                                device_ordinal,
+                                elem_count
+                            );
+                            let mut dst = unsafe { dev.alloc::<f32>(elem_count) }?;
                             nccl_comm
                                 .inner()
                                 .all_reduce(s, &mut dst, &ReduceOp::Sum)
@@ -569,7 +647,6 @@ mod nccl_ops {
             s: &candle_core::CudaStorage,
             l: &Layout,
         ) -> Result<(candle_core::CudaStorage, Shape)> {
-            use cudarc::driver::DeviceSlice;
             use half::{bf16, f16};
 
             let mut out_shape = l.shape().dims().to_vec();
@@ -588,9 +665,25 @@ mod nccl_ops {
                                 Some((0, l)) if l == s.len() => s,
                                 Some(_) | None => candle_core::bail!("input has to be contiguous"),
                             };
-                            assert_eq!(dev.ordinal(), nccl_comm.rank());
-                            assert!(elem_count > 0);
-                            let mut dst = unsafe { dev.alloc::<bf16>(elem_count) }.w()?;
+                            if elem_count == 0 {
+                                candle_core::bail!("NCCL all_gather: elem_count must be > 0");
+                            }
+                            let device_ordinal = dev.cuda_stream().context().ordinal();
+                            if device_ordinal != nccl_comm.rank() {
+                                candle_core::bail!(
+                                    "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
+                                     Ensure each rank uses the correct GPU.",
+                                    device_ordinal,
+                                    nccl_comm.rank()
+                                );
+                            }
+                            tracing::debug!(
+                                "NCCL all_gather (BF16): rank={}, device={}, elem_count={}",
+                                nccl_comm.rank(),
+                                device_ordinal,
+                                elem_count
+                            );
+                            let mut dst = unsafe { dev.alloc::<bf16>(elem_count) }?;
                             nccl_comm
                                 .inner()
                                 .all_gather(s, &mut dst)
@@ -603,7 +696,25 @@ mod nccl_ops {
                                 Some((0, l)) if l == s.len() => s,
                                 Some(_) | None => candle_core::bail!("input has to be contiguous"),
                             };
-                            let mut dst = unsafe { dev.alloc::<f16>(elem_count) }.w()?;
+                            if elem_count == 0 {
+                                candle_core::bail!("NCCL all_gather: elem_count must be > 0");
+                            }
+                            let device_ordinal = dev.cuda_stream().context().ordinal();
+                            if device_ordinal != nccl_comm.rank() {
+                                candle_core::bail!(
+                                    "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
+                                     Ensure each rank uses the correct GPU.",
+                                    device_ordinal,
+                                    nccl_comm.rank()
+                                );
+                            }
+                            tracing::debug!(
+                                "NCCL all_gather (F16): rank={}, device={}, elem_count={}",
+                                nccl_comm.rank(),
+                                device_ordinal,
+                                elem_count
+                            );
+                            let mut dst = unsafe { dev.alloc::<f16>(elem_count) }?;
                             nccl_comm
                                 .inner()
                                 .all_gather(s, &mut dst)
@@ -616,7 +727,25 @@ mod nccl_ops {
                                 Some((0, l)) if l == s.len() => s,
                                 Some(_) | None => candle_core::bail!("input has to be contiguous"),
                             };
-                            let mut dst = unsafe { dev.alloc::<f32>(elem_count) }.w()?;
+                            if elem_count == 0 {
+                                candle_core::bail!("NCCL all_gather: elem_count must be > 0");
+                            }
+                            let device_ordinal = dev.cuda_stream().context().ordinal();
+                            if device_ordinal != nccl_comm.rank() {
+                                candle_core::bail!(
+                                    "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
+                                     Ensure each rank uses the correct GPU.",
+                                    device_ordinal,
+                                    nccl_comm.rank()
+                                );
+                            }
+                            tracing::debug!(
+                                "NCCL all_gather (F32): rank={}, device={}, elem_count={}",
+                                nccl_comm.rank(),
+                                device_ordinal,
+                                elem_count
+                            );
+                            let mut dst = unsafe { dev.alloc::<f32>(elem_count) }?;
                             nccl_comm
                                 .inner()
                                 .all_gather(s, &mut dst)

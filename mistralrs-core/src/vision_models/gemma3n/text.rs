@@ -2,7 +2,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::Linear;
-use either::Either;
 use mistralrs_quant::{
     ColumnParallelLayer, QuantMethod, ReplicatedLayer, RowParallelLayer, ShardedVarBuilder,
 };
@@ -55,14 +54,13 @@ impl Mlp {
         layer_idx: usize,
     ) -> Result<Self> {
         let std_multiplier = Self::std_multiplier(cfg.activation_sparsity_pattern[layer_idx]);
-        let (intermediate_size, orig_intermediate_size) = cfg
-            .intermediate_size
-            .0
-            .clone()
-            .map_left(|left| (left, None))
-            .left_or_else(|(sizes, orig_intermediate_size)| {
-                (sizes[layer_idx], Some(orig_intermediate_size))
-            });
+        let (intermediate_size, orig_intermediate_size) = match &cfg.intermediate_size {
+            IntermediateSize::Single(size) => (*size, None),
+            IntermediateSize::PerLayer(sizes) => (sizes[layer_idx], None),
+            IntermediateSize::Matformer(sizes, orig_sizes) => {
+                (sizes[layer_idx], Some(orig_sizes[layer_idx]))
+            }
+        };
 
         if let Some(orig_intermediate_size) = orig_intermediate_size {
             Ok(Self {
@@ -158,7 +156,7 @@ impl Mlp {
             gate = self.gaussian_topk(&gate)?;
         }
         let up = self.up.forward(&xs)?;
-        // let mut res = self.down.forward(&candle_nn::ops::mul_and_act(
+        // let mut res = self.down.forward(&crate::ops::mul_and_act(
         //     &gate,
         //     &up,
         //     self.act.try_into()?,
@@ -398,8 +396,13 @@ impl Attention {
         let ((k, v), is_shared_kv) = if let Some(kv_shared_layer_index) = self.kv_shared_layer_index
         {
             let shared_cache = &kv_caches[kv_shared_layer_index];
+            // Cast device because kv cache on prev layer might be different device
+            // https://github.com/EricLBuehler/mistral.rs/pull/1650#issuecomment-3393222444
             (
-                (shared_cache.k()?.unwrap(), shared_cache.v()?.unwrap()),
+                (
+                    shared_cache.k()?.unwrap().to_device(q.device())?,
+                    shared_cache.v()?.unwrap().to_device(q.device())?,
+                ),
                 true,
             )
         } else {
@@ -429,27 +432,27 @@ impl Attention {
                 let kv_seq_len = k.dims()[2];
                 let mask_dims = mask.dims();
 
-                // Check if we need to adjust the mask dimensions
+                // Only narrow when the target dimension is strictly longer; otherwise reuse as-is.
                 match mask.rank() {
                     2 => {
-                        // For 2D masks: (q_len, kv_len)
-                        if mask_dims[1] != kv_seq_len {
+                        // 2D masks: (q_len, kv_len)
+                        if mask_dims[1] > kv_seq_len {
                             Some(mask.narrow(1, 0, kv_seq_len)?)
                         } else {
                             Some(mask.clone())
                         }
                     }
                     3 => {
-                        // For 3D masks: (batch, q_len, kv_len)
-                        if mask_dims[2] != kv_seq_len {
+                        // 3D masks: (batch, q_len, kv_len)
+                        if mask_dims[2] > kv_seq_len {
                             Some(mask.narrow(2, 0, kv_seq_len)?)
                         } else {
                             Some(mask.clone())
                         }
                     }
                     4 => {
-                        // For 4D masks: (batch, heads, q_len, kv_len)
-                        if mask_dims[3] != kv_seq_len {
+                        // 4D masks: (batch, heads, q_len, kv_len)
+                        if mask_dims[3] > kv_seq_len {
                             Some(mask.narrow(3, 0, kv_seq_len)?)
                         } else {
                             Some(mask.clone())
@@ -810,8 +813,12 @@ impl DecoderLayer {
         let added = slice_f32
             .broadcast_add(&first_pred_f32)?
             .to_dtype(corrected_predictions.dtype())?;
-        corrected_predictions =
-            corrected_predictions.slice_assign(&[&(1..), &.., &.., &..], &added)?;
+        let cp_dim0 = corrected_predictions.dim(0)?;
+        let cp_dim1 = corrected_predictions.dim(1)?;
+        let cp_dim2 = corrected_predictions.dim(2)?;
+        let cp_dim3 = corrected_predictions.dim(3)?;
+        corrected_predictions = corrected_predictions
+            .slice_assign(&[1..cp_dim0, 0..cp_dim1, 0..cp_dim2, 0..cp_dim3], &added)?;
 
         Ok(corrected_predictions)
     }
@@ -904,11 +911,15 @@ pub(crate) fn handle_matformer_slicing(
             cfg.activation_sparsity_pattern = activation_sparsity_list;
 
             cfg.num_hidden_layers = final_num_layers;
-            let orig_intermediate_size = cfg.intermediate_size.0.unwrap_left();
-            cfg.intermediate_size = IntermediateSize(Either::Right((
+            let orig_intermediate_size = match &cfg.intermediate_size {
+                IntermediateSize::Single(size) => vec![*size; orig_num_hidden_layers],
+                IntermediateSize::PerLayer(sizes) => sizes.clone(),
+                IntermediateSize::Matformer(_, orig) => orig.clone(),
+            };
+            cfg.intermediate_size = IntermediateSize::Matformer(
                 matformer_slice.ffn_hidden_dimensions.clone(),
                 orig_intermediate_size,
-            )));
+            );
 
             Ok((
                 cfg,
@@ -1210,6 +1221,7 @@ impl TextModel {
                 sliding_window: None,
                 k_head_dim: cfg.head_dim,
                 v_head_dim: cfg.head_dim,
+                kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             mapper,
             per_layer_input_scale: 1. / (2f64.sqrt()),
@@ -1405,6 +1417,7 @@ impl TextModel {
         xs = stacked_f32.mean(0)?.to_dtype(stacked.dtype())?;
 
         xs = xs.apply(&self.norm)?;
+        let mut xs = extract_logits(&xs, context_lens)?;
         if let Some(t) = self.lm_head.quantized_act_type() {
             xs = xs.to_dtype(t)?;
         }
@@ -1419,7 +1432,7 @@ impl TextModel {
             xs = (tanh_capped * final_logit_softcapping)?.to_dtype(xs.dtype())?;
         }
 
-        extract_logits(&xs, context_lens)
+        Ok(xs)
     }
 }
 
@@ -1519,8 +1532,8 @@ impl IsqModel for TextModel {
 
             // Laurel block
             let laurel_uvb = layer_uvb.pp("laurel");
-            laurel_uvb.pp("left").add(&layer.laurel.left);
-            laurel_uvb.pp("right").add(&layer.laurel.right);
+            laurel_uvb.pp("linear_left").add(&layer.laurel.left);
+            laurel_uvb.pp("linear_right").add(&layer.laurel.right);
             laurel_uvb
                 .pp("post_laurel_norm")
                 .add(&layer.laurel.post_norm);

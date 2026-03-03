@@ -1,9 +1,11 @@
 use crate::{
     get_mut_arcmutex, get_mut_group,
-    paged_attention::PhysicalTokenBlock,
+    harmony::HarmonyContext,
+    paged_attention::BlockRef,
     pipeline::{text_models_inputs_processor::PagedAttentionMeta, LayerCaches},
     response::{ChatCompletionChunkResponse, Choice, ChunkChoice, Response, SYSTEM_FINGERPRINT},
     sampler::{Logprobs, Sampler},
+    think_tags::ThinkTagContext,
     AudioInput, ChatCompletionResponse, Usage,
 };
 use crate::{
@@ -19,7 +21,7 @@ use std::{
     fmt::Display,
     hash::{DefaultHasher, Hash, Hasher},
     sync::{Arc, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{
     mpsc::{error::SendError, Sender},
@@ -78,7 +80,7 @@ pub enum SequenceRecognizer {
 enum SequenceCustomMetadata {
     PagedAttention {
         logical_token_blocks: Vec<LogicalTokenBlock>,
-        physical_blocks_prefill: Option<Vec<Arc<PhysicalTokenBlock>>>,
+        physical_blocks_prefill: Option<Vec<BlockRef>>,
         block_size: usize,
     },
     None,
@@ -87,11 +89,12 @@ enum SequenceCustomMetadata {
 macro_rules! blocks_to_add_new_tok {
     ($logical_token_blocks:expr) => {{
         let last = $logical_token_blocks.last();
-        if !last.is_some_and(|last| last.is_full() || last.is_empty()) {
-            // If we have space
-            0
-        } else {
-            1
+        match last {
+            // If the last block is not full (including the common "empty sentinel"
+            // case after an exact block-size prompt), we can reuse it.
+            Some(last) if !last.is_full() => 0,
+            // Otherwise we need to allocate a new physical block.
+            _ => 1,
         }
     }};
 }
@@ -108,13 +111,20 @@ pub(crate) fn util_append_token_to_blocks(
         }
         None => {
             logical_token_blocks.push(LogicalTokenBlock::new(block_size));
+            // SAFETY: We just pushed a block, so last_mut() will return Some
             logical_token_blocks
                 .last_mut()
-                .unwrap()
+                .expect("just pushed a block, vector cannot be empty")
                 .append_token_id(tok);
         }
     }
-    if logical_token_blocks.last().as_ref().unwrap().is_full() {
+    // SAFETY: At this point, we either had a block or just created one above,
+    // so the vector is guaranteed to be non-empty.
+    if logical_token_blocks
+        .last()
+        .expect("logical_token_blocks should not be empty after appending")
+        .is_full()
+    {
         logical_token_blocks.push(LogicalTokenBlock::new(block_size));
     }
 }
@@ -405,6 +415,9 @@ pub struct Sequence {
 
     // Prefix caching
     prefill_prompt_toks: Option<Vec<u32>>,
+    /// Number of tokens at the start of the prompt that are cached (KV already computed).
+    /// These tokens should be skipped during prefill.
+    prefix_cache_len: usize,
 
     // Cache
     normal_cache: Vec<Option<KvCache>>,
@@ -413,6 +426,8 @@ pub struct Sequence {
     cache: LayerCaches,
     draft_cache: LayerCaches,
     xlora_cache: Option<LayerCaches>,
+    /// For hybrid models: index into the Mamba state pool
+    mamba_state_idx: Option<usize>,
 
     // Preallocated KV cache (k,v)
     seq_preallocated_cache: Option<(Tensor, Tensor)>,
@@ -434,6 +449,7 @@ pub struct Sequence {
     pub prompt_tok_per_sec: f32,
     pub prompt_timestamp: Option<u128>,
     pub total_prompt_time: Option<u128>,
+    pub step_start_instant: Option<Instant>,
     group: Arc<Mutex<SequenceGroup>>,
     state: RwLock<SequenceState>,
 
@@ -442,6 +458,12 @@ pub struct Sequence {
 
     // Tool calls
     pub tools: Option<Arc<ToolCallingMatcher>>,
+
+    // Harmony format parsing context (for GPT-OSS models)
+    harmony_context: Option<HarmonyContext>,
+
+    // Think tag parsing context (for models using <think>...</think> tags)
+    think_tag_context: Option<ThinkTagContext>,
 }
 
 impl BlockEngineSequence for Sequence {
@@ -473,7 +495,7 @@ impl BlockEngineSequence for Sequence {
         }
     }
 
-    fn take_physical_blocks_prefill(&mut self) -> Option<Vec<Arc<PhysicalTokenBlock>>> {
+    fn take_physical_blocks_prefill(&mut self) -> Option<Vec<BlockRef>> {
         match &mut self.custom_metadata {
             SequenceCustomMetadata::PagedAttention {
                 logical_token_blocks: _,
@@ -488,6 +510,17 @@ impl BlockEngineSequence for Sequence {
         let prev = self.waitlisted_count;
         self.waitlisted_count += 1;
         prev
+    }
+
+    fn set_prefix_cache_len(&mut self, len: usize) {
+        self.prefix_cache_len = len;
+    }
+
+    fn block_size(&self) -> usize {
+        match &self.custom_metadata {
+            SequenceCustomMetadata::PagedAttention { block_size, .. } => *block_size,
+            SequenceCustomMetadata::None => unreachable!(),
+        }
     }
 }
 
@@ -556,6 +589,7 @@ impl Sequence {
             } else {
                 None
             },
+            mamba_state_idx: None,
             seq_preallocated_cache,
             responder,
             sampler: sampler.into(),
@@ -571,6 +605,7 @@ impl Sequence {
             creation_time,
             recognizer,
             prefill_prompt_toks: None,
+            prefix_cache_len: 0,
             suffix,
             prefix,
             cumulative_logprob: 0.,
@@ -595,7 +630,10 @@ impl Sequence {
             token_offset: 0,
             eos_tokens,
             total_prompt_time: None,
+            step_start_instant: None,
             waitlisted_count: 0,
+            harmony_context: None,
+            think_tag_context: None,
         }
     }
 
@@ -633,7 +671,7 @@ impl Sequence {
     pub fn prefill_v2_paged(
         mut self,
         logical_blocks: Vec<LogicalTokenBlock>,
-        physical_blocks: Vec<Arc<PhysicalTokenBlock>>,
+        physical_blocks: Vec<BlockRef>,
         toks: Vec<u32>,
         offset: usize,
     ) -> Self {
@@ -734,6 +772,17 @@ impl Sequence {
         self.token_offset
     }
 
+    /// Get the number of prefix tokens that are cached (KV already computed).
+    /// These tokens should be skipped during prefill.
+    pub fn prefix_cache_len(&self) -> usize {
+        self.prefix_cache_len
+    }
+
+    /// Set the number of prefix tokens that are cached.
+    pub fn set_prefix_cache_len(&mut self, len: usize) {
+        self.prefix_cache_len = len;
+    }
+
     /// This will also set prompt_len
     pub(crate) fn set_toks_and_reallocate(
         &mut self,
@@ -795,6 +844,14 @@ impl Sequence {
         &mut self.scaling_cache
     }
 
+    pub fn mamba_state_idx(&self) -> Option<usize> {
+        self.mamba_state_idx
+    }
+
+    pub fn set_mamba_state_idx(&mut self, idx: Option<usize>) {
+        self.mamba_state_idx = idx;
+    }
+
     pub fn is_xlora(&self) -> bool {
         self.xlora_cache.is_some()
     }
@@ -852,6 +909,19 @@ impl Sequence {
         self.custom_metadata
             .append_token_to_blocks(tok.token as usize);
 
+        // Process token through Harmony parser if in Harmony mode
+        if let Some(ref mut harmony_ctx) = self.harmony_context {
+            let _ = harmony_ctx.process_token(tok.token);
+        }
+
+        // Process token through think tag parser if in think tag mode
+        if let Some(ref mut think_ctx) = self.think_tag_context {
+            if !stopped_by_token {
+                // Use process_bytes to handle incomplete UTF-8 sequences (e.g., emojis split across tokens)
+                think_ctx.process_bytes(&completion_bytes);
+            }
+        }
+
         self.cumulative_logprob += tok.logprob;
         self.tokens.push(tok.token);
         self.logprobs.push(tok);
@@ -868,7 +938,8 @@ impl Sequence {
 
     pub fn set_state(&self, state: SequenceState) {
         if matches!(state, SequenceState::Error) {
-            get_mut_group!(self).n_choices = get_mut_group!(self).n_choices.saturating_sub(1);
+            let mut group = get_mut_group!(self);
+            group.n_choices = group.n_choices.saturating_sub(1);
         }
         *self.state.write().unwrap() = state;
     }
@@ -972,15 +1043,31 @@ impl Sequence {
         self.prompt_timestamp
     }
 
-    fn update_time_info(&self) {
+    /// Set the step start instant for accurate prompt timing measurement.
+    /// Call this right before step() is called.
+    pub fn set_step_start_instant(&mut self) {
+        self.step_start_instant = Some(Instant::now());
+    }
+
+    pub(crate) fn update_time_info(&self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time travel has occurred!")
             .as_millis();
 
+        // Prefer the recorded prompt time so it doesn't grow during decode steps.
+        // Fall back to the in-flight Instant timing only while the prompt step is running.
+        let prompt_time_ms = if let Some(pt) = self.total_prompt_time {
+            pt
+        } else if let Some(start) = self.step_start_instant {
+            start.elapsed().as_millis()
+        } else {
+            0
+        };
+
         if let Some(ts) = self.prompt_timestamp {
             get_mut_group!(self).total_completion_time = now - ts;
-            get_mut_group!(self).total_prompt_time = self.total_prompt_time.unwrap();
+            get_mut_group!(self).total_prompt_time = prompt_time_ms;
         }
 
         get_mut_group!(self).total_time = now - self.timestamp;
@@ -1006,6 +1093,11 @@ impl Sequence {
         get_mut_group!(self)
             .raw_choices
             .push((logit_chunks, self.tokens.clone()));
+        self.update_time_info();
+    }
+
+    pub fn add_embedding_choice_to_group(&self, embedding: Vec<f32>) {
+        get_mut_group!(self).embedding_choices.push(embedding);
         self.update_time_info();
     }
 
@@ -1105,6 +1197,155 @@ impl Sequence {
     pub fn eos_tokens(&self) -> &[u32] {
         &self.eos_tokens
     }
+
+    // === Harmony Format Support ===
+
+    /// Enable Harmony format parsing for this sequence.
+    /// Should be called when the model uses Harmony format (GPT-OSS models).
+    pub fn enable_harmony_mode(&mut self) -> Result<(), anyhow::Error> {
+        if self.harmony_context.is_none() {
+            self.harmony_context = Some(HarmonyContext::new()?);
+        }
+        Ok(())
+    }
+
+    /// Check if this sequence is in Harmony mode
+    pub fn is_harmony_mode(&self) -> bool {
+        self.harmony_context.is_some()
+    }
+
+    /// Process a token through the Harmony parser (if enabled).
+    /// Returns the Harmony delta if in Harmony mode.
+    pub fn process_harmony_token(&mut self, token_id: u32) -> Option<crate::harmony::HarmonyDelta> {
+        self.harmony_context
+            .as_mut()
+            .map(|ctx| ctx.process_token(token_id))
+    }
+
+    /// Get the latest Harmony reasoning delta (for streaming).
+    /// Returns None if not in Harmony mode or no new reasoning content.
+    pub fn get_harmony_reasoning_delta(&mut self) -> Option<String> {
+        self.harmony_context
+            .as_mut()
+            .and_then(|ctx| ctx.get_reasoning_delta())
+    }
+
+    /// Get the latest Harmony final content delta (for streaming).
+    /// Returns None if not in Harmony mode or no new final content.
+    pub fn get_harmony_final_delta(&mut self) -> Option<String> {
+        self.harmony_context
+            .as_mut()
+            .and_then(|ctx| ctx.get_final_delta())
+    }
+
+    /// Get accumulated Harmony reasoning content (for non-streaming).
+    /// Returns None if not in Harmony mode or no reasoning content.
+    pub fn get_harmony_reasoning_content(&self) -> Option<String> {
+        self.harmony_context
+            .as_ref()
+            .and_then(|ctx| ctx.reasoning_content())
+    }
+
+    /// Get accumulated Harmony final content.
+    /// Returns None if not in Harmony mode or no final content.
+    pub fn get_harmony_final_content(&self) -> Option<String> {
+        self.harmony_context
+            .as_ref()
+            .and_then(|ctx| ctx.final_content())
+    }
+
+    /// Signal end of stream to the Harmony parser
+    pub fn harmony_process_eos(&mut self) {
+        if let Some(ref mut ctx) = self.harmony_context {
+            ctx.process_eos();
+        }
+    }
+
+    /// Check if Harmony mode has detected any tool calls
+    pub fn has_harmony_tool_calls(&self) -> bool {
+        self.harmony_context
+            .as_ref()
+            .is_some_and(|ctx| ctx.has_tool_call())
+    }
+
+    /// Get all Harmony tool calls (finalizes any pending tool call)
+    pub fn get_harmony_tool_calls(&mut self) -> Vec<crate::harmony::HarmonyToolCall> {
+        self.harmony_context
+            .as_mut()
+            .map(|ctx| ctx.finalize_tool_calls())
+            .unwrap_or_default()
+    }
+
+    // === Think Tag Format Support ===
+
+    /// Enable think tag parsing for this sequence.
+    /// Should be called when the model uses `<think>...</think>` tags.
+    ///
+    /// If the prompt ends with `<think>`, the context will start inside a think block
+    /// since the chat template hardcoded the opening tag.
+    pub fn enable_think_tag_mode(&mut self) {
+        if self.think_tag_context.is_none() {
+            // Check if the prompt ends with <think> (template hardcoded the opening tag)
+            let starts_in_think_block = self.prompt.trim_end().ends_with("<think>");
+            self.think_tag_context = Some(if starts_in_think_block {
+                ThinkTagContext::new_in_think_block()
+            } else {
+                ThinkTagContext::new()
+            });
+        }
+    }
+
+    /// Check if this sequence is in think tag mode
+    pub fn is_think_tag_mode(&self) -> bool {
+        self.think_tag_context.is_some()
+    }
+
+    /// Process text through the think tag parser (if enabled).
+    pub fn process_think_tag_text(&mut self, text: &str) {
+        if let Some(ref mut ctx) = self.think_tag_context {
+            ctx.process_text(text);
+        }
+    }
+
+    /// Get the latest think tag reasoning delta (for streaming).
+    /// Returns None if not in think tag mode or no new reasoning content.
+    pub fn get_think_tag_reasoning_delta(&mut self) -> Option<String> {
+        self.think_tag_context
+            .as_mut()
+            .and_then(|ctx| ctx.get_reasoning_delta())
+    }
+
+    /// Get the latest think tag content delta (for streaming).
+    /// Returns None if not in think tag mode or no new content.
+    pub fn get_think_tag_content_delta(&mut self) -> Option<String> {
+        self.think_tag_context
+            .as_mut()
+            .and_then(|ctx| ctx.get_content_delta())
+    }
+
+    /// Get accumulated think tag reasoning content (for non-streaming).
+    /// Returns None if not in think tag mode or no reasoning content.
+    pub fn get_think_tag_reasoning_content(&self) -> Option<String> {
+        self.think_tag_context
+            .as_ref()
+            .and_then(|ctx| ctx.reasoning_content())
+    }
+
+    /// Get accumulated think tag content (for non-streaming).
+    /// Returns None if not in think tag mode or no content.
+    pub fn get_think_tag_content(&self) -> Option<String> {
+        self.think_tag_context
+            .as_ref()
+            .and_then(|ctx| ctx.content())
+    }
+
+    /// Finalize think tag parsing at end of stream.
+    /// Handles unclosed `<think>` blocks.
+    pub fn think_tag_finalize(&mut self) {
+        if let Some(ref mut ctx) = self.think_tag_context {
+            ctx.finalize();
+        }
+    }
 }
 
 pub struct SequenceGroup {
@@ -1119,6 +1360,7 @@ pub struct SequenceGroup {
     image_choices: Vec<ImageChoice>,
     speech_pcms: Vec<(Arc<Vec<f32>>, usize, usize)>, // (pcm, rate, channels)
     raw_choices: Vec<(Vec<Tensor>, Vec<u32>)>,
+    embedding_choices: Vec<Vec<f32>>,
     completion_choices: Vec<(f32, CompletionChoice)>,
     pub chat_streaming_chunks: Vec<ChunkChoice>,
     pub completion_streaming_chunks: Vec<CompletionChunkChoice>,
@@ -1138,6 +1380,7 @@ impl SequenceGroup {
             image_choices: Vec::new(),
             speech_pcms: Vec::new(),
             raw_choices: Vec::new(),
+            embedding_choices: Vec::new(),
             completion_choices: Vec::new(),
             n_choices,
             total_prompt_toks: 0,
@@ -1187,12 +1430,23 @@ impl SequenceGroup {
             completion_tokens: self.total_toks.saturating_sub(self.total_prompt_toks),
             prompt_tokens: self.total_prompt_toks,
             total_tokens: self.total_toks,
-            avg_tok_per_sec: (self.total_toks as f32 / self.total_time as f32) * 1000.,
-            avg_prompt_tok_per_sec: (self.total_prompt_toks as f32 / self.total_prompt_time as f32)
-                * 1000.,
-            avg_compl_tok_per_sec: (self.total_toks.saturating_sub(self.total_prompt_toks) as f32
-                / self.total_completion_time as f32)
-                * 1000.,
+            avg_tok_per_sec: if self.total_time > 0 {
+                (self.total_toks as f32 / self.total_time as f32) * 1000.
+            } else {
+                0.0
+            },
+            avg_prompt_tok_per_sec: if self.total_prompt_time > 0 {
+                (self.total_prompt_toks as f32 / self.total_prompt_time as f32) * 1000.
+            } else {
+                0.0
+            },
+            avg_compl_tok_per_sec: if self.total_completion_time > 0 {
+                (self.total_toks.saturating_sub(self.total_prompt_toks) as f32
+                    / self.total_completion_time as f32)
+                    * 1000.
+            } else {
+                0.0
+            },
             total_time_sec: self.total_time as f32 / 1000.,
             total_completion_time_sec: self.total_completion_time as f32 / 1000.,
             total_prompt_time_sec: self.total_prompt_time as f32 / 1000.,
@@ -1222,6 +1476,27 @@ impl SequenceGroup {
                 .send(Response::Raw {
                     logits_chunks,
                     tokens,
+                })
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn maybe_send_embedding_done_response(
+        &self,
+        sender: Sender<Response>,
+    ) -> Result<(), SendError<Response>> {
+        if self.embedding_choices.len() == self.n_choices {
+            assert_eq!(self.embedding_choices.len(), 1);
+            let embeddings = self.embedding_choices[0].clone();
+            let prompt_tokens = self.total_prompt_toks;
+            let total_tokens = self.total_toks;
+            sender
+                .send(Response::Embeddings {
+                    embeddings,
+                    prompt_tokens,
+                    total_tokens,
                 })
                 .await?;
         }

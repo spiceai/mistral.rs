@@ -1,9 +1,10 @@
 [package]
 name = "mistralrs-server-core"
-readme = "README.md"
+readme = "../README.md"
 authors = ["Eric Buehler"]
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description.workspace = true
 repository.workspace = true
 keywords.workspace = true
@@ -21,6 +22,7 @@ futures.workspace = true
 image.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
+base64.workspace = true
 mistralrs-core = { workspace = true, features = [
   "utoipa",
 ] }
@@ -33,6 +35,7 @@ tracing.workspace = true
 url.workspace = true
 utoipa = { workspace = true, features = ["axum_extras"] }
 utoipa-swagger-ui = { workspace = true, features = ["axum"] }
+uuid.workspace = true
 
 accelerate-src = { workspace = true, optional = true }
 intel-mkl-src = { workspace = true, optional = true }
@@ -42,6 +45,7 @@ cuda = ["mistralrs-core/cuda"]
 cudnn = ["mistralrs-core/cudnn"]
 metal = ["mistralrs-core/metal"]
 flash-attn = ["cuda", "mistralrs-core/flash-attn"]
+flash-attn-v3 = ["cuda", "mistralrs-core/flash-attn-v3"]
 accelerate = ["mistralrs-core/accelerate"]
 mkl = ["mistralrs-core/mkl"]
 nccl = ["mistralrs-core/nccl"]

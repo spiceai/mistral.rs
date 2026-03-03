@@ -4,6 +4,10 @@ use candle_core::{quantized::GgmlDType, DType, Device, Result, Tensor};
 use candle_nn::Linear;
 
 mod ops;
+pub use ops::{fp8_blockwise_dequantize, fp8_blockwise_quantize};
+#[cfg(feature = "cuda")]
+#[allow(unused_imports)]
+pub(crate) use ops::{fp8_blockwise_matmul, fp8_indexed_moe_gemm};
 
 #[cfg(feature = "cuda")]
 mod ffi;
@@ -38,7 +42,9 @@ impl QuantMethod for BlockwiseFP8Linear {
             | QuantMethodConfig::Unquantized(_)
             | QuantMethodConfig::Bnb { .. }
             | QuantMethodConfig::FP8 { .. }
-            | QuantMethodConfig::Afq { .. } => unreachable!(),
+            | QuantMethodConfig::PerTensorFP8 { .. }
+            | QuantMethodConfig::Afq { .. }
+            | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
             QuantMethodConfig::BlockwiseFP8 {
                 weight,
                 weight_scale_inv,
@@ -64,8 +70,50 @@ impl QuantMethod for BlockwiseFP8Linear {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        // Dequantize matmul always.
-        // TODO: add a specific kernel?
+        // Try to use native FP8 GEMM kernel on CUDA
+        #[cfg(feature = "cuda")]
+        {
+            if matches!(x.device(), candle_core::Device::Cuda(_))
+                && ffi::HAVE_BLOCKWISE_GEMM_KERNELS
+            {
+                // Handle batched inputs by flattening to 2D
+                let orig_dims = x.dims().to_vec();
+                let x_2d = if orig_dims.len() > 2 {
+                    // Flatten all but last dim: [batch, seq, features] -> [batch*seq, features]
+                    let features = orig_dims[orig_dims.len() - 1];
+                    let batch_size: usize = orig_dims[..orig_dims.len() - 1].iter().product();
+                    x.reshape((batch_size, features))?
+                } else {
+                    x.clone()
+                };
+
+                // Use native FP8 GEMM kernel
+                let result = ops::fp8_blockwise_matmul(
+                    &x_2d,
+                    &self.weight,
+                    &self.weight_scale_inv,
+                    &self.weight_block_size,
+                )?;
+
+                // Reshape back to original batch dimensions
+                let result = if orig_dims.len() > 2 {
+                    let out_features = result.dim(1)?;
+                    let mut new_dims = orig_dims[..orig_dims.len() - 1].to_vec();
+                    new_dims.push(out_features);
+                    result.reshape(new_dims)?
+                } else {
+                    result
+                };
+
+                // Apply bias if present
+                if let Some(ref bias) = self.bias {
+                    return result.broadcast_add(bias);
+                }
+                return Ok(result);
+            }
+        }
+
+        // Fallback: dequantize and use unquantized matmul
         let weight = self.dequantize_w()?;
         // Dispatch to unquant. This uses some cublaslt for bias & on cuda always, so it is better
         let unquant = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(
@@ -73,6 +121,84 @@ impl QuantMethod for BlockwiseFP8Linear {
             self.bias.clone(),
         )))?;
         unquant.forward(x)
+    }
+
+    /// Compute matmul of `self` and `a`. `self` should contain the weights.
+    ///
+    /// If `a` is (n_tokens, 1, cols), `self` weights are (n_experts, rows, cols),
+    /// then the indices are (n_tokens, n_experts_per_tok).
+    fn gather_forward(&self, x: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        // Try to use native FP8 indexed MoE GEMM kernel on CUDA
+        #[cfg(feature = "cuda")]
+        {
+            if matches!(x.device(), candle_core::Device::Cuda(_))
+                && ffi::HAVE_BLOCKWISE_GEMM_KERNELS
+            {
+                // Use native FP8 indexed MoE GEMM kernel (expects U32 indices)
+                let result = ops::fp8_indexed_moe_gemm(
+                    x,
+                    &self.weight,
+                    &self.weight_scale_inv,
+                    indices,
+                    &self.weight_block_size,
+                )?;
+                // Apply bias if present (broadcast over tokens and topk)
+                if let Some(ref bias) = self.bias {
+                    return result.broadcast_add(bias);
+                }
+                return Ok(result);
+            }
+        }
+
+        // Fallback: dequantize weights and compute manually
+        let weight = self.dequantize_w()?;
+
+        // Expected shapes:
+        // - x: (n_tokens, 1, hidden_dim) or (n_tokens, n_experts_per_tok, hidden_dim)
+        // - indices: (n_tokens, n_experts_per_tok)
+        // - weight: (n_experts, out_features, in_features)
+
+        let (n_tokens, n_experts_per_tok) = indices.dims2()?;
+        let (_n_experts, out_features, _in_features) = weight.dims3()?;
+
+        // Flatten indices to select expert weights
+        let flat_indices = indices.flatten_all()?;
+
+        // Select weights for each (token, expert) pair
+        // weight_selected: (n_tokens * n_experts_per_tok, out_features, in_features)
+        let weight_selected = weight.index_select(&flat_indices, 0)?;
+
+        // Reshape x for batched matmul
+        let x_expanded = if x.dims().len() == 3 && x.dim(1)? == 1 {
+            // x is (n_tokens, 1, hidden_dim) - broadcast to (n_tokens * n_experts_per_tok, 1, hidden_dim)
+            x.squeeze(1)?
+                .unsqueeze(1)?
+                .broadcast_as((n_tokens * n_experts_per_tok, 1, x.dim(2)?))?
+                .contiguous()?
+        } else if x.dims().len() == 3 {
+            // x is (n_tokens, n_experts_per_tok, hidden_dim)
+            x.reshape((n_tokens * n_experts_per_tok, 1, x.dim(2)?))?
+        } else {
+            // x is (n_tokens, hidden_dim)
+            x.unsqueeze(1)?
+                .broadcast_as((n_tokens * n_experts_per_tok, 1, x.dim(1)?))?
+                .contiguous()?
+        };
+
+        // Batched matmul: (batch, 1, k) @ (batch, k, n).T = (batch, 1, n)
+        // weight_selected is (batch, n, k), so we need to transpose last two dims
+        let weight_t = weight_selected.transpose(1, 2)?;
+        let result = x_expanded.matmul(&weight_t)?;
+
+        // Reshape result to (n_tokens, n_experts_per_tok, out_features)
+        let result = result.reshape((n_tokens, n_experts_per_tok, out_features))?;
+
+        // Apply bias if present
+        if let Some(ref bias) = self.bias {
+            result.broadcast_add(bias)
+        } else {
+            Ok(result)
+        }
     }
 
     fn quantized_act_type(&self) -> Option<DType> {
@@ -256,6 +382,23 @@ impl QuantizedSerde for BlockwiseFP8Linear {
     }
 }
 
+/// Create a BlockwiseFP8Linear for MoE with 3D weights [num_experts, N, K].
+/// This is used by FusedExperts to enable gather_forward with native FP8 GEMM.
+pub fn blockwise_fp8_moe(
+    weight: Tensor,
+    weight_scale_inv: Tensor,
+    weight_block_size: Vec<usize>,
+    dequant_dtype: DType,
+) -> Result<Arc<dyn QuantMethod>> {
+    Ok(Arc::new(BlockwiseFP8Linear {
+        weight,
+        weight_scale_inv,
+        bias: None,
+        dequant_dtype,
+        weight_block_size,
+    }))
+}
+
 pub fn blockwise_fp8_linear_b(
     in_dim: usize,
     out_dim: usize,
@@ -268,7 +411,7 @@ pub fn blockwise_fp8_linear_b(
         candle_core::bail!("Unexpected quantization config.")
     };
 
-    // Handle the case where we actually have an unqiantzed
+    // Handle the case where we actually have an unquantized layer
     if vb.contains_tensor("weight") && !vb.contains_tensor("weight_scale_inv") {
         return crate::linear_b(in_dim, out_dim, bias, &None, vb);
     }
@@ -279,6 +422,10 @@ pub fn blockwise_fp8_linear_b(
         return Ok(Arc::new(layer) as Arc<dyn QuantMethod>);
     }
 
+    // Blockwise FP8 requires weight_block_size to be set
+    let Some(weight_block_size) = weight_block_size else {
+        candle_core::bail!("Blockwise FP8 requires weight_block_size to be set. Use per-tensor FP8 for models without block sizes.")
+    };
     if weight_block_size.len() != 2 {
         candle_core::bail!("Expected weight_block_size to have length 2, got {weight_block_size:?}")
     }

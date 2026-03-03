@@ -2,12 +2,11 @@ use directories::ProjectDirs;
 use either::Either;
 use indexmap::IndexMap;
 use mistralrs_core::{
-    speech_utils, ChunkChoice, Constraint, Delta, DiffusionGenerationParams, DrySamplingParams,
+    speech_utils, Constraint, DiffusionGenerationParams, DrySamplingParams,
     ImageGenerationResponseFormat, MessageContent, MistralRs, ModelCategory, NormalRequest,
     Request, RequestMessage, Response, ResponseOk, SamplingParams, WebSearchOptions,
     TERMINATE_ALL_NEXT_STEP,
 };
-use once_cell::sync::Lazy;
 use regex::Regex;
 use rustyline::{error::ReadlineError, history::History, DefaultEditor, Editor, Helper};
 use serde_json::Value;
@@ -15,7 +14,7 @@ use std::{
     fs,
     io::{self, Write},
     path::PathBuf,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{atomic::Ordering, Arc, LazyLock, Mutex},
     time::Instant,
 };
 use tokio::sync::mpsc::channel;
@@ -71,8 +70,8 @@ fn read_line<H: Helper, I: History>(editor: &mut Editor<H, I>) -> String {
     }
 }
 
-static CTRLC_HANDLER: Lazy<Mutex<&'static (dyn Fn() + Sync)>> =
-    Lazy::new(|| Mutex::new(&exit_handler));
+static CTRLC_HANDLER: LazyLock<Mutex<&'static (dyn Fn() + Sync)>> =
+    LazyLock::new(|| Mutex::new(&exit_handler));
 
 pub async fn interactive_mode(
     mistralrs: Arc<MistralRs>,
@@ -91,6 +90,9 @@ pub async fn interactive_mode(
             audio_interactive_mode(mistralrs, do_search, enable_thinking).await
         }
         Ok(ModelCategory::Speech) => speech_interactive_mode(mistralrs, do_search).await,
+        Ok(ModelCategory::Embedding) => error!(
+            "Embedding models do not support interactive mode. Use the server or Python/Rust APIs."
+        ),
         Err(e) => eprintln!("Error getting model category: {e}"),
     }
 }
@@ -158,6 +160,7 @@ fn interactive_sample_parameters() -> SamplingParams {
         top_n_logprobs: 0,
         frequency_penalty: Some(0.1),
         presence_penalty: Some(0.1),
+        repetition_penalty: None,
         max_len: None,
         stop_toks: None,
         logits_bias: None,
@@ -311,6 +314,7 @@ async fn text_interactive_mode(
         let request_messages = RequestMessage::Chat {
             messages: messages.clone(),
             enable_thinking,
+            reasoning_effort: None,
         };
 
         let (tx, mut rx) = channel(10_000);
@@ -329,6 +333,7 @@ async fn text_interactive_mode(
             return_raw_logits: false,
             web_search_options: do_search.then(WebSearchOptions::default),
             model_id: None,
+            truncate_sequence: false,
         }));
         sender.send(req).await.unwrap();
         let start_ttft = Instant::now();
@@ -336,34 +341,43 @@ async fn text_interactive_mode(
 
         let mut assistant_output = String::new();
 
+        // ANSI escape codes for gray (muted) and reset
+        const GRAY: &str = "\x1b[90m";
+        const RESET: &str = "\x1b[0m";
+
         let mut last_usage = None;
         while let Some(resp) = rx.recv().await {
             match resp {
                 Response::Chunk(chunk) => {
                     last_usage = chunk.usage.clone();
-                    if let ChunkChoice {
-                        delta:
-                            Delta {
-                                content: Some(content),
-                                ..
-                            },
-                        finish_reason,
-                        ..
-                    } = &chunk.choices[0]
-                    {
-                        if first_token_duration.is_none() {
-                            let ttft = Instant::now().duration_since(start_ttft);
-                            first_token_duration = Some(ttft);
-                        }
+                    let choice = &chunk.choices[0];
+
+                    // Track first token timing
+                    let has_any_content =
+                        choice.delta.content.is_some() || choice.delta.reasoning_content.is_some();
+                    if has_any_content && first_token_duration.is_none() {
+                        let ttft = Instant::now().duration_since(start_ttft);
+                        first_token_duration = Some(ttft);
+                    }
+
+                    // Display reasoning content in gray (muted)
+                    if let Some(ref reasoning) = choice.delta.reasoning_content {
+                        print!("{GRAY}{reasoning}{RESET}");
+                        io::stdout().flush().unwrap();
+                    }
+
+                    // Display final content normally
+                    if let Some(ref content) = choice.delta.content {
                         assistant_output.push_str(content);
                         print!("{content}");
                         io::stdout().flush().unwrap();
-                        if finish_reason.is_some() {
-                            if matches!(finish_reason.as_ref().unwrap().as_str(), "length") {
-                                print!("...");
-                            }
-                            break;
+                    }
+
+                    if let Some(ref finish_reason) = choice.finish_reason {
+                        if matches!(finish_reason.as_str(), "length") {
+                            print!("...");
                         }
+                        break;
                     }
                 }
                 Response::InternalError(e) => {
@@ -385,6 +399,7 @@ async fn text_interactive_mode(
                 Response::ImageGeneration(_) => unreachable!(),
                 Response::Speech { .. } => unreachable!(),
                 Response::Raw { .. } => unreachable!(),
+                Response::Embeddings { .. } => unreachable!(),
             }
         }
 
@@ -454,10 +469,7 @@ async fn vision_interactive_mode(
     let config = mistralrs.config(None).unwrap();
     let prefixer = match &config.category {
         ModelCategory::Vision { prefixer } => prefixer,
-        ModelCategory::Text
-        | ModelCategory::Diffusion
-        | ModelCategory::Speech
-        | ModelCategory::Audio => {
+        _ => {
             panic!("`add_image_message` expects a vision model.")
         }
     };
@@ -616,6 +628,7 @@ async fn vision_interactive_mode(
             audios: audios.clone(),
             messages: messages.clone(),
             enable_thinking,
+            reasoning_effort: None,
         };
 
         let (tx, mut rx) = channel(10_000);
@@ -634,6 +647,7 @@ async fn vision_interactive_mode(
             return_raw_logits: false,
             web_search_options: do_search.then(WebSearchOptions::default),
             model_id: None,
+            truncate_sequence: false,
         }));
         sender.send(req).await.unwrap();
         let start_ttft = Instant::now();
@@ -641,34 +655,43 @@ async fn vision_interactive_mode(
 
         let mut assistant_output = String::new();
 
+        // ANSI escape codes for gray (muted) and reset
+        const GRAY: &str = "\x1b[90m";
+        const RESET: &str = "\x1b[0m";
+
         let mut last_usage = None;
         while let Some(resp) = rx.recv().await {
             match resp {
                 Response::Chunk(chunk) => {
                     last_usage = chunk.usage.clone();
-                    if let ChunkChoice {
-                        delta:
-                            Delta {
-                                content: Some(content),
-                                ..
-                            },
-                        finish_reason,
-                        ..
-                    } = &chunk.choices[0]
-                    {
-                        if first_token_duration.is_none() {
-                            let ttft = Instant::now().duration_since(start_ttft);
-                            first_token_duration = Some(ttft);
-                        }
+                    let choice = &chunk.choices[0];
+
+                    // Track first token timing
+                    let has_any_content =
+                        choice.delta.content.is_some() || choice.delta.reasoning_content.is_some();
+                    if has_any_content && first_token_duration.is_none() {
+                        let ttft = Instant::now().duration_since(start_ttft);
+                        first_token_duration = Some(ttft);
+                    }
+
+                    // Display reasoning content in gray (muted)
+                    if let Some(ref reasoning) = choice.delta.reasoning_content {
+                        print!("{GRAY}{reasoning}{RESET}");
+                        io::stdout().flush().unwrap();
+                    }
+
+                    // Display final content normally
+                    if let Some(ref content) = choice.delta.content {
                         assistant_output.push_str(content);
                         print!("{content}");
                         io::stdout().flush().unwrap();
-                        if finish_reason.is_some() {
-                            if matches!(finish_reason.as_ref().unwrap().as_str(), "length") {
-                                print!("...");
-                            }
-                            break;
+                    }
+
+                    if let Some(ref finish_reason) = choice.finish_reason {
+                        if matches!(finish_reason.as_str(), "length") {
+                            print!("...");
                         }
+                        break;
                     }
                 }
                 Response::InternalError(e) => {
@@ -690,6 +713,7 @@ async fn vision_interactive_mode(
                 Response::ImageGeneration(_) => unreachable!(),
                 Response::Speech { .. } => unreachable!(),
                 Response::Raw { .. } => unreachable!(),
+                Response::Embeddings { .. } => unreachable!(),
             }
         }
 
@@ -793,6 +817,7 @@ async fn diffusion_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) 
             return_raw_logits: false,
             web_search_options: do_search.then(WebSearchOptions::default),
             model_id: None,
+            truncate_sequence: false,
         }));
 
         let start = Instant::now();
@@ -881,6 +906,7 @@ async fn speech_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) {
             return_raw_logits: false,
             web_search_options: do_search.then(WebSearchOptions::default),
             model_id: None,
+            truncate_sequence: false,
         }));
 
         let start = Instant::now();

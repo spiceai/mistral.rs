@@ -35,12 +35,41 @@ pub enum ImageGenerationResponseFormat {
 
 pub type MessageContent = Either<String, Vec<IndexMap<String, Value>>>;
 
+/// Reasoning effort level for models that support it (e.g., GPT-OSS with Harmony format).
+/// Controls the depth of reasoning/analysis in the model's response.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Minimal reasoning, faster responses
+    Low,
+    /// Balanced reasoning depth
+    #[default]
+    Medium,
+    /// Deep reasoning, more thorough analysis
+    High,
+}
+
+impl ReasoningEffort {
+    /// Convert to string representation for chat template
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Message or messages for a [`Request`].
 pub enum RequestMessage {
     Chat {
         messages: Vec<IndexMap<String, MessageContent>>,
         enable_thinking: Option<bool>,
+        /// Reasoning effort level for Harmony-format models
+        reasoning_effort: Option<ReasoningEffort>,
     },
     Completion {
         text: String,
@@ -55,6 +84,8 @@ pub enum RequestMessage {
         audios: Vec<AudioInput>,
         messages: Vec<IndexMap<String, MessageContent>>,
         enable_thinking: Option<bool>,
+        /// Reasoning effort level for Harmony-format models
+        reasoning_effort: Option<ReasoningEffort>,
     },
     ImageGeneration {
         prompt: String,
@@ -63,6 +94,12 @@ pub enum RequestMessage {
     },
     SpeechGeneration {
         prompt: String,
+    },
+    Embedding {
+        prompt: String,
+    },
+    EmbeddingTokens {
+        prompt: Vec<u32>,
     },
 }
 
@@ -135,6 +172,7 @@ pub struct WebSearchOptions {
 ///     3) Apply temperature and softmax
 ///     4) Sample the next token (topk, topp, minp, etc)
 /// - `return_raw_logits`: Return raw logits.
+/// - `truncate_sequence`: Whether to truncate the prompt if it exceeds the model's maximum context length.
 pub struct NormalRequest {
     pub messages: RequestMessage,
     pub sampling_params: SamplingParams,
@@ -153,6 +191,8 @@ pub struct NormalRequest {
     pub return_raw_logits: bool,
     pub web_search_options: Option<WebSearchOptions>,
     pub model_id: Option<String>,
+    #[serde(default)]
+    pub truncate_sequence: bool,
 }
 
 impl NormalRequest {
@@ -179,6 +219,7 @@ impl NormalRequest {
             return_raw_logits: false,
             web_search_options: None,
             model_id: None,
+            truncate_sequence: false,
         }
     }
 }
@@ -192,6 +233,7 @@ pub struct TokenizationRequest {
     pub add_generation_prompt: bool,
     pub add_special_tokens: bool,
     pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default = "default_responder")]
     #[serde(skip)]
     pub response: Sender<anyhow::Result<Vec<u32>>>,

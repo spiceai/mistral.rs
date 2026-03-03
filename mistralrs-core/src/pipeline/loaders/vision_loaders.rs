@@ -20,6 +20,7 @@ use self::minicpmo::{MiniCpmOConfig, MiniCpmOModel, MiniCpmOProcessor};
 
 use super::{DeviceMappedModelLoader, NonMappedSubModel, NormalLoadingMetadata};
 use crate::amoe::AnyMoeBaseModelMixin;
+use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::DeviceMapper;
 use crate::layers::Conv3dConfig;
 use crate::matformer::MatformerSliceConfig;
@@ -35,7 +36,7 @@ use crate::utils::varbuilder_utils::DeviceForLoadTensor;
 use crate::vision_models::clip::ClipConfig;
 use crate::vision_models::gemma3::config::Gemma3Config;
 use crate::vision_models::gemma3::{Gemma3Model, Gemma3Processor};
-use crate::vision_models::gemma3n::config::Gemma3nConfig;
+use crate::vision_models::gemma3n::config::{Gemma3nConfig, IntermediateSize};
 use crate::vision_models::gemma3n::{Gemma3nModel, Gemma3nProcessor};
 use crate::vision_models::idefics2::{Config as Idefics2Config, Idefics2};
 use crate::vision_models::idefics2_input_processor::Idefics2Processor;
@@ -61,6 +62,10 @@ use crate::vision_models::qwen2_5_vl::{
     Config as Qwen2_5VLConfig, Qwen2_5VLModel, Qwen2_5VLProcessor,
 };
 use crate::vision_models::qwen2vl::{Config as Qwen2VLConfig, Qwen2VLModel, Qwen2VLProcessor};
+use crate::vision_models::qwen3_vl::{Config as Qwen3VLConfig, Qwen3VLModel, Qwen3VLProcessor};
+use crate::vision_models::qwen3_vl_moe::{
+    Config as Qwen3VLMoEConfig, Qwen3VLMoEModel, Qwen3VLMoEProcessor,
+};
 use crate::vision_models::{minicpmo, phi4};
 
 pub trait VisionModel: IsqModel + AnyMoeBaseModelMixin {
@@ -140,7 +145,7 @@ pub trait VisionModelLoader: IsqModelLoader + Send + Sync + DeviceMappedModelLoa
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyclass(eq, eq_int))]
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
 /// The architecture to load the vision model as.
 pub enum VisionLoaderType {
     #[serde(rename = "phi3v")]
@@ -171,6 +176,10 @@ pub enum VisionLoaderType {
     Llama4,
     #[serde(rename = "gemma3n")]
     Gemma3n,
+    #[serde(rename = "qwen3vl")]
+    Qwen3VL,
+    #[serde(rename = "qwen3vlmoe")]
+    Qwen3VLMoE,
 }
 
 // https://github.com/huggingface/transformers/blob/cff06aac6fad28019930be03f5d467055bf62177/src/transformers/models/auto/modeling_auto.py#L448
@@ -191,6 +200,8 @@ impl VisionLoaderType {
             "Mistral3ForConditionalGeneration" => Ok(Self::Mistral3),
             "Llama4ForConditionalGeneration" => Ok(Self::Llama4),
             "Gemma3nForConditionalGeneration" => Ok(Self::Gemma3n),
+            "Qwen3VLForConditionalGeneration" => Ok(Self::Qwen3VL),
+            "Qwen3VLMoeForConditionalGeneration" => Ok(Self::Qwen3VLMoE),
             other => anyhow::bail!(
                 "Unsupported Hugging Face Transformers -CausalLM model class `{other}`. Please raise an issue."
             ),
@@ -216,7 +227,9 @@ impl FromStr for VisionLoaderType {
             "mistral3" => Ok(Self::Mistral3),
             "llama4" => Ok(Self::Llama4),
             "gemma3n" => Ok(Self::Gemma3n),
-            a => Err(format!("Unknown architecture `{a}`. Possible architectures: `phi3v`, `idefics2`, `llava_next`, `llava`, `vllama`, `qwen2vl`, `idefics3`, `minicpmo`, `phi4mm`, `qwen2_5vl`, `gemma3`, `mistral3`, `llama4`, `gemma3n`.")),
+            "qwen3vl" => Ok(Self::Qwen3VL),
+            "qwen3vlmoe" => Ok(Self::Qwen3VLMoE),
+            a => Err(format!("Unknown architecture `{a}`. Possible architectures: `phi3v`, `idefics2`, `llava_next`, `llava`, `vllama`, `qwen2vl`, `idefics3`, `minicpmo`, `phi4mm`, `qwen2_5vl`, `gemma3`, `mistral3`, `llama4`, `gemma3n`, `qwen3vl`, `qwen3vlmoe`.")),
         }
     }
 }
@@ -238,6 +251,8 @@ impl std::fmt::Display for VisionLoaderType {
             VisionLoaderType::Mistral3 => "mistral3",
             VisionLoaderType::Llama4 => "llama4",
             VisionLoaderType::Gemma3n => "gemma3n",
+            VisionLoaderType::Qwen3VL => "qwen3vl",
+            VisionLoaderType::Qwen3VLMoE => "qwen3vlmoe",
         };
         write!(f, "{name}")
     }
@@ -279,6 +294,8 @@ impl AutoVisionLoader {
             VisionLoaderType::Mistral3 => Box::new(Mistral3Loader),
             VisionLoaderType::Llama4 => Box::new(VLlama4Loader),
             VisionLoaderType::Gemma3n => Box::new(Gemma3nLoader),
+            VisionLoaderType::Qwen3VL => Box::new(Qwen3VLLoader),
+            VisionLoaderType::Qwen3VLMoE => Box::new(Qwen3VLMoELoader),
         })
     }
 }
@@ -362,9 +379,8 @@ impl DeviceMappedModelLoader for AutoVisionLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
-        Self::get_loader(config)?.mapped_max_act_size_elems(config, params, prompt_chunksize)
+        Self::get_loader(config)?.mapped_max_act_size_elems(config, params)
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -466,7 +482,7 @@ fn get_clip_vit_num_elems(cfg: &ClipConfig) -> usize {
 
 /// [`VisionLoader`] for a Phi 3 Vision model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct Phi3VLoader;
 
 pub struct Phi3VPrefixer;
@@ -556,7 +572,6 @@ impl DeviceMappedModelLoader for Phi3VLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         // NOTE: we ignore max_num_images although it can only be one...
         let AutoDeviceMapParams::Vision {
@@ -578,7 +593,7 @@ impl DeviceMappedModelLoader for Phi3VLoader {
 
         let max_text_attn = {
             // This model injects the vision information directly into the input embeddings
-            let max_seq_len = img_seq_len + max_seq_len;
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
             max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
         };
 
@@ -734,6 +749,7 @@ impl DeviceMappedModelLoader for Phi3VLoader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.head_dim(),
             v_head_dim: cfg.head_dim(),
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -748,7 +764,7 @@ impl DeviceMappedModelLoader for Phi3VLoader {
 
 /// [`VisionLoader`] for an Idefics 2 Vision model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct Idefics2Loader;
 
 pub struct Idefics2Prefixer;
@@ -850,7 +866,6 @@ impl DeviceMappedModelLoader for Idefics2Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -869,7 +884,7 @@ impl DeviceMappedModelLoader for Idefics2Loader {
 
         let max_text_attn = {
             // This model injects the vision information directly into the input embeddings
-            let max_seq_len = img_seq_len + max_seq_len;
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
             max_batch_size * cfg.text_config.num_attention_heads * max_seq_len * max_seq_len
         };
 
@@ -1085,6 +1100,7 @@ impl DeviceMappedModelLoader for Idefics2Loader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -1099,7 +1115,7 @@ impl DeviceMappedModelLoader for Idefics2Loader {
 
 /// [`VisionLoader`] for an LLaVANext Vision model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct LLaVANextLoader;
 
 pub struct LLaVANextPrefixer;
@@ -1196,7 +1212,6 @@ impl DeviceMappedModelLoader for LLaVANextLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -1221,7 +1236,7 @@ impl DeviceMappedModelLoader for LLaVANextLoader {
         let max_text_attn = {
             let cfg = &config.text_config;
             // This model injects the vision information directly into the input embeddings
-            let max_seq_len = img_seq_len + max_seq_len;
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
 
             max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
         };
@@ -1355,6 +1370,7 @@ impl DeviceMappedModelLoader for LLaVANextLoader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -1369,7 +1385,7 @@ impl DeviceMappedModelLoader for LLaVANextLoader {
 
 /// [`VisionLoader`] for an LLaVA Vision model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct LLaVALoader;
 
 pub struct LLaVAPrefixer;
@@ -1466,7 +1482,6 @@ impl DeviceMappedModelLoader for LLaVALoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -1487,7 +1502,7 @@ impl DeviceMappedModelLoader for LLaVALoader {
         let max_text_attn = {
             let cfg = &config.text_config;
             // This model injects the vision information directly into the input embeddings
-            let max_seq_len = img_seq_len + max_seq_len;
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
 
             max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
         };
@@ -1617,6 +1632,7 @@ impl DeviceMappedModelLoader for LLaVALoader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -1631,7 +1647,7 @@ impl DeviceMappedModelLoader for LLaVALoader {
 
 /// [`VisionLoader`] for an Llama Vision model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct VLlamaLoader;
 
 pub struct VLlamaPrefixer;
@@ -1770,7 +1786,6 @@ impl DeviceMappedModelLoader for VLlamaLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -1799,7 +1814,7 @@ impl DeviceMappedModelLoader for VLlamaLoader {
 
         let max_self_text_attn = {
             let cfg = &config.text_config;
-            max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
+            max_batch_size * cfg.num_attention_heads * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2)
         };
 
         Ok(max_self_text_attn.max(max_cross_text_attn))
@@ -2003,6 +2018,7 @@ impl DeviceMappedModelLoader for VLlamaLoader {
             sliding_window: None,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -2017,7 +2033,7 @@ impl DeviceMappedModelLoader for VLlamaLoader {
 
 /// [`VisionLoader`] for an Qwen2-VL model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct Qwen2VLLoader;
 
 pub struct Qwen2VLPrefixer;
@@ -2109,7 +2125,6 @@ impl DeviceMappedModelLoader for Qwen2VLLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -2123,18 +2138,20 @@ impl DeviceMappedModelLoader for Qwen2VLLoader {
 
         let cfg: Qwen2VLConfig = serde_json::from_str(config)?;
 
+        // For images, grid_t=1. After spatial merging, grid_h and grid_w are reduced.
         let img_seq_len = {
             let cfg = &cfg.vision_config;
-            let grid_t = max_num_images / cfg.temporal_patch_size;
-            let grid_h = max_image_shape.0 / cfg.patch_size;
-            let grid_w = max_image_shape.1 / cfg.patch_size;
-            grid_t * grid_h * grid_w
+            // grid_t is 1 for images (temporal dimension is for video only)
+            let grid_t = 1;
+            // After patch embedding and spatial merge, the effective grid dimensions are reduced
+            let grid_h = (max_image_shape.0 / cfg.patch_size) / cfg.spatial_merge_size;
+            let grid_w = (max_image_shape.1 / cfg.patch_size) / cfg.spatial_merge_size;
+            grid_t * grid_h * grid_w * max_num_images
         };
-        let img_seq_len = img_seq_len * max_num_images;
 
         let max_text_attn = {
             // This model injects the vision information directly into the input embeddings
-            let max_seq_len = img_seq_len + max_seq_len;
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
             max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
         };
 
@@ -2158,9 +2175,11 @@ impl DeviceMappedModelLoader for Qwen2VLLoader {
 
         let cfg: Qwen2VLConfig = serde_json::from_str(config)?;
 
+        // For the vision encoder, before spatial merging
         let img_seq_len = {
             let cfg = &cfg.vision_config;
-            let grid_t = max_num_images / cfg.temporal_patch_size;
+            // grid_t is 1 for images
+            let grid_t = 1;
             let grid_h = max_image_shape.0 / cfg.patch_size;
             let grid_w = max_image_shape.1 / cfg.patch_size;
             grid_t * grid_h * grid_w
@@ -2300,6 +2319,7 @@ impl DeviceMappedModelLoader for Qwen2VLLoader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -2314,7 +2334,7 @@ impl DeviceMappedModelLoader for Qwen2VLLoader {
 
 /// [`VisionLoader`] for an Idefics 3 Vision model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct Idefics3Loader;
 
 pub struct Idefics3Prefixer;
@@ -2432,7 +2452,6 @@ impl DeviceMappedModelLoader for Idefics3Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -2451,7 +2470,7 @@ impl DeviceMappedModelLoader for Idefics3Loader {
 
         let max_text_attn = {
             // This model injects the vision information directly into the input embeddings
-            let max_seq_len = img_seq_len + max_seq_len;
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
             max_batch_size * cfg.text_config.num_attention_heads * max_seq_len * max_seq_len
         };
 
@@ -2618,6 +2637,7 @@ impl DeviceMappedModelLoader for Idefics3Loader {
             sliding_window: None,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -2632,7 +2652,7 @@ impl DeviceMappedModelLoader for Idefics3Loader {
 
 /// [`VisionLoader`] for an MiniCpm-O model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct MiniCpmOLoader;
 
 pub struct MiniCpmOPrefixer;
@@ -2722,7 +2742,6 @@ impl DeviceMappedModelLoader for MiniCpmOLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -2741,7 +2760,7 @@ impl DeviceMappedModelLoader for MiniCpmOLoader {
 
         let max_text_attn = {
             // This model injects the vision information directly into the input embeddings
-            let max_seq_len = img_seq_len + max_seq_len;
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
             max_batch_size * cfg.text_config.num_attention_heads * max_seq_len * max_seq_len
         };
 
@@ -2901,6 +2920,7 @@ impl DeviceMappedModelLoader for MiniCpmOLoader {
             sliding_window: None,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -2911,7 +2931,7 @@ impl DeviceMappedModelLoader for MiniCpmOLoader {
 
 /// [`VisionLoader`] for a Phi 4MM Vision model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct Phi4MMLoader;
 
 pub struct Phi4MMPrefixer;
@@ -3017,7 +3037,6 @@ impl DeviceMappedModelLoader for Phi4MMLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         // NOTE: we ignore max_num_images although it can only be one...
         let AutoDeviceMapParams::Vision {
@@ -3039,7 +3058,7 @@ impl DeviceMappedModelLoader for Phi4MMLoader {
 
         let max_text_attn = {
             // This model injects the vision information directly into the input embeddings
-            let max_seq_len = img_seq_len + max_seq_len;
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
             max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
         };
 
@@ -3243,6 +3262,7 @@ impl DeviceMappedModelLoader for Phi4MMLoader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.head_dim(),
             v_head_dim: cfg.head_dim(),
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -3257,7 +3277,7 @@ impl DeviceMappedModelLoader for Phi4MMLoader {
 
 /// [`VisionLoader`] for an Qwen2_5VL model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct Qwen2_5VLLoader;
 
 pub struct Qwen2_5VLPrefixer;
@@ -3349,7 +3369,6 @@ impl DeviceMappedModelLoader for Qwen2_5VLLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -3374,7 +3393,7 @@ impl DeviceMappedModelLoader for Qwen2_5VLLoader {
 
         let max_text_attn = {
             // This model injects the vision information directly into the input embeddings
-            let max_seq_len = img_seq_len + max_seq_len;
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
             max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
         };
 
@@ -3539,6 +3558,7 @@ impl DeviceMappedModelLoader for Qwen2_5VLLoader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -3553,7 +3573,7 @@ impl DeviceMappedModelLoader for Qwen2_5VLLoader {
 
 /// [`VisionLoader`] for an Gemma 3 model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct Gemma3Loader;
 
 pub struct Gemma3Prefixer;
@@ -3655,7 +3675,6 @@ impl DeviceMappedModelLoader for Gemma3Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -3672,8 +3691,7 @@ impl DeviceMappedModelLoader for Gemma3Loader {
         match cfg {
             Gemma3Config::Text(text_config) => Ok(max_batch_size
                 * text_config.num_attention_heads
-                * prompt_chunksize
-                * prompt_chunksize),
+                * max_seq_len.min(&ATTENTION_CHUNK_SIZE).pow(2)),
             Gemma3Config::WithVision {
                 text_config,
                 vision_config,
@@ -3684,7 +3702,7 @@ impl DeviceMappedModelLoader for Gemma3Loader {
 
                 let max_text_attn = {
                     // This model injects the vision information directly into the input embeddings
-                    let max_seq_len = img_seq_len + *max_seq_len;
+                    let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
                     max_batch_size * text_config.num_attention_heads * max_seq_len * max_seq_len
                 };
                 Ok(max_text_attn)
@@ -3879,6 +3897,7 @@ impl DeviceMappedModelLoader for Gemma3Loader {
             sliding_window: None, // None to be more forgiving, some do not
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -3893,7 +3912,7 @@ impl DeviceMappedModelLoader for Gemma3Loader {
 
 /// [`VisionLoader`] for an Mistral 3 model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct Mistral3Loader;
 
 pub struct Mistral3Prefixer;
@@ -3912,7 +3931,8 @@ impl VisionModelLoader for Mistral3Loader {
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn VisionModel + Send + Sync>> {
-        let cfg: crate::vision_models::mistral3::Mistral3Config = serde_json::from_str(config)?;
+        let mut cfg: crate::vision_models::mistral3::Mistral3Config = serde_json::from_str(config)?;
+        cfg.propagate_quantization_config();
         Ok(Box::new(Mistral3Model::new(
             &cfg,
             vb,
@@ -3991,7 +4011,6 @@ impl DeviceMappedModelLoader for Mistral3Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let cfg: Mistral3Config = serde_json::from_str(config)?;
         let vcfg = &cfg.vision_config;
@@ -4031,7 +4050,7 @@ impl DeviceMappedModelLoader for Mistral3Loader {
         };
 
         // This model injects the vision information directly into the input embeddings
-        let max_seq_len = img_seq_len * max_num_images + *max_seq_len;
+        let max_seq_len = img_seq_len * max_num_images + *max_seq_len.min(&ATTENTION_CHUNK_SIZE);
         Ok(max_batch_size * tcfg.num_attention_heads * max_seq_len * max_seq_len)
     }
 
@@ -4203,6 +4222,7 @@ impl DeviceMappedModelLoader for Mistral3Loader {
             sliding_window: cfg.sliding_window,
             k_head_dim: cfg.head_dim(),
             v_head_dim: cfg.head_dim(),
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -4217,7 +4237,7 @@ impl DeviceMappedModelLoader for Mistral3Loader {
 
 /// [`VisionLoader`] for an Llama Vision model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct VLlama4Loader;
 
 pub struct VLlama4Prefixer;
@@ -4239,7 +4259,8 @@ impl VisionModelLoader for VLlama4Loader {
         normal_loading_metadata: NormalLoadingMetadata,
         attention_mechanism: AttentionImplementation,
     ) -> Result<Box<dyn VisionModel + Send + Sync>> {
-        let cfg: crate::vision_models::llama4::Llama4Config = serde_json::from_str(config)?;
+        let mut cfg: crate::vision_models::llama4::Llama4Config = serde_json::from_str(config)?;
+        cfg.propagate_quantization_config();
         Ok(Box::new(Llama4Model::new(
             &cfg,
             vb,
@@ -4252,7 +4273,8 @@ impl VisionModelLoader for VLlama4Loader {
         false
     }
     fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
-        let cfg: crate::vision_models::llama4::Llama4Config = serde_json::from_str(config)?;
+        let mut cfg: crate::vision_models::llama4::Llama4Config = serde_json::from_str(config)?;
+        cfg.propagate_quantization_config();
         Ok(Box::new(cfg))
     }
     fn get_processor(
@@ -4397,7 +4419,6 @@ impl DeviceMappedModelLoader for VLlama4Loader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -4414,7 +4435,7 @@ impl DeviceMappedModelLoader for VLlama4Loader {
         let (_pixels_batch_size, num_text_image_toks) =
             self.run_dummy_processing(&cfg, *height, *width, *max_num_images, *max_batch_size)?;
 
-        let max_seq_len = max_seq_len + num_text_image_toks;
+        let max_seq_len = max_seq_len.min(&ATTENTION_CHUNK_SIZE) + num_text_image_toks;
 
         Ok(max_batch_size * cfg.text_config.num_attention_heads * max_seq_len * max_seq_len)
     }
@@ -4607,6 +4628,7 @@ impl DeviceMappedModelLoader for VLlama4Loader {
             sliding_window: None,
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -4621,9 +4643,10 @@ impl DeviceMappedModelLoader for VLlama4Loader {
 
 /// [`VisionLoader`] for an Gemma 3n model.
 ///
-/// [`VisionLoader`]: https://ericlbuehler.github.io/mistral.rs/mistralrs/struct.VisionLoader.html
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
 pub struct Gemma3nLoader;
 
+#[allow(dead_code)]
 pub struct Gemma3nPrefixer;
 
 impl MultimodalPromptPrefixer for Gemma3nPrefixer {
@@ -4792,7 +4815,6 @@ impl DeviceMappedModelLoader for Gemma3nLoader {
         &self,
         config: &str,
         params: &AutoDeviceMapParams,
-        _prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Vision {
             max_seq_len,
@@ -4810,7 +4832,7 @@ impl DeviceMappedModelLoader for Gemma3nLoader {
         // Gemma3n is an "inject into the prompt" model, similar to Gemma3
         // We need to account for vision and audio tokens in the sequence length
 
-        let mut total_seq_len = *max_seq_len;
+        let mut total_seq_len = *max_seq_len.min(&ATTENTION_CHUNK_SIZE);
 
         // Add vision tokens
         {
@@ -5396,11 +5418,11 @@ impl DeviceMappedModelLoader for Gemma3nLoader {
                 let v_norm = text_cfg.head_dim; // No bias for v_norm
 
                 // MLP components - use the adjusted intermediate sizes from matformer
-                let intermediate_size = text_cfg
-                    .intermediate_size
-                    .0
-                    .clone()
-                    .left_or_else(|(sizes, _)| sizes[layer_idx]);
+                let intermediate_size = match &text_cfg.intermediate_size {
+                    IntermediateSize::Single(size) => *size,
+                    IntermediateSize::PerLayer(sizes) => sizes[layer_idx],
+                    IntermediateSize::Matformer(sizes, _) => sizes[layer_idx],
+                };
                 let gate_proj = text_cfg.hidden_size * intermediate_size / weight_pack_factor;
                 let up_proj = text_cfg.hidden_size * intermediate_size / weight_pack_factor;
                 let down_proj = intermediate_size * text_cfg.hidden_size / weight_pack_factor;
@@ -5481,6 +5503,7 @@ impl DeviceMappedModelLoader for Gemma3nLoader {
             sliding_window: None, // None to be more forgiving, some do not
             k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
             v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
         };
 
         Ok(Box::new(cfg))
@@ -5488,5 +5511,633 @@ impl DeviceMappedModelLoader for Gemma3nLoader {
 
     fn non_mapped_sub_models(&self) -> Option<Vec<NonMappedSubModel>> {
         Some(vec![NonMappedSubModel::Vision, NonMappedSubModel::Audio])
+    }
+}
+
+// ======================== Qwen3VL Loader
+
+/// [`VisionLoader`] for an Qwen3VL model.
+///
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
+pub struct Qwen3VLLoader;
+
+pub struct Qwen3VLPrefixer;
+
+impl MultimodalPromptPrefixer for Qwen3VLPrefixer {
+    // No-op: With MessagesAction::Keep, the chat template handles image tokens
+    // when it sees {"type": "image"} entries in the content.
+}
+
+impl VisionModelLoader for Qwen3VLLoader {
+    fn load(
+        &self,
+        config: &str,
+        vb: ShardedVarBuilder,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Box<dyn VisionModel + Send + Sync>> {
+        let cfg: Qwen3VLConfig = serde_json::from_str(config)?;
+        Ok(Box::new(Qwen3VLModel::new(
+            &cfg,
+            vb,
+            self.is_gptx(config),
+            normal_loading_metadata,
+            attention_mechanism,
+        )?))
+    }
+    fn is_gptx(&self, _config: &str) -> bool {
+        true
+    }
+    fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
+        let config: Qwen3VLConfig = serde_json::from_str(config)?;
+        Ok(Box::new(config))
+    }
+    fn get_processor(
+        &self,
+        _model_config: &str,
+        _processor_config: Option<ProcessorConfig>,
+        _preprocessor_config: PreProcessorConfig,
+        max_edge: Option<u32>,
+    ) -> Arc<dyn Processor + Send + Sync> {
+        Arc::new(Qwen3VLProcessor::new(max_edge))
+    }
+    fn supports_paged_attention(&self, _config: &str) -> bool {
+        true
+    }
+    fn prefixer(&self, _config: &str) -> Arc<dyn MultimodalPromptPrefixer> {
+        Arc::new(Qwen3VLPrefixer)
+    }
+    fn modalities(&self, _config: &str) -> Result<Modalities> {
+        Ok(Modalities {
+            input: vec![SupportedModality::Text, SupportedModality::Vision],
+            output: vec![SupportedModality::Text],
+        })
+    }
+}
+
+impl IsqModelLoader for Qwen3VLLoader {
+    fn isq_layer_regexes(&self, _config: &str) -> Result<Vec<Regex>> {
+        Ok(vec![
+            Regex::new(r"lm_head\.(weight|bias)$")?,
+            // Attention
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$")?,
+            // MLP
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.gate_proj\.(weight|bias)$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.up_proj\.(weight|bias)$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.down_proj\.(weight|bias)$")?,
+        ])
+    }
+    fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+}
+
+impl DeviceMappedModelLoader for Qwen3VLLoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Qwen3VLConfig = serde_json::from_str(config)?;
+
+        // For images, grid_t=1. After spatial merging, grid_h and grid_w are reduced.
+        let img_seq_len = {
+            let cfg = &cfg.vision_config;
+            // grid_t is 1 for images (temporal dimension is for video only)
+            let grid_t = 1;
+            // After patch embedding and spatial merge, the effective grid dimensions are reduced
+            let grid_h = (max_image_shape.0 / cfg.patch_size) / cfg.spatial_merge_size;
+            let grid_w = (max_image_shape.1 / cfg.patch_size) / cfg.spatial_merge_size;
+            grid_t * grid_h * grid_w * max_num_images
+        };
+
+        let max_text_attn = {
+            let cfg = &cfg.text_config;
+            // This model injects the vision information directly into the input embeddings
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
+            max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
+        };
+
+        Ok(max_text_attn)
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len: _,
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Qwen3VLConfig = serde_json::from_str(config)?;
+
+        // For the vision encoder, before spatial merging
+        let img_seq_len = {
+            let cfg = &cfg.vision_config;
+            // grid_t is 1 for images
+            let grid_t = 1;
+            let grid_h = max_image_shape.0 / cfg.patch_size;
+            let grid_w = max_image_shape.1 / cfg.patch_size;
+            grid_t * grid_h * grid_w
+        };
+
+        let max_vision_attn = {
+            let cfg = &cfg.vision_config;
+            (max_batch_size * max_num_images) * cfg.num_heads * img_seq_len * img_seq_len
+        };
+
+        Ok(max_vision_attn)
+    }
+
+    fn non_mapped_size_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<usize> {
+        let cfg: Qwen3VLConfig = serde_json::from_str(config)?;
+        let tie = cfg.tie_word_embeddings;
+        let text_elems = {
+            let cfg = &cfg.text_config;
+            let embed_tokens = cfg.hidden_size * cfg.vocab_size / weight_pack_factor;
+            // If embeddings are tied and no packing, reuse weights -> no separate lm_head needed
+            let lm_head = if !tie || weight_pack_factor != 1 {
+                cfg.hidden_size * cfg.vocab_size / weight_pack_factor
+            } else {
+                0
+            };
+            let norm = cfg.hidden_size;
+            embed_tokens + lm_head + norm
+        };
+
+        let patch_merger = {
+            let cfg = &cfg.vision_config;
+            let hidden_size = cfg.hidden_size * cfg.spatial_merge_size.pow(2);
+
+            let mlp0 = hidden_size * hidden_size + hidden_size;
+            let mlp2 = hidden_size * cfg.hidden_size + cfg.hidden_size;
+
+            let ln_q = cfg.hidden_size + bias_if!(true, cfg.hidden_size);
+
+            mlp0 + mlp2 + ln_q
+        };
+
+        let patch_embed = {
+            let cfg = &cfg.vision_config;
+            let conv_cfg = Conv3dConfig {
+                stride: cfg.patch_size,
+                ..Default::default()
+            };
+            let kernel_sizes = [cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size];
+            cfg.in_chans * cfg.hidden_size / conv_cfg.groups
+                * kernel_sizes[0]
+                * kernel_sizes[1]
+                * kernel_sizes[2]
+        };
+
+        let encoder_layer = {
+            let cfg = &cfg.vision_config;
+            let norm1 = cfg.hidden_size + bias_if!(true, cfg.hidden_size);
+            let norm2 = cfg.hidden_size + bias_if!(true, cfg.hidden_size);
+
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            let fc1 = cfg.hidden_size * cfg.intermediate_size + cfg.intermediate_size;
+            let fc2 = cfg.hidden_size * cfg.intermediate_size + cfg.hidden_size;
+
+            let qkv = cfg.hidden_size * cfg.hidden_size * 3 + cfg.hidden_size * 3;
+            let out = cfg.hidden_size * cfg.hidden_size + cfg.hidden_size;
+
+            norm1 + norm2 + fc1 + fc2 + qkv + out
+        };
+
+        let elems =
+            text_elems + patch_merger + patch_embed + encoder_layer * cfg.vision_config.depth;
+
+        Ok(elems * dtype.size_in_bytes())
+    }
+
+    fn layer_sizes_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<Vec<usize>> {
+        let cfg: Qwen3VLConfig = serde_json::from_str(config)?;
+        let per_layer_elems = {
+            let cfg = &cfg.text_config;
+            let input_layernorm = cfg.hidden_size;
+            let post_attention_layernorm = cfg.hidden_size;
+
+            let size_in = cfg.hidden_size;
+            let size_q = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_attention_heads;
+            let size_kv = (cfg.hidden_size / cfg.num_attention_heads) * cfg.num_key_value_heads;
+            let q_proj = size_in * size_q / weight_pack_factor + size_q;
+            let k_proj = size_in * size_kv / weight_pack_factor + size_kv;
+            let v_proj = size_in * size_kv / weight_pack_factor + size_kv;
+            let o_proj = size_q * size_in / weight_pack_factor;
+
+            let h_size = cfg.hidden_size;
+            let i_size = cfg.intermediate_size;
+            let gate_proj = h_size * i_size / weight_pack_factor;
+            let up_proj = h_size * i_size / weight_pack_factor;
+            let down_proj = i_size * h_size / weight_pack_factor;
+
+            input_layernorm
+                + post_attention_layernorm
+                + q_proj
+                + k_proj
+                + v_proj
+                + o_proj
+                + gate_proj
+                + up_proj
+                + down_proj
+        };
+        Ok(vec![
+            per_layer_elems * dtype.size_in_bytes();
+            cfg.text_config.num_hidden_layers
+        ])
+    }
+
+    fn num_layers(&self, config: &str) -> Result<usize> {
+        let cfg: Qwen3VLConfig = serde_json::from_str(config)?;
+        let cfg = &cfg.text_config;
+        Ok(cfg.num_hidden_layers)
+    }
+
+    fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
+        let cfg: Qwen3VLConfig = serde_json::from_str(config)?;
+        let cfg = &cfg.text_config;
+
+        let cfg = ModelConfigMetadata {
+            max_seq_len: cfg.max_position_embeddings,
+            num_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            num_kv_heads: cfg.num_key_value_heads,
+            num_attn_heads: cfg.num_attention_heads,
+            sliding_window: cfg.sliding_window,
+            k_head_dim: cfg.head_dim,
+            v_head_dim: cfg.head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
+        };
+
+        Ok(Box::new(cfg))
+    }
+
+    fn non_mapped_sub_models(&self) -> Option<Vec<NonMappedSubModel>> {
+        Some(vec![NonMappedSubModel::Vision])
+    }
+}
+
+// ======================== Qwen3VLMoE Loader
+
+/// [`VisionLoader`] for a Qwen3VLMoE model.
+///
+/// [`VisionLoader`]: https://docs.rs/mistralrs/latest/mistralrs/struct.VisionLoader.html
+pub struct Qwen3VLMoELoader;
+
+pub struct Qwen3VLMoEPrefixer;
+
+impl MultimodalPromptPrefixer for Qwen3VLMoEPrefixer {
+    // No-op: With MessagesAction::Keep, the chat template handles image tokens
+    // when it sees {"type": "image"} entries in the content.
+}
+
+impl VisionModelLoader for Qwen3VLMoELoader {
+    fn load(
+        &self,
+        config: &str,
+        vb: ShardedVarBuilder,
+        normal_loading_metadata: NormalLoadingMetadata,
+        attention_mechanism: AttentionImplementation,
+    ) -> Result<Box<dyn VisionModel + Send + Sync>> {
+        let cfg: Qwen3VLMoEConfig = serde_json::from_str(config)?;
+        Ok(Box::new(Qwen3VLMoEModel::new(
+            &cfg,
+            vb,
+            self.is_gptx(config),
+            normal_loading_metadata,
+            attention_mechanism,
+        )?))
+    }
+    fn is_gptx(&self, _config: &str) -> bool {
+        true
+    }
+    fn get_config_repr(&self, config: &str) -> Result<Box<dyn Debug>> {
+        let config: Qwen3VLMoEConfig = serde_json::from_str(config)?;
+        Ok(Box::new(config))
+    }
+    fn get_processor(
+        &self,
+        _model_config: &str,
+        _processor_config: Option<ProcessorConfig>,
+        _preprocessor_config: PreProcessorConfig,
+        max_edge: Option<u32>,
+    ) -> Arc<dyn Processor + Send + Sync> {
+        Arc::new(Qwen3VLMoEProcessor::new(max_edge))
+    }
+    fn supports_paged_attention(&self, _config: &str) -> bool {
+        true
+    }
+    fn prefixer(&self, _config: &str) -> Arc<dyn MultimodalPromptPrefixer> {
+        Arc::new(Qwen3VLMoEPrefixer)
+    }
+    fn modalities(&self, _config: &str) -> Result<Modalities> {
+        Ok(Modalities {
+            input: vec![SupportedModality::Text, SupportedModality::Vision],
+            output: vec![SupportedModality::Text],
+        })
+    }
+}
+
+impl IsqModelLoader for Qwen3VLMoELoader {
+    fn isq_layer_regexes(&self, _config: &str) -> Result<Vec<Regex>> {
+        Ok(vec![
+            Regex::new(r"lm_head\.(weight|bias)$")?,
+            // Attention
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.self_attn\.q_proj\.(weight|bias)$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.self_attn\.k_proj\.(weight|bias)$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.self_attn\.v_proj\.(weight|bias)$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.self_attn\.o_proj\.(weight|bias)$")?,
+            // MLP (dense layers)
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.gate_proj\.(weight|bias)$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.up_proj\.(weight|bias)$")?,
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.down_proj\.(weight|bias)$")?,
+            // MoE router
+            Regex::new(r"model\.language_model\.layers\.(\d+)\.mlp\.gate\.(weight|bias)$")?,
+            // MoE experts - now unpacked into individual experts
+            Regex::new(
+                r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.gate_proj\.(weight|bias)$",
+            )?,
+            Regex::new(
+                r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.up_proj\.(weight|bias)$",
+            )?,
+            Regex::new(
+                r"model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.down_proj\.(weight|bias)$",
+            )?,
+        ])
+    }
+    fn immediate_isq_predicates(&self, config: &str) -> Result<Vec<Regex>> {
+        self.isq_layer_regexes(config)
+    }
+}
+
+impl DeviceMappedModelLoader for Qwen3VLMoELoader {
+    fn mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len,
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Qwen3VLMoEConfig = serde_json::from_str(config)?;
+
+        // For images, grid_t=1. After spatial merging, grid_h and grid_w are reduced.
+        let img_seq_len = {
+            let cfg = &cfg.vision_config;
+            // grid_t is 1 for images (temporal dimension is for video only)
+            let grid_t = 1;
+            // After patch embedding and spatial merge, the effective grid dimensions are reduced
+            let grid_h = (max_image_shape.0 / cfg.patch_size) / cfg.spatial_merge_size;
+            let grid_w = (max_image_shape.1 / cfg.patch_size) / cfg.spatial_merge_size;
+            grid_t * grid_h * grid_w * max_num_images
+        };
+
+        let max_text_attn = {
+            let cfg = &cfg.text_config;
+            // This model injects the vision information directly into the input embeddings
+            let max_seq_len = img_seq_len + max_seq_len.min(&ATTENTION_CHUNK_SIZE);
+            max_batch_size * cfg.num_attention_heads * max_seq_len * max_seq_len
+        };
+
+        Ok(max_text_attn)
+    }
+
+    fn non_mapped_max_act_size_elems(
+        &self,
+        config: &str,
+        params: &AutoDeviceMapParams,
+    ) -> Result<usize> {
+        let AutoDeviceMapParams::Vision {
+            max_seq_len: _,
+            max_batch_size,
+            max_image_shape,
+            max_num_images,
+        } = params
+        else {
+            anyhow::bail!("Expected vision AutoDeviceMapParams for this model!")
+        };
+
+        let cfg: Qwen3VLMoEConfig = serde_json::from_str(config)?;
+
+        // For the vision encoder, before spatial merging
+        let img_seq_len = {
+            let cfg = &cfg.vision_config;
+            // grid_t is 1 for images
+            let grid_t = 1;
+            let grid_h = max_image_shape.0 / cfg.patch_size;
+            let grid_w = max_image_shape.1 / cfg.patch_size;
+            grid_t * grid_h * grid_w
+        };
+
+        let max_vision_attn = {
+            let cfg = &cfg.vision_config;
+            (max_batch_size * max_num_images) * cfg.num_heads * img_seq_len * img_seq_len
+        };
+
+        Ok(max_vision_attn)
+    }
+
+    fn non_mapped_size_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<usize> {
+        let cfg: Qwen3VLMoEConfig = serde_json::from_str(config)?;
+        let tie = cfg.tie_word_embeddings;
+        let text_elems = {
+            let cfg = &cfg.text_config;
+            let embed_tokens = cfg.hidden_size * cfg.vocab_size / weight_pack_factor;
+            // If embeddings are tied and no packing, reuse weights -> no separate lm_head needed
+            let lm_head = if !tie || weight_pack_factor != 1 {
+                cfg.hidden_size * cfg.vocab_size / weight_pack_factor
+            } else {
+                0
+            };
+            let norm = cfg.hidden_size;
+            embed_tokens + lm_head + norm
+        };
+
+        let patch_merger = {
+            let cfg = &cfg.vision_config;
+            let hidden_size = cfg.hidden_size * cfg.spatial_merge_size.pow(2);
+
+            let mlp0 = hidden_size * hidden_size + hidden_size;
+            let mlp2 = hidden_size * cfg.hidden_size + cfg.hidden_size;
+
+            let ln_q = cfg.hidden_size + bias_if!(true, cfg.hidden_size);
+
+            mlp0 + mlp2 + ln_q
+        };
+
+        let patch_embed = {
+            let cfg = &cfg.vision_config;
+            let conv_cfg = Conv3dConfig {
+                stride: cfg.patch_size,
+                ..Default::default()
+            };
+            let kernel_sizes = [cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size];
+            cfg.in_chans * cfg.hidden_size / conv_cfg.groups
+                * kernel_sizes[0]
+                * kernel_sizes[1]
+                * kernel_sizes[2]
+        };
+
+        let encoder_layer = {
+            let cfg = &cfg.vision_config;
+            let norm1 = cfg.hidden_size + bias_if!(true, cfg.hidden_size);
+            let norm2 = cfg.hidden_size + bias_if!(true, cfg.hidden_size);
+
+            #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+            let fc1 = cfg.hidden_size * cfg.intermediate_size + cfg.intermediate_size;
+            let fc2 = cfg.hidden_size * cfg.intermediate_size + cfg.hidden_size;
+
+            let qkv = cfg.hidden_size * cfg.hidden_size * 3 + cfg.hidden_size * 3;
+            let out = cfg.hidden_size * cfg.hidden_size + cfg.hidden_size;
+
+            norm1 + norm2 + fc1 + fc2 + qkv + out
+        };
+
+        let elems =
+            text_elems + patch_merger + patch_embed + encoder_layer * cfg.vision_config.depth;
+
+        Ok(elems * dtype.size_in_bytes())
+    }
+
+    fn layer_sizes_in_bytes(
+        &self,
+        config: &str,
+        dtype: DType,
+        weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
+    ) -> Result<Vec<usize>> {
+        let cfg: Qwen3VLMoEConfig = serde_json::from_str(config)?;
+        let text_cfg = &cfg.text_config;
+
+        let mut layer_sizes = Vec::with_capacity(text_cfg.num_hidden_layers);
+
+        for layer_idx in 0..text_cfg.num_hidden_layers {
+            let input_layernorm = text_cfg.hidden_size;
+            let post_attention_layernorm = text_cfg.hidden_size;
+
+            let size_in = text_cfg.hidden_size;
+            let size_q = (text_cfg.hidden_size / text_cfg.num_attention_heads)
+                * text_cfg.num_attention_heads;
+            let size_kv = (text_cfg.hidden_size / text_cfg.num_attention_heads)
+                * text_cfg.num_key_value_heads;
+            let q_proj = size_in * size_q / weight_pack_factor + size_q;
+            let k_proj = size_in * size_kv / weight_pack_factor + size_kv;
+            let v_proj = size_in * size_kv / weight_pack_factor + size_kv;
+            let o_proj = size_q * size_in / weight_pack_factor;
+
+            // Check if this is a MoE layer
+            let is_moe = !text_cfg.mlp_only_layers.contains(&layer_idx)
+                && (text_cfg.num_experts > 0
+                    && (layer_idx + 1) % text_cfg.decoder_sparse_step == 0);
+
+            let mlp_elems = if is_moe {
+                // MoE layer: gate + experts
+                let gate = text_cfg.hidden_size * text_cfg.num_experts;
+                let per_expert = {
+                    let h_size = text_cfg.hidden_size;
+                    let i_size = text_cfg.moe_intermediate_size;
+                    let gate_proj = h_size * i_size / weight_pack_factor;
+                    let up_proj = h_size * i_size / weight_pack_factor;
+                    let down_proj = i_size * h_size / weight_pack_factor;
+                    gate_proj + up_proj + down_proj
+                };
+                gate + per_expert * text_cfg.num_experts
+            } else {
+                // Dense MLP layer
+                let h_size = text_cfg.hidden_size;
+                let i_size = text_cfg.intermediate_size;
+                let gate_proj = h_size * i_size / weight_pack_factor;
+                let up_proj = h_size * i_size / weight_pack_factor;
+                let down_proj = i_size * h_size / weight_pack_factor;
+                gate_proj + up_proj + down_proj
+            };
+
+            let per_layer_elems = input_layernorm
+                + post_attention_layernorm
+                + q_proj
+                + k_proj
+                + v_proj
+                + o_proj
+                + mlp_elems;
+
+            layer_sizes.push(per_layer_elems * dtype.size_in_bytes());
+        }
+
+        Ok(layer_sizes)
+    }
+
+    fn num_layers(&self, config: &str) -> Result<usize> {
+        let cfg: Qwen3VLMoEConfig = serde_json::from_str(config)?;
+        let cfg = &cfg.text_config;
+        Ok(cfg.num_hidden_layers)
+    }
+
+    fn model_config(&self, config: &str) -> Result<Box<dyn ModelConfigLike>> {
+        let cfg: Qwen3VLMoEConfig = serde_json::from_str(config)?;
+        let cfg = &cfg.text_config;
+
+        let cfg = ModelConfigMetadata {
+            max_seq_len: cfg.max_position_embeddings,
+            num_layers: cfg.num_hidden_layers,
+            hidden_size: cfg.hidden_size,
+            num_kv_heads: cfg.num_key_value_heads,
+            num_attn_heads: cfg.num_attention_heads,
+            sliding_window: cfg.sliding_window,
+            k_head_dim: cfg.head_dim,
+            v_head_dim: cfg.head_dim,
+            kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
+        };
+
+        Ok(Box::new(cfg))
+    }
+
+    fn non_mapped_sub_models(&self) -> Option<Vec<NonMappedSubModel>> {
+        Some(vec![NonMappedSubModel::Vision])
     }
 }

@@ -1,47 +1,52 @@
 use super::llg::build_llg_factory;
 use super::{
-    text_models_inputs_processor::ModelInputs, AdapterKind, CacheManager, GeneralMetadata, Loader,
-    ModelKind, ModelPaths, QuantizationKind, TokenSource,
+    get_model_paths, get_xlora_paths, text_models_inputs_processor::ModelInputs, AdapterKind,
+    CacheManager, GeneralMetadata, Loader, ModelKind, ModelPaths, QuantizationKind, TokenSource,
 };
 use super::{
     AnyMoePipelineMixin, CacheManagerMixin, EitherCache, ForwardInputsResult, IsqPipelineMixin,
     MetadataMixin, ModelCategory, PreProcessingMixin,
 };
+use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::DeviceMapper;
 use crate::kv_cache::FullCacheManager;
 use crate::lora::Ordering;
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
-use crate::pipeline::hf::get_paths;
-use crate::pipeline::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
 use crate::pipeline::sampling::sample_and_add_toks;
-use crate::pipeline::ChatTemplate;
 use crate::pipeline::{get_chat_template, Modalities, SupportedModality};
+use crate::pipeline::{ChatTemplate, LocalModelPaths};
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::debug::DeviceRepr;
 use crate::utils::model_config as ModelConfig;
+use crate::utils::progress::ProgressScopeGuard;
 use crate::utils::tokenizer::get_tokenizer;
 use crate::xlora_models::NonGranularState;
 use crate::{
-    get_mut_arcmutex, DeviceMapSetting, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
-    DEBUG,
+    get_mut_arcmutex, get_paths, DeviceMapSetting, PagedAttentionConfig, Pipeline, Topology,
+    TryIntoDType, DEBUG,
 };
-use crate::{models::quantized_llama::ModelWeights as QLlama, xlora_models::XLoraQLlama};
+use crate::{
+    models::quantized_llama::ModelWeights as QLlama, utils::tokens::get_token,
+    xlora_models::XLoraQLlama,
+};
 use anyhow::Result;
 use candle_core::quantized::ggml_file;
 use candle_core::{Device, Tensor};
+use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
 use std::any::Any;
 use std::fs;
-use std::num::{NonZero, NonZeroUsize};
+use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 enum Model {
-    Llama(QLlama),
+    Llama(Box<QLlama>),
     XLoraLlama(Box<XLoraQLlama>),
 }
 
@@ -76,7 +81,6 @@ pub struct GGMLLoader {
 /// Config for a GGML loader.
 pub struct GGMLSpecificConfig {
     pub gqa: usize,
-    pub prompt_chunksize: Option<NonZeroUsize>,
     pub topology: Option<Topology>,
 }
 
@@ -247,6 +251,7 @@ impl Loader for GGMLLoader {
         in_situ_quant: Option<IsqType>,
         mut paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
+        let _progress_guard = ProgressScopeGuard::new(silent);
         if in_situ_quant.is_some() {
             anyhow::bail!(
                 "You are trying to in-situ quantize a GGML model. This will not do anything."
@@ -263,20 +268,18 @@ impl Loader for GGMLLoader {
             paged_attn_config = None;
         }
 
-        // Apply default prompt size here
-        let prompt_chunksize = self
-            .config
-            .prompt_chunksize
-            .unwrap_or(DEFAULT_PROMPT_CHUNK_SIZE.try_into().unwrap())
-            .get();
-
-        info!("Prompt chunk size is {prompt_chunksize}.",);
+        info!("Prompt chunk size is {ATTENTION_CHUNK_SIZE}.");
 
         info!(
             "Loading model `{}` on {}.",
             self.get_id(),
             device.device_pretty_repr()
         );
+
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(dev) = &device {
+            unsafe { dev.disable_event_tracking() };
+        }
 
         let mut file = std::fs::File::open(paths.get_weight_filenames().first().unwrap())?;
         let model = ggml_file::Content::read(&mut file, device)
@@ -330,7 +333,9 @@ impl Loader for GGMLLoader {
         // Config into model:
         // NOTE: No architecture to infer like GGUF, Llama model is implicitly matched
         let model = match self.kind {
-            ModelKind::GgufQuantized { .. } => Model::Llama(QLlama::try_from(model_config)?),
+            ModelKind::GgufQuantized { .. } => {
+                Model::Llama(Box::new(QLlama::try_from(model_config)?))
+            }
             ModelKind::GgufAdapter { .. } => {
                 Model::XLoraLlama(Box::new(XLoraQLlama::try_from(model_config)?))
             }
@@ -388,7 +393,6 @@ impl Loader for GGMLLoader {
                 sliding_window: None,
                 cache_config: None,
                 cache_engine: None,
-                prompt_chunksize: Some(NonZero::new(prompt_chunksize).unwrap()),
                 model_metadata: None,
                 modalities: Modalities {
                     input: vec![SupportedModality::Text],
@@ -410,21 +414,19 @@ impl Loader for GGMLLoader {
         in_situ_quant: Option<IsqType>,
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
-        let paths: Box<dyn ModelPaths> = get_paths(
-            self.model_id.clone(),
-            self.tokenizer_json.as_deref(),
-            self.xlora_model_id.as_deref(),
-            self.xlora_order.as_ref(),
-            self.chat_template.as_deref(),
+        let _progress_guard = ProgressScopeGuard::new(silent);
+        let paths: anyhow::Result<Box<dyn ModelPaths>> = get_paths!(
+            LocalModelPaths,
             &token_source,
             revision,
-            self.quantized_model_id.as_deref(),
+            self,
+            self.quantized_model_id,
             Some(vec![self.quantized_filename.as_ref().unwrap().clone()]),
-            false, // Never loading UQFF
             silent,
-        )?;
+            false // Never loading UQFF
+        );
         self.load_model_from_path(
-            &paths,
+            &paths?,
             dtype,
             device,
             silent,

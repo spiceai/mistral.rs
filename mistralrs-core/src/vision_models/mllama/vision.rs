@@ -4,7 +4,9 @@ use std::{ops::Mul, sync::Arc};
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Conv2d, Conv2dConfig, Embedding, LayerNorm, LayerNormConfig, Module};
-use mistralrs_quant::{ColumnParallelLayer, QuantMethod, RowParallelLayer, ShardedVarBuilder};
+use mistralrs_quant::{
+    ColumnParallelLayer, Convolution, QuantMethod, RowParallelLayer, ShardedVarBuilder,
+};
 
 use crate::{
     attention::SdpaParams,
@@ -452,7 +454,7 @@ fn _prepare_aspect_ratio_attention_mask(
     let pad_patches = target_length - num_patches;
     let (bs, d1, d2, d3) = attention_mask.dims4()?;
     attention_mask = attention_mask.slice_assign(
-        &[&.., &.., &(d2 - pad_patches..), &..],
+        &[0..bs, 0..d1, (d2 - pad_patches)..d2, 0..d3],
         &Tensor::zeros(
             (bs, d1, pad_patches, d3),
             attention_mask.dtype(),
@@ -596,7 +598,7 @@ impl MLlamaVisionModel {
         let aspect_ratio_ids = aspect_ratio_ids.reshape((bs * num_concurrent_media, ()))?;
 
         // Patch embedding
-        let patch_embeds = self.patch_embedding.forward(&pixel_values)?;
+        let patch_embeds = Convolution.forward_2d(&self.patch_embedding, &pixel_values)?;
         let mut hidden_state = patch_embeds.flatten_from(2)?.transpose(1, 2)?;
 
         // Tile embeddings
