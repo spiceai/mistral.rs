@@ -1,9 +1,9 @@
-from mistralrs import Runner, Which, ChatCompletionRequest, MultimodalArchitecture
+from mistralrs import Runner, Which, ChatCompletionRequest, VisionArchitecture
 
 runner = Runner(
-    which=Which.MultimodalPlain(
+    which=Which.VisionPlain(
         model_id="google/gemma-3n-E4B-it",
-        arch=MultimodalArchitecture.Gemma3n,
+        arch=VisionArchitecture.Gemma3n,
     ),
 )
 

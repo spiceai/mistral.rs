@@ -45,9 +45,9 @@ Text: The image shows a steep, snow-covered hillside with a pine tree on the rig
 1) Start the server
 
 ```
-mistralrs serve multimodal -p 1234 --isq 4 -m llava-hf/llava-v1.6-mistral-7b-hf
+mistralrs serve vision -p 1234 --isq 4 -m llava-hf/llava-v1.6-mistral-7b-hf
 # or for vicuna backend, specify the chat template:
-mistralrs serve multimodal -p 1234 --isq 4 -c ./chat_templates/vicuna.json -m llava-hf/llava-v1.6-vicuna-7b-hf
+mistralrs serve vision -p 1234 --isq 4 -c ./chat_templates/vicuna.json -m llava-hf/llava-v1.6-vicuna-7b-hf
 ```
 
 2) Send a request
@@ -91,13 +91,13 @@ print(resp)
 ---
 
 ## Rust
-You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/models/multimodal_models/main.rs).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/llava_next/main.rs).
 
 This is a minimal example of running the LLaVA and LLaVANext model with a dummy image.
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, MultimodalMessages, MultimodalModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {

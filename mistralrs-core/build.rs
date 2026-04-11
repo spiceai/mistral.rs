@@ -9,10 +9,18 @@ fn main() {
         use std::path::PathBuf;
         println!("cargo:rerun-if-changed=build.rs");
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-
-        let mut builder = cudaforge::KernelBuilder::new()
-            .source_glob("src/cuda/*.cu")
-            .out_dir(&build_dir)
+        let lib_files = vec![
+            "src/cuda/sort.cu",
+            "src/cuda/moe_gemm.cu",
+            "src/cuda/moe_gemm_wmma.cu",
+            "src/cuda/moe_gemv.cu",
+        ];
+        for lib_file in lib_files.iter() {
+            println!("cargo:rerun-if-changed={lib_file}");
+        }
+        let mut builder = bindgen_cuda::Builder::default()
+            .kernel_paths(lib_files)
+            .out_dir(build_dir.clone())
             .arg("-std=c++17")
             .arg("-O3")
             .arg("-U__CUDA_NO_HALF_OPERATORS__")
@@ -28,9 +36,11 @@ fn main() {
 
         // Check if CUDA_COMPUTE_CAP < 80 and disable bf16 kernels if so.
         // bf16 WMMA operations and certain bf16 intrinsics are only available on sm_80+.
-        if let Some(compute_cap) = builder.get_compute_cap() {
-            if compute_cap < 80 {
-                builder = builder.arg("-DNO_BF16_KERNEL");
+        if let Ok(compute_cap) = std::env::var("CUDA_COMPUTE_CAP") {
+            if let Ok(cap) = compute_cap.parse::<u32>() {
+                if cap < 80 {
+                    builder = builder.arg("-DNO_BF16_KERNEL");
+                }
             }
         }
 

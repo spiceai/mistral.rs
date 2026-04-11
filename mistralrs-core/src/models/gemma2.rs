@@ -465,7 +465,7 @@ impl Model {
                 &comm,
             )
         })?;
-        let norm = GemmaRmsNorm::new(
+        let norm = RmsNorm::new_gemma(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             mapper.set_nm_device(vb_m.pp("norm"), false),

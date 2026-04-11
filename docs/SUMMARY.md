@@ -12,7 +12,6 @@
 
 # SDKs & APIs
 
-- [Rust SDK](RUST_SDK.md)
 - [Python SDK](PYTHON_SDK.md)
 - [Python Installation](PYTHON_INSTALLATION.md)
 - [HTTP Server](HTTP.md)
@@ -21,9 +20,8 @@
 # Models
 
 - [Supported Models](SUPPORTED_MODELS.md)
-- [Multimodal Models](MULTIMODAL_MODELS.md)
+- [Vision Models](VISION_MODELS.md)
 - [Image Generation](IMAGEGEN_MODELS.md)
-- [Speech Models](SPEECH_MODELS.md)
 - [Embeddings](EMBEDDINGS.md)
 
 ## Text Model Guides
@@ -38,12 +36,10 @@
 - [GLM-4.7 MoE](GLM4_MOE.md)
 - [GPT-OSS](GPT_OSS.md)
 - [Qwen 3](QWEN3.md)
-- [Qwen 3 Next](QWEN3NEXT.md)
 - [SmolLM3](SMOLLM3.md)
 
-## Multimodal Model Guides
+## Vision Model Guides
 
-- [Gemma 4](GEMMA4.md)
 - [Idefics 2](IDEFICS2.md)
 - [Idefics 3](IDEFICS3.md)
 - [LLaVA](LLaVA.md)
@@ -56,13 +52,10 @@
 - [Phi 4 Multimodal](PHI4MM.md)
 - [Qwen 2-VL](QWEN2VL.md)
 - [Qwen 3-VL](QWEN3VL.md)
-- [Qwen 3.5](QWEN3_5.md)
-- [Video Input](VIDEO.md)
 
 ## Other Model Guides
 
 - [FLUX (Diffusion)](FLUX.md)
-- [Voxtral (Speech-to-Text)](VOXTRAL.md)
 - [Dia (Speech)](DIA.md)
 - [EmbeddingGemma](EMBEDDINGGEMMA.md)
 - [Qwen3 Embedding](QWEN3_EMBEDDING.md)

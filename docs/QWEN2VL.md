@@ -28,7 +28,7 @@ Mistral.rs supports interactive mode for multimodal models! It is an easy way to
 1) Start up interactive mode with the Qwen2-VL model
 
 ```
-mistralrs run multimodal -m Qwen/Qwen2-VL-2B-Instruct
+mistralrs run vision -m Qwen/Qwen2-VL-2B-Instruct
 ```
 
 2) Say hello!
@@ -86,7 +86,7 @@ In conclusion, camellias are beautiful flowers that add color and interest to ga
 1) Start the server
 
 ```
-mistralrs serve multimodal -p 1234 -m Qwen/Qwen2-VL-2B-Instruct
+mistralrs serve vision -p 1234 -m Qwen/Qwen2-VL-2B-Instruct
 ```
 
 2) Send a request
@@ -131,18 +131,18 @@ print(resp)
 ---
 
 ## Rust
-You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/models/multimodal_models/main.rs).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/qwen2vl/main.rs).
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, MultimodalMessages, MultimodalModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 const MODEL_ID: &str = "Qwen/Qwen2-VL-2B-Instruct";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let model =
-        MultimodalModelBuilder::new(MODEL_ID)
+        VisionModelBuilder::new(MODEL_ID)
             .with_isq(IsqType::Q4K)
             .with_logging()
             .build()

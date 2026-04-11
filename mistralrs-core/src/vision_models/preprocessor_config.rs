@@ -81,39 +81,6 @@ pub struct PreProcessorConfig {
     pub(crate) sampling_rate: Option<usize>,
 }
 
-impl PreProcessorConfig {
-    pub fn from_processor_config_json(json: &str) -> serde_json::Result<Self> {
-        let value: Value = serde_json::from_str(json)?;
-        let mut merged = Map::new();
-
-        if let Some(obj) = value.as_object() {
-            for (key, value) in obj {
-                if key != "image_processor" && key != "feature_extractor" && !value.is_null() {
-                    merged.insert(key.clone(), value.clone());
-                }
-            }
-
-            if let Some(image_processor) = obj.get("image_processor").and_then(Value::as_object) {
-                Self::merge_processor_section(&mut merged, image_processor);
-            }
-            if let Some(feature_extractor) = obj.get("feature_extractor").and_then(Value::as_object)
-            {
-                Self::merge_processor_section(&mut merged, feature_extractor);
-            }
-        }
-
-        serde_json::from_value(Value::Object(merged))
-    }
-
-    fn merge_processor_section(target: &mut Map<String, Value>, source: &Map<String, Value>) {
-        for (key, value) in source {
-            if !value.is_null() {
-                target.insert(key.clone(), value.clone());
-            }
-        }
-    }
-}
-
 #[allow(dead_code)]
 pub(crate) trait ToFilter {
     fn to_filter(self) -> Result<FilterType>;

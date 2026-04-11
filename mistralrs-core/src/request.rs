@@ -79,13 +79,11 @@ pub enum RequestMessage {
         best_of: Option<usize>,
     },
     CompletionTokens(Vec<u32>),
-    MultimodalChat {
+    VisionChat {
         #[serde(skip)] // TODO
         images: Vec<image::DynamicImage>,
         #[serde(skip)] // TODO
         audios: Vec<AudioInput>,
-        #[serde(skip)]
-        videos: Vec<VideoInput>,
         messages: Vec<IndexMap<String, MessageContent>>,
         enable_thinking: Option<bool>,
         /// Reasoning effort level for Harmony-format models
@@ -96,6 +94,15 @@ pub enum RequestMessage {
         format: ImageGenerationResponseFormat,
         generation_params: DiffusionGenerationParams,
         save_file: Option<PathBuf>,
+    },
+    SpeechGeneration {
+        prompt: String,
+    },
+    Embedding {
+        prompt: String,
+    },
+    EmbeddingTokens {
+        prompt: Vec<u32>,
     },
     SpeechGeneration {
         prompt: String,

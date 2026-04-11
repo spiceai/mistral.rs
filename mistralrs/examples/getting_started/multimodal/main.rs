@@ -5,12 +5,12 @@
 ///
 /// Run with: `cargo run --release --example multimodal_basic -p mistralrs`
 use anyhow::Result;
-use mistralrs::{IsqBits, ModelBuilder, MultimodalMessages, TextMessageRole};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model = ModelBuilder::new("google/gemma-4-E4B-it")
-        .with_auto_isq(IsqBits::Four)
+    let model = VisionModelBuilder::new("openbmb/MiniCPM-o-2_6")
+        .with_isq(IsqType::Q4K)
         .with_logging()
         .build()
         .await?;
@@ -25,9 +25,10 @@ async fn main() -> Result<()> {
 
     let messages = MultimodalMessages::new().add_image_message(
         TextMessageRole::User,
-        "What is this flower?",
+        "What is depicted here? Please describe the scene in detail.",
         vec![image],
-    );
+        &model,
+    )?;
 
     let response = model.send_chat_request(messages).await?;
     println!("{}", response.choices[0].message.content.as_ref().unwrap());

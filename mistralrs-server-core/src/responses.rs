@@ -1152,8 +1152,7 @@ impl futures::Stream for OpenResponsesStreamer {
                 }
                 _ => Poll::Pending,
             },
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending | Poll::Ready(None) => Poll::Pending,
         }
     }
 }

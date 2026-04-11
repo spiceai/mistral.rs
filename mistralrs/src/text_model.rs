@@ -1,8 +1,6 @@
 use candle_core::Device;
 use mistralrs_core::*;
 use mistralrs_core::{SearchCallback, Tool, ToolCallback};
-
-use crate::{IsqBits, IsqSetting};
 use std::collections::HashMap;
 use std::{
     ops::{Deref, DerefMut},
@@ -45,7 +43,7 @@ pub struct TextModelBuilder {
     pub(crate) loader_type: Option<NormalLoaderType>,
     pub(crate) dtype: ModelDType,
     pub(crate) force_cpu: bool,
-    pub(crate) isq: Option<IsqSetting>,
+    pub(crate) isq: Option<IsqType>,
     pub(crate) throughput_logging: bool,
 
     // Other things
@@ -97,13 +95,11 @@ impl PagedAttentionMetaBuilder {
         self
     }
 
-    /// Set the paged cache data type. Defaults to `PagedCacheType::Auto`.
     pub fn with_paged_cache_type(mut self, cache_type: PagedCacheType) -> Self {
         self.cache_type = cache_type;
         self
     }
 
-    /// Build the [`PagedAttentionConfig`]. Returns an error if the configuration is invalid.
     pub fn build(self) -> anyhow::Result<PagedAttentionConfig> {
         PagedAttentionConfig::new(self.block_size, self.mem_gpu, self.cache_type)
     }
@@ -155,13 +151,94 @@ impl TextModelBuilder {
         }
     }
 
-    // Shared methods from builder_macros.rs
-    common_builder_methods!();
+    /// Enable searching compatible with the OpenAI `web_search_options` setting. This loads the selected search embedding reranker (EmbeddingGemma by default).
+    pub fn with_search(mut self, search_embedding_model: SearchEmbeddingModel) -> Self {
+        self.search_embedding_model = Some(search_embedding_model);
+        self
+    }
+
+    /// Override the search function used when `web_search_options` is enabled.
+    pub fn with_search_callback(mut self, callback: Arc<SearchCallback>) -> Self {
+        self.search_callback = Some(callback);
+        self
+    }
+
+    /// Register a callback for a specific tool name.
+    pub fn with_tool_callback(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+    ) -> Self {
+        self.tool_callbacks.insert(name.into(), callback);
+        self
+    }
+
+    /// Register a callback with an associated Tool definition that will be automatically
+    /// added to requests when tool callbacks are active.
+    pub fn with_tool_callback_and_tool(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+        tool: Tool,
+    ) -> Self {
+        let name = name.into();
+        self.tool_callbacks_with_tools
+            .insert(name, ToolCallbackWithTool { callback, tool });
+        self
+    }
 
     /// Configure MCP client to connect to external MCP servers and automatically
     /// register their tools for use in automatic tool calling.
     pub fn with_mcp_client(mut self, config: McpClientConfig) -> Self {
         self.mcp_client_config = Some(config);
+        self
+    }
+
+    /// Enable runner throughput logging.
+    pub fn with_throughput_logging(mut self) -> Self {
+        self.throughput_logging = true;
+        self
+    }
+
+    /// Explicit JINJA chat template file (.jinja) to be used. If specified, this overrides all other chat templates.
+    pub fn with_jinja_explicit(mut self, jinja_explicit: String) -> Self {
+        self.jinja_explicit = Some(jinja_explicit);
+        self
+    }
+
+    /// Set the model topology for use during loading. If there is an overlap, the topology type is used over the ISQ type.
+    pub fn with_topology(mut self, topology: Topology) -> Self {
+        self.topology = Some(topology);
+        self
+    }
+
+    /// Set the model topology from a path. This preserves the path for unload/reload support.
+    /// If there is an overlap, the topology type is used over the ISQ type.
+    pub fn with_topology_from_path<P: AsRef<std::path::Path>>(
+        mut self,
+        path: P,
+    ) -> anyhow::Result<Self> {
+        let path_str = path.as_ref().to_string_lossy().to_string();
+        self.topology = Some(Topology::from_path(&path)?);
+        self.topology_path = Some(path_str);
+        Ok(self)
+    }
+
+    /// Organize ISQ to enable MoQE (Mixture of Quantized Experts, <https://arxiv.org/abs/2310.02410>)
+    pub fn with_mixture_qexperts_isq(mut self) -> Self {
+        self.organization = IsqOrganization::MoeExpertsOnly;
+        self
+    }
+
+    /// Literal Jinja chat template OR Path (ending in `.json`) to one.
+    pub fn with_chat_template(mut self, chat_template: impl ToString) -> Self {
+        self.chat_template = Some(chat_template.to_string());
+        self
+    }
+
+    /// Path to a discrete `tokenizer.json` file.
+    pub fn with_tokenizer_json(mut self, tokenizer_json: impl ToString) -> Self {
+        self.tokenizer_json = Some(tokenizer_json.to_string());
         self
     }
 
@@ -178,15 +255,30 @@ impl TextModelBuilder {
         self
     }
 
+    /// Set the number of sequences to hold in the prefix cache. Set to `None` to disable the prefix cacher.
+    pub fn with_prefix_cache_n(mut self, n_seqs: Option<usize>) -> Self {
+        self.prefix_cache_n = n_seqs;
+        self
+    }
+
+    /// Enable logging.
+    pub fn with_logging(mut self) -> Self {
+        self.with_logging = true;
+        self
+    }
+
+    /// Provide metadata to initialize the device mapper.
+    pub fn with_device_mapping(mut self, device_mapping: DeviceMapSetting) -> Self {
+        self.device_mapping = Some(device_mapping);
+        self
+    }
+
     #[deprecated(
         note = "Use `UqffTextModelBuilder` to load a UQFF model instead of the generic `from_uqff`"
     )]
     /// Path to read a `.uqff` file from. Other necessary configuration files must be present at this location.
     ///
-    /// For sharded UQFF models, you only need to specify the first shard file
-    /// (e.g., `q4k-0.uqff`). The remaining shards are auto-discovered.
-    ///
-    /// For example, required files include:
+    /// For example, these include:
     /// - `residual.safetensors`
     /// - `tokenizer.json`
     /// - `config.json`
@@ -196,7 +288,45 @@ impl TextModelBuilder {
         self
     }
 
-    /// Load the text model and return a ready-to-use [`Model`].
+    /// Path to write a `.uqff` file to and serialize the other necessary files.
+    ///
+    /// The parent (part of the path excluding the filename) will determine where any other files
+    /// serialized are written to.
+    ///
+    /// For example, these include:
+    /// - `residual.safetensors`
+    /// - `tokenizer.json`
+    /// - `config.json`
+    /// - More depending on the model
+    pub fn write_uqff(mut self, path: PathBuf) -> Self {
+        self.write_uqff = Some(path);
+        self
+    }
+
+    /// Cache path for Hugging Face models downloaded locally
+    pub fn from_hf_cache_pathf(mut self, hf_cache_path: PathBuf) -> Self {
+        self.hf_cache_path = Some(hf_cache_path);
+        self
+    }
+
+    /// Set the main device to load this model onto. Automatic device mapping will be performed starting with this device.
+    pub fn with_device(mut self, device: Device) -> Self {
+        self.device = Some(device);
+        self
+    }
+
+    /// Path to a Matryoshka Transformer configuration CSV file.
+    pub fn with_matformer_config_path(mut self, path: PathBuf) -> Self {
+        self.matformer_config_path = Some(path);
+        self
+    }
+
+    /// Name of the slice to use from the Matryoshka Transformer configuration.
+    pub fn with_matformer_slice_name(mut self, name: String) -> Self {
+        self.matformer_slice_name = Some(name);
+        self
+    }
+
     pub async fn build(self) -> anyhow::Result<Model> {
         let (pipeline, scheduler_config, add_model_config) = build_text_pipeline(self).await?;
         Ok(build_model_from_pipeline(pipeline, scheduler_config, add_model_config).await)
@@ -209,28 +339,23 @@ impl TextModelBuilder {
 pub struct UqffTextModelBuilder(TextModelBuilder);
 
 impl UqffTextModelBuilder {
-    /// Create a UQFF text model builder. A few defaults are applied here:
+    /// A few defaults are applied here:
     /// - MoQE ISQ organization
     /// - Token source is from the cache (.cache/huggingface/token)
     /// - Maximum number of sequences running is 32
     /// - Number of sequences to hold in prefix cache is 16.
     /// - Automatic device mapping with model defaults according to `AutoDeviceMapParams`
-    ///
-    /// For sharded UQFF models, you only need to specify the first shard file
-    /// (e.g., `q4k-0.uqff`). The remaining shards are auto-discovered from the
-    /// same directory or Hugging Face repository.
     pub fn new(model_id: impl ToString, uqff_file: Vec<PathBuf>) -> Self {
         let mut inner = TextModelBuilder::new(model_id);
         inner.from_uqff = Some(uqff_file);
         Self(inner)
     }
 
-    /// Load the UQFF text model and return a ready-to-use [`Model`].
     pub async fn build(self) -> anyhow::Result<Model> {
         self.0.build().await
     }
 
-    /// Unwrap into the inner [`TextModelBuilder`]. Take care not to call UQFF-related methods on it.
+    /// This wraps the VisionModelBuilder, so users should take care to not call UQFF-related methods.
     pub fn into_inner(self) -> TextModelBuilder {
         self.0
     }

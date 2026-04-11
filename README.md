@@ -23,21 +23,15 @@ Fast, flexible LLM inference.
   </a>
 </p>
 
-## Latest
-
-- **Gemma 4**: Full multimodal: text, image, video, and audio input. [Guide](docs/GEMMA4.md) | [Video setup](docs/VIDEO.md)
-- **MXFP4 ISQ quantization**: MXFP4 with optimized decode kernels for faster, smaller models. [Quantization docs](docs/QUANTS.md)
-- **Qwen 3.5 model family**: Support for the Qwen 3.5 series including vision. [Guide](docs/QWEN3_5.md)
-
 ## Why mistral.rs?
 
-- **Any Hugging Face model, zero config**: Just `mistralrs run -m user/model`.
-- **True multimodality**: Text, vision, video, and audio, speech generation, image generation, and embeddings in one engine.
+- **Any HuggingFace model, zero config**: Just `mistralrs run -m user/model`. Auto-detects architecture, quantization, chat template.
+- **True multimodality**: Vision, audio, speech generation, image generation, embeddings.
+- **Not another model registry**: Use HuggingFace models directly. No converting, no uploading to a separate service.
 - **Full quantization control**: Choose the precise quantization you want to use, or make your own UQFF with `mistralrs quantize`.
 - **Built-in web UI**: `mistralrs serve --ui` gives you a web interface instantly.
 - **Hardware-aware**: `mistralrs tune` benchmarks your system and picks optimal quantization + device mapping.
 - **Flexible SDKs**: Python package and Rust crate to build your projects.
-- **Agentic features** — tool calling, web search, and MCP client built in
 
 ## Quick Start
 
@@ -61,14 +55,8 @@ irm https://raw.githubusercontent.com/EricLBuehler/mistral.rs/master/install.ps1
 # Interactive chat
 mistralrs run -m Qwen/Qwen3-4B
 
-# One-shot prompt (no interactive session)
-mistralrs run -m Qwen/Qwen3-4B -i "What is the capital of France?"
-
-# One-shot with an image
-mistralrs run -m google/gemma-4-E4B-it --image photo.jpg -i "Describe this image"
-
 # Or start a server with web UI
-mistralrs serve --ui -m google/gemma-4-E4B-it
+mistralrs serve --ui -m google/gemma-3-4b-it
 ```
 
 Then visit `http://localhost:1234/ui` for the web chat interface.
@@ -104,9 +92,8 @@ mistralrs doctor
 ## What Makes It Fast
 
 **Performance**
-- Continuous batching support by default on all devices.
 - CUDA with [FlashAttention](docs/FLASH_ATTENTION.md) V2/V3, Metal, [multi-GPU tensor parallelism](docs/DISTRIBUTED/DISTRIBUTED.md)
-- [PagedAttention](docs/PAGED_ATTENTION.md) for high throughput continuous batching on CUDA or Apple Silicon, prefix caching (including multimodal)
+- [PagedAttention](docs/PAGED_ATTENTION.md) for high throughput, prefix caching (including multimodal)
 
 **Quantization** ([full docs](docs/QUANTS.md))
 - [In-situ quantization (ISQ)](docs/ISQ.md) of any Hugging Face model
@@ -122,7 +109,7 @@ mistralrs doctor
 **Agentic Features**
 - Integrated [tool calling](docs/TOOL_CALLING.md) with Python/Rust callbacks
 - ⭐ [Web search integration](docs/WEB_SEARCH.md)
-- ⭐ [MCP client](docs/MCP/client.md): Connect to external tools automatically
+- ⭐ [MCP client](docs/MCP/README.md): Connect to external tools automatically
 
 [Full feature documentation](docs/README.md)
 
@@ -136,7 +123,6 @@ mistralrs doctor
 - DeepSeek V3
 - GPT-OSS
 - DeepSeek V2
-- Qwen 3 Next
 - Qwen 3 MoE
 - Phi 3.5 MoE
 - Qwen 3
@@ -155,12 +141,9 @@ mistralrs doctor
 </details>
 
 <details>
-<summary><b>Multimodal Models</b></summary>
+<summary><b>Vision Models</b></summary>
 
-- Qwen 3.5
-- Qwen 3.5 MoE
 - Qwen 3-VL
-- Qwen 3-VL MoE
 - Gemma 3n
 - Llama 4
 - Gemma 3
@@ -180,7 +163,6 @@ mistralrs doctor
 <details>
 <summary><b>Speech Models</b></summary>
 
-- Voxtral (ASR/speech-to-text)
 - Dia
 </details>
 
@@ -233,11 +215,11 @@ cargo add mistralrs
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, TextMessages, MultimodalModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, TextMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model = MultimodalModelBuilder::new("google/gemma-4-E4B-it")
+    let model = VisionModelBuilder::new("google/gemma-3-4b-it")
         .with_isq(IsqType::Q4K)
         .with_logging()
         .build()
@@ -256,7 +238,7 @@ async fn main() -> Result<()> {
 }
 ```
 
-[API Docs](https://docs.rs/mistralrs) | [Crate](https://crates.io/crates/mistralrs) | [Examples](mistralrs/examples)
+[Rust SDK](https://crates.io/crates/mistralrs) | [Examples](mistralrs/examples)
 
 ## Docker
 

@@ -6,8 +6,6 @@ use indexmap::IndexMap;
 use tokenizers::InputSequence;
 use tracing::{level_filters::LevelFilter, Dispatch};
 
-use serde_json::Value;
-
 use crate::{
     get_mut_arcmutex,
     request::SearchContextSize,
@@ -18,22 +16,6 @@ use crate::{
 
 use super::Engine;
 
-/// Build a `tool_calls` structured field for an assistant message in the
-/// auto-tool-calling loop.  This enables Gemma 4 (and other templates that
-/// use `message.tool_calls`) to render the tool call correctly.
-fn build_tool_calls_field(tc: &ToolCallResponse) -> MessageContent {
-    let mut tc_map = IndexMap::new();
-    tc_map.insert("id".to_string(), Value::String(tc.id.clone()));
-    tc_map.insert("type".to_string(), Value::String("function".to_string()));
-    let mut function_map = serde_json::Map::new();
-    function_map.insert("name".to_string(), Value::String(tc.function.name.clone()));
-    let args_value = serde_json::from_str(&tc.function.arguments)
-        .unwrap_or(Value::String(tc.function.arguments.clone()));
-    function_map.insert("arguments".to_string(), args_value);
-    tc_map.insert("function".to_string(), Value::Object(function_map));
-    Either::Right(vec![tc_map])
-}
-
 async fn do_search(
     this: Arc<Engine>,
     mut second_request: NormalRequest,
@@ -41,7 +23,7 @@ async fn do_search(
     web_search_options: &WebSearchOptions,
 ) -> NormalRequest {
     let messages = match &mut second_request.messages {
-        RequestMessage::Chat { messages, .. } | RequestMessage::MultimodalChat { messages, .. } => {
+        RequestMessage::Chat { messages, .. } | RequestMessage::VisionChat { messages, .. } => {
             messages
         }
         _ => unreachable!(),
@@ -58,7 +40,6 @@ async fn do_search(
                 tool_calls.function.name, tool_calls.function.arguments
             )),
         );
-        message.insert("tool_calls".to_string(), build_tool_calls_field(tool_calls));
         messages.push(message);
     }
     let tool_call_params: SearchFunctionParameters =
@@ -216,10 +197,17 @@ async fn do_search(
         let mut message: IndexMap<String, MessageContent> = IndexMap::new();
         message.insert("role".to_string(), Either::Left("tool".to_string()));
         message.insert(
-            "name".to_string(),
-            Either::Left(tool_calls.function.name.clone()),
+            "content".to_string(),
+            Either::Left(
+                // Format the tool output JSON and append the search tool description for context
+                format!(
+                    "{}\n\n{}\n\n{}",
+                    tool_result,
+                    search::SEARCH_DESCRIPTION,
+                    search::EXTRACT_DESCRIPTION,
+                ),
+            ),
         );
-        message.insert("content".to_string(), Either::Left(tool_result));
         messages.push(message);
     }
 
@@ -238,7 +226,7 @@ async fn do_extraction(
     web_search_options: &WebSearchOptions,
 ) -> NormalRequest {
     let messages = match &mut second_request.messages {
-        RequestMessage::Chat { messages, .. } | RequestMessage::MultimodalChat { messages, .. } => {
+        RequestMessage::Chat { messages, .. } | RequestMessage::VisionChat { messages, .. } => {
             messages
         }
         _ => unreachable!(),
@@ -255,7 +243,6 @@ async fn do_extraction(
                 tool_calls.function.name, tool_calls.function.arguments
             )),
         );
-        message.insert("tool_calls".to_string(), build_tool_calls_field(tool_calls));
         messages.push(message);
     }
     let tool_call_params: ExtractFunctionParameters =
@@ -318,12 +305,16 @@ async fn do_extraction(
         let mut message: IndexMap<String, MessageContent> = IndexMap::new();
         message.insert("role".to_string(), Either::Left("tool".to_string()));
         message.insert(
-            "name".to_string(),
-            Either::Left(tool_calls.function.name.clone()),
-        );
-        message.insert(
             "content".to_string(),
-            Either::Left(format!("{{\"output\": \"{tool_result}\"}}")),
+            Either::Left(
+                // Format the tool output JSON and append the search tool description for context
+                format!(
+                    "{{\"output\": \"{}\"}}\n\n{}\n\n{}",
+                    tool_result,
+                    search::SEARCH_DESCRIPTION,
+                    search::EXTRACT_DESCRIPTION,
+                ),
+            ),
         );
         messages.push(message);
     }
@@ -342,7 +333,7 @@ async fn do_custom_tool(
     tool_calls: &ToolCallResponse,
 ) -> NormalRequest {
     let messages = match &mut second_request.messages {
-        RequestMessage::Chat { messages, .. } | RequestMessage::MultimodalChat { messages, .. } => {
+        RequestMessage::Chat { messages, .. } | RequestMessage::VisionChat { messages, .. } => {
             messages
         }
         _ => unreachable!(),
@@ -358,7 +349,6 @@ async fn do_custom_tool(
                 tool_calls.function.name, tool_calls.function.arguments
             )),
         );
-        message.insert("tool_calls".to_string(), build_tool_calls_field(tool_calls));
         messages.push(message);
     }
 
@@ -392,10 +382,6 @@ async fn do_custom_tool(
     {
         let mut message: IndexMap<String, MessageContent> = IndexMap::new();
         message.insert("role".to_string(), Either::Left("tool".to_string()));
-        message.insert(
-            "name".to_string(),
-            Either::Left(tool_calls.function.name.clone()),
-        );
         message.insert("content".to_string(), Either::Left(result));
         messages.push(message);
     }

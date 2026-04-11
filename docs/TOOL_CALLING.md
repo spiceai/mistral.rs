@@ -14,7 +14,6 @@ OpenAI docs: https://cookbook.openai.com/examples/how_to_call_functions_with_cha
 
 We support the following models' tool calling in OpenAI-compatible and parse native tool calling:
 
-- Gemma 4
 - Llama 4
 - Llama 3.1/3.2/3.3
 - Mistral Small (including 3.1 + multimodal)
@@ -32,7 +31,7 @@ Please see [our example here](https://github.com/EricLBuehler/mistral.rs/blob/ma
 > OpenAI docs: https://platform.openai.com/docs/api-reference/chat/create?lang=curl
 
 ## Rust example
-Please see [our example here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/advanced/tools/main.rs).
+Please see [our example here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/tools/main.rs).
 
 ## Python example
 Please see [our notebook here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/python/tool_calling.ipynb).
@@ -59,7 +58,7 @@ runner = Runner(
 
 See [custom_search.py](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/python/custom_search.py) for a full
 example. In Rust pass `.with_tool_callback(...)` to the builder as demonstrated
-in [tool_callback/main.rs](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/advanced/tool_callback/main.rs).
+in [custom_search/main.rs](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/custom_search/main.rs).
 
 ## Search callbacks
 

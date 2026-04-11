@@ -9,7 +9,6 @@ use mistralrs_quant::{Convolution, QuantMethod, ShardedVarBuilder};
 use crate::{
     attention::SdpaParams,
     layers::{self, Activation, Sdpa},
-    pipeline::text_models_inputs_processor::FlashParams,
     vision_models::conformer::{
         nemo::NemoConvSubsampling,
         pos_embed::{AbsolutePositionalEncoding, T5RelativeAttentionLogitBias},
@@ -100,20 +99,17 @@ impl Attention {
             (None, None) => None,
             (None, Some(relative_attention_bias)) => Some(relative_attention_bias.contiguous()?),
         };
-        let flash_params = FlashParams::empty(false);
-
         let attn_weights = Sdpa.run_attention(
             &q.contiguous()?,
             &k.contiguous()?,
             &v.contiguous()?,
             attention_mask.as_ref(),
-            Some(&flash_params),
+            None,
             &SdpaParams {
                 n_kv_groups: 1,
                 sliding_window: None,
                 softcap: None,
                 softmax_scale: self.scale,
-                sinks: None,
             },
         )?;
 

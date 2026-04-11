@@ -19,35 +19,6 @@ use tokenizers::Tokenizer;
 static DRY_SEQUENCE_BREAKERS: LazyLock<Vec<String>> =
     LazyLock::new(|| ["\n", ":", "\"", "*"].map(String::from).to_vec());
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-/// Optional generation defaults parsed from a model's `generation_config.json`.
-///
-/// These defaults are descriptive and opt-in: consumers may choose to apply them,
-/// partially apply them, or ignore them entirely.
-pub struct ModelGenerationDefaults {
-    pub do_sample: Option<bool>,
-    pub temperature: Option<f64>,
-    pub top_k: Option<usize>,
-    pub top_p: Option<f64>,
-    pub min_p: Option<f64>,
-    pub repetition_penalty: Option<f32>,
-    pub max_new_tokens: Option<usize>,
-    pub max_length: Option<usize>,
-}
-
-impl ModelGenerationDefaults {
-    pub fn is_empty(&self) -> bool {
-        self.do_sample.is_none()
-            && self.temperature.is_none()
-            && self.top_k.is_none()
-            && self.top_p.is_none()
-            && self.min_p.is_none()
-            && self.repetition_penalty.is_none()
-            && self.max_new_tokens.is_none()
-            && self.max_length.is_none()
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Stop sequences or ids.
 pub enum StopTokens {
@@ -83,7 +54,7 @@ impl SamplingParams {
     pub fn neutral() -> Self {
         Self {
             temperature: None,
-            top_k: None,
+            top_k: Some(1),
             top_p: None,
             min_p: None,
             top_n_logprobs: 0,
@@ -306,7 +277,17 @@ pub struct Logprobs {
 /// Comparator for descending order by probability (second element of tuple).
 #[inline]
 fn cmp_desc_by_prob(a: &(u32, f32), b: &(u32, f32)) -> std::cmp::Ordering {
-    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    match (a.1.is_nan(), b.1.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => b.1.partial_cmp(&a.1).unwrap_or_else(|| {
+            panic!(
+                "Incomparable log probs at indices i={}, j={}. Cannot compare probs[i]={} & probs[j]={}",
+                a.0, b.0, a.1, b.1
+            )
+        }),
+    }
 }
 
 /// Returns the top-k (index, probability) pairs from `probs`, sorted in descending order.
@@ -738,38 +719,7 @@ impl Sampler {
         return_logprobs: bool,
         rng: Arc<Mutex<Isaac64Rng>>,
     ) -> Result<Logprobs> {
-        let distr = match WeightedIndex::new(probs) {
-            Ok(distr) => distr,
-            Err(e) => {
-                if let Some((idx, prob)) = probs
-                    .iter()
-                    .enumerate()
-                    .find(|(_, prob)| !prob.is_finite() || **prob < 0.0)
-                {
-                    return Err(Error::Msg(format!(
-                        "Invalid sampling probability at index {idx}: {prob}. The model likely produced NaN/Inf logits."
-                    )));
-                }
-
-                let positive_weight_sum: f64 = probs
-                    .iter()
-                    .copied()
-                    .filter(|prob| prob.is_finite() && *prob > 0.0)
-                    .map(f64::from)
-                    .sum();
-
-                if positive_weight_sum == 0.0 {
-                    return Err(Error::Msg(
-                        "All sampling probabilities are zero after filtering (top-k/top-p/min-p)."
-                            .to_string(),
-                    ));
-                }
-
-                return Err(Error::Msg(format!(
-                    "Failed to construct multinomial sampler: {e}"
-                )));
-            }
-        };
+        let distr = WeightedIndex::new(probs).map_err(Error::wrap)?;
 
         let mut mut_ref_rng = &mut *rng.lock().expect("could not lock rng mutex");
         let next_token = distr.sample(&mut mut_ref_rng); // "Find the first item which has a weight *higher* than the chosen weight."

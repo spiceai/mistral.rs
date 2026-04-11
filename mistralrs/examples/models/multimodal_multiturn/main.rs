@@ -1,6 +1,5 @@
-//! Multi-turn conversation with a multimodal model across turns.
-//!
-//! Run with: `cargo run --release --example multimodal_multiturn -p mistralrs`
+use anyhow::Result;
+use mistralrs::{RequestBuilder, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 use anyhow::Result;
 use mistralrs::{ModelBuilder, MultimodalMessages, RequestBuilder, TextMessageRole};
@@ -9,7 +8,7 @@ const MODEL_ID: &str = "Qwen/Qwen3-VL-4B-Instruct";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model = ModelBuilder::new(MODEL_ID)
+    let model = VisionModelBuilder::new(MODEL_ID)
         .with_logging()
         .with_isq(mistralrs::IsqType::Q8_0)
         .build()
@@ -41,7 +40,8 @@ async fn main() -> Result<()> {
         TextMessageRole::User,
         "What is depicted here? Please describe the scene in detail.",
         vec![image],
-    );
+        &model,
+    )?;
     let resp = model
         .send_chat_request(RequestBuilder::from(messages.clone()).set_sampler_max_len(100))
         .await?
@@ -61,7 +61,8 @@ async fn main() -> Result<()> {
         };
     let image = image::load_from_memory(&bytes)?;
 
-    messages = messages.add_image_message(TextMessageRole::User, "What is this?", vec![image]);
+    messages =
+        messages.add_image_message(TextMessageRole::User, "What is this?", vec![image], &model)?;
     let resp = model
         .send_chat_request(RequestBuilder::from(messages.clone()).set_sampler_max_len(100))
         .await?
@@ -81,7 +82,8 @@ async fn main() -> Result<()> {
         };
     let image = image::load_from_memory(&bytes)?;
 
-    messages = messages.add_image_message(TextMessageRole::User, "What is this?", vec![image]);
+    messages =
+        messages.add_image_message(TextMessageRole::User, "What is this?", vec![image], &model)?;
     let resp = model
         .send_chat_request(RequestBuilder::from(messages.clone()).set_sampler_max_len(100))
         .await?

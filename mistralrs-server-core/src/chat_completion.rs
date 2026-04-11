@@ -37,7 +37,6 @@ use crate::{
     streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
     types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
     util::{parse_audio_url, parse_image_url, sanitize_error_message, validate_model_name},
-    video::parse_video_url,
 };
 
 /// A callback function that processes streaming response chunks before they are sent to the client.
@@ -127,15 +126,11 @@ impl futures::Stream for ChatCompletionStreamer {
                     self.done_state = DoneState::SendingDone;
                     Poll::Ready(Some(Ok(Event::default().data(msg))))
                 }
-                Response::ValidationError(e) => {
-                    self.done_state = DoneState::SendingDone;
-                    Poll::Ready(Some(Ok(
-                        Event::default().data(sanitize_error_message(e.as_ref()))
-                    )))
-                }
+                Response::ValidationError(e) => Poll::Ready(Some(Ok(
+                    Event::default().data(sanitize_error_message(e.as_ref()))
+                ))),
                 Response::InternalError(e) => {
                     MistralRs::maybe_log_error(self.state.clone(), &*e);
-                    self.done_state = DoneState::SendingDone;
                     Poll::Ready(Some(Ok(
                         Event::default().data(sanitize_error_message(e.as_ref()))
                     )))
@@ -166,8 +161,7 @@ impl futures::Stream for ChatCompletionStreamer {
                 Response::Raw { .. } => unreachable!(),
                 Response::Embeddings { .. } => unreachable!(),
             },
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending | Poll::Ready(None) => Poll::Pending,
         }
     }
 }
@@ -238,7 +232,6 @@ pub async fn parse_request(
             let mut messages = Vec::new();
             let mut image_urls = Vec::new();
             let mut audio_urls = Vec::new();
-            let mut video_urls = Vec::new();
             for message in req_messages {
                 let content = match message.content.as_deref() {
                     Some(content) => content.clone(),
@@ -349,7 +342,6 @@ pub async fn parse_request(
                             Text { text: String },
                             Image { image_url: String },
                             Audio { audio_url: String },
-                            Video { video_url: String },
                         }
 
                         let mut items = Vec::new();
@@ -391,20 +383,6 @@ pub async fn parse_request(
                                             .clone(),
                                     });
                                 }
-                                Some(MessageInnerContent(Either::Left(x))) if x == "video_url" => {
-                                    items.push(ContentPart::Video {
-                                        video_url: image_message
-                                            .get("video_url")
-                                            .as_ref()
-                                            .context("Video sub-content must have `video_url` key.")?
-                                            .as_ref()
-                                            .right()
-                                            .context("Video sub-content `video_url` key must be an object.")?
-                                            .get("url")
-                                            .context("Video sub-content `video_url` object must have a `url` key.")?
-                                            .clone(),
-                                    });
-                                }
                                 _ => anyhow::bail!("Expected array content sub-content to be of format {{`type`: `text`, `text`: ...}} and {{`type`: `url`, `image_url`: {{`url`: ...}}}}")
                             }
                         }
@@ -432,21 +410,12 @@ pub async fn parse_request(
                             })
                             .collect::<Vec<_>>();
 
-                        let video_urls_iter = items
-                            .iter()
-                            .filter_map(|item| match item {
-                                ContentPart::Video { video_url } => Some(video_url.clone()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>();
-
-                        // Apply prefixer to text content if this is a multimodal model with images/audio/video
+                        // Apply prefixer to text content if this is a vision model with images/audio
                         // This matches the behavior of interactive mode which auto-inserts media tokens
                         let text_content = if !image_urls_iter.is_empty()
                             || !audio_urls_iter.is_empty()
-                            || !video_urls_iter.is_empty()
                         {
-                            if let Ok(ModelCategory::Multimodal { prefixer }) =
+                            if let Ok(ModelCategory::Vision { prefixer }) =
                                 state.get_model_category(None)
                             {
                                 let mut prefixed = text_content;
@@ -465,14 +434,6 @@ pub async fn parse_request(
                                     let audio_indices: Vec<usize> =
                                         (start_idx..start_idx + audio_urls_iter.len()).collect();
                                     prefixed = prefixer.prefix_audio(audio_indices, &prefixed);
-                                }
-
-                                // Apply video prefixer
-                                if !video_urls_iter.is_empty() {
-                                    let start_idx = video_urls.len();
-                                    let video_indices: Vec<usize> =
-                                        (start_idx..start_idx + video_urls_iter.len()).collect();
-                                    prefixed = prefixer.prefix_video(video_indices, &prefixed);
                                 }
 
                                 prefixed
@@ -502,12 +463,6 @@ pub async fn parse_request(
                                 .insert("type".to_string(), Value::String("audio".to_string()));
                             content_map.push(content_audio_map);
                         }
-                        for _ in &video_urls_iter {
-                            let mut content_video_map = IndexMap::new();
-                            content_video_map
-                                .insert("type".to_string(), Value::String("video".to_string()));
-                            content_map.push(content_video_map);
-                        }
                         {
                             let mut content_text_map = IndexMap::new();
                             content_text_map
@@ -521,11 +476,10 @@ pub async fn parse_request(
                         messages.push(message_map);
                         image_urls.extend(image_urls_iter);
                         audio_urls.extend(audio_urls_iter);
-                        video_urls.extend(video_urls_iter);
                     }
                 }
             }
-            if !image_urls.is_empty() || !audio_urls.is_empty() || !video_urls.is_empty() {
+            if !image_urls.is_empty() || !audio_urls.is_empty() {
                 // Parse images
                 let mut images = Vec::new();
                 for url_unparsed in image_urls {
@@ -544,20 +498,10 @@ pub async fn parse_request(
                     audios.push(audio);
                 }
 
-                // Parse videos
-                let mut videos = Vec::new();
-                for url_unparsed in video_urls {
-                    let video = parse_video_url(&url_unparsed, None)
-                        .await
-                        .context(format!("Failed to parse video resource: {url_unparsed}"))?;
-                    videos.push(video);
-                }
-
-                RequestMessage::MultimodalChat {
+                RequestMessage::VisionChat {
                     messages,
                     images,
                     audios,
-                    videos,
                     enable_thinking: oairequest.enable_thinking,
                     reasoning_effort,
                 }

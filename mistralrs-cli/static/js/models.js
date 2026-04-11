@@ -1,7 +1,7 @@
 // Model management functionality
 
 // Global model state
-const models = Object.create(null); // name -> kind
+const models = Object.create(null); // name → kind
 let prevModel = null;
 
 /**
@@ -49,7 +49,6 @@ async function selectModel(name, notify = true) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name })
   });
-  await loadSettings();
 }
 
 /**

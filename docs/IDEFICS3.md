@@ -34,7 +34,7 @@ Mistral.rs supports interactive mode for multimodal models! It is an easy way to
 1) Start up interactive mode with the Idefics 3 model
 
 ```
-mistralrs run multimodal --isq 4 -m HuggingFaceM4/Idefics3-8B-Llama3
+mistralrs run vision --isq 4 -m HuggingFaceM4/Idefics3-8B-Llama3
 ```
 
 2) Ask a question
@@ -103,7 +103,7 @@ On closer inspection near one side of this grandeur scene stands tall trees with
 1) Start the server
 
 ```
-mistralrs serve multimodal -p 1234 --isq 4 -m HuggingFaceM4/Idefics3-8B-Llama3
+mistralrs serve vision -p 1234 --isq 4 -m HuggingFaceM4/Idefics3-8B-Llama3
 ```
 
 2) Send a request
@@ -147,17 +147,17 @@ print(resp)
 ---
 
 ## Rust
-You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/models/multimodal_models/main.rs).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/idefics3/main.rs).
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, MultimodalMessages, MultimodalModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 const MODEL_ID: &str = "HuggingFaceM4/Idefics3-8B-Llama3";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model = MultimodalModelBuilder::new(MODEL_ID)
+    let model = VisionModelBuilder::new(MODEL_ID)
         .with_isq(IsqType::Q8_0)
         .with_logging()
         .build()

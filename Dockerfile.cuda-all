@@ -9,7 +9,6 @@ RUN <<HEREDOC
     apt-get update
     apt-get install -y --no-install-recommends \
         curl \
-        git \
         libssl-dev \
         pkg-config
 

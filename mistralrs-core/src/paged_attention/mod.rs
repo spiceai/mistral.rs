@@ -12,20 +12,23 @@ pub mod encoder_cache;
 /// KV Cache Manager: high-level block allocation, prefix cache lookups, per-request tracking.
 pub mod kv_cache_manager;
 mod layers;
+/// Prefix caching for KV cache reuse across requests with shared prefixes.
+mod prefix_cacher;
 mod scheduler;
 pub const _PAD_SLOT_ID: i64 = -1;
 
+pub use block_engine::{BlockEngine, BlockRef, BlockTables, LogicalTokenBlock};
+pub use block_engine_sequence::BlockEngineSequence;
 pub use cache_engine::{CacheConfig, CacheEngine, PagedCacheType};
 use candle_core::{DType, Device};
 pub use config::{KvCacheLayout, ModelConfigLike, ModelConfigMetadata};
-pub use kv_cache_manager::KVCacheManager;
 pub use layers::PagedAttention;
 pub use scheduler::{
     PagedAttentionScheduler, PagedAttentionSchedulerConfig, PagedAttentionSchedulerOutput,
 };
 
 use crate::MemoryUsage;
-use tracing::info;
+use tracing::{info, warn};
 
 pub const DEFAULT_PAGED_ATTENTION_BLOCK_SIZE: usize = 32;
 
@@ -159,26 +162,34 @@ pub fn calculate_cache_config(
         min_mem_gpu = min_mem_gpu.min(mem_gpu);
     }
 
-    // On Metal (unified memory), cap KV cache to what the model can actually use.
-    // Unlike CUDA with dedicated VRAM where unused memory is wasted, Metal's wired
-    // buffers compete with the OS and CPU for the same physical RAM.
-    // On CUDA, all available memory is used for maximum request concurrency (vLLM approach).
-    #[allow(unused_mut, unused_variables)]
-    let mut mem_gpu = min_mem_gpu;
-    if device.is_metal() {
-        let max_tokens = max_num_tokens.unwrap_or(config.max_seq_len());
-        let mem_for_tokens =
-            ctxt_to_blocks!(max_tokens, dtype_size, block_size, config) / SIZE_IN_MB;
-        if mem_for_tokens < mem_gpu {
+    // // Cap at kv cache for max seq len
+    // let mem_for_toks =
+    //     ctxt_to_blocks!(config.max_seq_len(), dtype_size, block_size, config) / SIZE_IN_MB;
+    // let mem_gpu = min_mem_gpu.min(mem_for_toks);
+
+    // Cap Metal GPU memory to the wired (non‑paged) allocation limit reported by the kernel (`iogpu.wired_limit_mb`).
+    // Users can raise this limit with `sudo sysctl -w iogpu.wired_limit_mb=<desired_mb>`.
+    let mem_gpu = if matches!(device, Device::Metal(_)) {
+        let metal_cap_mb = MemoryUsage.get_total_memory(device)? / SIZE_IN_MB;
+
+        info!("Metal GPU wired limit is {metal_cap_mb} MB.");
+
+        if min_mem_gpu > metal_cap_mb {
             if !silent {
-                info!(
-                    "Metal: capping KV cache from {} MB to {} MB ({} tokens).",
-                    mem_gpu, mem_for_tokens, max_tokens
+                warn!(
+                    "Capping Metal GPU memory allocation from {} MB to {} MB (limited by iogpu.wired_limit_mb). \
+To raise this cap run: `sudo sysctl -w iogpu.wired_limit_mb=<desired_mb>`.",
+                    min_mem_gpu,
+                    metal_cap_mb
                 );
             }
-            mem_gpu = mem_for_tokens;
+            metal_cap_mb
+        } else {
+            min_mem_gpu
         }
-    }
+    } else {
+        min_mem_gpu
+    };
 
     let num_gpu_blocks = mb_to_blocks!(mem_gpu * SIZE_IN_MB, dtype_size, block_size, config);
     if num_gpu_blocks == 0 {

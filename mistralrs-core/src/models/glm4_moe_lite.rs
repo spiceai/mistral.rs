@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
-    device_map::{DeviceMappedMask, DeviceMapper},
+    device_map::DeviceMapper,
     layers::{
         embedding, Activation, CausalMasker, DeepSeekV2RopeConfig, DeepSeekV2RotaryEmbedding, Mlp,
         RmsNorm, Sdpa,
@@ -215,7 +215,6 @@ impl Attention {
                 softcap: None,
                 softmax_scale: cfg.softmax_scale(),
                 sliding_window: None,
-                sinks: None,
             },
             mla_weights,
         })
@@ -961,12 +960,14 @@ impl Glm4MoeLite {
                 .map(|(_, meta)| meta.is_first_prompt_chunk)
                 .unwrap_or(true)
         });
-        let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(
                 &xs,
-                attention_mask.as_ref().map(|m| m.get(xs.device())),
+                attention_mask
+                    .as_ref()
+                    .map(|m| m.to_device(xs.device()).unwrap())
+                    .as_ref(),
                 seqlen_offsets,
                 &mut cache[i],
                 metadata

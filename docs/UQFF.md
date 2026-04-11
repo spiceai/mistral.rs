@@ -15,14 +15,11 @@ The uniquely powerful quantized file format.
   - [Motivation](#motivation)
   - [Support](#support)
   - [Loading a UQFF model](#loading-a-uqff-model)
-    - [Shard auto-discovery](#shard-auto-discovery)
     - [Running with the CLI](#running-with-the-cli)
-    - [Using with the Rust SDK](#using-with-the-rust-sdk)
-    - [Using the Python SDK](#using-the-python-sdk)
-    - [Using topology for device mapping with UQFF](#using-topology-for-device-mapping-with-uqff)
+    - [Using with the Rust SDK](#using-with-the-rust-api)
+    - [Using the Python SDK](#using-the-python-api)
   - [Creating a UQFF model](#creating-a-uqff-model)
-    - [Model card generation](#model-card-generation)
-    - [Uploading to Hugging Face](#uploading-to-hugging-face)
+    - [Upload with Git](#upload-with-git)
   - [List of models](#list-of-models)
 
 ## Motivation
@@ -69,9 +66,6 @@ The following quantization formats are supported in UQFF. One can, of course, be
     - AFQ6
     - AFQ8
 
-- F8Q8:
-    - F8Q8
-
 ## Loading a UQFF model
 
 To load a UQFF model, specify the filename of the first (or only) UQFF shard. This will be located based on the model ID, and can
@@ -100,14 +94,14 @@ This also works when multiple quantizations exist in the same repo (e.g., `q4k-*
 ### Running with the CLI
 
 ```bash
-mistralrs run -m EricB/Phi-3.5-mini-instruct-UQFF --from-uqff phi3.5-mini-instruct-f8e4m3-0.uqff
+mistralrs run -m EricB/Phi-3.5-mini-instruct-UQFF --from-uqff phi3.5-mini-instruct-f8e4m3.uqff
 ```
 
 ### Using with the Rust SDK
 
 Check out the following examples:
 - Normal: [uqff/main.rs](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/uqff/main.rs)
-- Multimodal: [uqff_multimodal/main.rs](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/quantization/uqff_multimodal/main.rs)
+- Vision: [uqff_vision/main.rs](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/uqff_vision/main.rs)
 
 ### Using the Python SDK
 Modify the `Which` instantiation as follows:
@@ -177,46 +171,18 @@ UQFF model, and should be kept together or uploaded.
 
 > Note: Only the `.uqff` files are unique to the quantization level(s). If you are generating multiple UQFF files, it is OK for the others to be overwritten.
 
-**Single quantization (file output):**
-```bash
-mistralrs quantize -m microsoft/Phi-3.5-mini-instruct --isq q4k -o phi3.5-uqff/phi3.5-mini-instruct-q4k.uqff
-```
+After creating the UQFF file, you can upload the model to Hugging Face. To do this:
+1) [Create a new model](https://huggingface.co/docs/transformers/v4.17.0/en/create_a_model).
+2) Upload the UQFF file:
+    - With the web interface: [guide here](https://huggingface.co/docs/hub/en/models-uploading#using-the-web-interface).
+    - With Git: [steps here](#upload-with-git-lfs)
+3) Locally, generate the model card file with [this Python script](https://github.com/EricLBuehler/mistral.rs/blob/master/scripts/generate_uqff_card.py)..
+4) In the web interface, press the `Create Model Card` button and paste the generated model card.
 
-**Single quantization (directory output):**
-```bash
-mistralrs quantize -m microsoft/Phi-3.5-mini-instruct --isq q4k -o phi3.5-uqff/
-```
-
-**Multiple quantizations at once (directory output):**
-
-Generate multiple UQFF files by specifying multiple `--isq` types. All quantizations go to the same output directory.
+**⭐ Check out [uqff_maker](https://github.com/EricLBuehler/uqff_maker) to make UQFF models with an easy CLI!**
 
 ```bash
-# Comma-separated ISQ types
-mistralrs quantize -m microsoft/Phi-3.5-mini-instruct --isq q4k,q8_0 -o phi3.5-uqff/
-
-# Equivalent: repeated --isq flags
-mistralrs quantize -m microsoft/Phi-3.5-mini-instruct --isq q4k --isq q8_0 -o phi3.5-uqff/
-```
-
-This produces the following in `phi3.5-uqff/`:
-- `q4k-0.uqff` (and additional shards `q4k-1.uqff`, ... if the model is large)
-- `q8_0-0.uqff` (and additional shards if needed)
-- `README.md` (auto-generated model card for Hugging Face)
-- Shared files: `config.json`, `tokenizer.json`, `residual.safetensors`, etc.
-
-> Note: Multiple `--isq` values require a directory output path (not a `.uqff` file path).
-
-### Model card generation
-
-When using directory output mode, the `quantize` command automatically generates a `README.md` model card in the output directory. This model card includes Hugging Face YAML frontmatter, a description, and an examples table with the appropriate `--from-uqff` commands for each quantization.
-
-By default, the command prompts interactively for the base model and HF repo ID. To bypass the interactive prompts (e.g. in CI or scripts), use `--uqff-base-model` and/or `--uqff-repo-id`:
-
-```bash
-mistralrs quantize -m microsoft/Phi-3.5-mini-instruct --isq q4k -o phi3.5-uqff/ \
-    --uqff-base-model microsoft/Phi-3.5-mini-instruct \
-    --uqff-repo-id EricB/Phi-3.5-mini-instruct-UQFF
+mistralrs quantize -m microsoft/Phi-3.5-mini-instruct --isq 4 -o phi3.5-mini-instruct-q4k.uqff
 ```
 
 To skip model card generation entirely, use `--no-readme`:

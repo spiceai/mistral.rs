@@ -25,7 +25,6 @@ struct PagedAttention {
     max_context_len: usize,
     k_scale: Option<Tensor>,
     v_scale: Option<Tensor>,
-    sinks: Option<Tensor>,
 }
 
 impl PagedAttention {
@@ -157,19 +156,6 @@ impl PagedAttention {
                 (std::ptr::null(), std::ptr::null())
             };
 
-        let sinks_ptr = if let Some(sinks) = self.sinks.as_ref() {
-            let (s, s_l) = sinks.storage_and_layout();
-            let s = match &*s {
-                Storage::Cuda(s) => s,
-                _ => candle::bail!("sinks must be a cuda tensor"),
-            };
-            let s = s.as_cuda_slice::<f32>()?;
-            let (s_ptr, _s_guard) = slice_ptr(s, s_l.start_offset());
-            s_ptr as *const f32
-        } else {
-            std::ptr::null()
-        };
-
         let (num_seqs, num_heads, head_size) = q_l.shape().dims3()?;
         if !(head_size == 64
             || head_size == 80
@@ -267,7 +253,6 @@ impl PagedAttention {
                     cache_dtype,
                     k_scale_ptr,
                     v_scale_ptr,
-                    sinks_ptr,
                 )
             }
         } else {
@@ -315,7 +300,6 @@ impl PagedAttention {
                     cache_dtype,
                     k_scale_ptr,
                     v_scale_ptr,
-                    sinks_ptr,
                 )
             }
         }
@@ -392,9 +376,6 @@ pub fn paged_attention(
         alibi_slopes: alibi_slopes.cloned(),
         k_scale: k_scale.cloned(),
         v_scale: v_scale.cloned(),
-        sinks: sinks
-            .map(|s| s.to_dtype(candle_core::DType::F32))
-            .transpose()?,
     };
     q.apply_op1(op)
 }

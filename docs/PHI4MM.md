@@ -44,7 +44,7 @@ A mountain with snow on it.
 1) Start the server
 
 ```
-mistralrs serve multimodal -p 1234 -m microsoft/Phi-4-multimodal-instruct
+mistralrs serve vision -p 1234 -m microsoft/Phi-4-multimodal-instruct
 ```
 
 2) Send a request
@@ -89,18 +89,18 @@ print(resp)
 ---
 
 ## Rust
-You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/models/multimodal_models/main.rs).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/phi3v/main.rs).
 
 This is a minimal example of running the Phi 4 Multimodal model with a dummy image.
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, MultimodalMessages, MultimodalModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let model =
-        MultimodalModelBuilder::new("microsoft/Phi-4-multimodal-instruct")
+        VisionModelBuilder::new("microsoft/Phi-4-multimodal-instruct")
             .with_isq(IsqType::Q4K)
             .with_logging()
             .build()
@@ -181,7 +181,7 @@ print(res.usage)
 
 ## Audio input
 
-Alongside vision, Phi 4 Multimodal in `mistral.rs` can accept **audio** as an additional modality.  This unlocks fully-local pipelines such as **text + speech + vision -> text** where the model can reason jointly over what it *hears* and what it *sees*.
+Alongside vision, Phi 4 Multimodal in `mistral.rs` can accept **audio** as an additional modality.  This unlocks fully-local pipelines such as **text + speech + vision → text** where the model can reason jointly over what it *hears* and what it *sees*.
 
 `mistral.rs` automatically decodes the supplied audio (WAV/MP3/FLAC/OGG/… – anything [Symphonia](https://github.com/pdeljanov/Symphonia) can handle) into 16-bit PCM.
 
@@ -213,11 +213,11 @@ Audio is delivered with the `audio_url` content-type that mirrors OpenAIʼs offi
 
 ```rust
 use anyhow::Result;
-use mistralrs::{AudioInput, IsqType, TextMessageRole, MultimodalMessages, MultimodalModelBuilder};
+use mistralrs::{AudioInput, IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model = MultimodalModelBuilder::new("microsoft/Phi-4-multimodal-instruct")
+    let model = VisionModelBuilder::new("microsoft/Phi-4-multimodal-instruct")
         .with_isq(IsqType::Q4K)
         .with_logging()
         .build()
@@ -237,14 +237,14 @@ async fn main() -> Result<()> {
     .to_vec();
     let image = image::load_from_memory(&image_bytes)?;
 
-    let messages = MultimodalMessages::new()
+    let messages = VisionMessages::new()
         .add_multimodal_message(
             TextMessageRole::User,
             "Describe in detail what is happening.",
             vec![image],
             vec![audio],
-            vec![],
-        );
+            &model,
+        )?;
 
     let response = model.send_chat_request(messages).await?;
 

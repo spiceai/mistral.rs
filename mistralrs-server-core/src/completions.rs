@@ -7,20 +7,6 @@ use std::{
     time::Duration,
 };
 
-use crate::{
-    completion_core::{
-        convert_stop_tokens, get_dry_sampling_params, handle_completion_error,
-        BaseCompletionResponder,
-    },
-    handler_core::{
-        base_process_non_streaming_response, create_response_channel, send_request,
-        BaseJsonModelError, ErrorToResponse, JsonError, ModelErrorMessage,
-    },
-    openai::{CompletionRequest, Grammar},
-    streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
-    types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
-    util::{sanitize_error_message, validate_model_name},
-};
 use anyhow::Result;
 use axum::{
     extract::{Json, State},
@@ -35,6 +21,22 @@ use mistralrs_core::{
     RequestMessage, Response, SamplingParams,
 };
 use tokio::sync::mpsc::{Receiver, Sender};
+use tracing::warn;
+
+use crate::{
+    completion_core::{
+        convert_stop_tokens, get_dry_sampling_params, handle_completion_error,
+        BaseCompletionResponder,
+    },
+    handler_core::{
+        base_process_non_streaming_response, create_response_channel, send_request,
+        BaseJsonModelError, ErrorToResponse, JsonError, ModelErrorMessage,
+    },
+    openai::{CompletionRequest, Grammar},
+    streaming::{base_create_streamer, get_keep_alive_interval, BaseStreamer, DoneState},
+    types::{ExtractedMistralRsState, OnChunkCallback, OnDoneCallback, SharedMistralRsState},
+    util::{sanitize_error_message, validate_model_name},
+};
 
 /// A callback function that processes streaming response chunks before they are sent to the client.
 ///
@@ -117,15 +119,11 @@ impl futures::Stream for CompletionStreamer {
                     self.done_state = DoneState::SendingDone;
                     Poll::Ready(Some(Ok(Event::default().data(msg))))
                 }
-                Response::ValidationError(e) => {
-                    self.done_state = DoneState::SendingDone;
-                    Poll::Ready(Some(Ok(
-                        Event::default().data(sanitize_error_message(e.as_ref()))
-                    )))
-                }
+                Response::ValidationError(e) => Poll::Ready(Some(Ok(
+                    Event::default().data(sanitize_error_message(e.as_ref()))
+                ))),
                 Response::InternalError(e) => {
                     MistralRs::maybe_log_error(self.state.clone(), &*e);
-                    self.done_state = DoneState::SendingDone;
                     Poll::Ready(Some(Ok(
                         Event::default().data(sanitize_error_message(e.as_ref()))
                     )))
@@ -156,8 +154,7 @@ impl futures::Stream for CompletionStreamer {
                 Response::Raw { .. } => unreachable!(),
                 Response::Embeddings { .. } => unreachable!(),
             },
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            Poll::Pending | Poll::Ready(None) => Poll::Pending,
         }
     }
 }
@@ -207,6 +204,10 @@ pub fn parse_request(
 
     let stop_toks = convert_stop_tokens(oairequest.stop_seqs);
 
+    if oairequest.logprobs.is_some() {
+        warn!("Completion requests do not support logprobs.");
+    }
+
     let is_streaming = oairequest.stream.unwrap_or(false);
 
     let dry_params = get_dry_sampling_params(
@@ -229,7 +230,7 @@ pub fn parse_request(
                 top_k: oairequest.top_k,
                 top_p: oairequest.top_p,
                 min_p: oairequest.min_p,
-                top_n_logprobs: oairequest.logprobs.unwrap_or(1),
+                top_n_logprobs: 1,
                 frequency_penalty: oairequest.frequency_penalty,
                 presence_penalty: oairequest.presence_penalty,
                 repetition_penalty: oairequest.repetition_penalty,
@@ -240,7 +241,7 @@ pub fn parse_request(
                 dry_params,
             },
             response: tx,
-            return_logprobs: oairequest.logprobs.is_some(),
+            return_logprobs: false,
             is_streaming,
             suffix: oairequest.suffix,
             constraint: match oairequest.grammar {

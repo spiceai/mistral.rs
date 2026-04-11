@@ -2,6 +2,7 @@ use std::{
     fmt::Debug,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
@@ -42,9 +43,9 @@ pub trait DiffusionModel {
 
 pub trait DiffusionModelLoader: Send + Sync {
     /// If the model is being loaded with `load_model_from_hf` (so manual paths not provided), this will be called.
-    fn get_model_paths(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>>;
+    fn get_model_paths(&self, api: &Arc<ApiRepo>, model_id: &Path) -> Result<Vec<PathBuf>>;
     /// If the model is being loaded with `load_model_from_hf` (so manual paths not provided), this will be called.
-    fn get_config_filenames(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>>;
+    fn get_config_filenames(&self, api: &Arc<ApiRepo>, model_id: &Path) -> Result<Vec<PathBuf>>;
     fn force_cpu_vb(&self) -> Vec<bool>;
     // `configs` and `vbs` should be corresponding. It is up to the implementer to maintain this invaraint.
     fn load(
@@ -59,7 +60,7 @@ pub trait DiffusionModelLoader: Send + Sync {
 
 #[cfg_attr(feature = "pyo3_macros", pyclass(eq, eq_int))]
 #[derive(Clone, Debug, Deserialize, serde::Serialize, PartialEq)]
-/// The architecture to load the diffusion model as.
+/// The architecture to load the vision model as.
 pub enum DiffusionLoaderType {
     #[serde(rename = "flux")]
     Flux,
@@ -159,7 +160,7 @@ pub struct FluxLoader {
 }
 
 impl DiffusionModelLoader for FluxLoader {
-    fn get_model_paths(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>> {
+    fn get_model_paths(&self, api: &Arc<ApiRepo>, model_id: &Path) -> Result<Vec<PathBuf>> {
         let regex = Regex::new(r"^flux\d+-(schnell|dev)\.safetensors$")?;
         let flux_name = api_dir_list!(api, model_id, true)
             .filter(|x| regex.is_match(x))
@@ -171,7 +172,7 @@ impl DiffusionModelLoader for FluxLoader {
         // NOTE(EricLBuehler): disgusting way of doing this but the 0th path is the flux, 1 is ae
         Ok(vec![flux_file, ae_file])
     }
-    fn get_config_filenames(&self, api: &ApiRepo, model_id: &Path) -> Result<Vec<PathBuf>> {
+    fn get_config_filenames(&self, api: &Arc<ApiRepo>, model_id: &Path) -> Result<Vec<PathBuf>> {
         let flux_file = api_get_file!(api, "transformer/config.json", model_id);
         let ae_file = api_get_file!(api, "vae/config.json", model_id);
 

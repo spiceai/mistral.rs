@@ -154,18 +154,9 @@ impl QuantMethod for FP8Linear {
         device: Device,
         _n_quantized: &AtomicUsize,
         _imatrix_weight: Option<Vec<f32>>,
-        guard: QuantizeOntoGuard,
+        _guard: QuantizeOntoGuard,
     ) -> Result<Arc<dyn QuantMethod>> {
-        match dtype {
-            Some(IsqType::F8Q8) => {
-                let _acquired_quantize_guard = guard.acquire(&device);
-                let dequant = self.dequantize(DType::F32)?;
-                let w = dequant.weight().to_device(&device)?;
-                let b = dequant.bias().map(|b| b.to_device(&device)).transpose()?;
-                Ok(Arc::new(crate::F8Q8Linear::from_weight(&w, b)?))
-            }
-            _ => todo!(),
-        }
+        todo!()
     }
 }
 

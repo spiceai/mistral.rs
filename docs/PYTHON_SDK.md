@@ -28,8 +28,6 @@ If you do not specify the architecture, an attempt will be made to use the model
 - `Qwen2`
 - `Gemma2`
 - `GLM4`
-- `GLM4MoeLite`
-- `GLM4Moe`
 - `Starcoder2`
 - `Phi3_5MoE`
 - `DeepseekV2`
@@ -39,13 +37,12 @@ If you do not specify the architecture, an attempt will be made to use the model
 - `SmolLm3`
 - `GraniteMoeHybrid`
 - `GptOss`
-- `Qwen3Next`
 
 ### ISQ Organization
 - `Default`
 - `MoQE`: if applicable, only quantize MoE experts. https://arxiv.org/abs/2310.02410
 
-### Architecture for multimodal models
+### Architecture for vision models
 - `Phi3V`
 - `Idefics2`
 - `LLaVaNext`
@@ -57,15 +54,10 @@ If you do not specify the architecture, an attempt will be made to use the model
 - `Phi4MM`
 - `Qwen2_5VL`
 - `Gemma3`
-- `Gemma4`
 - `Mistral3`
 - `Llama4`
 - `Gemma3n`
 - `Qwen3VL`
-- `Qwen3VLMoE`
-- `Qwen3_5`
-- `Qwen3_5Moe`
-- `Voxtral`
 
 ### Architecture for diffusion models
 - `Flux`
@@ -82,7 +74,7 @@ If you do not specify the architecture, an attempt will be made to use the model
 - `Default`
 - `MoQE`: if applicable, only quantize MoE experts. https://arxiv.org/abs/2310.02410
 
-> Note: `from_uqff` specifies a UQFF path to load from. If provided, this takes precedence over applying ISQ. For sharded models, you only need to specify the first shard (e.g., `q4k-0.uqff`) -- the remaining shards are auto-discovered. For multiple different quantizations, use a semicolon delimiter (;).
+> Note: `from_uqff` specified a UQFF path to load from. If provided, this takes precedence over applying ISQ. Specify multiple files using a semicolon delimiter (;).
 
 > Note: `enable_thinking` enables thinking for models that support the configuration.
 > Note: `truncate_sequence=True` trims prompts that would otherwise exceed the model's maximum context length. Leave it `False` to receive a validation error instead.
@@ -213,16 +205,16 @@ class Which(Enum):
         hf_cache_path: str | None = None
 
     @dataclass
-    class MultimodalPlain:
+    class VisionPlain:
         model_id: str
-        arch: MultimodalArchitecture
+        arch: VisionArchitecture
         tokenizer_json: str | None = None
         topology: str | None = None
         from_uqff: str | list[str] | None = None
         write_uqff: str | None = None
         dtype: ModelDType = ModelDType.Auto
         max_edge: int | None = None
-        auto_map_params: MultimodalAutoMapParams | None = (None,)
+        auto_map_params: VisionAutoMapParams | None = (None,)
         calibration_file: str | None = None
         imatrix: str | None = None
         hf_cache_path: str | None = None
@@ -250,18 +242,18 @@ The `mistralrs` Python SDK supports running multiple models using the `Runner` c
 ```python
 import mistralrs
 
-# Create a Runner with a multimodal model (Gemma 4 E4B)
+# Create a Runner with a vision model (Gemma 3 4B)
 runner = mistralrs.Runner(
-    which=mistralrs.Which.MultimodalPlain(
-        model_id="google/gemma-4-E4B-it",
-        arch=mistralrs.MultimodalArchitecture.Gemma4,
+    which=mistralrs.Which.VisionPlain(
+        model_id="google/gemma-3-4b-it",
+        arch=mistralrs.VisionArchitecture.Gemma3,
     ),
     in_situ_quant="Q4K",
 )
 
 # List available models (model IDs are registered IDs, aliases if configured)
 models = runner.list_models()
-print(f"Available models: {models}")  # ["google/gemma-4-E4B-it"]
+print(f"Available models: {models}")  # ["google/gemma-3-4b-it"]
 
 # Send request to specific model using model_id parameter
 response = runner.send_chat_completion_request(
@@ -269,7 +261,7 @@ response = runner.send_chat_completion_request(
         messages=[{"role": "user", "content": "Hello!"}],
         max_tokens=100
     ),
-    model_id="google/gemma-4-E4B-it"  # Target specific model
+    model_id="google/gemma-3-4b-it"  # Target specific model
 )
 
 # Send request without model_id (uses default model)
@@ -293,7 +285,7 @@ default_model = runner.get_default_model_id()
 print(f"Default model: {default_model}")
 
 # Change default model (model must be loaded)
-runner.set_default_model_id("google/gemma-4-E4B-it")
+runner.set_default_model_id("google/gemma-3-4b-it")
 
 # List models with their status
 models_with_status = runner.list_models_with_status()
@@ -306,7 +298,7 @@ for model_id, status in models_with_status:
 You can unload models to free memory and reload them on demand:
 
 ```python
-model_id = "google/gemma-4-E4B-it"
+model_id = "google/gemma-3-4b-it"
 
 # Check if model is loaded
 is_loaded = runner.is_model_loaded(model_id)

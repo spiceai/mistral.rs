@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use either::Either;
 use mistralrs_core::{
-    AutoDeviceMapParams, DiffusionLoaderType, EmbeddingLoaderType, ModelDType,
-    MultimodalLoaderType, NormalLoaderType,
+    AutoDeviceMapParams, DiffusionLoaderType, EmbeddingLoaderType, ModelDType, NormalLoaderType,
+    VisionLoaderType,
 };
 use pyo3::{pyclass, pymethods};
 
@@ -30,7 +30,6 @@ pub enum Architecture {
     SmolLm3,
     GraniteMoeHybrid,
     GptOss,
-    Qwen3Next,
 }
 
 impl From<Architecture> for NormalLoaderType {
@@ -56,7 +55,22 @@ impl From<Architecture> for NormalLoaderType {
             Architecture::SmolLm3 => Self::SmolLm3,
             Architecture::GraniteMoeHybrid => Self::GraniteMoeHybrid,
             Architecture::GptOss => Self::GptOss,
-            Architecture::Qwen3Next => Self::Qwen3Next,
+        }
+    }
+}
+
+#[pyclass(eq, eq_int)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum EmbeddingArchitecture {
+    EmbeddingGemma,
+    Qwen3Embedding,
+}
+
+impl From<EmbeddingArchitecture> for EmbeddingLoaderType {
+    fn from(value: EmbeddingArchitecture) -> Self {
+        match value {
+            EmbeddingArchitecture::EmbeddingGemma => EmbeddingLoaderType::EmbeddingGemma,
+            EmbeddingArchitecture::Qwen3Embedding => EmbeddingLoaderType::Qwen3Embedding,
         }
     }
 }
@@ -95,36 +109,26 @@ pub enum MultimodalArchitecture {
     Llama4,
     Gemma3n,
     Qwen3VL,
-    Qwen3VLMoE,
-    Qwen3_5,
-    Qwen3_5Moe,
-    Voxtral,
-    Gemma4,
 }
 
 impl From<MultimodalArchitecture> for MultimodalLoaderType {
     fn from(value: MultimodalArchitecture) -> Self {
         match value {
-            MultimodalArchitecture::Phi3V => MultimodalLoaderType::Phi3V,
-            MultimodalArchitecture::Idefics2 => MultimodalLoaderType::Idefics2,
-            MultimodalArchitecture::LLaVANext => MultimodalLoaderType::LLaVANext,
-            MultimodalArchitecture::LLaVA => MultimodalLoaderType::LLaVA,
-            MultimodalArchitecture::VLlama => MultimodalLoaderType::VLlama,
-            MultimodalArchitecture::Qwen2VL => MultimodalLoaderType::Qwen2VL,
-            MultimodalArchitecture::Idefics3 => MultimodalLoaderType::Idefics3,
-            MultimodalArchitecture::MiniCpmO => MultimodalLoaderType::MiniCpmO,
-            MultimodalArchitecture::Phi4MM => MultimodalLoaderType::Phi4MM,
-            MultimodalArchitecture::Qwen2_5VL => MultimodalLoaderType::Qwen2_5VL,
-            MultimodalArchitecture::Gemma3 => MultimodalLoaderType::Gemma3,
-            MultimodalArchitecture::Mistral3 => MultimodalLoaderType::Mistral3,
-            MultimodalArchitecture::Llama4 => MultimodalLoaderType::Llama4,
-            MultimodalArchitecture::Gemma3n => MultimodalLoaderType::Gemma3n,
-            MultimodalArchitecture::Qwen3VL => MultimodalLoaderType::Qwen3VL,
-            MultimodalArchitecture::Qwen3VLMoE => MultimodalLoaderType::Qwen3VLMoE,
-            MultimodalArchitecture::Qwen3_5 => MultimodalLoaderType::Qwen3_5,
-            MultimodalArchitecture::Qwen3_5Moe => MultimodalLoaderType::Qwen3_5Moe,
-            MultimodalArchitecture::Voxtral => MultimodalLoaderType::Voxtral,
-            MultimodalArchitecture::Gemma4 => MultimodalLoaderType::Gemma4,
+            VisionArchitecture::Phi3V => VisionLoaderType::Phi3V,
+            VisionArchitecture::Idefics2 => VisionLoaderType::Idefics2,
+            VisionArchitecture::LLaVANext => VisionLoaderType::LLaVANext,
+            VisionArchitecture::LLaVA => VisionLoaderType::LLaVA,
+            VisionArchitecture::VLlama => VisionLoaderType::VLlama,
+            VisionArchitecture::Qwen2VL => VisionLoaderType::Qwen2VL,
+            VisionArchitecture::Idefics3 => VisionLoaderType::Idefics3,
+            VisionArchitecture::MiniCpmO => VisionLoaderType::MiniCpmO,
+            VisionArchitecture::Phi4MM => VisionLoaderType::Phi4MM,
+            VisionArchitecture::Qwen2_5VL => VisionLoaderType::Qwen2_5VL,
+            VisionArchitecture::Gemma3 => VisionLoaderType::Gemma3,
+            VisionArchitecture::Mistral3 => VisionLoaderType::Mistral3,
+            VisionArchitecture::Llama4 => VisionLoaderType::Llama4,
+            VisionArchitecture::Gemma3n => VisionLoaderType::Gemma3n,
+            VisionArchitecture::Qwen3VL => VisionLoaderType::Qwen3VL,
         }
     }
 }
@@ -494,11 +498,10 @@ pub enum Which {
         hf_cache_path = None,
         matformer_config_path = None,
         matformer_slice_name = None,
-        organization = None,
     ))]
     MultimodalPlain {
         model_id: String,
-        arch: Option<MultimodalArchitecture>,
+        arch: Option<VisionArchitecture>,
         tokenizer_json: Option<String>,
         topology: Option<String>,
         write_uqff: Option<PathBuf>,
@@ -507,11 +510,10 @@ pub enum Which {
         max_edge: Option<u32>,
         calibration_file: Option<PathBuf>,
         imatrix: Option<PathBuf>,
-        auto_map_params: Option<MultimodalAutoMapParams>,
+        auto_map_params: Option<VisionAutoMapParams>,
         hf_cache_path: Option<PathBuf>,
         matformer_config_path: Option<PathBuf>,
         matformer_slice_name: Option<String>,
-        organization: Option<IsqOrganization>,
     },
 
     #[pyo3(constructor = (

@@ -10,7 +10,7 @@ use statrs::distribution::{ContinuousCDF, Normal};
 use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
-    device_map::{DeviceMappedMask, DeviceMapper},
+    device_map::DeviceMapper,
     layers::{
         self, embedding, Activation, CausalMasker, Gemma3nRotaryEmbedding, MatMul, RmsNorm,
         RotaryEmbedding, ScaledEmbedding, Sdpa,
@@ -20,8 +20,8 @@ use crate::{
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, KvCache, MultimodalModel, NormalCache, NormalCacheType,
-        NormalLoadingMetadata,
+        EitherCache, IsqModel, KvCache, NormalCache, NormalCacheType, NormalLoadingMetadata,
+        VisionModel,
     },
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
@@ -35,23 +35,6 @@ macro_rules! is_sliding {
 }
 
 const EPS: f64 = 1e-8;
-
-fn kv_shared_layer_index(cfg: &Gemma3nTextConfig, layer_idx: usize) -> Option<usize> {
-    if cfg.num_kv_shared_layers == 0 {
-        return None;
-    }
-
-    let first_kv_shared_layer_idx = cfg.num_hidden_layers - cfg.num_kv_shared_layers;
-    if first_kv_shared_layer_idx == 0 || layer_idx < first_kv_shared_layer_idx {
-        return None;
-    }
-
-    if is_sliding!(layer_idx, cfg) {
-        Some(first_kv_shared_layer_idx - 2)
-    } else {
-        Some(first_kv_shared_layer_idx - 1)
-    }
-}
 
 #[derive(Clone)]
 pub struct Mlp {
@@ -285,7 +268,18 @@ impl Attention {
             mapper.set_device(layer_idx, vb.pp("v_norm"), false),
         )?;
 
-        let kv_shared_layer_index = kv_shared_layer_index(cfg, layer_idx);
+        let first_kv_shared_layer_idx = cfg.num_hidden_layers - cfg.num_kv_shared_layers;
+        let is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx;
+
+        let kv_shared_layer_index = if !is_kv_shared_layer {
+            None
+        } else if sliding_window.is_some() {
+            // Last layer that computes local sliding attention is always 2 before sharing starts
+            Some(first_kv_shared_layer_idx - 2)
+        } else {
+            // Last layer before sharing starts is always the last that computes global attention layer
+            Some(first_kv_shared_layer_idx - 1)
+        };
         Ok(Self {
             q_proj,
             k_proj,
@@ -306,7 +300,6 @@ impl Attention {
                 softcap: None,
                 softmax_scale: 1.0,
                 sliding_window,
-                sinks: None,
             },
             q_norm,
             k_norm,
@@ -1199,17 +1192,13 @@ impl TextModel {
 
         let cache_types = (0..cfg.num_hidden_layers)
             .map(|layer_idx| {
-                if let Some(owner) = kv_shared_layer_index(cfg, layer_idx) {
-                    NormalCacheType::Shared { owner }
-                } else if is_sliding!(layer_idx, cfg) {
-                    NormalCacheType::SlidingWindow {
+                is_sliding!(layer_idx, cfg)
+                    .then(|| NormalCacheType::SlidingWindow {
                         window: cfg.sliding_window,
-                    }
-                } else {
-                    NormalCacheType::Normal {
+                    })
+                    .unwrap_or(NormalCacheType::Normal {
                         max_seq_len: cfg.max_position_embeddings,
-                    }
-                }
+                    })
             })
             .collect::<Vec<_>>();
         Ok(Self {
@@ -1229,7 +1218,7 @@ impl TextModel {
                 num_attn_heads: cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size(),
                 num_kv_heads: (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size())
                     .max(1),
-                sliding_window: Some(cfg.sliding_window),
+                sliding_window: None,
                 k_head_dim: cfg.head_dim,
                 v_head_dim: cfg.head_dim,
                 kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
@@ -1377,16 +1366,20 @@ impl TextModel {
         }
         xs = Tensor::stack(&temp_hidden_states, 0)?;
 
-        let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
-        let sliding_attention_mask = DeviceMappedMask::new(sliding_attention_mask, &*self.mapper)?;
         for (i, layer) in self.layers.iter().enumerate() {
             let per_layer_input = per_layer_inputs.i((.., .., i, ..))?;
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(
                 &xs,
                 &per_layer_input.to_device(xs.device())?,
-                attention_mask.as_ref().map(|m| m.get(xs.device())),
-                sliding_attention_mask.as_ref().map(|m| m.get(xs.device())),
+                attention_mask
+                    .as_ref()
+                    .map(|m| m.to_device(xs.device()).unwrap())
+                    .as_ref(),
+                sliding_attention_mask
+                    .as_ref()
+                    .map(|m| m.to_device(xs.device()).unwrap())
+                    .as_ref(),
                 seqlen_offsets,
                 &mut *cache,
                 flash_params,
@@ -1569,7 +1562,7 @@ impl IsqModel for TextModel {
     }
 }
 
-impl MultimodalModel for TextModel {
+impl VisionModel for TextModel {
     fn forward(
         &self,
         _input_ids: &Tensor,

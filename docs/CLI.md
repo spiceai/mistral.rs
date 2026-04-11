@@ -5,7 +5,7 @@ This is the comprehensive CLI reference for `mistralrs`. The CLI provides comman
 ## Table of Contents
 
 - [Commands](#commands)
-  - [run](#run---interactive--one-shot-mode): run model in interactive or one-shot mode
+  - [run](#run---interactive-mode): run model in interactive mode
   - [serve](#serve---http-server): start HTTP/MCP server and (optionally) the UI
   - [from-config](#from-config---toml-configuration): run from a [TOML configuration file](CLI_CONFIG.md)
   - [quantize](#quantize---uqff-generation): generate UQFF quantized model file
@@ -18,7 +18,7 @@ This is the comprehensive CLI reference for `mistralrs`. The CLI provides comman
 - [Model Types](#model-types)
   - [auto](#auto)
   - [text](#text)
-  - [multimodal](#multimodal)
+  - [vision](#vision)
   - [diffusion](#diffusion)
   - [speech](#speech)
   - [embedding](#embedding)
@@ -38,9 +38,9 @@ This is the comprehensive CLI reference for `mistralrs`. The CLI provides comman
 
 ## Commands
 
-### run - Interactive & One-Shot Mode
+### run - Interactive Mode
 
-Start a model in interactive mode for conversational use, or run a single one-shot request with `-i`.
+Start a model in interactive mode for conversational use.
 
 ```bash
 mistralrs run [MODEL_TYPE] -m <MODEL_ID> [OPTIONS]
@@ -48,55 +48,27 @@ mistralrs run [MODEL_TYPE] -m <MODEL_ID> [OPTIONS]
 
 Note: `MODEL_TYPE` is optional and defaults to `auto` if not specified. This allows a shorter syntax.
 
-**Interactive mode examples:**
+**Examples:**
 
 ```bash
 # Run a text model interactively (shorthand - auto type is implied)
 mistralrs run -m Qwen/Qwen3-4B
 
+# Explicit auto type (equivalent to above)
+mistralrs run -m Qwen/Qwen3-4B
+
 # Run with thinking mode enabled
-mistralrs run -m Qwen/Qwen3-4B --thinking
+mistralrs run -m Qwen/Qwen3-4B --enable-thinking
 
-# Run a multimodal model
-mistralrs run -m google/gemma-4-E4B-it
-```
-
-**One-shot mode examples:**
-
-When `-i` is provided, the model processes a single request and exits. Combine with `--image`, `--video`, or `--audio` for multimodal input.
-
-```bash
-# Text-only one-shot
-mistralrs run -m Qwen/Qwen3-4B -i "What is the capital of France?"
-
-# Describe an image
-mistralrs run -m google/gemma-4-E4B-it --image photo.jpg -i "Describe this image"
-
-# Multiple images
-mistralrs run -m google/gemma-4-E4B-it --image img1.jpg --image img2.png -i "Compare these images"
-
-# Video input
-mistralrs run -m google/gemma-4-E4B-it --video clip.mp4 -i "What happens in this video?"
-
-# Audio input
-mistralrs run -m google/gemma-4-E4B-it --audio recording.wav -i "Transcribe this audio"
-
-# Mixed media (image + audio)
-mistralrs run -m google/gemma-4-E4B-it --image photo.jpg --audio clip.mp3 -i "Describe the image and transcribe the audio"
-
-# URLs work too
-mistralrs run -m google/gemma-4-E4B-it --image https://example.com/photo.jpg -i "What is in this image?"
+# Run a vision model
+mistralrs run -m google/gemma-3-4b-it
 ```
 
 **Options:**
 
 | Option | Description |
 |--------|-------------|
-| `--thinking [true\|false]` | Control thinking mode. `--thinking` forces on, `--thinking false` forces off. Omit to use chat template default. |
-| `-i, --input <TEXT>` | One-shot prompt. Sends a single request and exits instead of entering interactive mode |
-| `--image <URL\|PATH>` | Image file path or URL to include (repeatable, requires `-i`) |
-| `--video <URL\|PATH>` | Video file path or URL to include (repeatable, requires `-i`) |
-| `--audio <URL\|PATH>` | Audio file path or URL to include (repeatable, requires `-i`) |
+| `--enable-thinking` | Enable thinking mode for models that support it |
 
 The `run` command also accepts all [runtime options](#runtime-options).
 
@@ -147,49 +119,38 @@ The `serve` command also accepts all [runtime options](#runtime-options).
 
 ### quantize - UQFF Generation
 
-Generate UQFF (Unified Quantized File Format) files from a model. Supports multiple quantization types in a single command.
+Generate a UQFF (Unified Quantized File Format) file from a model.
 
 ```bash
-mistralrs quantize <MODEL_TYPE> -m <MODEL_ID> --isq <LEVEL>[,<LEVEL>...] -o <OUTPUT>
+mistralrs quantize <MODEL_TYPE> -m <MODEL_ID> --isq <LEVEL> -o <OUTPUT>
 ```
 
 **Examples:**
 
 ```bash
-# Quantize to a single type (file output)
-mistralrs quantize -m Qwen/Qwen3-4B --isq q4k -o qwen3-4b-uqff/qwen3-4b-q4k.uqff
+# Quantize a text model to 4-bit
+mistralrs quantize -m Qwen/Qwen3-4B --isq 4 -o qwen3-4b-q4.uqff
 
-# Quantize to a single type (directory output, auto-named)
-mistralrs quantize -m Qwen/Qwen3-4B --isq q4k -o qwen3-4b-uqff/
+# Quantize with Q4_K format
+mistralrs quantize -m Qwen/Qwen3-4B --isq q4k -o qwen3-4b-q4k.uqff
 
-# Quantize to multiple types at once (directory output)
-mistralrs quantize -m Qwen/Qwen3-4B --isq q4k,q8_0 -o qwen3-4b-uqff/
-
-# Equivalent: repeated --isq flags
-mistralrs quantize -m Qwen/Qwen3-4B --isq q4k --isq q8_0 -o qwen3-4b-uqff/
-
-# Quantize a multimodal model
-mistralrs quantize -m google/gemma-4-E4B-it --isq 4 -o gemma4-E4B-uqff/
+# Quantize a vision model
+mistralrs quantize -m google/gemma-3-4b-it --isq 4 -o gemma3-4b-q4.uqff
 
 # Quantize with imatrix for better quality
-mistralrs quantize -m Qwen/Qwen3-4B --isq q4k --imatrix imatrix.dat -o qwen3-4b-uqff/qwen3-4b-q4k.uqff
+mistralrs quantize -m Qwen/Qwen3-4B --isq q4k --imatrix imatrix.dat -o qwen3-4b-q4k.uqff
 ```
-
-When using directory output mode, the `quantize` command automatically:
-- Generates a `README.md` model card with Hugging Face frontmatter and example commands
-- Prints the `huggingface-cli upload` command to upload your UQFF to Hugging Face
 
 **Quantize Options:**
 
 | Option | Required | Description |
 |--------|----------|-------------|
 | `-m, --model-id <ID>` | Yes | Model ID or local path |
-| `--isq <LEVEL>` | Yes | Quantization level(s), comma-separated or repeated (see [ISQ Quantization](#isq-quantization)) |
-| `-o, --output <PATH>` | Yes | Output path: `.uqff` file (single ISQ) or directory (auto-named per ISQ type) |
+| `--isq <LEVEL>` | Yes | Quantization level (see [ISQ Quantization](#isq-quantization)) |
+| `-o, --output <PATH>` | Yes | Output UQFF file path |
 | `--isq-organization <TYPE>` | No | ISQ organization strategy: `default` or `moqe` |
 | `--imatrix <PATH>` | No | imatrix file for enhanced quantization |
 | `--calibration-file <PATH>` | No | Calibration file for imatrix generation |
-| `--no-readme` | No | Skip automatic README.md model card generation |
 
 ---
 
@@ -384,7 +345,7 @@ HuggingFace Model Cache
 │ Model                    │ Size     │ Last Used   │
 ├──────────────────────────┼──────────┼─────────────┤
 │ Qwen/Qwen3-4B            │ 8.5 GB   │ today       │
-│ google/gemma-4-E4B-it     │ 6.2 GB   │ 2 days ago  │
+│ google/gemma-3-4b-it     │ 6.2 GB   │ 2 days ago  │
 │ meta-llama/Llama-3.2-3B  │ 5.8 GB   │ 1 week ago  │
 └──────────────────────────┴──────────┴─────────────┘
 
@@ -473,7 +434,7 @@ The `bench` command also accepts all model loading options (ISQ, device mapping,
 
 ### from-config - TOML Configuration
 
-Run the CLI from a TOML configuration file. This is the recommended way to run multiple models simultaneously, including models of different types (e.g., text + multimodal + embedding).
+Run the CLI from a TOML configuration file. This is the recommended way to run multiple models simultaneously, including models of different types (e.g., text + vision + embedding).
 
 See [CLI_CONFIG.md](CLI_CONFIG.md) for full TOML configuration format details.
 
@@ -501,8 +462,8 @@ kind = "auto"
 model_id = "Qwen/Qwen3-4B"
 
 [[models]]
-kind = "multimodal"
-model_id = "google/gemma-4-E4B-it"
+kind = "vision"
+model_id = "google/gemma-3-4b-it"
 
 [[models]]
 kind = "embedding"
@@ -547,7 +508,7 @@ mistralrs run -m Qwen/Qwen3-4B
 mistralrs serve -m Qwen/Qwen3-4B
 ```
 
-The `auto` type supports text, multimodal, and other model types through automatic detection.
+The `auto` type supports text, vision, and other model types through automatic detection.
 
 ### text
 
@@ -558,16 +519,16 @@ mistralrs run text -m Qwen/Qwen3-4B
 mistralrs serve text -m Qwen/Qwen3-4B
 ```
 
-### multimodal
+### vision
 
-Multimodal models that can process images, audio, and text.
+Vision-language models that can process images and text.
 
 ```bash
-mistralrs run multimodal -m google/gemma-4-E4B-it
-mistralrs serve multimodal -m google/gemma-4-E4B-it
+mistralrs run vision -m google/gemma-3-4b-it
+mistralrs serve vision -m google/gemma-3-4b-it
 ```
 
-**Multimodal Options:**
+**Vision Options:**
 
 | Option | Description |
 |--------|-------------|
@@ -637,26 +598,23 @@ mistralrs run -m Qwen/Qwen3-4B --isq q4k --isq-organization moqe
 
 UQFF (Unified Quantized File Format) provides pre-quantized model files for faster loading.
 
-**Generate UQFF files:**
+**Generate a UQFF file:**
 
 ```bash
-mistralrs quantize -m Qwen/Qwen3-4B --isq q4k -o qwen3-4b-uqff/
+mistralrs quantize auto -m Qwen/Qwen3-4B --isq q4k -o qwen3-4b-q4k.uqff
 ```
 
 **Load from UQFF:**
 
 ```bash
-# Specify just the first shard -- remaining shards are auto-discovered
-mistralrs run -m Qwen/Qwen3-4B --from-uqff q4k-0.uqff
+mistralrs run -m Qwen/Qwen3-4B --from-uqff qwen3-4b-q4k.uqff
 ```
 
-**Multiple UQFF files (semicolon-separated, for different quantizations in one load):**
+**Multiple UQFF files (semicolon-separated):**
 
 ```bash
-mistralrs run -m Qwen/Qwen3-4B --from-uqff "q4k-0.uqff;q8_0-0.uqff"
+mistralrs run -m Qwen/Qwen3-4B --from-uqff "part1.uqff;part2.uqff"
 ```
-
-> Note: Shard auto-discovery means you no longer need to list every shard file. Specifying `q4k-0.uqff` will automatically find `q4k-1.uqff`, `q4k-2.uqff`, etc.
 
 ---
 
@@ -815,17 +773,11 @@ mistralrs run -m Qwen/Qwen3-4B --enable-search --search-embedding-model embeddin
 
 ### Thinking Mode
 
-Control thinking/reasoning mode for models that support it (like DeepSeek, Qwen3).
+Enable thinking/reasoning mode for models that support it (like DeepSeek, Qwen3).
 
 ```bash
-# Force thinking on (equivalent to --thinking true)
-mistralrs run -m Qwen/Qwen3-4B --thinking
-
-# Force thinking off
-mistralrs run -m Qwen/Qwen3-4B --thinking false
+mistralrs run -m Qwen/Qwen3-4B --enable-thinking
 ```
-
-`--thinking` (or `--thinking true`) forces thinking on. `--thinking false` forces thinking off. If you omit the flag entirely, `mistralrs run` defers to the chat template's default behavior. Templates with an explicit thinking toggle use the repository fallback of `true` when no override is provided.
 
 In interactive mode, thinking content is displayed in gray text before the final response.
 
@@ -944,9 +896,9 @@ Ahoy there, matey! What brings ye to these waters?
 > \exit
 ```
 
-**Multimodal Model Interactive Mode:**
+**Vision Model Interactive Mode:**
 
-For multimodal models, you can include images in your prompts by specifying file paths or URLs:
+For vision models, you can include images in your prompts by specifying file paths or URLs:
 
 ```
 > Describe this image: /path/to/image.jpg
@@ -954,8 +906,7 @@ For multimodal models, you can include images in your prompts by specifying file
 > Describe the image and transcribe the audio: photo.jpg recording.mp3
 ```
 
-**Note**: The CLI automatically detects paths to supported image, audio, and video files within your prompt. You do not need special syntax; simply paste the absolute or relative path to the file.
+**Note**: The CLI automatically detects paths to supported image and audio files within your prompt. You do not need special syntax; simply paste the absolute or relative path to the file.
 
 Supported image formats: PNG, JPEG, BMP, GIF, WebP
 Supported audio formats: WAV, MP3, FLAC, OGG
-Supported video formats: MP4, AVI, MOV, MKV, WebM, M4V, GIF (see [VIDEO.md](VIDEO.md))

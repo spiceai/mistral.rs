@@ -2,6 +2,8 @@ use core::ffi::{c_int, c_long, c_uint, c_void};
 
 use candle_core::cuda::cudarc::driver::sys::CUstream;
 
+use candle_core::cuda::cudarc::driver::sys::CUstream;
+
 extern "C" {
     pub fn reshape_and_cache(
         key: *const c_void,
@@ -83,27 +85,6 @@ extern "C" {
         dtype: u32,
     );
 
-    pub fn gather_kv_cache(
-        key_cache: *const c_void,
-        value_cache: *const c_void,
-        k_out: *const c_void,
-        v_out: *const c_void,
-        k_scale: *const f32,
-        v_scale: *const f32,
-        block_table: *const c_int,
-        cu_seq_lens: *const c_int,
-        num_tokens: c_int,
-        num_seqs: c_int,
-        block_size: c_int,
-        block_table_stride: c_int,
-        num_kv_heads: c_int,
-        head_size: c_int,
-        x: c_int,
-        stream: CUstream,
-        out_dtype: u32,
-        cache_dtype: u32,
-    );
-
     pub fn paged_attention_v1_f16(
         out: *const c_void,
         query: *const c_void,
@@ -128,7 +109,6 @@ extern "C" {
         cache_dtype: u32,
         k_scale: *const f32,
         v_scale: *const f32,
-        sinks: *const f32,
     );
 
     pub fn paged_attention_v1_bf16(
@@ -155,7 +135,6 @@ extern "C" {
         cache_dtype: u32,
         k_scale: *const f32,
         v_scale: *const f32,
-        sinks: *const f32,
     );
 
     pub fn paged_attention_v1_f32(
@@ -182,7 +161,6 @@ extern "C" {
         cache_dtype: u32,
         k_scale: *const f32,
         v_scale: *const f32,
-        sinks: *const f32,
     );
 
     pub fn paged_attention_v2_f16(
@@ -212,7 +190,6 @@ extern "C" {
         cache_dtype: u32,
         k_scale: *const f32,
         v_scale: *const f32,
-        sinks: *const f32,
     );
 
     pub fn paged_attention_v2_bf16(
@@ -242,7 +219,6 @@ extern "C" {
         cache_dtype: u32,
         k_scale: *const f32,
         v_scale: *const f32,
-        sinks: *const f32,
     );
 
     pub fn paged_attention_v2_f32(
@@ -272,7 +248,6 @@ extern "C" {
         cache_dtype: u32,
         k_scale: *const f32,
         v_scale: *const f32,
-        sinks: *const f32,
     );
 
     pub fn copy_blocks_bf16(
@@ -333,110 +308,5 @@ extern "C" {
         k_scales: *const f32,
         v_scales: *const f32,
         stream: i64,
-    );
-
-    pub fn flash_attn_sinks_f16(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        out: *mut c_void,
-        sinks: *const f32,
-        scale: f32,
-        batch_size: c_int,
-        q_len: c_int,
-        kv_len: c_int,
-        num_heads: c_int,
-        num_kv_heads: c_int,
-        head_dim: c_int,
-        window_size: c_int,
-        stream: CUstream,
-    );
-
-    pub fn flash_attn_sinks_bf16(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        out: *mut c_void,
-        sinks: *const f32,
-        scale: f32,
-        batch_size: c_int,
-        q_len: c_int,
-        kv_len: c_int,
-        num_heads: c_int,
-        num_kv_heads: c_int,
-        head_dim: c_int,
-        window_size: c_int,
-        stream: CUstream,
-    );
-
-    pub fn flash_attn_sinks_f32(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        out: *mut c_void,
-        sinks: *const f32,
-        scale: f32,
-        batch_size: c_int,
-        q_len: c_int,
-        kv_len: c_int,
-        num_heads: c_int,
-        num_kv_heads: c_int,
-        head_dim: c_int,
-        window_size: c_int,
-        stream: CUstream,
-    );
-
-    pub fn flash_attn_sinks_varlen_f16(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        out: *mut c_void,
-        sinks: *const f32,
-        cu_seqlens_q: *const c_uint,
-        cu_seqlens_k: *const c_uint,
-        scale: f32,
-        batch_size: c_int,
-        max_q_len: c_int,
-        num_heads: c_int,
-        num_kv_heads: c_int,
-        head_dim: c_int,
-        window_size: c_int,
-        stream: CUstream,
-    );
-
-    pub fn flash_attn_sinks_varlen_bf16(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        out: *mut c_void,
-        sinks: *const f32,
-        cu_seqlens_q: *const c_uint,
-        cu_seqlens_k: *const c_uint,
-        scale: f32,
-        batch_size: c_int,
-        max_q_len: c_int,
-        num_heads: c_int,
-        num_kv_heads: c_int,
-        head_dim: c_int,
-        window_size: c_int,
-        stream: CUstream,
-    );
-
-    pub fn flash_attn_sinks_varlen_f32(
-        q: *const c_void,
-        k: *const c_void,
-        v: *const c_void,
-        out: *mut c_void,
-        sinks: *const f32,
-        cu_seqlens_q: *const c_uint,
-        cu_seqlens_k: *const c_uint,
-        scale: f32,
-        batch_size: c_int,
-        max_q_len: c_int,
-        num_heads: c_int,
-        num_kv_heads: c_int,
-        head_dim: c_int,
-        window_size: c_int,
-        stream: CUstream,
     );
 }

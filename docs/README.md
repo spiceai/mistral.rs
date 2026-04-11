@@ -8,7 +8,6 @@
 | Understand cargo features | [Cargo Features](CARGO_FEATURES.md) |
 | Run a model | [CLI Reference](CLI.md) |
 | Use the HTTP API | [HTTP Server](HTTP.md) |
-| Create & publish UQFF models | [UQFF Guide](UQFF.md#creating-a-uqff-model) |
 | Fix an error | [Troubleshooting](TROUBLESHOOTING.md) |
 | Configure environment | [Configuration](CONFIGURATION.md) |
 | Check model support | [Supported Models](SUPPORTED_MODELS.md) |
@@ -19,7 +18,6 @@
 - [Cargo Features](CARGO_FEATURES.md) - Complete cargo features reference
 - [CLI Reference](CLI.md) - Complete CLI command reference
 - [CLI TOML Configuration](CLI_CONFIG.md) - Configure via TOML files
-- [Create & Publish UQFF Models](UQFF.md#creating-a-uqff-model) - Quantize models and upload to Hugging Face
 - [Troubleshooting](TROUBLESHOOTING.md) - Common issues and solutions
 
 ## SDKs & APIs
@@ -34,7 +32,7 @@
 
 ### By Category
 - [Supported Models](SUPPORTED_MODELS.md) - Complete model list and compatibility
-- [Multimodal Models](MULTIMODAL_MODELS.md) - Multimodal model overview
+- [Vision Models](VISION_MODELS.md) - Vision model overview
 - [Image Generation](IMAGEGEN_MODELS.md) - Diffusion models
 - [Embeddings](EMBEDDINGS.md) - Embedding model overview
 
@@ -45,16 +43,16 @@
 
 **Text Models:**
 - [DeepSeek V2](DEEPSEEKV2.md) | [DeepSeek V3](DEEPSEEKV3.md)
-- [Gemma 2](GEMMA2.md) | [Gemma 3](GEMMA3.md) | [Gemma 3n](GEMMA3N.md) | [Gemma 4](GEMMA4.md)
+- [Gemma 2](GEMMA2.md) | [Gemma 3](GEMMA3.md) | [Gemma 3n](GEMMA3N.md)
 - [GLM4](GLM4.md) | [GLM-4.7-Flash](GLM4_MOE_LITE.md) | [GLM-4.7](GLM4_MOE.md)
-- [Qwen 3](QWEN3.md) | [Qwen 3 Next](QWEN3NEXT.md) | [SmolLM3](SMOLLM3.md) | [GPT-OSS](GPT_OSS.md)
+- [Qwen 3](QWEN3.md) | [SmolLM3](SMOLLM3.md) | [GPT-OSS](GPT_OSS.md)
 
-**Multimodal Models:**
+**Vision Models:**
 - [Idefics 2](IDEFICS2.md) | [Idefics 3](IDEFICS3.md)
 - [LLaVA](LLaVA.md) | [Llama 3.2 Vision](VLLAMA.md) | [Llama 4](LLAMA4.md)
 - [MiniCPM-O 2.6](MINICPMO_2_6.md) | [Mistral 3](MISTRAL3.md)
 - [Phi 3.5 MoE](PHI3.5MOE.md) | [Phi 3.5 Vision](PHI3V.md) | [Phi 4 Multimodal](PHI4MM.md)
-- [Qwen 2-VL](QWEN2VL.md) | [Qwen 3 VL](QWEN3VL.md) | [Qwen 3.5](QWEN3_5.md)
+- [Qwen 2-VL](QWEN2VL.md) | [Qwen 3 VL](QWEN3VL.md)
 
 **Other Models:**
 - [FLUX (Diffusion)](FLUX.md) | [Dia (Speech)](DIA.md)

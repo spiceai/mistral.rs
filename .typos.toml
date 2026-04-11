@@ -4,8 +4,7 @@ extend-exclude = [
     "calibration_data/",
     "examples/server/phi3_duckduckgo_mistral.rs.ipynb",
     "mistralrs-web-chat/static/",
-    "mistralrs-cli/static/",
-    "CLAUDE.md",
+    "mistralrs-cli/static/"
 ]
 ignore-hidden = false
 
@@ -28,15 +27,9 @@ extend-ignore-re = [
     "elem_to_loc_2_nd",
     "elem_to_loc_3_nd",
     "thr_reduce",
-    "(?i)thw",
+    "thw",
     "iy",
-    "mxfp4_get_max_smem_optin",
-    "alog",
-    "ba",
 ]
-
-[default.extend-words]
-"layrnorm" = "layrnorm"
 
 [type.rust.extend-identifiers]
 "arange" = "arange"
@@ -61,5 +54,3 @@ extend-ignore-re = [
 "depthwise_seperable_out_channel" = "depthwise_seperable_out_channel"
 "default_depthwise_seperable_out_channel" = "default_depthwise_seperable_out_channel"
 "DepthWiseSeperableConv1d" = "DepthWiseSeperableConv1d"
-"layrnorm" = "layrnorm"
-"pre_layrnorm" = "pre_layrnorm"

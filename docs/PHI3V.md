@@ -44,7 +44,7 @@ The perspective from which this photo is taken offers an expansive view of the m
 1) Start the server
 
 ```
-mistralrs serve multimodal -p 1234 -m microsoft/Phi-3.5-vision-instruct
+mistralrs serve vision -p 1234 -m microsoft/Phi-3.5-vision-instruct
 ```
 
 2) Send a request
@@ -89,18 +89,18 @@ print(resp)
 ---
 
 ## Rust
-You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/models/multimodal_models/main.rs).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/phi3v/main.rs).
 
 This is a minimal example of running the Phi 3 Vision model with a dummy image.
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, MultimodalMessages, MultimodalModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let model =
-        MultimodalModelBuilder::new("microsoft/Phi-3.5-vision-instruct")
+        VisionModelBuilder::new("microsoft/Phi-3.5-vision-instruct")
             .with_isq(IsqType::Q4K)
             .with_logging()
             .build()

@@ -8,7 +8,7 @@ use candle_nn::{Conv2d, Embedding, LayerNorm, Linear};
 use itertools::Itertools;
 use mistralrs_quant::QuantMethod;
 
-use crate::layers::{F32RmsNorm, GemmaRmsNorm, QLinear, RmsNorm, ScaledEmbedding};
+use crate::layers::{F32RmsNorm, QLinear, RmsNorm, ScaledEmbedding};
 
 pub trait ToTensors {
     /// Tensor names to tensors

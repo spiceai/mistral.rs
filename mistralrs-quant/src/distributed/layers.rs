@@ -10,9 +10,9 @@ use crate::{
     lora::merge_lora_weights,
     pertensor_fp8::pertensor_fp8_linear_b,
     should_apply_immediate_isq,
-    utils::isq::apply_immediate_isq,
-    AfqLayer, BnbLinear, DistributedKind, DummyLayer, F8Q8Linear, FP8Linear, GgufMatMul, HqqLayer,
-    MXFP4Layer, QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig, QuantizedSerde,
+    utils::isq::{apply_immediate_isq, apply_immediate_isq_always},
+    AfqLayer, BnbLinear, DistributedKind, DummyLayer, FP8Linear, GgufMatMul, HqqLayer, MXFP4Layer,
+    QuantMethod, QuantMethodConfig, QuantizeOntoGuard, QuantizedConfig, QuantizedSerde,
     QuantizedSerdeType, Shard, ShardedVarBuilder, UnquantLinear,
 };
 
@@ -316,8 +316,6 @@ impl QuantizedSerde for RowParallelLayer {
             QuantizedSerdeType::Hqq => HqqLayer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Fp8 => FP8Linear::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Afq => AfqLayer::deserialize_ext_bias(data, device, guard)?,
-            QuantizedSerdeType::F8Q8 => F8Q8Linear::deserialize_ext_bias(data, device, guard)?,
-            QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize_ext_bias(data, device, guard)?,
         };
         Ok(Arc::new(Self {
             weight,
@@ -644,8 +642,6 @@ impl QuantizedSerde for ColumnParallelLayer {
             QuantizedSerdeType::Hqq => HqqLayer::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Fp8 => FP8Linear::deserialize_ext_bias(data, device, guard)?,
             QuantizedSerdeType::Afq => AfqLayer::deserialize_ext_bias(data, device, guard)?,
-            QuantizedSerdeType::F8Q8 => F8Q8Linear::deserialize_ext_bias(data, device, guard)?,
-            QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize_ext_bias(data, device, guard)?,
         };
         Ok(Arc::new(Self { weight, bias }))
     }
@@ -658,55 +654,9 @@ pub struct ReplicatedLayer(Arc<dyn QuantMethod>);
 impl ReplicatedLayer {
     pub fn from_linear(lin: Linear) -> Result<Arc<dyn QuantMethod>> {
         let dev = lin.weight().device().clone();
-        if let Some(crate::ImmediateIsqParams {
-            guard,
-            ty: Some(immediate_isq),
-            pool,
-            backpressure,
-            ..
-        }) = crate::get_immediate_isq()
-        {
-            // Global ISQ type is set — move to CPU for GGML quantization,
-            // then quantize onto the original device.
-            let lin = if !dev.is_cpu() {
-                Linear::new(lin.weight().to_device(&Device::Cpu)?, lin.bias().cloned())
-            } else {
-                lin
-            };
-            let layer: Arc<dyn QuantMethod> =
-                Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(lin))?);
-            if let Some(pool) = &pool {
-                backpressure.acquire();
-                let backpressure = backpressure.clone();
-                let dev = dev.clone();
-                let (tx, rx) = crate::pending_layer::pending_isq_channel();
-                pool.spawn(move || {
-                    let result = layer.clone().apply_isq(
-                        Some(immediate_isq),
-                        dev,
-                        &std::sync::atomic::AtomicUsize::new(0),
-                        None,
-                        guard,
-                    );
-                    let _ = tx.send(result);
-                    backpressure.release();
-                });
-                Ok(Arc::new(crate::PendingIsqLayer::new(rx)))
-            } else {
-                layer.clone().apply_isq(
-                    Some(immediate_isq),
-                    dev,
-                    &std::sync::atomic::AtomicUsize::new(0),
-                    None,
-                    guard,
-                )
-            }
-        } else {
-            // No global ISQ — keep as unquantized on original device.
-            Ok(Arc::new(UnquantLinear::new(
-                QuantMethodConfig::Unquantized(lin),
-            )?))
-        }
+        let this_unquant = Arc::new(UnquantLinear::new(QuantMethodConfig::Unquantized(lin))?);
+        let this: Arc<dyn QuantMethod> = apply_immediate_isq_always(this_unquant, &dev)?;
+        Ok(this)
     }
 
     #[allow(clippy::new_ret_no_self)]
@@ -972,8 +922,6 @@ impl QuantizedSerde for ReplicatedLayer {
             QuantizedSerdeType::Hqq => HqqLayer::deserialize(data, device, comm, guard)?,
             QuantizedSerdeType::Fp8 => FP8Linear::deserialize(data, device, comm, guard)?,
             QuantizedSerdeType::Afq => AfqLayer::deserialize(data, device, comm, guard)?,
-            QuantizedSerdeType::F8Q8 => F8Q8Linear::deserialize(data, device, comm, guard)?,
-            QuantizedSerdeType::Mxfp4 => MXFP4Layer::deserialize(data, device, comm, guard)?,
         };
         Ok(Arc::new(Self(deserialized)))
     }
@@ -1623,32 +1571,14 @@ impl FusedExperts {
                         "FP8 quantization config specified but no scale tensors found for stacked MoE experts. \
                         Loading as unquantized."
                     );
-                let gate_up_proj = experts_vb
-                    .get(
-                        (num_experts, hidden_size, moe_intermediate_size * 2),
-                        "gate_up_proj",
-                    )
-                    .or_else(|_| {
-                        experts_vb
-                            .get(
-                                (num_experts, moe_intermediate_size * 2, hidden_size),
-                                "gate_up_proj",
-                            )
-                            .and_then(|t| t.transpose(1, 2)?.contiguous())
-                    })?;
-                let down_proj_packed = experts_vb
-                    .get(
-                        (num_experts, moe_intermediate_size, hidden_size),
-                        "down_proj",
-                    )
-                    .or_else(|_| {
-                        experts_vb
-                            .get(
-                                (num_experts, hidden_size, moe_intermediate_size),
-                                "down_proj",
-                            )
-                            .and_then(|t| t.transpose(1, 2)?.contiguous())
-                    })?;
+                let gate_up_proj = experts_vb.get(
+                    (num_experts, hidden_size, moe_intermediate_size * 2),
+                    "gate_up_proj",
+                )?;
+                let down_proj_packed = experts_vb.get(
+                    (num_experts, moe_intermediate_size, hidden_size),
+                    "down_proj",
+                )?;
 
                 // Split gate_up_proj into gate_proj and up_proj along the last dimension
                 let gate_proj = gate_up_proj.narrow(2, 0, moe_intermediate_size)?;
@@ -1660,37 +1590,20 @@ impl FusedExperts {
                 let up_proj = up_proj.transpose(1, 2)?.contiguous()?;
                 let down_proj = down_proj_packed.transpose(1, 2)?.contiguous()?;
 
-                // When immediate ISQ targets these weights, move to CPU for GGML quantization.
-                let isq_gate_up = should_apply_immediate_isq(&experts_vb.pp("gate_up_proj"));
-                let isq_down = should_apply_immediate_isq(&experts_vb.pp("down_proj"));
-                let target_device = gate_proj.device().clone();
-                let (gate_proj, up_proj, down_proj) =
-                    if (isq_gate_up || isq_down) && !target_device.is_cpu() {
-                        (
-                            gate_proj.to_device(&Device::Cpu)?,
-                            up_proj.to_device(&Device::Cpu)?,
-                            down_proj.to_device(&Device::Cpu)?,
-                        )
-                    } else {
-                        (gate_proj, up_proj, down_proj)
-                    };
-
                 let mut fused_gate_proj: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
-                    QuantMethodConfig::Unquantized(Linear::new(gate_proj, None)),
+                    QuantMethodConfig::Unquantized(Linear::new(gate_proj.clone(), None)),
                 )?);
                 let mut fused_up_proj: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
-                    QuantMethodConfig::Unquantized(Linear::new(up_proj, None)),
+                    QuantMethodConfig::Unquantized(Linear::new(up_proj.clone(), None)),
                 )?);
                 let mut fused_down_proj: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
-                    QuantMethodConfig::Unquantized(Linear::new(down_proj, None)),
+                    QuantMethodConfig::Unquantized(Linear::new(down_proj.clone(), None)),
                 )?);
-                // Pass the original-device VB so apply_immediate_isq targets
-                // the correct device and respects topology overrides.
-                let vb_gate_up = experts_vb.pp("gate_up_proj");
-                let vb_down = experts_vb.pp("down_proj");
-                fused_gate_proj = apply_immediate_isq(fused_gate_proj, vb_gate_up.clone())?;
-                fused_up_proj = apply_immediate_isq(fused_up_proj, vb_gate_up)?;
-                fused_down_proj = apply_immediate_isq(fused_down_proj, vb_down)?;
+                // Use apply_immediate_isq_always to ensure ISQ is applied to expert weights
+                let device = gate_proj.device();
+                fused_gate_proj = apply_immediate_isq_always(fused_gate_proj, device)?;
+                fused_up_proj = apply_immediate_isq_always(fused_up_proj, device)?;
+                fused_down_proj = apply_immediate_isq_always(fused_down_proj, device)?;
 
                 (fused_gate_proj, fused_up_proj, fused_down_proj)
             }
@@ -1733,41 +1646,21 @@ impl FusedExperts {
 
             (fused_gate_proj, fused_up_proj, fused_down_proj)
         } else if is_stacked_format {
-            // Stacked format from safetensors. Two conventions exist:
-            // Convention A: [num_experts, hidden_size, intermediate_size * 2]
-            // Convention B (nn.Linear): [num_experts, intermediate_size * 2, hidden_size]
+            // Stacked format from safetensors:
+            // - gate_up_proj: [num_experts, hidden_size, intermediate_size * 2] = [128, 2048, 1536]
+            // - down_proj: [num_experts, intermediate_size, hidden_size] = [128, 768, 2048]
             //
             // GGUF/indexed_moe_forward expects:
-            // - gate/up: [num_experts, intermediate_size, hidden_size]
-            // - down: [num_experts, hidden_size, intermediate_size]
-            //
-            // Try convention A first, fall back to convention B (transposing to A).
-            let gate_up_proj = experts_vb
-                .get(
-                    (num_experts, hidden_size, moe_intermediate_size * 2),
-                    "gate_up_proj",
-                )
-                .or_else(|_| {
-                    experts_vb
-                        .get(
-                            (num_experts, moe_intermediate_size * 2, hidden_size),
-                            "gate_up_proj",
-                        )
-                        .and_then(|t| t.transpose(1, 2)?.contiguous())
-                })?;
-            let down_proj_packed = experts_vb
-                .get(
-                    (num_experts, moe_intermediate_size, hidden_size),
-                    "down_proj",
-                )
-                .or_else(|_| {
-                    experts_vb
-                        .get(
-                            (num_experts, hidden_size, moe_intermediate_size),
-                            "down_proj",
-                        )
-                        .and_then(|t| t.transpose(1, 2)?.contiguous())
-                })?;
+            // - gate/up: [num_experts, intermediate_size, hidden_size] = [128, 768, 2048]
+            // - down: [num_experts, hidden_size, intermediate_size] = [128, 2048, 768]
+            let gate_up_proj = experts_vb.get(
+                (num_experts, hidden_size, moe_intermediate_size * 2),
+                "gate_up_proj",
+            )?;
+            let down_proj_packed = experts_vb.get(
+                (num_experts, moe_intermediate_size, hidden_size),
+                "down_proj",
+            )?;
 
             // Split gate_up_proj into gate_proj and up_proj along the last dimension
             // gate_proj: [num_experts, hidden_size, intermediate_size]
@@ -1782,37 +1675,20 @@ impl FusedExperts {
             // down_proj: [num_experts, intermediate_size, hidden_size] -> [num_experts, hidden_size, intermediate_size]
             let down_proj = down_proj_packed.transpose(1, 2)?.contiguous()?;
 
-            // When immediate ISQ targets these weights, move to CPU for GGML quantization.
-            let isq_gate_up = should_apply_immediate_isq(&experts_vb.pp("gate_up_proj"));
-            let isq_down = should_apply_immediate_isq(&experts_vb.pp("down_proj"));
-            let target_device = gate_proj.device().clone();
-            let (gate_proj, up_proj, down_proj) =
-                if (isq_gate_up || isq_down) && !target_device.is_cpu() {
-                    (
-                        gate_proj.to_device(&Device::Cpu)?,
-                        up_proj.to_device(&Device::Cpu)?,
-                        down_proj.to_device(&Device::Cpu)?,
-                    )
-                } else {
-                    (gate_proj, up_proj, down_proj)
-                };
-
             let mut fused_gate_proj: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
-                QuantMethodConfig::Unquantized(Linear::new(gate_proj, None)),
+                QuantMethodConfig::Unquantized(Linear::new(gate_proj.clone(), None)),
             )?);
             let mut fused_up_proj: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
-                QuantMethodConfig::Unquantized(Linear::new(up_proj, None)),
+                QuantMethodConfig::Unquantized(Linear::new(up_proj.clone(), None)),
             )?);
             let mut fused_down_proj: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
-                QuantMethodConfig::Unquantized(Linear::new(down_proj, None)),
+                QuantMethodConfig::Unquantized(Linear::new(down_proj.clone(), None)),
             )?);
-            // Pass the original-device VB so apply_immediate_isq targets
-            // the correct device and respects topology overrides.
-            let vb_gate_up = experts_vb.pp("gate_up_proj");
-            let vb_down = experts_vb.pp("down_proj");
-            fused_gate_proj = apply_immediate_isq(fused_gate_proj, vb_gate_up.clone())?;
-            fused_up_proj = apply_immediate_isq(fused_up_proj, vb_gate_up)?;
-            fused_down_proj = apply_immediate_isq(fused_down_proj, vb_down)?;
+            // Use apply_immediate_isq_always to ensure ISQ is applied to expert weights
+            let device = gate_proj.device();
+            fused_gate_proj = apply_immediate_isq_always(fused_gate_proj, device)?;
+            fused_up_proj = apply_immediate_isq_always(fused_up_proj, device)?;
+            fused_down_proj = apply_immediate_isq_always(fused_down_proj, device)?;
 
             (fused_gate_proj, fused_up_proj, fused_down_proj)
         } else if matches!(&quantization_config, Some(QuantizedConfig::Fp8 { .. })) {
@@ -1918,30 +1794,13 @@ impl FusedExperts {
                 blockwise_fp8_moe(down_fp8, down_scale, weight_block_size, vb.dtype())?;
 
             (fused_gate_proj, fused_up_proj, fused_down_proj)
-        } else if !experts_vb.pp("0").contains_tensor("gate_proj.weight") {
-            // Handle the case where the layer is dummy (no tensors) during UQFF loading.
-            // Deserialize will handle it.
-            let fused_gate_proj: Arc<dyn QuantMethod> =
-                Arc::new(DummyLayer::new(QuantMethodConfig::Dummy)?);
-            let fused_up_proj: Arc<dyn QuantMethod> =
-                Arc::new(DummyLayer::new(QuantMethodConfig::Dummy)?);
-            let fused_down_proj: Arc<dyn QuantMethod> =
-                Arc::new(DummyLayer::new(QuantMethodConfig::Dummy)?);
-            (fused_gate_proj, fused_up_proj, fused_down_proj)
         } else {
             // Per-expert format: load each expert individually and stack
-            // When immediate ISQ is active, load on CPU for GGML quantization.
-            let load_experts_vb =
-                if crate::get_immediate_isq().is_some() && !experts_vb.device().is_cpu() {
-                    experts_vb.clone().set_device(Device::Cpu)
-                } else {
-                    experts_vb.clone()
-                };
             let mut gate_proj_vec = Vec::new();
             let mut up_proj_vec = Vec::new();
             let mut down_proj_vec = Vec::new();
             for i in 0..num_experts {
-                let expert_vb = load_experts_vb.pp(i);
+                let expert_vb = experts_vb.pp(i);
                 let gate_proj =
                     expert_vb.get((moe_intermediate_size, hidden_size), "gate_proj.weight")?;
                 let up_proj =

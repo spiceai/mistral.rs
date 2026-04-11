@@ -1,7 +1,4 @@
-use std::collections::HashMap;
-
 use candle_core::{DType, Device, Result, Tensor};
-#[allow(unused_imports)]
 use mistralrs_paged_attn::{kv_scale_update, paged_attention, reshape_and_cache};
 
 const KV_SCALE_UPDATE_ITERATION: i32 = 128;
@@ -144,20 +141,19 @@ impl PagedAttention {
         flash_params: Option<&FlashParams>,
         write_cache: bool,
     ) -> Result<Tensor> {
-        if write_cache {
-            if let (Some(k_scale), Some(v_scale), Some(key_cache)) =
-                (&self.k_scale, &self.v_scale, &key_cache)
+        if let (Some(k_scale), Some(v_scale), Some(key_cache)) =
+            (&self.k_scale, &self.v_scale, &key_cache)
+        {
+            if self.kv_updated_times.load(Ordering::Relaxed) < KV_SCALE_UPDATE_ITERATION
+                && key_cache.dtype() == DType::F8E4M3
             {
-                if self.kv_updated_times.load(Ordering::Relaxed) < KV_SCALE_UPDATE_ITERATION
-                    && key_cache.dtype() == DType::F8E4M3
-                {
-                    kv_scale_update(key, value, k_scale, v_scale)?;
-                    self.kv_updated_times.fetch_add(1, Ordering::Relaxed);
-                }
+                // scale update only used for fp8 kvcache
+                kv_scale_update(key, value, k_scale, v_scale)?;
+                self.kv_updated_times.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        let slot_mapping_full = input_metadata
+        let slot_mapping = input_metadata
             .slot_mappings
             .get(&query.device().location())
             .unwrap();
@@ -396,7 +392,6 @@ impl PagedAttention {
 
         // === Decode path ===
         #[allow(clippy::cast_possible_truncation)]
-        let dev = query.device().location();
         let res = paged_attention(
             &query,
             self.k_scale.as_ref(),
@@ -413,70 +408,8 @@ impl PagedAttention {
             },
             sdpa_params.softmax_scale,
             sdpa_params.softcap.unwrap_or(1.0f32),
-            sdpa_params.sinks.as_ref(),
         )?;
 
         Ok(res)
-    }
-
-    /// Standard paged attention forward: writes key/value to cache, then
-    /// runs attention (Sdpa for prompt, paged kernel for decode).
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
-        &self,
-        query: &Tensor,
-        key: &Tensor,
-        value: &Tensor,
-        attention_mask: Option<&Tensor>,
-        key_cache: Option<Tensor>,
-        value_cache: Option<Tensor>,
-        input_metadata: &PagedAttentionInputMetadata,
-        sdpa_params: &SdpaParams,
-        flash_params: Option<&FlashParams>,
-    ) -> Result<Tensor> {
-        self.forward_impl(
-            query,
-            key,
-            value,
-            attention_mask,
-            key_cache,
-            value_cache,
-            input_metadata,
-            sdpa_params,
-            flash_params,
-            true,
-        )
-    }
-
-    /// Read-only paged attention against a donor layer's cache. Identical to
-    /// [`forward`] but never calls `reshape_and_cache`, the donor layer has
-    /// already written its K,V.  On prompt the donor's cached K,V are
-    /// gathered; on decode the paged-attention kernel reads them directly.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward_donor_cache(
-        &self,
-        query: &Tensor,
-        key_cache: &Tensor,
-        value_cache: &Tensor,
-        attention_mask: Option<&Tensor>,
-        input_metadata: &PagedAttentionInputMetadata,
-        sdpa_params: &SdpaParams,
-        flash_params: Option<&FlashParams>,
-    ) -> Result<Tensor> {
-        // key/value are unused (donor's cache already has them), but
-        // forward_impl needs tensors for shape queries. Reuse query as
-        // a placeholder, reshape_and_cache is skipped so they're never read.
-        self.forward_impl(
-            query,
-            query,
-            query,
-            attention_mask,
-            Some(key_cache.clone()),
-            Some(value_cache.clone()),
-            input_metadata,
-            sdpa_params,
-            flash_params,
-            false,
-        )
     }
 }

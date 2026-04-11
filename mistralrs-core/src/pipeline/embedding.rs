@@ -6,7 +6,7 @@ use super::{
 };
 use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
-use crate::distributed::{self, use_ring, WorkerTransferData};
+use crate::distributed::{self, WorkerTransferData};
 use crate::embedding_models::inputs_processor::{EmbeddingProcessor, ModelInputs};
 use crate::embedding_models::{Dense, DenseActivation, Normalize, Pooling};
 use crate::embedding_normal_model_loader;
@@ -33,8 +33,8 @@ use crate::utils::{
 use crate::Modalities;
 use crate::SupportedModality;
 use crate::{
-    get_uqff_paths, DeviceMapSetting, PagedAttentionConfig, Pipeline, Topology, TryIntoDType,
-    GLOBAL_HF_CACHE,
+    api_get_file, get_uqff_paths, DeviceMapSetting, PagedAttentionConfig, Pipeline, Topology,
+    TryIntoDType, GLOBAL_HF_CACHE,
 };
 use anyhow::Context;
 use anyhow::Result;
@@ -73,7 +73,7 @@ pub struct EmbeddingPipeline {
     processor: Arc<dyn Processor + Send + Sync>,
 }
 
-/// A loader for an embedding (non-quantized) model.
+/// A loader for a vision (non-quantized) model.
 pub struct EmbeddingLoader {
     inner: Box<dyn EmbeddingModelLoader>,
     model_id: String,
@@ -88,7 +88,7 @@ pub struct EmbeddingLoader {
 }
 
 #[derive(Default)]
-/// A builder for a loader for an embedding (non-quantized) model.
+/// A builder for a loader for a vision (non-quantized) model.
 pub struct EmbeddingLoaderBuilder {
     model_id: Option<String>,
     config: EmbeddingSpecificConfig,
@@ -99,7 +99,7 @@ pub struct EmbeddingLoaderBuilder {
 }
 
 #[derive(Clone, Default)]
-/// Config specific to loading an embedding model.
+/// Config specific to loading a vision model.
 pub struct EmbeddingSpecificConfig {
     pub topology: Option<Topology>,
     pub write_uqff: Option<PathBuf>,
@@ -188,14 +188,14 @@ impl Loader for EmbeddingLoader {
             silent,
             self.config.from_uqff.is_some()
         );
+        if let Some(from_uqff) = self.config.from_uqff.clone() {
+            *self.from_uqff.write().unwrap() = Some(get_uqff_paths!(&from_uqff, self, silent));
+        }
         *self
             .token_source
             .write()
             .expect("Failed to write to token source") = Some(token_source);
-        *self.revision.write().expect("Failed to write to revision") = revision.clone();
-        if let Some(from_uqff) = self.config.from_uqff.clone() {
-            *self.from_uqff.write().unwrap() = Some(get_uqff_paths!(&from_uqff, self, silent));
-        }
+        *self.revision.write().expect("Failed to write to revision") = revision;
         self.load_model_from_path(
             &paths?,
             dtype,
@@ -234,7 +234,7 @@ impl Loader for EmbeddingLoader {
             let payload: WorkerTransferData = serde_json::from_str(&payload)?;
             let WorkerTransferData::Init { id: _, worker_rank } = payload;
             vec![candle_core::Device::new_cuda_with_stream(worker_rank + 1)?]
-        } else if use_nccl || use_ring() {
+        } else if use_nccl {
             vec![candle_core::Device::new_cuda_with_stream(0)?]
         } else {
             device_map::get_all_similar_devices(device)?
@@ -245,14 +245,14 @@ impl Loader for EmbeddingLoader {
                 unsafe { dev.disable_event_tracking() };
             }
         }
-        let device = if use_nccl || use_ring() {
+        let device = if use_nccl {
             available_devices[0].clone()
         } else {
             device.clone()
         };
 
         // If auto, convert to Map if not using nccl
-        if use_nccl || use_ring() {
+        if use_nccl {
             mapper = DeviceMapSetting::DummyNccl {
                 nm_device: available_devices[0].clone(),
             };
@@ -290,8 +290,6 @@ impl Loader for EmbeddingLoader {
                                     AfqLayer::get_isq_type_from_uqff(Cow::Borrowed(artifact))?
                                         .pack_factor(dtype)
                                 }
-                                QuantizedSerdeType::F8Q8 => IsqType::F8Q8.pack_factor(dtype),
-                                QuantizedSerdeType::Mxfp4 => IsqType::MXFP4.pack_factor(dtype),
                             };
                             total_pack_factors += pack_factor;
                         }
@@ -425,7 +423,7 @@ impl Loader for EmbeddingLoader {
             .as_ref()
             .is_some_and(|topology| topology.requires_post_quantization());
 
-        let allow_immediate_cli = in_situ_quant.is_some();
+        let allow_immediate_cli = !device.is_cuda() && in_situ_quant.is_some();
 
         let mut immediate_ty = None;
         let mut immediate_predicates = Vec::new();
@@ -440,13 +438,10 @@ impl Loader for EmbeddingLoader {
 
         let use_immediate = allow_immediate_cli || has_override_isq;
         if use_immediate {
-            let (pool, num_threads) = mistralrs_quant::create_isq_thread_pool(immediate_ty);
-            info!("Applying immediate ISQ in parallel on {num_threads} threads.");
-            mistralrs_quant::set_immediate_isq_with_pool(
+            mistralrs_quant::set_immediate_isq_with_overrides(
                 immediate_ty,
                 immediate_predicates.clone(),
                 topology_overrides.clone(),
-                pool,
             );
         }
 
@@ -457,20 +452,11 @@ impl Loader for EmbeddingLoader {
             in_situ_quant.is_some()
         };
         loading_isq |= topology_requires_post_quant;
-        loading_isq |= self.config.from_uqff.is_some();
 
-        // Load onto the regular device if not using isq.
-        // For immediate ISQ on discrete GPUs, load to CPU: the mapper will set the correct target
-        // device per-layer, and linear constructors will override to CPU for ISQ-targeted weights.
-        // On integrated/unified memory systems (e.g. Grace Blackwell), CPU and GPU share memory,
-        // so we load directly to the device.
+        // Load onto the regular device if not using isq
         let load_device = if !loading_isq {
             loading_isq = false;
-            if use_immediate && !crate::utils::normal::is_integrated_gpu(&device) {
-                Device::Cpu
-            } else {
-                device.clone()
-            }
+            device.clone()
         } else {
             Device::Cpu
         };
@@ -524,7 +510,7 @@ impl Loader for EmbeddingLoader {
         }
         let modules_ser = EmbeddingModulePaths::serialize_modules(&modules_config);
 
-        let mut model = if use_nccl || use_ring() {
+        let mut model = if use_nccl {
             let (mapper, sharded_vb) = distributed::prepare_distributed_mapper(
                 dtype,
                 &device,

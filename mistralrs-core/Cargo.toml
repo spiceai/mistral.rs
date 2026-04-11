@@ -79,7 +79,6 @@ as-any.workspace = true
 float8.workspace = true
 llguidance.workspace = true
 toktrie_hf_tokenizers.workspace = true
-toktrie.workspace = true
 candle-flash-attn-v3 = { workspace = true, optional = true }
 safetensors.workspace = true
 serde-big-array.workspace = true
@@ -106,8 +105,9 @@ rust-mcp-schema.workspace = true
 mistralrs-mcp = { workspace = true, features = ["utoipa"] }
 statrs.workspace = true
 openai-harmony = "0.0.8"
+signal-hook = "0.3"
 
-[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 objc = { workspace = true, optional = true }
 objc2-metal = { workspace = true, optional = true }
 candle-metal-kernels = { workspace = true, optional = true }
@@ -142,4 +142,4 @@ utoipa = ["dep:utoipa"]
 ring = ["mistralrs-quant/ring"]
 
 [build-dependencies]
-cudaforge = { workspace = true, optional = true }
+bindgen_cuda = { workspace = true, optional = true }

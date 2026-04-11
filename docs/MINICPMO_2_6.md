@@ -29,7 +29,7 @@ Mistral.rs supports interactive mode for multimodal models! It is an easy way to
 1) Start up interactive mode with the MiniCPM-O 2.6 Model model
 
 ```
-mistralrs run multimodal --isq 4 -m openbmb/MiniCPM-o-2_6
+mistralrs run vision --isq 4 -m openbmb/MiniCPM-o-2_6
 ```
 
 2) Say hello!
@@ -88,7 +88,7 @@ Overall, the image showcases the diverse geological and ecological features of M
 1) Start the server
 
 ```
-mistralrs serve multimodal -p 1234 --isq 4 -m openbmb/MiniCPM-o-2_6
+mistralrs serve vision -p 1234 --isq 4 -m openbmb/MiniCPM-o-2_6
 ```
 
 2) Send a request
@@ -133,18 +133,18 @@ print(resp)
 ---
 
 ## Rust
-You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/models/multimodal_models/main.rs).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/minicpmo_2_6/main.rs).
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, MultimodalMessages, MultimodalModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 const MODEL_ID: &str = "openbmb/MiniCPM-o-2_6";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let model =
-        MultimodalModelBuilder::new(MODEL_ID)
+        VisionModelBuilder::new(MODEL_ID)
             .with_isq(IsqType::Q4K)
             .with_logging()
             .build()

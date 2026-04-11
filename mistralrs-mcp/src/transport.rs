@@ -24,47 +24,6 @@ pub trait McpTransport: Send + Sync {
     async fn send_initialization_notification(&self) -> Result<()>;
 }
 
-fn normalize_params(params: Value) -> Value {
-    if params.is_null() {
-        serde_json::json!({})
-    } else {
-        params
-    }
-}
-
-fn build_jsonrpc_request(
-    request_id: &std::sync::Arc<std::sync::atomic::AtomicU64>,
-    method: &str,
-    params: Value,
-) -> (u64, Value) {
-    let id = request_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let request_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "method": method,
-        "params": normalize_params(params)
-    });
-    (id, request_body)
-}
-
-fn initialized_notification() -> Value {
-    serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized",
-    })
-}
-
-fn extract_jsonrpc_result(response_body: Value) -> Result<Value> {
-    if let Some(error) = response_body.get("error") {
-        return Err(anyhow::anyhow!("MCP server error: {}", error));
-    }
-
-    response_body
-        .get("result")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("No result in MCP response"))
-}
-
 /// HTTP-based MCP transport
 ///
 /// Provides communication with MCP servers over HTTP using JSON-RPC 2.0 protocol.
@@ -303,7 +262,22 @@ impl McpTransport for HttpTransport {
     /// }
     /// ```
     async fn send_request(&self, method: &str, params: Value) -> Result<Value> {
-        let (_, request_body) = build_jsonrpc_request(&self.request_id, method, params);
+        // Ensure params is an object, not null
+        let params = if params.is_null() {
+            serde_json::json!({})
+        } else {
+            params
+        };
+
+        let id = self
+            .request_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        });
 
         let mut request_builder = self
             .client
@@ -334,7 +308,15 @@ impl McpTransport for HttpTransport {
             response.json().await?
         };
 
-        extract_jsonrpc_result(response_body)
+        // Check for JSON-RPC errors
+        if let Some(error) = response_body.get("error") {
+            return Err(anyhow::anyhow!("MCP server error: {}", error));
+        }
+
+        response_body
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No result in MCP response"))
     }
 
     /// Tests the HTTP connection by sending a ping request
@@ -371,7 +353,10 @@ impl McpTransport for HttpTransport {
 
     /// Sends the server a initialization notification to let it know we are done initializing
     async fn send_initialization_notification(&self) -> Result<()> {
-        let request_body = initialized_notification();
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        });
 
         let mut request_builder = self
             .client
@@ -630,7 +615,22 @@ impl McpTransport for ProcessTransport {
     async fn send_request(&self, method: &str, params: Value) -> Result<Value> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let (_, request_body) = build_jsonrpc_request(&self.request_id, method, params);
+        // Ensure params is an object, not null
+        let params = if params.is_null() {
+            serde_json::json!({})
+        } else {
+            params
+        };
+        // Generate unique request ID
+        let id = self
+            .request_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        });
 
         // Send request via stdin
         let request_line = serde_json::to_string(&request_body)? + "\n";
@@ -647,7 +647,15 @@ impl McpTransport for ProcessTransport {
 
         let response_body: Value = serde_json::from_str(response_line.trim())?;
 
-        extract_jsonrpc_result(response_body)
+        // Check for JSON-RPC errors
+        if let Some(error) = response_body.get("error") {
+            return Err(anyhow::anyhow!("MCP server error: {}", error));
+        }
+
+        response_body
+            .get("result")
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No result in MCP response"))
     }
 
     /// Tests the process connection by sending a ping request
@@ -700,7 +708,13 @@ impl McpTransport for ProcessTransport {
         use tokio::io::AsyncWriteExt;
         let mut stdin = self.stdin.lock().await;
         stdin
-            .write_all(format!("{}\n", initialized_notification()).as_bytes())
+            .write_all(
+                format!(
+                    "{}\n",
+                    serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                )
+                .as_bytes(),
+            )
             .await?;
         stdin.flush().await?;
         drop(stdin);
@@ -904,7 +918,24 @@ impl McpTransport for WebSocketTransport {
     /// }
     /// ```
     async fn send_request(&self, method: &str, params: Value) -> Result<Value> {
-        let (id, request_body) = build_jsonrpc_request(&self.request_id, method, params);
+        // Ensure params is an object, not null
+        let params = if params.is_null() {
+            serde_json::json!({})
+        } else {
+            params
+        };
+
+        // Generate unique request ID
+        let id = self
+            .request_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        });
 
         // Send request
         let message = Message::Text(serde_json::to_string(&request_body)?.into());
@@ -934,7 +965,15 @@ impl McpTransport for WebSocketTransport {
                     // Check if this is the response to our request
                     if let Some(response_id) = response_body.get("id").and_then(|v| v.as_u64()) {
                         if response_id == id {
-                            return extract_jsonrpc_result(response_body);
+                            // Check for JSON-RPC errors
+                            if let Some(error) = response_body.get("error") {
+                                return Err(anyhow::anyhow!("MCP server error: {}", error));
+                            }
+
+                            return response_body
+                                .get("result")
+                                .cloned()
+                                .ok_or_else(|| anyhow::anyhow!("No result in MCP response"));
                         }
                     }
                     // If it's not our response, continue reading
@@ -1007,7 +1046,10 @@ impl McpTransport for WebSocketTransport {
 
     /// Sends the server a initialization notification to let it know we are done initializing
     async fn send_initialization_notification(&self) -> Result<()> {
-        let request_body = initialized_notification();
+        let request_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        });
 
         // Send request
         let message = Message::Text(serde_json::to_string(&request_body)?.into());

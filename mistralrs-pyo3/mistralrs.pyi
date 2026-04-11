@@ -125,6 +125,11 @@ class EmbeddingArchitecture(Enum):
     Qwen3Embedding = "qwen3embedding"
 
 @dataclass
+class EmbeddingArchitecture(Enum):
+    EmbeddingGemma = "embeddinggemma"
+    Qwen3Embedding = "qwen3embedding"
+
+@dataclass
 class MultimodalArchitecture(Enum):
     Phi3V = "phi3v"
     Idefics2 = "idefics2"
@@ -141,11 +146,6 @@ class MultimodalArchitecture(Enum):
     Llama4 = "llama4"
     Gemma3n = "Gemma3n"
     Qwen3VL = "Qwen3VL"
-    Qwen3VLMoE = "Qwen3VLMoE"
-    Qwen3_5 = "Qwen3_5"
-    Qwen3_5Moe = "Qwen3_5Moe"
-    Voxtral = "Voxtral"
-    Gemma4 = "Gemma4"
 
 @dataclass
 class DiffusionArchitecture(Enum):
@@ -491,9 +491,7 @@ class Runner:
             model_id: Optional model ID to send the request to. If None, uses the default model.
         """
 
-    def generate_audio(
-        self, prompt: str, model_id: str | None = None
-    ) -> SpeechGenerationResponse:
+    def generate_audio(self, prompt: str, model_id: str | None = None) -> SpeechGenerationResponse:
         """
         Generate audio given a (model specific) prompt. PCM and sampling rate as well as the number of channels is returned.
 

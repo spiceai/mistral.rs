@@ -33,7 +33,7 @@ fn get_model_id(model_type: &ModelType) -> String {
     match model_type {
         ModelType::Auto { model, .. }
         | ModelType::Text { model, .. }
-        | ModelType::Multimodal { model, .. }
+        | ModelType::Vision { model, .. }
         | ModelType::Diffusion { model, .. }
         | ModelType::Speech { model, .. }
         | ModelType::Embedding { model, .. } => model.model_id.clone(),
@@ -101,11 +101,6 @@ pub async fn run_bench(
             let _ = run_single_bench(&mistralrs, 32, 16).await;
         }
         info!("Warmup complete.");
-
-        // Reset logger counters so benchmark stats are clean
-        if let Ok(logger) = mistralrs.get_logger(None) {
-            logger.reset();
-        }
     }
 
     // Run benchmarks

@@ -2,13 +2,29 @@ use std::{
     env, fs,
     io::Read,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
 use hf_hub::api::sync::{ApiError, ApiRepo};
+use signal_hook::consts::TERM_SIGNALS;
 use tracing::{info, warn};
 
 use super::FileListCache;
+
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum HFError {
+    #[error("HF download file cancelled")]
+    HFDownloadFileCancelled,
+    #[error(transparent)]
+    ApiError(#[from] ApiError),
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RemoteAccessIssue {
@@ -284,7 +300,7 @@ pub(crate) fn list_repo_files(
     }
 }
 
-pub(crate) fn get_file(api: &ApiRepo, model_id: &Path, file: &str) -> Result<PathBuf> {
+pub(crate) fn get_file(api: &Arc<ApiRepo>, model_id: &Path, file: &str) -> Result<PathBuf> {
     if model_id.exists() {
         let path = model_id.join(file);
         if !path.exists() {
@@ -294,6 +310,37 @@ pub(crate) fn get_file(api: &ApiRepo, model_id: &Path, file: &str) -> Result<Pat
         return Ok(path);
     }
 
-    api.get(file)
-        .map_err(|err| hf_api_error(model_id, Some(file), &err))
+    // Set up SIGTERM handling to allow graceful cancellation of downloads
+    let should_terminate = Arc::new(AtomicBool::new(false));
+    for sig in TERM_SIGNALS {
+        if let Err(e) = signal_hook::flag::register(*sig, Arc::clone(&should_terminate)) {
+            warn!("Failed to register signal handler for signal {sig}: {e}");
+        }
+    }
+
+    let api = Arc::clone(api);
+    let file_owned = file.to_string();
+    let (tx, rx) = mpsc::channel();
+
+    // Spawn the download on a separate thread so that we can return immediately
+    // on SIGTERM without blocking until the download finishes.
+    thread::spawn(move || {
+        let _ = tx.send(api.get(&file_owned));
+    });
+
+    loop {
+        match rx.try_recv() {
+            Ok(result) => {
+                return result.map_err(|err| hf_api_error(model_id, Some(file), &err));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow::anyhow!("Download thread terminated unexpectedly"));
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if should_terminate.load(Ordering::SeqCst) {
+            return Err(anyhow!(HFError::HFDownloadFileCancelled));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }

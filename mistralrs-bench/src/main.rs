@@ -487,8 +487,7 @@ async fn main() -> anyhow::Result<()> {
     let isq = args
         .in_situ_quant
         .as_ref()
-        .map(|isq| parse_isq_value(isq, Some(&device)).map_err(|e| anyhow::anyhow!("{e}")))
-        .transpose()?;
+        .and_then(|isq| parse_isq_value(isq, Some(&device)).ok());
 
     let pipeline = loader.load_model_from_hf(
         None,

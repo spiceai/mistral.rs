@@ -7,7 +7,6 @@ use mistralrs_quant::{QuantizedConfig, ShardedVarBuilder};
 use crate::{
     attention::SdpaParams,
     layers::{self, Activation, Conv3dConfig, Conv3dNoBias, Sdpa},
-    pipeline::text_models_inputs_processor::FlashParams,
     utils::unvarbuilder::UnVarBuilder,
 };
 
@@ -157,17 +156,14 @@ impl VisionAttention {
             .permute((1, 0, 2, 3))?;
         let mut q = qkv.i(0)?.squeeze(0)?;
         let mut k = qkv.i(1)?.squeeze(0)?;
-        let v = qkv.i(2)?.squeeze(0)?;
+        let mut v = qkv.i(2)?.squeeze(0)?;
 
-        let orig_dtype = q.dtype();
         let cos = cos.to_dtype(DType::F32)?;
         let sin = sin.to_dtype(DType::F32)?;
         q = q.to_dtype(DType::F32)?;
         k = k.to_dtype(DType::F32)?;
+        v = v.to_dtype(DType::F32)?;
         (q, k) = apply_rotary_pos_emb_vision(&q, &k, &cos, &sin)?;
-        // Cast back so flash attention is enabled
-        q = q.to_dtype(orig_dtype)?;
-        k = k.to_dtype(orig_dtype)?;
 
         let mut outputs = Vec::new();
         for window in cu_seqlens.windows(2) {
@@ -181,25 +177,23 @@ impl VisionAttention {
             let k_chunk = k.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
             let v_chunk = v.narrow(0, start, len)?.transpose(0, 1)?.contiguous()?;
 
-            let flash_params = FlashParams::empty(false);
-
             let mut chunk_out = Sdpa
                 .run_attention(
                     &q_chunk.unsqueeze(0)?,
                     &k_chunk.unsqueeze(0)?,
                     &v_chunk.unsqueeze(0)?,
                     None,
-                    Some(&flash_params),
+                    None,
                     &SdpaParams {
                         n_kv_groups: 1,
                         sliding_window: None,
                         softcap: None,
                         softmax_scale: 1.0 / (self.head_dim as f32).sqrt(),
-                        sinks: None,
                     },
                 )?
                 .squeeze(0)?
                 .transpose(0, 1)?;
+            chunk_out.device().synchronize()?;
             chunk_out = chunk_out.reshape((len, self.num_heads * self.head_dim))?;
             outputs.push(chunk_out.to_dtype(xs.dtype())?);
         }

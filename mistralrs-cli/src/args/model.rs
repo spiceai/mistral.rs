@@ -1,7 +1,7 @@
 //! Model-related argument structs
 
 use clap::{Args, ValueEnum};
-use mistralrs_core::{AutoDeviceMapParams, IsqOrganization, ModelDType, NormalLoaderType};
+use mistralrs_core::{IsqOrganization, ModelDType, NormalLoaderType};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -88,12 +88,7 @@ pub struct QuantizationOptions {
     #[arg(long = "isq")]
     pub in_situ_quant: Option<String>,
 
-    /// UQFF file(s) to load from. Accepts numeric shorthands (2, 3, 4, 5, 6, 8)
-    /// to auto-detect the appropriate UQFF file (e.g., `--from-uqff 8` finds
-    /// q8_0-0.uqff or afq8-0.uqff). Also accepts ISQ type names (e.g., q4k, afq8).
-    /// Shards are auto-discovered: specifying the first shard (e.g., q4k-0.uqff)
-    /// automatically finds q4k-1.uqff, etc. Use semicolons to separate different
-    /// quantizations.
+    /// UQFF file(s) to load from (semicolon-separated for multiple)
     #[arg(long)]
     pub from_uqff: Option<String>,
 
@@ -132,19 +127,19 @@ pub struct DeviceOptions {
     pub hf_cache: Option<PathBuf>,
 
     /// Max sequence length for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN)]
+    #[arg(long, default_value_t = 4096)]
     #[serde(default = "default_max_seq_len")]
     pub max_seq_len: usize,
 
     /// Max batch size for automatic device mapping
-    #[arg(long, default_value_t = AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE)]
+    #[arg(long, default_value_t = 1)]
     #[serde(default = "default_max_batch_size")]
     pub max_batch_size: usize,
 }
 
-/// Multimodal model specific options
+/// Vision model specific options
 #[derive(Args, Clone, Default, Deserialize)]
-pub struct MultimodalOptions {
+pub struct VisionOptions {
     /// Maximum edge length for image resizing (aspect ratio preserved)
     #[arg(long)]
     pub max_edge: Option<u32>,
@@ -171,9 +166,9 @@ fn default_gqa() -> usize {
 }
 
 fn default_max_seq_len() -> usize {
-    AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN
+    4096
 }
 
 fn default_max_batch_size() -> usize {
-    AutoDeviceMapParams::DEFAULT_MAX_BATCH_SIZE
+    1
 }

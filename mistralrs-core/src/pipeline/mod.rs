@@ -19,6 +19,7 @@ mod response;
 mod sampling;
 mod speculative;
 mod speech;
+mod vision;
 
 pub use super::diffusion_models::DiffusionGenerationParams;
 use crate::amoe::{AnyMoeConfig, AnyMoeExpertType, AnyMoeTrainingInputs, AnyMoeTrainingResult};
@@ -36,26 +37,23 @@ pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
 use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
 pub(crate) use isq::IsqModelLoader;
-pub use isq::{
-    expand_isq_value, parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER,
-};
+pub use isq::{parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER};
 use llguidance::toktrie::TokEnv;
 pub use loaders::{
-    AdapterKind, AutoDeviceMapParams, AutoEmbeddingLoader, AutoMultimodalLoader, AutoNormalLoader,
+    AdapterKind, AutoDeviceMapParams, AutoEmbeddingLoader, AutoNormalLoader, AutoVisionLoader,
     DeepSeekV2Loader, DeepSeekV3Loader, DeviceMappedModelLoader, DiffusionLoaderType,
     DiffusionModel, DiffusionModelLoader, EmbeddingGemmaLoader, EmbeddingLoaderType,
     EmbeddingModel, EmbeddingModelLoader, EmbeddingModelPaths, EmbeddingModule,
     EmbeddingModulePaths, EmbeddingModuleType, FluxLoader, GLM4Loader, GLM4MoeLiteLoader,
-    GLM4MoeLoader, Gemma2Loader, Gemma3Loader, Gemma3nLoader, Gemma4Loader, GemmaLoader,
-    GptOssLoader, GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader,
-    LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader,
-    MistralLoader, MixtralLoader, ModelKind, ModelPaths, MultimodalLoaderType, MultimodalModel,
-    MultimodalModelLoader, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
-    Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader, PrettyName,
-    QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader, Qwen3EmbeddingLoader,
-    Qwen3Loader, Qwen3MoELoader, Qwen3NextLoader, Qwen3VLLoader, Qwen3VLMoELoader, Qwen3_5Loader,
-    Qwen3_5MoeLoader, SmolLm3Loader, Starcoder2Loader, TokenSource, VLlama4Loader, VLlamaLoader,
-    VoxtralLoader,
+    GLM4MoeLoader, Gemma2Loader, Gemma3Loader, Gemma3nLoader, GemmaLoader, GptOssLoader,
+    GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader,
+    LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader, MistralLoader,
+    MixtralLoader, ModelKind, ModelPaths, NormalLoaderType, NormalLoadingMetadata, NormalModel,
+    NormalModelLoader, Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader,
+    PrettyName, QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader,
+    Qwen3EmbeddingLoader, Qwen3Loader, Qwen3MoELoader, Qwen3VLLoader, Qwen3VLMoELoader,
+    SmolLm3Loader, Starcoder2Loader, TokenSource, VLlama4Loader, VLlamaLoader, VisionLoaderType,
+    VisionModel, VisionModelLoader,
 };
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_device_layers_for_loader(
@@ -95,8 +93,8 @@ use rand_isaac::Isaac64Rng;
 pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline};
 pub use speech::{SpeechLoader, SpeechPipeline};
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
@@ -111,8 +109,7 @@ pub use self::inputs_processor::{
 };
 use self::text_models_inputs_processor::PagedAttentionMeta;
 pub use crate::kv_cache::{
-    Cache, CacheManager, EitherCache, HybridLayerCache, KvCache, LayerCaches, NormalCache,
-    NormalCacheType,
+    Cache, CacheManager, EitherCache, KvCache, LayerCaches, NormalCache, NormalCacheType,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -120,7 +117,6 @@ pub enum SupportedModality {
     Text,
     Audio,
     Vision,
-    Video,
     Embedding,
 }
 
@@ -130,7 +126,6 @@ impl Debug for SupportedModality {
             Self::Text => write!(f, "📝 Text"),
             Self::Audio => write!(f, "🔊 Audio"),
             Self::Vision => write!(f, "🖼️ Vision"),
-            Self::Video => write!(f, "🎬 Video"),
             Self::Embedding => write!(f, "🔢 Embedding"),
         }
     }
@@ -211,6 +206,9 @@ pub trait CacheManagerMixin {
         load_preallocated_cache: bool,
     );
     fn cache(&self) -> &EitherCache;
+    fn do_preallocated_cache(&self) -> bool {
+        matches!(self.cache(), EitherCache::Normal(_))
+    }
 }
 
 pub trait MetadataMixin {
@@ -285,7 +283,7 @@ pub trait AnyMoePipelineMixin {
 #[derive(Clone)]
 pub enum ModelCategory {
     Text,
-    Multimodal {
+    Vision {
         prefixer: Arc<dyn MultimodalPromptPrefixer>,
     },
     Diffusion,
@@ -298,9 +296,7 @@ impl std::fmt::Debug for ModelCategory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ModelCategory::Text => write!(f, "ModelCategory::Text"),
-            ModelCategory::Multimodal { .. } => {
-                write!(f, "ModelCategory::Multimodal {{ prefixer: .. }}")
-            }
+            ModelCategory::Vision { .. } => write!(f, "ModelCategory::Vision {{ prefixer: .. }}"),
             ModelCategory::Diffusion => write!(f, "ModelCategory::Diffusion"),
             ModelCategory::Audio => write!(f, "ModelCategory::Audio"),
             ModelCategory::Speech => write!(f, "ModelCategory::Speech"),
@@ -313,14 +309,14 @@ impl PartialEq for ModelCategory {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Text, Self::Text) => true,
-            (Self::Multimodal { .. }, Self::Multimodal { .. }) => true,
+            (Self::Vision { .. }, Self::Vision { .. }) => true,
             (Self::Audio, Self::Audio) => true,
             (Self::Speech, Self::Speech) => true,
             (Self::Diffusion, Self::Diffusion) => true,
             (Self::Embedding, Self::Embedding) => true,
             (
                 Self::Text
-                | Self::Multimodal { .. }
+                | Self::Vision { .. }
                 | Self::Diffusion
                 | Self::Audio
                 | Self::Speech
@@ -341,13 +337,8 @@ pub trait MultimodalPromptPrefixer: Send + Sync {
     fn prefix_audio(&self, _audio_indexes: Vec<usize>, prompt: &str) -> String {
         prompt.to_string()
     }
-    /// Prefix for inclusion in messages (may do nothing if the chat template handles it).
-    fn prefix_video(&self, _video_indexes: Vec<usize>, prompt: &str) -> String {
-        prompt.to_string()
-    }
 }
 
-#[derive(Clone)]
 pub enum CacheBackendMetadata {
     DefaultInstructions {
         pre_op: CacheInstruction,
@@ -355,6 +346,7 @@ pub enum CacheBackendMetadata {
     },
     PagedAttention {
         metadata: PagedAttentionMeta,
+        blocks_to_copy: HashMap<usize, Vec<usize>>,
     },
 }
 
@@ -468,7 +460,6 @@ pub trait Pipeline:
                         self.get_metadata().no_kv_cache,
                         None,
                         return_raw_logits,
-                        self.get_metadata().sliding_window,
                         self.get_input_processor_config(),
                         None,
                         self.device_mapper(),
@@ -681,34 +672,16 @@ pub trait Pipeline:
 
                 Ok(exec_duration)
             }
-            CacheBackendMetadata::PagedAttention { metadata } => {
-                // For hybrid models, build state_indices tensor from sequences'
-                // recurrent_state_idx so recurrent layers are active during forward.
-                // Paged attention manages KV caches separately, but recurrent state
-                // pool access still needs the indices tensor to be set.
-                if self.cache().is_hybrid() {
-                    let mut hybrid_cache = self.cache().hybrid();
-                    let recurrent_device = hybrid_cache.caches.iter().find_map(|c| {
-                        if let HybridLayerCache::Recurrent(pool) = c {
-                            Some(pool.device().clone())
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(device) = recurrent_device {
-                        #[allow(clippy::cast_possible_truncation)]
-                        let indices: Vec<u32> = input_seqs
-                            .iter()
-                            .filter_map(|seq| seq.recurrent_state_idx().map(|idx| idx as u32))
-                            .collect();
-                        if indices.len() == input_seqs.len() {
-                            if let Ok(si) = Tensor::from_vec(indices, (input_seqs.len(),), &device)
-                            {
-                                hybrid_cache.set_state_indices(Some(si));
-                            }
-                        }
-                    }
-                }
+            CacheBackendMetadata::PagedAttention {
+                metadata,
+                blocks_to_copy,
+            } => {
+                // Cloning might be bad?
+                self.get_metadata()
+                    .cache_engine
+                    .as_ref()
+                    .expect("PagedAttention must have cache engines.")
+                    .execute_scheduler_ops(&blocks_to_copy)?;
 
                 let inputs_iter =
                     std::iter::once(self.get_processor().inputs_processor().process_inputs(
@@ -720,7 +693,6 @@ pub trait Pipeline:
                         self.get_metadata().no_kv_cache,
                         None,
                         return_raw_logits,
-                        self.get_metadata().sliding_window,
                         self.get_input_processor_config(),
                         Some(metadata),
                         self.device_mapper(),

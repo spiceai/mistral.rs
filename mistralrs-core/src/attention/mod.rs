@@ -7,7 +7,7 @@ use candle_core::{DType, Device, Result, Tensor};
 mod backends;
 
 #[allow(unused)]
-pub(crate) use backends::{flash_attn, maybe_synchronize, naive_sdpa, sinks_attn};
+pub(crate) use backends::{flash_attn, maybe_synchronize, naive_sdpa};
 
 /// Chunk size for attention computation to avoid OOM on long sequences
 pub(crate) const ATTENTION_CHUNK_SIZE: usize = 1024;
@@ -86,7 +86,6 @@ pub struct SdpaParams {
     pub softcap: Option<f32>,
     pub softmax_scale: f32,
     pub sliding_window: Option<usize>,
-    pub sinks: Option<Tensor>,
 }
 
 pub struct Sdpa;
@@ -113,11 +112,6 @@ impl Sdpa {
         flash_params: Option<&FlashParams>,
         sdpa_params: &SdpaParams,
     ) -> Result<Tensor> {
-        // If sinks are present, dispatch to the sinks backend
-        if let Some(sinks) = &sdpa_params.sinks {
-            return sinks_attn(q, k, v, sinks, mask, flash_params, sdpa_params);
-        }
-
         let (b_sz, n_attn_heads, seq_len, head_dim) = q.dims4()?;
         let (_, _, _, k_head_dim) = k.dims4()?;
         let (_, _, _, v_head_dim) = v.dims4()?;
@@ -184,17 +178,16 @@ impl Sdpa {
                 && sdpa_params.softcap.is_none_or(|x| x == 1.0)
         });
         let valid_head_dims: &[usize] = if seq_len == 1 {
-            &[32, 64, 72, 80, 96, 128, 256, 512]
+            &[32, 64, 72, 80, 96, 128, 256]
         } else {
-            &[32, 64, 72, 80, 96, 128, 256, 512]
+            // Not sure why the full kernel doesn't like 256.
+            // [32, 64, 72, 80, 96, 128, 256]
+            &[32, 64, 72, 80, 96, 128]
         };
-        // Metal SDPA full kernel requires q_seq <= k_seq when a mask is present.
-        let metal_supports_mask = mask.is_none() || seq_len <= k.dim(2)?;
         if [q, k, v].into_iter().all(|x| x.device().is_metal())
             && all_head_dims_match
             && valid_head_dims.contains(&head_dim)
             && can_use_mask
-            && metal_supports_mask
         {
             let mask = match mask {
                 Some(mask) => Some(mask.broadcast_as(tgt_mask_shape)?),

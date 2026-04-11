@@ -24,7 +24,7 @@ use crate::{
         },
         InputProcessorOutput, InputsProcessor, InputsProcessorType, MessagesAction, Processor,
     },
-    sequence::{build_mm_features_from_ranges, find_image_delimited_ranges, Sequence},
+    sequence::Sequence,
     vision_models::{
         image_processor::{ImagePreProcessor, PreprocessedImages},
         preprocessor_config::PreProcessorConfig,
@@ -134,7 +134,6 @@ impl InputsProcessor for Llama4ImageProcessor {
         no_kv_cache: bool,
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
-        sliding_window: Option<usize>,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
@@ -220,25 +219,16 @@ impl InputsProcessor for Llama4ImageProcessor {
                     )
                     .expect("Preprocessing failed");
                 // Intentionally don't unsqueeze here as the BS is already included. Just stack now.
-                // Trim cached images per-sequence before pushing.
-                let cached = seq.count_prefix_cached_mm_items();
-                let n_images = pixel_values.dim(0).unwrap_or(0);
-                if cached < n_images {
-                    if cached > 0 {
-                        pixel_values_accum
-                            .push(pixel_values.narrow(0, cached, n_images - cached).unwrap());
-                    } else {
-                        pixel_values_accum.push(pixel_values);
-                    }
-                }
+                pixel_values_accum.push(pixel_values);
                 aspect_ratios_accum.push(aspect_ratio_ids.unwrap());
             }
 
+            let pixel_values = Tensor::cat(&pixel_values_accum, 0).unwrap();
             let aspect_ratios = Tensor::cat(&aspect_ratios_accum, 0).unwrap();
 
             let (image_h, image_w) = (
-                pixel_values_accum[0].dim(D::Minus2).unwrap(),
-                pixel_values_accum[0].dim(D::Minus1).unwrap(),
+                pixel_values.dim(D::Minus2).unwrap(),
+                pixel_values.dim(D::Minus1).unwrap(),
             );
             let num_patches_per_chunk =
                 (image_h / self.patch_size) * (image_w / self.patch_size) / self.downsample_ratio;
@@ -276,31 +266,12 @@ impl InputsProcessor for Llama4ImageProcessor {
                         .expect("Detokenization failed!");
 
                     let ids = toks.get_ids().to_vec();
-
-                    // Build mm_features for position-aware prefix cache hashing
-                    if seq.mm_features().is_empty() {
-                        if let (Some(hashes), Some(start_id), Some(end_id)) = (
-                            seq.image_hashes().map(|h| h.to_vec()),
-                            tokenizer.token_to_id(IMAGE_START),
-                            tokenizer.token_to_id(IMAGE_END),
-                        ) {
-                            let ranges = find_image_delimited_ranges(&ids, start_id, end_id);
-                            seq.set_mm_features(build_mm_features_from_ranges(
-                                &ranges, &hashes, "img",
-                            ));
-                        }
-                    }
-
                     seq.set_toks_and_reallocate(ids, paged_attn_metadata.as_mut());
                     seq.multimodal.has_changed_prompt = true;
                 }
             }
 
-            if !pixel_values_accum.is_empty() {
-                Some(Tensor::cat(&pixel_values_accum, 0).unwrap())
-            } else {
-                None
-            }
+            Some(pixel_values)
         } else {
             None
         };
@@ -328,7 +299,6 @@ impl InputsProcessor for Llama4ImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
-                sliding_window,
             )
             .unwrap()
         } else {
@@ -344,31 +314,8 @@ impl InputsProcessor for Llama4ImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
-                sliding_window,
             )
             .unwrap()
-        };
-
-        let pixel_values = if is_prompt { pixel_values } else { None };
-
-        let image_hashes: Vec<u64> = if is_prompt {
-            input_seqs
-                .iter()
-                .flat_map(|seq| {
-                    seq.image_hashes()
-                        .map(|h| {
-                            let cached = seq.count_prefix_cached_mm_items();
-                            if cached < h.len() {
-                                h[cached..].to_vec()
-                            } else {
-                                vec![]
-                            }
-                        })
-                        .unwrap_or_default()
-                })
-                .collect()
-        } else {
-            vec![]
         };
 
         let inputs: Box<dyn Any> = Box::new(ModelInputs {
@@ -377,7 +324,7 @@ impl InputsProcessor for Llama4ImageProcessor {
             context_lens,
             position_ids,
             pixel_values,
-            model_specific_args: Box::new(Llama4ModelSpecificArgs { image_hashes }),
+            model_specific_args: Box::new(Llama4ModelSpecificArgs),
             paged_attn_meta,
             flash_meta,
         });

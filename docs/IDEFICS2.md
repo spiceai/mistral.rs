@@ -38,7 +38,7 @@ The image depicts a group of orange ants climbing over a black pole. The ants ar
 1) Start the server
 
 ```
-mistralrs serve multimodal -p 1234 --isq 4 -m HuggingFaceM4/idefics2-8b-chatty
+mistralrs serve vision -p 1234 --isq 4 -m HuggingFaceM4/idefics2-8b-chatty
 ```
 
 2) Send a request
@@ -82,13 +82,13 @@ print(resp)
 ---
 
 ## Rust
-You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/models/multimodal_models/main.rs).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/idefics2/main.rs).
 
 This is a minimal example of running the Idefics 2 model with a dummy image.
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, MultimodalMessages, MultimodalModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {

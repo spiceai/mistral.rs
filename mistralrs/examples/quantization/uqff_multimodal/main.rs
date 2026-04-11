@@ -3,19 +3,15 @@
 //! Run with: `cargo run --release --example uqff_multimodal -p mistralrs`
 
 use anyhow::Result;
-use mistralrs::{IsqBits, MultimodalMessages, TextMessageRole, UqffMultimodalModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model = UqffMultimodalModelBuilder::new(
-        "EricB/Phi-3.5-vision-instruct-UQFF",
-        vec!["phi3.5-vision-instruct-q8_0.uqff".into()],
-    )
-    .into_inner()
-    .with_auto_isq(IsqBits::Four)
-    .with_logging()
-    .build()
-    .await?;
+    let model = VisionModelBuilder::new("microsoft/Phi-4-multimodal-instruct")
+        .with_isq(IsqType::Q4K)
+        .with_logging()
+        .build()
+        .await?;
 
     let bytes = match reqwest::blocking::get(
         "https://cdn.britannica.com/45/5645-050-B9EC0205/head-treasure-flower-disk-flowers-inflorescence-ray.jpg",
@@ -29,7 +25,8 @@ async fn main() -> Result<()> {
         TextMessageRole::User,
         "What is depicted here? Please describe the scene in detail.",
         vec![image],
-    );
+        &model,
+    )?;
 
     let response = model.send_chat_request(messages).await?;
 

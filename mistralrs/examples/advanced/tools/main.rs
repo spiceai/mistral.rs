@@ -21,7 +21,7 @@ fn get_weather(input: GetWeatherInput) -> String {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model = ModelBuilder::new("Qwen/Qwen3-4B")
+    let model = TextModelBuilder::new("meta-llama/Meta-Llama-3.1-8B-Instruct")
         .with_logging()
         .with_auto_isq(IsqBits::Eight)
         .build()

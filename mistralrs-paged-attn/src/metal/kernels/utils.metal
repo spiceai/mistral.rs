@@ -1,8 +1,3 @@
-// Portions of this file are adapted from Apple's MLX framework
-// (https://github.com/ml-explore/mlx)
-// Licensed under the Apache License 2.0
-// Copyright © 2023 Apple Inc.
-
 #include "float8.metal"
 #include <metal_stdlib>
 

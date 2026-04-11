@@ -10,19 +10,14 @@ use requests::{
 };
 use serde_json::Value;
 use std::{
+    cell::RefCell,
     path::PathBuf,
     str::FromStr,
     sync::{Arc, OnceLock},
 };
 use stream::ChatCompletionStreamer;
-use tokio::{
-    runtime::Runtime,
-    sync::mpsc::{channel, Receiver},
-};
-use util::{
-    next_request_id, parse_chat_response, parse_completion_response, parse_embedding_response,
-    send_request_and_wait, send_request_with_optional_stream, PyApiErr, PyApiResult,
-};
+use tokio::{runtime::Runtime, sync::mpsc::channel};
+use util::{PyApiErr, PyApiResult};
 
 use candle_core::{Device, Result};
 use mistralrs_core::{
@@ -32,11 +27,11 @@ use mistralrs_core::{
     DiffusionGenerationParams, DiffusionLoaderBuilder, DrySamplingParams, EmbeddingLoaderBuilder,
     EmbeddingSpecificConfig, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
     GGUFSpecificConfig, ImageGenerationResponse, ImageGenerationResponseFormat, LlguidanceGrammar,
-    Loader, MemoryGpuConfig, MistralRs, MistralRsBuilder, MultimodalLoaderBuilder,
-    MultimodalSpecificConfig, NormalLoaderBuilder, NormalRequest, NormalSpecificConfig,
-    PagedAttentionConfig, PagedCacheType, ReasoningEffort, Request as _Request, RequestMessage,
-    Response, ResponseOk, SamplingParams, SchedulerConfig, SearchEmbeddingModel, SpeculativeConfig,
-    SpeculativeLoader, SpeechLoader, StopTokens, TokenSource, TokenizationRequest, Tool, Topology,
+    Loader, MemoryGpuConfig, MistralRs, MistralRsBuilder, NormalLoaderBuilder, NormalRequest,
+    NormalSpecificConfig, PagedAttentionConfig, PagedCacheType, ReasoningEffort,
+    Request as _Request, RequestMessage, Response, ResponseOk, SamplingParams, SchedulerConfig,
+    SearchEmbeddingModel, SpeculativeConfig, SpeculativeLoader, SpeechLoader, StopTokens,
+    TokenSource, TokenizationRequest, Tool, Topology, VisionLoaderBuilder, VisionSpecificConfig,
 };
 use mistralrs_core::{
     CalledFunction, SearchCallback, SearchFunctionParameters, SearchResult, ToolCallback,
@@ -53,7 +48,7 @@ mod requests;
 mod stream;
 mod util;
 mod which;
-use which::{Architecture, DiffusionArchitecture, MultimodalArchitecture, SpeechLoaderType, Which};
+use which::{Architecture, DiffusionArchitecture, SpeechLoaderType, VisionArchitecture, Which};
 
 /// Parse reasoning effort string to ReasoningEffort enum
 fn parse_reasoning_effort(effort: &Option<String>) -> Option<ReasoningEffort> {
@@ -109,6 +104,63 @@ pub struct SpeechGenerationResponse {
 /// An object wrapping the underlying Rust system to handle requests and process conversations.
 struct Runner {
     runner: Arc<MistralRs>,
+}
+
+fn wrap_search_callback(cb: PyObject) -> Arc<SearchCallback> {
+    Arc::new(move |params: &SearchFunctionParameters| {
+        Python::with_gil(|py| {
+            let obj = cb.call1(py, (params.query.clone(),))?;
+            let list = obj.downcast_bound::<PyList>(py)?;
+            let mut results = Vec::new();
+            for item in list.iter() {
+                let title: String = item.get_item("title")?.extract()?;
+                let description: String = item.get_item("description")?.extract()?;
+                let url: String = item.get_item("url")?.extract()?;
+                let content: String = item.get_item("content")?.extract()?;
+                results.push(SearchResult {
+                    title,
+                    description,
+                    url,
+                    content,
+                });
+            }
+            Ok(results)
+        })
+        .map_err(|e: PyErr| anyhow::anyhow!(e.to_string()))
+    })
+}
+
+fn wrap_tool_callback(cb: PyObject) -> Arc<ToolCallback> {
+    Arc::new(move |func: &CalledFunction| {
+        Python::with_gil(|py| {
+            let json = py.import("json")?;
+            let args: Py<PyAny> = json
+                .call_method1("loads", (func.arguments.clone(),))?
+                .into();
+            let obj = cb.call1(py, (func.name.clone(), args))?;
+            obj.extract::<String>(py)
+        })
+        .map_err(|e: PyErr| anyhow::anyhow!(e.to_string()))
+    })
+}
+
+fn wrap_tool_callbacks(obj: PyObject) -> anyhow::Result<ToolCallbacks> {
+    Python::with_gil(|py| {
+        let dict = obj
+            .downcast_bound::<pyo3::types::PyDict>(py)
+            .map_err(|e| anyhow::anyhow!("Failed to downcast to PyDict: {}", e))?;
+
+        let mut map = ToolCallbacks::new();
+
+        for (name, cb) in dict.iter() {
+            let name: String = name
+                .extract()
+                .map_err(|e: PyErr| anyhow::anyhow!(e.to_string()))?;
+            let cb_obj: PyObject = cb.into();
+            map.insert(name, wrap_tool_callback(cb_obj));
+        }
+        Ok(map)
+    })
 }
 
 fn wrap_search_callback(cb: PyObject) -> Arc<SearchCallback> {
@@ -504,9 +556,8 @@ fn parse_which(
             hf_cache_path,
             matformer_config_path,
             matformer_slice_name,
-            organization,
-        } => MultimodalLoaderBuilder::new(
-            MultimodalSpecificConfig {
+        } => VisionLoaderBuilder::new(
+            VisionSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
                 write_uqff,
                 from_uqff: from_uqff.map(|x| {
@@ -521,7 +572,6 @@ fn parse_which(
                 hf_cache_path,
                 matformer_config_path,
                 matformer_slice_name,
-                organization: organization.map(Into::into).unwrap_or_default(),
             },
             chat_template,
             tokenizer_json,
@@ -647,7 +697,7 @@ impl Runner {
             | Which::GGML { .. }
             | Which::LoraGGML { .. }
             | Which::Embedding { .. }
-            | Which::MultimodalPlain { .. }
+            | Which::VisionPlain { .. }
             | Which::DiffusionPlain { .. }
             | Which::Speech { .. } => None,
             Which::XLora {
@@ -671,7 +721,7 @@ impl Runner {
             | Which::GGML { dtype, .. }
             | Which::LoraGGML { dtype, .. }
             | Which::Embedding { dtype, .. }
-            | Which::MultimodalPlain { dtype, .. }
+            | Which::VisionPlain { dtype, .. }
             | Which::DiffusionPlain { dtype, .. }
             | Which::Speech { dtype, .. }
             | Which::XLora { dtype, .. }
@@ -722,7 +772,7 @@ impl Runner {
                     max_image_shape: (p.max_image_length, p.max_image_length),
                     max_num_images: p.max_num_images,
                 })
-                .unwrap_or(AutoDeviceMapParams::default_multimodal()),
+                .unwrap_or(AutoDeviceMapParams::default_vision()),
             Which::Embedding { .. } | Which::DiffusionPlain { .. } | Which::Speech { .. } => {
                 AutoDeviceMapParams::default_text()
             }
@@ -989,7 +1039,6 @@ impl Runner {
                     let mut messages_vec = Vec::new();
                     let mut image_urls = Vec::new();
                     let mut audio_urls = Vec::new();
-                    let mut video_urls = Vec::new();
                     for message in messages {
                         let role = message["role"].as_ref().left().unwrap().clone();
                         match &message["content"] {
@@ -1039,7 +1088,6 @@ impl Runner {
                                     Text { text: String },
                                     Image { image_url: String },
                                     Audio { audio_url: String },
-                                    Video { video_url: String },
                                 }
 
                                 let mut items = Vec::new();
@@ -1081,20 +1129,6 @@ impl Runner {
                                                     .clone(),
                                             });
                                         }
-                                        Some(Either::Left(x)) if x == "video_url" => {
-                                            items.push(ContentPart::Video {
-                                                video_url: image_message
-                                                    .get("video_url")
-                                                    .as_ref()
-                                                    .context("Video sub-content must have `video_url` key.")?
-                                                    .as_ref()
-                                                    .right()
-                                                    .context("Video sub-content `video_url` key must be an object.")?
-                                                    .get("url")
-                                                    .context("Video sub-content `video_url` object must have a `url` key.")?
-                                                    .clone(),
-                                            });
-                                        }
                                         _ => return Err(PyApiErr::from("Expected array content sub-content to be of format {{`type`: `text`, `text`: ...}} and {{`type`: `url`, `image_url`: {{`url`: ...}}}}"))
                                     }
                                 }
@@ -1122,14 +1156,6 @@ impl Runner {
                                     })
                                     .collect::<Vec<_>>();
 
-                                let video_urls_iter = items
-                                    .iter()
-                                    .filter_map(|item| match item {
-                                        ContentPart::Video { video_url } => Some(video_url.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>();
-
                                 let mut message_map: IndexMap<
                                     String,
                                     Either<String, Vec<IndexMap<String, Value>>>,
@@ -1153,14 +1179,6 @@ impl Runner {
                                     );
                                     content_map.push(content_audio_map);
                                 }
-                                for _ in &video_urls_iter {
-                                    let mut content_video_map = IndexMap::new();
-                                    content_video_map.insert(
-                                        "type".to_string(),
-                                        Value::String("video".to_string()),
-                                    );
-                                    content_map.push(content_video_map);
-                                }
                                 {
                                     let mut content_text_map = IndexMap::new();
                                     content_text_map.insert(
@@ -1177,11 +1195,10 @@ impl Runner {
                                 messages_vec.push(message_map);
                                 image_urls.extend(image_urls_iter);
                                 audio_urls.extend(audio_urls_iter);
-                                video_urls.extend(video_urls_iter);
                             }
                         }
                     }
-                    if !image_urls.is_empty() || !audio_urls.is_empty() || !video_urls.is_empty() {
+                    if !image_urls.is_empty() || !audio_urls.is_empty() {
                         let mut images = Vec::new();
                         for url in image_urls {
                             let url_unparsed = url.trim();
@@ -1195,17 +1212,10 @@ impl Runner {
                             let audio = util::parse_audio_url(url_unparsed)?;
                             audios.push(audio);
                         }
-                        let mut videos = Vec::new();
-                        for url in video_urls {
-                            let url_unparsed = url.trim();
-                            let video = util::parse_video_url(url_unparsed)?;
-                            videos.push(video);
-                        }
-                        RequestMessage::MultimodalChat {
+                        RequestMessage::VisionChat {
                             messages: messages_vec,
                             images,
                             audios,
-                            videos,
                             enable_thinking: request.enable_thinking,
                             reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
                         }
@@ -1250,7 +1260,13 @@ impl Runner {
             };
 
             let model_request = _Request::Normal(Box::new(NormalRequest {
-                id: next_request_id(),
+                id: {
+                    let l = NEXT_REQUEST_ID.lock().unwrap();
+                    let last = &mut *l.borrow_mut();
+                    let last_v = *last;
+                    *last += 1;
+                    last_v
+                },
                 messages,
                 sampling_params: SamplingParams {
                     temperature: request.temperature,
@@ -1281,9 +1297,9 @@ impl Runner {
                 truncate_sequence: request.truncate_sequence,
             }));
 
-            let is_streaming = request.stream;
-            let debug_repr = format!("{request:?}");
-            drop(request);
+            MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
+            let sender = self.runner.get_sender(model_id.as_deref())?;
+            sender.blocking_send(model_request).unwrap();
 
             let runner = self.runner.clone();
             let send_recv_result = py
@@ -1299,9 +1315,21 @@ impl Runner {
                 })
                 .map_err(PyApiErr::from)?;
 
-            match send_recv_result {
-                either::Either::Right(rx) => Ok(Either::Right(ChatCompletionStreamer::from_rx(rx))),
-                either::Either::Left(response) => parse_chat_response(response).map(Either::Left),
+                match response {
+                    Response::ValidationError(e) | Response::InternalError(e) => {
+                        Err(PyApiErr::from(e.to_string()))
+                    }
+                    Response::Done(response) => Ok(Either::Left(response)),
+                    Response::ModelError(msg, _) => Err(PyApiErr::from(msg.to_string())),
+                    Response::Chunk(_) => unreachable!(),
+                    Response::CompletionDone(_) => unreachable!(),
+                    Response::CompletionModelError(_, _) => unreachable!(),
+                    Response::CompletionChunk(_) => unreachable!(),
+                    Response::ImageGeneration(_) => unreachable!(),
+                    Response::Speech { .. } => unreachable!(),
+                    Response::Raw { .. } => unreachable!(),
+                    Response::Embeddings { .. } => unreachable!(),
+                }
             }
         })
     }
@@ -1324,75 +1352,121 @@ impl Runner {
                 )
             };
 
-            let runner = self.runner.clone();
-            py.allow_threads(move || -> std::result::Result<Vec<Vec<f32>>, String> {
-                MistralRs::maybe_log_request(runner.clone(), debug_repr);
-                let sender = runner
-                    .get_sender(model_id.as_deref())
-                    .map_err(|e| e.to_string())?;
+            MistralRs::maybe_log_request(self.runner.clone(), debug_repr);
+            let sender = self.runner.get_sender(model_id.as_deref())?;
 
-                let expected = match &inputs {
-                    PythonEmbeddingInputs::Prompts(prompts) => prompts.len(),
-                    PythonEmbeddingInputs::Tokens(batches) => batches.len(),
+            let expected = match &inputs {
+                PythonEmbeddingInputs::Prompts(prompts) => prompts.len(),
+                PythonEmbeddingInputs::Tokens(batches) => batches.len(),
+            };
+
+            let mut receivers = Vec::with_capacity(expected);
+
+            let mut enqueue = |message: RequestMessage| -> PyApiResult<()> {
+                let (tx, rx) = channel(1);
+                let request_id = {
+                    let l = NEXT_REQUEST_ID.lock().unwrap();
+                    let last = &mut *l.borrow_mut();
+                    let last_v = *last;
+                    *last += 1;
+                    last_v
                 };
 
-                let mut receivers = Vec::with_capacity(expected);
+                let model_request = _Request::Normal(Box::new(NormalRequest {
+                    id: request_id,
+                    messages: message,
+                    sampling_params: SamplingParams::deterministic(),
+                    response: tx,
+                    return_logprobs: false,
+                    is_streaming: false,
+                    constraint: Constraint::None,
+                    suffix: None,
+                    tool_choice: None,
+                    tools: None,
+                    logits_processors: None,
+                    return_raw_logits: false,
+                    web_search_options: None,
+                    model_id: model_id.clone(),
+                    truncate_sequence,
+                }));
 
-                let mut enqueue = |message: RequestMessage| -> std::result::Result<(), String> {
-                    let (tx, rx) = channel(1);
-                    let request_id = next_request_id();
+                sender
+                    .blocking_send(model_request)
+                    .map_err(|e| PyApiErr::from(e.to_string()))?;
+                receivers.push(rx);
+                Ok(())
+            };
 
-                    let model_request = _Request::Normal(Box::new(NormalRequest {
-                        id: request_id,
-                        messages: message,
-                        sampling_params: SamplingParams::deterministic(),
-                        response: tx,
-                        return_logprobs: false,
-                        is_streaming: false,
-                        constraint: Constraint::None,
-                        suffix: None,
-                        tool_choice: None,
-                        tools: None,
-                        logits_processors: None,
-                        return_raw_logits: false,
-                        web_search_options: None,
-                        model_id: model_id.clone(),
-                        truncate_sequence,
-                    }));
-
-                    sender
-                        .blocking_send(model_request)
-                        .map_err(|e| e.to_string())?;
-                    receivers.push(rx);
-                    Ok(())
-                };
-
-                match inputs {
-                    PythonEmbeddingInputs::Prompts(prompts) => {
-                        for prompt in prompts {
-                            enqueue(RequestMessage::Embedding { prompt })?;
-                        }
-                    }
-                    PythonEmbeddingInputs::Tokens(batches) => {
-                        for tokens in batches {
-                            enqueue(RequestMessage::EmbeddingTokens { prompt: tokens })?;
-                        }
+            match inputs {
+                PythonEmbeddingInputs::Prompts(prompts) => {
+                    for prompt in prompts {
+                        enqueue(RequestMessage::Embedding { prompt })?;
                     }
                 }
-
-                let mut all_embeddings = Vec::with_capacity(receivers.len());
-
-                for mut rx in receivers {
-                    let response = rx.blocking_recv().ok_or_else(|| {
-                        "Embedding response channel closed unexpectedly".to_string()
-                    })?;
-
-                    all_embeddings.push(parse_embedding_response(response)?);
+                PythonEmbeddingInputs::Tokens(batches) => {
+                    for tokens in batches {
+                        enqueue(RequestMessage::EmbeddingTokens { prompt: tokens })?;
+                    }
                 }
+            }
 
-                Ok(all_embeddings)
-            })
-            .map_err(PyApiErr::from)
+            let mut all_embeddings = Vec::with_capacity(receivers.len());
+
+            for mut rx in receivers {
+                let response = rx.blocking_recv().ok_or_else(|| {
+                    PyApiErr::from("Embedding response channel closed unexpectedly")
+                })?;
+
+                match response {
+                    Response::Embeddings { embeddings, .. } => all_embeddings.push(embeddings),
+                    Response::ValidationError(e) | Response::InternalError(e) => {
+                        return Err(PyApiErr::from(e.to_string()))
+                    }
+                    Response::ModelError(msg, _) => return Err(PyApiErr::from(msg.to_string())),
+                    Response::Done(_) => {
+                        return Err(PyApiErr::from(
+                            "Received chat completion response from embeddings request.",
+                        ))
+                    }
+                    Response::Chunk(_) => {
+                        return Err(PyApiErr::from(
+                            "Received chat completion chunk from embeddings request.",
+                        ))
+                    }
+                    Response::CompletionDone(_) => {
+                        return Err(PyApiErr::from(
+                            "Received completion response from embeddings request.",
+                        ))
+                    }
+                    Response::CompletionChunk(_) => {
+                        return Err(PyApiErr::from(
+                            "Received completion chunk from embeddings request.",
+                        ))
+                    }
+                    Response::CompletionModelError(_, _) => {
+                        return Err(PyApiErr::from(
+                            "Received completion model error from embeddings request.",
+                        ))
+                    }
+                    Response::ImageGeneration(_) => {
+                        return Err(PyApiErr::from(
+                            "Received image generation response from embeddings request.",
+                        ))
+                    }
+                    Response::Speech { .. } => {
+                        return Err(PyApiErr::from(
+                            "Received speech response from embeddings request.",
+                        ))
+                    }
+                    Response::Raw { .. } => {
+                        return Err(PyApiErr::from(
+                            "Received raw logits response from embeddings request.",
+                        ))
+                    }
+                }
+            }
+
+            Ok(all_embeddings)
         })
     }
 
@@ -1440,7 +1514,13 @@ impl Runner {
             };
 
             let model_request = _Request::Normal(Box::new(NormalRequest {
-                id: next_request_id(),
+                id: {
+                    let l = NEXT_REQUEST_ID.lock().unwrap();
+                    let last = &mut *l.borrow_mut();
+                    let last_v = *last;
+                    *last += 1;
+                    last_v
+                },
                 messages: RequestMessage::Completion {
                     text: request.prompt.clone(),
                     echo_prompt: request.echo_prompt,
@@ -1475,17 +1555,26 @@ impl Runner {
                 truncate_sequence: request.truncate_sequence,
             }));
 
-            let debug_repr = format!("{request:?}");
-            drop(request);
+            MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
+            let sender = self.runner.get_sender(model_id.as_deref())?;
+            sender.blocking_send(model_request).unwrap();
+            let response = rx.blocking_recv().unwrap();
 
-            let runner = self.runner.clone();
-            let response = py
-                .allow_threads(move || -> std::result::Result<Response, String> {
-                    send_request_and_wait(runner, model_id, model_request, rx, debug_repr)
-                })
-                .map_err(PyApiErr::from)?;
-
-            parse_completion_response(response)
+            match response {
+                Response::ValidationError(e) | Response::InternalError(e) => {
+                    Err(PyApiErr::from(e.to_string()))
+                }
+                Response::CompletionDone(response) => Ok(response),
+                Response::CompletionModelError(msg, _) => Err(PyApiErr::from(msg.to_string())),
+                Response::Chunk(_) => unreachable!(),
+                Response::Done(_) => unreachable!(),
+                Response::ModelError(_, _) => unreachable!(),
+                Response::CompletionChunk(_) => unreachable!(),
+                Response::ImageGeneration(_) => unreachable!(),
+                Response::Speech { .. } => unreachable!(),
+                Response::Raw { .. } => unreachable!(),
+                Response::Embeddings { .. } => unreachable!(),
+            }
         })
     }
 
@@ -1496,7 +1585,6 @@ impl Runner {
         height = 720,
         width = 1280,
         model_id = None,
-        save_file = None,
     ))]
     fn generate_image(
         &self,
@@ -1506,7 +1594,6 @@ impl Runner {
         height: usize,
         width: usize,
         model_id: Option<String>,
-        save_file: Option<PathBuf>,
     ) -> PyApiResult<ImageGenerationResponse> {
         let (tx, mut rx) = channel(1);
 
@@ -1533,17 +1620,8 @@ impl Runner {
             truncate_sequence: false,
         }));
 
-        let runner = self.runner.clone();
-        let response = py
-            .allow_threads(move || -> std::result::Result<Response, String> {
-                let sender = runner
-                    .get_sender(model_id.as_deref())
-                    .map_err(|e| e.to_string())?;
-                sender.blocking_send(request).map_err(|e| e.to_string())?;
-                rx.blocking_recv()
-                    .ok_or_else(|| "Channel was erroneously closed!".to_string())
-            })
-            .map_err(PyApiErr::from)?;
+        let sender = self.runner.get_sender(model_id.as_deref())?;
+        sender.blocking_send(request).unwrap();
 
         let ResponseOk::ImageGeneration(response) = response.as_result()? else {
             return Err(PyApiErr::from("Got unexpected response type."));
@@ -1559,7 +1637,6 @@ impl Runner {
     ))]
     fn generate_audio(
         &self,
-        py: Python<'_>,
         prompt: String,
         model_id: Option<String>,
     ) -> PyApiResult<SpeechGenerationResponse> {
@@ -1583,23 +1660,17 @@ impl Runner {
             truncate_sequence: false,
         }));
 
-        let runner = self.runner.clone();
-        let response = py
-            .allow_threads(move || -> std::result::Result<Response, String> {
-                let sender = runner
-                    .get_sender(model_id.as_deref())
-                    .map_err(|e| e.to_string())?;
-                sender.blocking_send(request).map_err(|e| e.to_string())?;
-                rx.blocking_recv()
-                    .ok_or_else(|| "Channel was erroneously closed!".to_string())
-            })
-            .map_err(PyApiErr::from)?;
+        let sender = self.runner.get_sender(model_id.as_deref())?;
+        sender.blocking_send(request).unwrap();
 
         let ResponseOk::Speech {
             pcm,
             rate,
             channels,
-        } = response.as_result()?
+        } = rx
+            .blocking_recv()
+            .context("Channel was erroneously closed!")?
+            .as_result()?
         else {
             return Err(PyApiErr::from("Got unexpected response type."));
         };
@@ -1614,29 +1685,19 @@ impl Runner {
     /// Send a request to re-ISQ the model. If the model was loaded as GGUF or GGML
     /// then nothing will happen.
     #[pyo3(signature = (dtype, model_id = None))]
-    fn send_re_isq(
-        &self,
-        py: Python<'_>,
-        dtype: String,
-        model_id: Option<String>,
-    ) -> PyApiResult<()> {
+    fn send_re_isq(&self, dtype: String, model_id: Option<String>) -> PyApiResult<()> {
         let request = _Request::ReIsq(parse_isq_value(&dtype, None)?);
-        let runner = self.runner.clone();
-        py.allow_threads(move || {
-            runner
-                .get_sender(model_id.as_deref())
-                .map_err(|e| e.to_string())?
-                .blocking_send(request)
-                .map_err(|e| e.to_string())
-        })
-        .map_err(PyApiErr::from)
+        self.runner
+            .get_sender(model_id.as_deref())?
+            .blocking_send(request)
+            .unwrap();
+        Ok(())
     }
 
     /// Tokenize some text, returning raw tokens.
     #[pyo3(signature = (text, add_special_tokens, enable_thinking, model_id = None))]
     fn tokenize_text(
         &self,
-        py: Python<'_>,
         text: String,
         add_special_tokens: bool,
         enable_thinking: Option<bool>,
@@ -1653,27 +1714,20 @@ impl Runner {
             reasoning_effort: None,
         });
 
-        let runner = self.runner.clone();
-        py.allow_threads(
-            move || -> std::result::Result<anyhow::Result<Vec<u32>>, String> {
-                runner
-                    .get_sender(model_id.as_deref())
-                    .map_err(|e| e.to_string())?
-                    .blocking_send(request)
-                    .map_err(|e| e.to_string())?;
-                rx.blocking_recv()
-                    .ok_or_else(|| "Channel was erroneously closed!".to_string())
-            },
-        )
-        .map_err(PyApiErr::from)?
-        .map_err(PyApiErr::from)
+        self.runner
+            .get_sender(model_id.as_deref())?
+            .blocking_send(request)
+            .unwrap();
+
+        rx.blocking_recv()
+            .context("Channel was erroneously closed!")?
+            .map_err(PyApiErr::from)
     }
 
     /// Detokenize some tokens, returning text.
     #[pyo3(signature = (tokens, skip_special_tokens, model_id = None))]
     fn detokenize_text(
         &self,
-        py: Python<'_>,
         tokens: Vec<u32>,
         skip_special_tokens: bool,
         model_id: Option<String>,
@@ -1685,20 +1739,22 @@ impl Runner {
             response: tx,
         });
 
-        let runner = self.runner.clone();
-        py.allow_threads(
-            move || -> std::result::Result<anyhow::Result<String>, String> {
-                runner
-                    .get_sender(model_id.as_deref())
-                    .map_err(|e| e.to_string())?
-                    .blocking_send(request)
-                    .map_err(|e| e.to_string())?;
-                rx.blocking_recv()
-                    .ok_or_else(|| "Channel was erroneously closed!".to_string())
-            },
-        )
-        .map_err(PyApiErr::from)?
-        .map_err(PyApiErr::from)
+        self.runner
+            .get_sender(model_id.as_deref())?
+            .blocking_send(request)
+            .unwrap();
+
+    /// List all available model IDs in multi-model mode (aliases if configured).
+    fn list_models(&self) -> PyApiResult<Vec<String>> {
+        self.runner.list_models().map_err(PyApiErr::from)
+    }
+
+    /// Return the maximum supported sequence length for the requested model, if available.
+    #[pyo3(signature = (model_id = None))]
+    fn max_sequence_length(&self, model_id: Option<String>) -> PyApiResult<Option<usize>> {
+        self.runner
+            .max_sequence_length(model_id.as_deref())
+            .map_err(PyApiErr::from)
     }
 
     /// List all available model IDs in multi-model mode (aliases if configured).
@@ -1737,7 +1793,7 @@ impl Runner {
         request: Py<ChatCompletionRequest>,
         model_id: String,
     ) -> PyApiResult<Either<ChatCompletionResponse, ChatCompletionStreamer>> {
-        let (tx, rx) = channel(10_000);
+        let (tx, mut rx) = channel(10_000);
         Python::with_gil(|py| {
             let request = request.bind(py).borrow();
             let stop_toks = request
@@ -1763,7 +1819,6 @@ impl Runner {
                     let mut messages_vec = Vec::new();
                     let mut image_urls = Vec::new();
                     let mut audio_urls = Vec::new();
-                    let mut video_urls = Vec::new();
                     for message in messages {
                         let role = message["role"].as_ref().left().unwrap().clone();
                         match &message["content"] {
@@ -1813,7 +1868,6 @@ impl Runner {
                                     Text { text: String },
                                     Image { image_url: String },
                                     Audio { audio_url: String },
-                                    Video { video_url: String },
                                 }
 
                                 let mut items = Vec::new();
@@ -1855,20 +1909,6 @@ impl Runner {
                                                     .clone(),
                                             });
                                         }
-                                        Some(Either::Left(x)) if x == "video_url" => {
-                                            items.push(ContentPart::Video {
-                                                video_url: image_message
-                                                    .get("video_url")
-                                                    .as_ref()
-                                                    .context("Video sub-content must have `video_url` key.")?
-                                                    .as_ref()
-                                                    .right()
-                                                    .context("Video sub-content `video_url` key must be an object.")?
-                                                    .get("url")
-                                                    .context("Video sub-content `video_url` object must have a `url` key.")?
-                                                    .clone(),
-                                            });
-                                        }
                                         _ => return Err(PyApiErr::from("Expected array content sub-content to be of format {{`type`: `text`, `text`: ...}} and {{`type`: `url`, `image_url`: {{`url`: ...}}}}"))
                                     }
                                 }
@@ -1896,14 +1936,6 @@ impl Runner {
                                     })
                                     .collect::<Vec<_>>();
 
-                                let video_urls_iter = items
-                                    .iter()
-                                    .filter_map(|item| match item {
-                                        ContentPart::Video { video_url } => Some(video_url.clone()),
-                                        _ => None,
-                                    })
-                                    .collect::<Vec<_>>();
-
                                 let mut message_map: IndexMap<
                                     String,
                                     Either<String, Vec<IndexMap<String, Value>>>,
@@ -1927,14 +1959,6 @@ impl Runner {
                                     );
                                     content_map.push(content_audio_map);
                                 }
-                                for _ in &video_urls_iter {
-                                    let mut content_video_map = IndexMap::new();
-                                    content_video_map.insert(
-                                        "type".to_string(),
-                                        Value::String("video".to_string()),
-                                    );
-                                    content_map.push(content_video_map);
-                                }
                                 {
                                     let mut content_text_map = IndexMap::new();
                                     content_text_map.insert(
@@ -1951,11 +1975,10 @@ impl Runner {
                                 messages_vec.push(message_map);
                                 image_urls.extend(image_urls_iter);
                                 audio_urls.extend(audio_urls_iter);
-                                video_urls.extend(video_urls_iter);
                             }
                         }
                     }
-                    if !image_urls.is_empty() || !audio_urls.is_empty() || !video_urls.is_empty() {
+                    if !image_urls.is_empty() || !audio_urls.is_empty() {
                         let mut images = Vec::new();
                         for url in image_urls {
                             let url_unparsed = url.trim();
@@ -1969,17 +1992,10 @@ impl Runner {
                             let audio = util::parse_audio_url(url_unparsed)?;
                             audios.push(audio);
                         }
-                        let mut videos = Vec::new();
-                        for url in video_urls {
-                            let url_unparsed = url.trim();
-                            let video = util::parse_video_url(url_unparsed)?;
-                            videos.push(video);
-                        }
-                        RequestMessage::MultimodalChat {
+                        RequestMessage::VisionChat {
                             messages: messages_vec,
                             images,
                             audios,
-                            videos,
                             enable_thinking: request.enable_thinking,
                             reasoning_effort: parse_reasoning_effort(&request.reasoning_effort),
                         }
@@ -2024,7 +2040,13 @@ impl Runner {
             };
 
             let model_request = _Request::Normal(Box::new(NormalRequest {
-                id: next_request_id(),
+                id: {
+                    let l = NEXT_REQUEST_ID.lock().unwrap();
+                    let last = &mut *l.borrow_mut();
+                    let last_v = *last;
+                    *last += 1;
+                    last_v
+                },
                 messages,
                 sampling_params: SamplingParams {
                     temperature: request.temperature,
@@ -2055,27 +2077,30 @@ impl Runner {
                 truncate_sequence: request.truncate_sequence,
             }));
 
-            let is_streaming = request.stream;
-            let debug_repr = format!("{request:?}");
-            drop(request);
+            MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
+            let sender = self.runner.get_sender(Some(&model_id))?;
+            sender.blocking_send(model_request).unwrap();
 
-            let runner = self.runner.clone();
-            let send_recv_result = py
-                .allow_threads(move || -> std::result::Result<either::Either<Response, Receiver<Response>>, String> {
-                    send_request_with_optional_stream(
-                        runner,
-                        Some(model_id),
-                        model_request,
-                        rx,
-                        debug_repr,
-                        is_streaming,
-                    )
-                })
-                .map_err(PyApiErr::from)?;
+            if request.stream {
+                Ok(Either::Right(ChatCompletionStreamer::from_rx(rx)))
+            } else {
+                let response = rx.blocking_recv().unwrap();
 
-            match send_recv_result {
-                either::Either::Right(rx) => Ok(Either::Right(ChatCompletionStreamer::from_rx(rx))),
-                either::Either::Left(response) => parse_chat_response(response).map(Either::Left),
+                match response {
+                    Response::ValidationError(e) | Response::InternalError(e) => {
+                        Err(PyApiErr::from(e.to_string()))
+                    }
+                    Response::Done(response) => Ok(Either::Left(response)),
+                    Response::ModelError(msg, _) => Err(PyApiErr::from(msg.to_string())),
+                    Response::Chunk(_) => unreachable!(),
+                    Response::CompletionDone(_) => unreachable!(),
+                    Response::CompletionModelError(_, _) => unreachable!(),
+                    Response::CompletionChunk(_) => unreachable!(),
+                    Response::ImageGeneration(_) => unreachable!(),
+                    Response::Speech { .. } => unreachable!(),
+                    Response::Raw { .. } => unreachable!(),
+                    Response::Embeddings { .. } => unreachable!(),
+                }
             }
         })
     }
@@ -2086,7 +2111,7 @@ impl Runner {
         request: Py<CompletionRequest>,
         model_id: String,
     ) -> PyApiResult<CompletionResponse> {
-        let (tx, rx) = channel(10_000);
+        let (tx, mut rx) = channel(10_000);
         Python::with_gil(|py| {
             let request = request.bind(py).borrow();
             let stop_toks = request
@@ -2123,7 +2148,13 @@ impl Runner {
             };
 
             let model_request = _Request::Normal(Box::new(NormalRequest {
-                id: next_request_id(),
+                id: {
+                    let l = NEXT_REQUEST_ID.lock().unwrap();
+                    let last = &mut *l.borrow_mut();
+                    let last_v = *last;
+                    *last += 1;
+                    last_v
+                },
                 messages: RequestMessage::Completion {
                     text: request.prompt.clone(),
                     echo_prompt: request.echo_prompt,
@@ -2158,17 +2189,26 @@ impl Runner {
                 truncate_sequence: request.truncate_sequence,
             }));
 
-            let debug_repr = format!("{request:?}");
-            drop(request);
+            MistralRs::maybe_log_request(self.runner.clone(), format!("{request:?}"));
+            let sender = self.runner.get_sender(Some(&model_id))?;
+            sender.blocking_send(model_request).unwrap();
+            let response = rx.blocking_recv().unwrap();
 
-            let runner = self.runner.clone();
-            let response = py
-                .allow_threads(move || -> std::result::Result<Response, String> {
-                    send_request_and_wait(runner, Some(model_id), model_request, rx, debug_repr)
-                })
-                .map_err(PyApiErr::from)?;
-
-            parse_completion_response(response)
+            match response {
+                Response::ValidationError(e) | Response::InternalError(e) => {
+                    Err(PyApiErr::from(e.to_string()))
+                }
+                Response::CompletionDone(response) => Ok(response),
+                Response::CompletionModelError(msg, _) => Err(PyApiErr::from(msg.to_string())),
+                Response::Chunk(_) => unreachable!(),
+                Response::Done(_) => unreachable!(),
+                Response::ModelError(_, _) => unreachable!(),
+                Response::CompletionChunk(_) => unreachable!(),
+                Response::ImageGeneration(_) => unreachable!(),
+                Response::Speech { .. } => unreachable!(),
+                Response::Raw { .. } => unreachable!(),
+                Response::Embeddings { .. } => unreachable!(),
+            }
         })
     }
 
@@ -2180,14 +2220,10 @@ impl Runner {
     }
 
     /// Manually reload a previously unloaded model.
-    fn reload_model(&self, py: Python<'_>, model_id: String) -> PyApiResult<()> {
-        let runner = self.runner.clone();
-        py.allow_threads(move || {
-            runner
-                .reload_model_blocking(&model_id)
-                .map_err(|e| e.to_string())
-        })
-        .map_err(PyApiErr::from)
+    fn reload_model(&self, model_id: String) -> PyApiResult<()> {
+        self.runner
+            .reload_model_blocking(&model_id)
+            .map_err(PyApiErr::from)
     }
 
     /// List all unloaded model IDs.
@@ -2397,7 +2433,7 @@ fn mistralrs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<EmbeddingRequest>()?;
     m.add_class::<Architecture>()?;
     m.add_class::<which::EmbeddingArchitecture>()?;
-    m.add_class::<MultimodalArchitecture>()?;
+    m.add_class::<VisionArchitecture>()?;
     m.add_class::<DiffusionArchitecture>()?;
     m.add_class::<AnyMoeConfig>()?;
     m.add_class::<AnyMoeExpertType>()?;

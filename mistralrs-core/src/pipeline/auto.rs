@@ -1,9 +1,9 @@
 use super::hf::{hf_access_error, remote_issue_from_api_error, RemoteAccessIssue};
 use super::{
     DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoaderBuilder, EmbeddingLoaderType,
-    EmbeddingSpecificConfig, Loader, ModelKind, ModelPaths, MultimodalLoaderBuilder,
-    MultimodalLoaderType, MultimodalSpecificConfig, NormalLoaderBuilder, NormalLoaderType,
-    NormalSpecificConfig, SpeechLoader, TokenSource,
+    EmbeddingSpecificConfig, Loader, ModelKind, ModelPaths, NormalLoaderBuilder, NormalLoaderType,
+    NormalSpecificConfig, SpeechLoader, TokenSource, VisionLoaderBuilder, VisionLoaderType,
+    VisionSpecificConfig,
 };
 use crate::utils::{progress::ProgressScopeGuard, tokens::get_token};
 use crate::Ordering;
@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 pub struct AutoLoader {
     model_id: String,
     normal_builder: Mutex<Option<NormalLoaderBuilder>>,
-    multimodal_builder: Mutex<Option<MultimodalLoaderBuilder>>,
+    vision_builder: Mutex<Option<VisionLoaderBuilder>>,
     embedding_builder: Mutex<Option<EmbeddingLoaderBuilder>>,
     loader: Mutex<Option<Box<dyn Loader>>>,
     hf_cache_path: Option<PathBuf>,
@@ -34,7 +34,7 @@ pub struct AutoLoader {
 
 pub struct AutoLoaderBuilder {
     normal_cfg: NormalSpecificConfig,
-    multimodal_cfg: MultimodalSpecificConfig,
+    vision_cfg: VisionSpecificConfig,
     embedding_cfg: EmbeddingSpecificConfig,
     chat_template: Option<String>,
     tokenizer_json: Option<String>,
@@ -52,7 +52,7 @@ impl AutoLoaderBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         normal_cfg: NormalSpecificConfig,
-        multimodal_cfg: MultimodalSpecificConfig,
+        vision_cfg: VisionSpecificConfig,
         embedding_cfg: EmbeddingSpecificConfig,
         chat_template: Option<String>,
         tokenizer_json: Option<String>,
@@ -62,7 +62,7 @@ impl AutoLoaderBuilder {
     ) -> Self {
         Self {
             normal_cfg,
-            multimodal_cfg,
+            vision_cfg,
             embedding_cfg,
             chat_template,
             tokenizer_json,
@@ -104,7 +104,7 @@ impl AutoLoaderBuilder {
     pub fn build(self) -> Box<dyn Loader> {
         let Self {
             normal_cfg,
-            multimodal_cfg,
+            vision_cfg,
             embedding_cfg,
             chat_template,
             tokenizer_json,
@@ -137,18 +137,18 @@ impl AutoLoaderBuilder {
             normal_builder = normal_builder.hf_cache_path(path.clone());
         }
 
-        let mut multimodal_builder = MultimodalLoaderBuilder::new(
-            multimodal_cfg,
+        let mut vision_builder = VisionLoaderBuilder::new(
+            vision_cfg,
             chat_template,
             tokenizer_json.clone(),
             Some(model_id.clone()),
             jinja_explicit,
         );
         if let Some(ref adapters) = lora_adapter_ids {
-            multimodal_builder = multimodal_builder.with_lora(adapters.clone());
+            vision_builder = vision_builder.with_lora(adapters.clone());
         }
         if let Some(ref path) = hf_cache_path {
-            multimodal_builder = multimodal_builder.hf_cache_path(path.clone());
+            vision_builder = vision_builder.hf_cache_path(path.clone());
         }
 
         let mut embedding_builder =
@@ -163,7 +163,7 @@ impl AutoLoaderBuilder {
         Box::new(AutoLoader {
             model_id,
             normal_builder: Mutex::new(Some(normal_builder)),
-            multimodal_builder: Mutex::new(Some(multimodal_builder)),
+            vision_builder: Mutex::new(Some(vision_builder)),
             embedding_builder: Mutex::new(Some(embedding_builder)),
             loader: Mutex::new(None),
             hf_cache_path,
@@ -186,7 +186,7 @@ struct ConfigArtifacts {
 
 enum Detected {
     Normal(NormalLoaderType),
-    Multimodal(MultimodalLoaderType),
+    Vision(VisionLoaderType),
     Embedding(Option<EmbeddingLoaderType>),
     Diffusion(DiffusionLoaderType),
     Speech(crate::speech_models::SpeechLoaderType),
@@ -280,11 +280,11 @@ impl AutoLoader {
         }
         let api = api.build()?;
         let revision = revision.unwrap_or_else(|| "main".to_string());
-        let api = api.repo(Repo::with_revision(
+        let api = std::sync::Arc::new(api.repo(Repo::with_revision(
             self.model_id.clone(),
             RepoType::Model,
             revision,
-        ));
+        )));
         let model_id = Path::new(&self.model_id);
         let mut remote_access_issue = None;
         let contents = match Self::try_get_file(&api, model_id, "config.json") {
@@ -375,13 +375,6 @@ impl AutoLoader {
             return Ok(Detected::Embedding(None));
         }
 
-        // Detect Mistral-native models that use params.json instead of config.json
-        if artifacts.contents.is_none() && artifacts.repo_files.iter().any(|f| f == "params.json") {
-            // Voxtral uses params.json with a "multimodal" key containing "whisper_model_args"
-            info!("Detected `params.json` in repo; routing as Voxtral.");
-            return Ok(Detected::Multimodal(MultimodalLoaderType::Voxtral));
-        }
-
         let config = artifacts.contents.as_ref().ok_or_else(|| {
             if let Some(issue) = artifacts.remote_access_issue.as_ref() {
                 hf_access_error(Path::new(&self.model_id), issue)
@@ -396,8 +389,8 @@ impl AutoLoader {
             anyhow::bail!("Expected exactly one architecture in config");
         }
         let name = &cfg.architectures[0];
-        if let Ok(tp) = MultimodalLoaderType::from_causal_lm_name(name) {
-            return Ok(Detected::Multimodal(tp));
+        if let Ok(tp) = VisionLoaderType::from_causal_lm_name(name) {
+            return Ok(Detected::Vision(tp));
         }
         let tp = NormalLoaderType::from_causal_lm_name(name)?;
         Ok(Detected::Normal(tp))
@@ -419,9 +412,9 @@ impl AutoLoader {
                 let loader = builder.build(Some(tp)).expect("build normal");
                 *guard = Some(loader);
             }
-            Detected::Multimodal(tp) => {
+            Detected::Vision(tp) => {
                 let builder = self
-                    .multimodal_builder
+                    .vision_builder
                     .lock()
                     .unwrap()
                     .take()

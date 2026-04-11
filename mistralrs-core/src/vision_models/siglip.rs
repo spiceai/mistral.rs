@@ -283,28 +283,18 @@ impl Attention {
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        // Vision encoders use bidirectional (non-causal) self-attention.
-        // Use flash attention with causal=false for both correctness and numerical
-        // compatibility with HuggingFace's PyTorch implementation.
-        let sdpa_params = SdpaParams {
-            n_kv_groups: 1,
-            sliding_window: None,
-            softcap: None,
-            softmax_scale: self.scale,
-            sinks: None,
-        };
-
-        // Build FlashParams with causal=false for bidirectional vision attention.
-        // Empty cumulative_seqlens: flash backend uses the non-varlen path with causal=false.
-        let flash_params = FlashParams::empty(false);
-
         let attn_weights = Sdpa.run_attention(
             &q,
             &k,
             &v,
             attention_mask,
-            Some(&flash_params),
-            &sdpa_params,
+            None,
+            &SdpaParams {
+                n_kv_groups: 1,
+                sliding_window: None,
+                softcap: None,
+                softmax_scale: self.scale,
+            },
         )?;
 
         self.o_proj.forward(&attn_weights.transpose(1, 2)?.reshape((

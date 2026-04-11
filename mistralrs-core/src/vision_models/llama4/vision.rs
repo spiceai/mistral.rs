@@ -11,7 +11,7 @@ use crate::{
     attention::SdpaParams,
     layers::{layer_norm, linear_no_bias, Activation, Sdpa},
     ops::RepeatInterleaveOp,
-    pipeline::{text_models_inputs_processor::FlashParams, IsqModel},
+    pipeline::IsqModel,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
 
@@ -153,7 +153,6 @@ impl Llama4VisionAttention {
                 softcap: None,
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
-                sinks: None,
             },
             head_dim,
             freqs,
@@ -198,17 +197,8 @@ impl Llama4VisionAttention {
             k = candle_nn::rotary_emb::rope_i(&k, &self.freqs.cos, &self.freqs.sin)?;
         }
 
-        let flash_params = FlashParams::empty(false);
-
         let mut attn_output = Sdpa
-            .run_attention(
-                &q,
-                &k,
-                &v,
-                attention_mask,
-                Some(&flash_params),
-                &self.sdpa_params,
-            )?
+            .run_attention(&q, &k, &v, attention_mask, None, &self.sdpa_params)?
             .transpose(1, 2)?
             .contiguous()?
             .reshape((bs, q_sq, ()))?

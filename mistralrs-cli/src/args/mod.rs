@@ -50,7 +50,7 @@ pub enum Command {
         runtime: RuntimeOptions,
     },
 
-    /// Run model in interactive mode, or one-shot mode with `-i`
+    /// Run model in interactive mode
     Run {
         #[command(subcommand)]
         model_type: Option<ModelType>,
@@ -62,32 +62,9 @@ pub enum Command {
         #[command(flatten)]
         runtime: RuntimeOptions,
 
-        /// Control thinking mode for models that support it.
-        /// Use --thinking or --thinking true to force on, --thinking false to force off.
-        /// Omit to defer to the chat template default.
-        #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = clap::value_parser!(bool))]
-        thinking: Option<bool>,
-
-        /// One-shot text prompt. When provided, sends a single request and exits
-        /// instead of entering interactive mode.
-        /// Combine with --image, --video, or --audio for multimodal requests.
-        #[arg(short = 'i', long)]
-        input: Option<String>,
-
-        /// Image URL(s) or file path(s) to include in the request (requires -i).
-        /// Can be specified multiple times: --image img1.jpg --image img2.png
-        #[arg(long, requires = "input")]
-        image: Vec<String>,
-
-        /// Video URL(s) or file path(s) to include in the request (requires -i).
-        /// Can be specified multiple times: --video vid1.mp4 --video vid2.webm
-        #[arg(long, requires = "input")]
-        video: Vec<String>,
-
-        /// Audio URL(s) or file path(s) to include in the request (requires -i).
-        /// Can be specified multiple times: --audio audio1.wav --audio audio2.mp3
-        #[arg(long, requires = "input")]
-        audio: Vec<String>,
+        /// Enable thinking mode for models that support it
+        #[arg(long)]
+        enable_thinking: bool,
     },
 
     /// Generate shell completions
@@ -100,11 +77,7 @@ pub enum Command {
     /// Generate UQFF quantized model file
     Quantize {
         #[command(subcommand)]
-        model_type: Option<QuantizeModelType>,
-
-        /// Default quantize options (used when model type is not specified)
-        #[command(flatten)]
-        default_quantize: QuantizeDefaultOptions,
+        model_type: QuantizeModelType,
     },
 
     /// Run system diagnostics and environment checks
@@ -237,7 +210,7 @@ pub struct DefaultModelOptions {
     pub cache: CacheOptions,
 
     #[command(flatten)]
-    pub multimodal: MultimodalOptions,
+    pub vision: VisionOptions,
 }
 
 impl DefaultModelOptions {
@@ -259,7 +232,7 @@ impl DefaultModelOptions {
             quantization: self.quantization,
             device: self.device,
             cache: self.cache,
-            multimodal: self.multimodal,
+            vision: self.vision,
         })
     }
 }
@@ -308,7 +281,7 @@ pub enum ModelType {
         cache: CacheOptions,
 
         #[command(flatten)]
-        multimodal: MultimodalOptions,
+        vision: VisionOptions,
     },
 
     /// Text generation model with explicit configuration
@@ -332,8 +305,8 @@ pub enum ModelType {
         cache: CacheOptions,
     },
 
-    /// Multimodal model
-    Multimodal {
+    /// Vision-language model
+    Vision {
         #[command(flatten)]
         model: ModelSourceOptions,
 
@@ -353,7 +326,7 @@ pub enum ModelType {
         cache: CacheOptions,
 
         #[command(flatten)]
-        multimodal: MultimodalOptions,
+        vision: VisionOptions,
     },
 
     /// Image generation model (diffusion)

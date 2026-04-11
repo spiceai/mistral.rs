@@ -2,8 +2,6 @@
 
 In situ quantization (ISQ) quantizes model weights in place as they are loaded, so the full unquantized model never needs to fit in memory. Using with I/O and parallel pipelining, this means you can load and run a model that is larger than the total amount of RAM (CPU or GPU) on your system.
 
-If the quantized weights are small enough to fit even though the original weights would not, you can still run the model! Like all quantization, ISQ may also increase inference performance due to reduced memory bandwidth pressure.
-
 **Quick start**: Just use `--isq 4` (or 2, 3, 5, 6, 8) and mistral.rs will pick the best quantization for your hardware:
 ```
 mistralrs run --isq 4 -m meta-llama/Llama-3.2-3B-Instruct
@@ -52,6 +50,8 @@ mistralrs run --isq 4 -m meta-llama/Llama-3.2-3B-Instruct
 mistralrs run --isq 4 -m meta-llama/Llama-3.2-3B-Instruct
 ```
 
+When using ISQ, it will automatically load ISQ-able weights into CPU memory before applying ISQ. The ISQ application process moves the weights to device memory. This process is implemented to avoid memory spikes from loading the model in full precision.
+
 For Mixture of Expert models, a method called [MoQE](https://arxiv.org/abs/2310.02410) can be applied to only quantize MoE layers. This is configured via the ISQ "organization" parameter in all APIs. The following models support MoQE:
 - [Phi 3.5 MoE](PHI3.5MOE.md)
 - [DeepSeek V2](DEEPSEEKV2.md)
@@ -80,7 +80,7 @@ Deferred ISQ loads the full unquantized model into CPU memory first, then quanti
 ## Accuracy
 
 Accuracy of ISQ can be measured by the performance degradation versus the unquantized model.
-This is commonly measured with perplexity. Please see the [perplexity](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/advanced/perplexity/main.rs) example.
+This is commonly measured with perplexity. Please see the [perplexity](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/perplexity/README.md) example.
 
 To improve the accuracy of a model with ISQ, use an imatrix file. These can be found online (for example, on Hugging Face), and should be passed with the `--imatrix` flag for `plain` models. This will increase the accuracy of the quantization significantly and bring the ISQ quantization up to par with the GGUF counterpart.
 

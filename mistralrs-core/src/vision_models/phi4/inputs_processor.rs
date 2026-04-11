@@ -192,16 +192,12 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                 }
                 num_img_tokens_accum.push(num_img_tokens.unwrap());
             }
-            if !pixel_values_accum.is_empty() {
-                (
-                    Some(Tensor::cat(&pixel_values_accum, 0).unwrap()),
-                    Some(Tensor::cat(&pixel_attention_masks_accum, 0).unwrap()),
-                    Some(image_sizes_accum),
-                    Some(num_img_tokens_accum),
-                )
-            } else {
-                (None, None, None, Some(num_img_tokens_accum))
-            }
+            (
+                Some(Tensor::cat(&pixel_values_accum, 0).unwrap()),
+                Some(Tensor::cat(&pixel_attention_masks_accum, 0).unwrap()),
+                Some(image_sizes_accum),
+                Some(num_img_tokens_accum),
+            )
         } else if has_audios {
             (None, None, None, Some(vec![vec![]; input_seqs.len()]))
         } else {
@@ -215,7 +211,6 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                     no_kv_cache,
                     last_n_context_len,
                     return_raw_logits,
-                    sliding_window,
                     other_config,
                     paged_attn_metadata,
                     mapper,
@@ -253,7 +248,6 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                             input_audio_embeds: None,
                             audio_embed_sizes: None,
                             audio_attention_mask: None,
-                            image_hashes: vec![],
                         }),
                         paged_attn_meta,
                         flash_meta,
@@ -336,54 +330,10 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                 i += token_count;
             }
             if !has_changed_prompt {
-                // Build mm_features for position-aware prefix cache hashing
-                if seq.mm_features().is_empty() {
-                    if let Some(hashes) = seq.image_hashes().map(|h| h.to_vec()) {
-                        let ranges = find_image_placeholder_ranges(
-                            seq.get_toks(),
-                            IMAGE_SPECIAL_TOKEN_ID as u32,
-                        );
-                        seq.set_mm_features(build_mm_features_from_ranges(&ranges, &hashes, "img"));
-                    }
-                }
-                // Also include audio features in mm_features for prefix cache hashing
-                if let Some(audio_hashes) = seq.audio_hashes().map(|h| h.to_vec()) {
-                    if !audio_hashes.is_empty() {
-                        let audio_ranges = find_image_placeholder_ranges(
-                            seq.get_toks(),
-                            AUDIO_SPECIAL_TOKEN_ID as u32,
-                        );
-                        let audio_features =
-                            build_mm_features_from_ranges(&audio_ranges, &audio_hashes, "audio");
-                        let mut features = seq.mm_features().to_vec();
-                        features.extend(audio_features);
-                        seq.set_mm_features(features);
-                    }
-                }
                 seq.multimodal.has_changed_prompt = true;
             }
             toks.push(seq.get_toks().to_vec());
         }
-
-        let image_hashes: Vec<u64> = if is_prompt {
-            input_seqs
-                .iter()
-                .flat_map(|seq| {
-                    seq.image_hashes()
-                        .map(|h| {
-                            let cached = seq.count_prefix_cached_mm_items();
-                            if cached < h.len() {
-                                h[cached..].to_vec()
-                            } else {
-                                vec![]
-                            }
-                        })
-                        .unwrap_or_default()
-                })
-                .collect()
-        } else {
-            vec![]
-        };
 
         let result = if is_prompt {
             get_prompt_input(
@@ -436,11 +386,10 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                 model_specific_args: Box::new(Phi4MMVisionSpecificArgs {
                     input_image_embeds: pixel_values,
                     image_attention_mask: pixel_attention_mask,
-                    image_sizes,
+                    image_sizes: image_sizes.clone(),
                     input_audio_embeds: input_audio_embeds.clone(),
                     audio_embed_sizes: audio_embed_sizes.clone(),
                     audio_attention_mask: audio_attention_mask.clone(),
-                    image_hashes,
                 }),
                 paged_attn_meta,
                 flash_meta,

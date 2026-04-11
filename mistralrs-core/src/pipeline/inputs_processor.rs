@@ -59,7 +59,7 @@ pub mod text_models_inputs_processor {
     use crate::{
         device_map::DeviceMapper,
         get_mut_arcmutex,
-        paged_attention::{KVCacheManager, _PAD_SLOT_ID},
+        paged_attention::{BlockEngine, _PAD_SLOT_ID},
         sequence::Sequence,
     };
 
@@ -81,11 +81,10 @@ pub mod text_models_inputs_processor {
         Tensor::cat(&padded_x[..], 0).map_err(anyhow::Error::msg)
     }
 
-    #[derive(Clone)]
     pub struct PagedAttentionMeta {
         pub sliding_window: Option<usize>,
         pub block_size: usize,
-        pub kv_cache_manager: Arc<tokio::sync::Mutex<KVCacheManager>>,
+        pub block_engine: Arc<tokio::sync::Mutex<BlockEngine>>,
     }
 
     #[derive(Clone, Debug)]
@@ -112,19 +111,6 @@ pub mod text_models_inputs_processor {
         pub paged_kv_tile_indices: Option<HashMap<DeviceLocation, Tensor>>,
         pub paged_kv_o_indptr: Option<HashMap<DeviceLocation, Tensor>>,
         pub paged_kv_chunk_size: Option<HashMap<DeviceLocation, Tensor>>,
-        /// Number of cached tokens per sequence (from prefix cache hits).
-        /// When present and > 0, gather_kv_cache + Sdpa is used during prefill
-        /// instead of flash attention. The Q/K/V tensors should only contain
-        /// the NEW (non-cached) tokens.
-        pub num_cached_tokens: Option<Vec<usize>>,
-        /// Number of new tokens per sequence (query lengths).
-        pub query_lens: Option<Vec<usize>>,
-        /// Cumulative query lengths [batch+1], u32, for Sdpa varlen flash path.
-        /// Precomputed to avoid Tensor::new in the forward hot path.
-        pub cu_seqlens_q: Option<HashMap<DeviceLocation, Tensor>>,
-        /// Cumulative KV lengths [batch+1], u32, for gather_kv_cache and flash_attn_varlen.
-        /// Each entry is sum of (cached + new) tokens.
-        pub cu_seqlens_kv: Option<HashMap<DeviceLocation, Tensor>>,
     }
 
     impl PagedAttentionInputMetadata {
@@ -147,10 +133,6 @@ pub mod text_models_inputs_processor {
                 paged_kv_tile_indices: None,
                 paged_kv_o_indptr: None,
                 paged_kv_chunk_size: None,
-                num_cached_tokens: None,
-                query_lens: None,
-                cu_seqlens_q: None,
-                cu_seqlens_kv: None,
             })
         }
     }
@@ -189,29 +171,8 @@ pub mod text_models_inputs_processor {
     pub struct FlashParams {
         pub max_q: u32,
         pub cumulative_seqlens_q: HashMap<DeviceLocation, Tensor>,
-        pub logical_k: FlashKMeta,
-        pub sliding_k: Option<FlashKMeta>,
+        pub cumulative_seqlens_k: HashMap<DeviceLocation, Tensor>,
         pub causal: bool,
-    }
-
-    impl FlashParams {
-        pub fn empty(causal: bool) -> Self {
-            Self {
-                max_q: 0,
-                cumulative_seqlens_q: HashMap::new(),
-                logical_k: FlashKMeta::empty(),
-                sliding_k: None,
-                causal,
-            }
-        }
-
-        pub fn k_meta(&self, sliding_window: Option<usize>) -> &FlashKMeta {
-            if sliding_window.is_some() {
-                self.sliding_k.as_ref().unwrap_or(&self.logical_k)
-            } else {
-                &self.logical_k
-            }
-        }
     }
 
     pub struct InputMetadata {
@@ -344,25 +305,16 @@ pub mod text_models_inputs_processor {
         let flash_attn = crate::using_flash_attn();
         let mut seqlens_q = if flash_attn { vec![0] } else { Vec::new() };
         let mut seqlens_k = if flash_attn { vec![0] } else { Vec::new() };
-        let mut num_cached_tokens_vec: Vec<usize> = Vec::new();
-        let mut query_lens_vec: Vec<usize> = Vec::new();
-        let has_any_cache_hit = prefix_cache_lens.is_some_and(|lens| lens.iter().any(|&l| l > 0));
-        for (seq_idx, (seq_id, ctxt)) in seq_ids.iter().zip(&toks).enumerate() {
-            let cached = prefix_cache_lens.map_or(0, |lens| lens[seq_idx]);
-            let full_prompt_len = ctxt.len();
-            // The new (non-cached) tokens to process
-            let new_toks = &ctxt[cached..];
-            let new_len = new_toks.len();
-
+        for (seq_id, ctxt) in seq_ids.iter().zip(toks) {
+            let prompt_len = ctxt.len();
             let offset = last_n_context_len.unwrap_or_default();
-            // seqlen_offset includes cached prefix so position IDs are correct
-            seqlen_offsets.push(offset.1 + chunk_offset_toks + cached);
+            seqlen_offsets.push(offset.1 + chunk_offset_toks);
 
-            position_ids.push(new_len + chunk_offset_toks + cached);
-            let mut padded = new_toks.to_vec();
-            padded.extend(std::iter::repeat_n(
+            position_ids.push(ctxt.len() + chunk_offset_toks);
+            let mut ctxt = ctxt.to_vec();
+            ctxt.extend(std::iter::repeat_n(
                 padding_tok,
-                max_len.saturating_sub(padded.len()),
+                max_len.saturating_sub(ctxt.len()),
             ));
             // If we are returning raw logits, we want to not trim the logits at all.
             if return_raw_logits {
@@ -373,17 +325,15 @@ pub mod text_models_inputs_processor {
                 context_lens.push((0, padded.len()));
             } else {
                 context_lens.push((
-                    padded
-                        .len()
+                    ctxt.len()
                         .saturating_sub(last_n_context_len.map(|(a, _)| a).unwrap_or(1)),
                     last_n_context_len.map(|(a, _)| a).unwrap_or(1),
                 ));
             }
 
             if flash_attn {
-                // Padded lengths, see FlashParams doc comment for prefix cache nuance.
-                seqlens_q.push(padded.len() as u32);
-                seqlens_k.push((padded.len() + chunk_offset_toks + cached) as u32);
+                seqlens_q.push(ctxt.len() as u32);
+                seqlens_k.push((ctxt.len() + chunk_offset_toks) as u32);
             }
 
             seqs_tensors.push(Tensor::new(padded, device).unwrap().unsqueeze(0).unwrap());
@@ -394,19 +344,29 @@ pub mod text_models_inputs_processor {
             }
 
             if let Some(paged_attn_metadata) = &mut paged_attn_metadata {
-                let kv_mgr = get_mut_arcmutex!(paged_attn_metadata.kv_cache_manager);
-                let block_ids = kv_mgr.get_block_ids(*seq_id);
+                let block_engine = get_mut_arcmutex!(paged_attn_metadata.block_engine);
+                let table = block_engine.block_tables.get(seq_id);
 
                 if block_ids.is_none() {
                     // Will be None during profiling.
                     slot_mappings.push([_PAD_SLOT_ID].repeat(new_len));
                     continue;
                 }
-                let table: Vec<usize> = block_ids.unwrap().to_vec();
-                drop(kv_mgr);
-
-                // Block table covers the full context (cached + new)
+                let table = table
+                    .unwrap()
+                    .iter()
+                    .map(|block| block.block_id())
+                    .collect::<Vec<_>>();
+                // Only store one block table per sequence. The previous per-token
+                // duplication scaled as O(prompt_len * num_blocks) and could
+                // become very large at high context lengths.
                 let table_for_seq = table.clone();
+
+                let start_idx = if let Some(sliding_window) = paged_attn_metadata.sliding_window {
+                    prompt_len.saturating_sub(sliding_window)
+                } else {
+                    0
+                };
 
                 // Slot mappings only for new tokens (cached tokens are already in cache)
                 let slot_start = cached + chunk_offset_toks;
@@ -443,10 +403,42 @@ pub mod text_models_inputs_processor {
             }
         }
 
-        let flash_meta = if flash_attn {
-            make_flash_params(device, mapper, &seqlens_q, &seqlens_k, sliding_window, true)?
+        let (max_q, max_k, seqlens_q_map, seqlens_k_map) = if flash_attn {
+            // SAFETY: seqlens_q/k are initialized with vec![0] when flash_attn is true,
+            // so they are guaranteed to be non-empty here.
+            let max_q = *seqlens_q
+                .iter()
+                .max()
+                .expect("seqlens_q should not be empty when flash_attn is enabled");
+            let max_k = *seqlens_k
+                .iter()
+                .max()
+                .expect("seqlens_k should not be empty when flash_attn is enabled");
+            // Create tensors on CPU first to avoid CUDA context issues when copying
+            // between different GPU devices. Each GPU has its own CUDA context, and
+            // candle/cudarc doesn't properly switch contexts when doing GPU-to-GPU
+            // transfers (which go through CPU). By creating on CPU first, we avoid
+            // the cross-context memory access that causes CUDA_ERROR_INVALID_VALUE.
+            let seqlens_q = Tensor::new(seqlens_q, &Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .cumsum(0)?
+                .to_dtype(DType::U32)?;
+            let seqlens_k = Tensor::new(seqlens_k, &Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .cumsum(0)?
+                .to_dtype(DType::U32)?;
+
+            let mut seqlens_q_map = HashMap::new();
+            let mut seqlens_k_map = HashMap::new();
+
+            let devices = mapper.unwrap().get_unique_devices();
+            for device in devices {
+                seqlens_q_map.insert(device.location(), seqlens_q.to_device(&device)?);
+                seqlens_k_map.insert(device.location(), seqlens_k.to_device(&device)?);
+            }
+            (max_q, max_k, seqlens_q_map, seqlens_k_map)
         } else {
-            FlashParams::empty(true)
+            (0, 0, HashMap::new(), HashMap::new())
         };
 
         let input = Tensor::cat(&seqs_tensors, 0).unwrap();
@@ -521,49 +513,6 @@ pub mod text_models_inputs_processor {
                 paged_kv_tile_indices: None,
                 paged_kv_o_indptr: None,
                 paged_kv_chunk_size: None,
-                num_cached_tokens: if has_any_cache_hit {
-                    Some(num_cached_tokens_vec.clone())
-                } else {
-                    None
-                },
-                query_lens: if has_any_cache_hit {
-                    Some(query_lens_vec.clone())
-                } else {
-                    None
-                },
-                cu_seqlens_q: if has_any_cache_hit {
-                    // Cumulative query lengths for Sdpa varlen: [0, q0, q0+q1, ...]
-                    let mut cu_q = vec![0u32];
-                    for &ql in &query_lens_vec {
-                        cu_q.push(cu_q.last().unwrap() + ql as u32);
-                    }
-                    let cu_q_t = Tensor::new(&cu_q[..], &Device::Cpu)?;
-                    let devices = mapper.unwrap().get_unique_devices();
-                    let mut map = HashMap::new();
-                    for device in &devices {
-                        map.insert(device.location(), cu_q_t.to_device(device)?);
-                    }
-                    Some(map)
-                } else {
-                    None
-                },
-                cu_seqlens_kv: if has_any_cache_hit {
-                    // Cumulative KV lengths: [0, c0+q0, c0+q0+c1+q1, ...]
-                    // U32 to match flash-attn varlen expectations
-                    let mut cu_kv = vec![0u32];
-                    for (&nc, &ql) in num_cached_tokens_vec.iter().zip(query_lens_vec.iter()) {
-                        cu_kv.push(cu_kv.last().unwrap() + (nc + ql) as u32);
-                    }
-                    let cu_kv_t = Tensor::new(&cu_kv[..], &Device::Cpu)?;
-                    let devices = mapper.unwrap().get_unique_devices();
-                    let mut map = HashMap::new();
-                    for device in &devices {
-                        map.insert(device.location(), cu_kv_t.to_device(device)?);
-                    }
-                    Some(map)
-                } else {
-                    None
-                },
             })
         } else {
             None
@@ -575,7 +524,13 @@ pub mod text_models_inputs_processor {
             context_lens,
             position_ids,
             paged_attn_meta,
-            flash_meta,
+            flash_meta: FlashParams {
+                max_k,
+                max_q,
+                cumulative_seqlens_k: seqlens_k_map,
+                cumulative_seqlens_q: seqlens_q_map,
+                causal: true,
+            },
         })
     }
 
@@ -597,8 +552,6 @@ pub mod text_models_inputs_processor {
         let mut slot_mappings = Vec::new();
         let mut block_tables = Vec::new();
         let mut paged_attn_context_lens = Vec::new();
-        let mut full_block_tables = Vec::new();
-        let mut full_paged_attn_context_lens = Vec::new();
         let mut seqlens_q = if flash_attn { vec![0] } else { Vec::new() };
         let mut seqlens_k = if flash_attn { vec![0] } else { Vec::new() };
         for (seq, ctxt) in input_seqs.iter().zip(toks) {
@@ -616,12 +569,13 @@ pub mod text_models_inputs_processor {
             seqs_tensors.push(Tensor::new(ctxt, device).unwrap().unsqueeze(0).unwrap());
 
             if let Some(paged_attn_metadata) = &mut paged_attn_metadata {
-                let kv_mgr = get_mut_arcmutex!(paged_attn_metadata.kv_cache_manager);
-                let table: Vec<usize> = kv_mgr
-                    .get_block_ids(*seq.id())
-                    .expect("Sequence must have allocated blocks for completion")
-                    .to_vec();
-                drop(kv_mgr);
+                let block_engine = get_mut_arcmutex!(paged_attn_metadata.block_engine);
+                let table = block_engine.block_tables.get(seq.id()).unwrap();
+
+                let table = table
+                    .iter()
+                    .map(|block| block.block_id())
+                    .collect::<Vec<_>>();
 
                 let block_pos = start_pos - seq.token_offset();
                 let block_number = if block_pos / paged_attn_metadata.block_size >= table.len() {
@@ -667,10 +621,38 @@ pub mod text_models_inputs_processor {
             }
         }
 
-        let flash_meta = if flash_attn {
-            make_flash_params(device, mapper, &seqlens_q, &seqlens_k, sliding_window, true)?
+        let (max_q, max_k, seqlens_q_map, seqlens_k_map) = if flash_attn {
+            // SAFETY: seqlens_q/k are initialized with vec![0] when flash_attn is true,
+            // so they are guaranteed to be non-empty here.
+            let max_q = *seqlens_q
+                .iter()
+                .max()
+                .expect("seqlens_q should not be empty when flash_attn is enabled");
+            let max_k = *seqlens_k
+                .iter()
+                .max()
+                .expect("seqlens_k should not be empty when flash_attn is enabled");
+            // Create tensors on CPU first to avoid CUDA context issues (see make_prompt_chunk)
+            let seqlens_q = Tensor::new(seqlens_q, &Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .cumsum(0)?
+                .to_dtype(DType::U32)?;
+            let seqlens_k = Tensor::new(seqlens_k, &Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .cumsum(0)?
+                .to_dtype(DType::U32)?;
+
+            let mut seqlens_q_map = HashMap::new();
+            let mut seqlens_k_map = HashMap::new();
+
+            let devices = mapper.unwrap().get_unique_devices();
+            for device in devices {
+                seqlens_q_map.insert(device.location(), seqlens_q.to_device(&device)?);
+                seqlens_k_map.insert(device.location(), seqlens_k.to_device(&device)?);
+            }
+            (max_q, max_k, seqlens_q_map, seqlens_k_map)
         } else {
-            FlashParams::empty(true)
+            (0, 0, HashMap::new(), HashMap::new())
         };
 
         let paged_attn_meta = if let Some(paged_attn_input) = &paged_attn_metadata {
@@ -749,44 +731,11 @@ pub mod text_models_inputs_processor {
             let o_indptr = Tensor::from_vec(o_indptr, (batch_size + 1,), &Device::Cpu)?;
             let kv_chunk_size = Tensor::from_vec(kv_chunk_size, (1,), &Device::Cpu)?;
 
-            // Build full (unwindowed) block tables and context lens.
-            let full_max_block_table_len =
-                full_block_tables.iter().map(|x| x.len()).max().unwrap_or(0);
-
-            let full_block_tables_tensor = _make_tensor_with_pad(
-                full_block_tables
-                    .iter()
-                    .map(|x| x.iter().map(|x| *x as u32).collect::<Vec<_>>())
-                    .collect::<Vec<_>>(),
-                full_max_block_table_len.max(1),
-                0,
-                &Device::Cpu,
-            )?;
-            let full_block_tables_tensor =
-                full_block_tables_tensor.reshape(((), full_max_block_table_len.max(1)))?;
-
-            let full_max_context_len = full_paged_attn_context_lens
-                .iter()
-                .max()
-                .copied()
-                .unwrap_or(0);
-
-            let full_context_lens_tensor = Tensor::from_vec(
-                full_paged_attn_context_lens
-                    .iter()
-                    .map(|x| *x as u32)
-                    .collect::<Vec<_>>(),
-                (full_paged_attn_context_lens.len(),),
-                &Device::Cpu,
-            )?;
-
             // For device mapping, make a copy of each tensor for each device
             let devices = mapper.unwrap().get_unique_devices();
             let mut slot_mappings_map = HashMap::new();
             let mut block_tables_map = HashMap::new();
             let mut context_lens_map = HashMap::new();
-            let mut full_block_tables_map = HashMap::new();
-            let mut full_context_lens_map = HashMap::new();
             let mut paged_kv_indptr_map = HashMap::new();
             let mut paged_kv_indices_map = HashMap::new();
             let mut paged_kv_last_page_len_map = HashMap::new();
@@ -802,14 +751,6 @@ pub mod text_models_inputs_processor {
                     .insert(device.location(), block_tables.clone().to_device(&device)?);
                 context_lens_map
                     .insert(device.location(), context_lens.clone().to_device(&device)?);
-                full_block_tables_map.insert(
-                    device.location(),
-                    full_block_tables_tensor.clone().to_device(&device)?,
-                );
-                full_context_lens_map.insert(
-                    device.location(),
-                    full_context_lens_tensor.clone().to_device(&device)?,
-                );
                 paged_kv_indptr_map.insert(
                     device.location(),
                     paged_kv_indptr.clone().to_device(&device)?,
@@ -852,10 +793,6 @@ pub mod text_models_inputs_processor {
                 paged_kv_tile_indices: Some(paged_kv_tile_indices_map),
                 paged_kv_o_indptr: Some(paged_kv_o_indptr_map),
                 paged_kv_chunk_size: Some(paged_kv_chunk_size_map),
-                num_cached_tokens: None,
-                query_lens: None,
-                cu_seqlens_q: None,
-                cu_seqlens_kv: None,
             })
         } else {
             None
@@ -867,7 +804,13 @@ pub mod text_models_inputs_processor {
             context_lens,
             position_ids,
             paged_attn_meta,
-            flash_meta,
+            flash_meta: FlashParams {
+                max_k,
+                max_q,
+                cumulative_seqlens_k: seqlens_k_map,
+                cumulative_seqlens_q: seqlens_q_map,
+                causal: true,
+            },
         })
     }
 
@@ -880,13 +823,8 @@ pub mod text_models_inputs_processor {
         return_raw_logits: bool,
         paged_attn_metadata: Option<&mut PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
-        sliding_window: Option<usize>,
     ) -> Result<InnerInputProcessorOutput> {
         let offset = input_seqs[0].token_offset();
-        // Collect prefix cache lens when paged attention is in use
-        let prefix_cache_lens: Vec<usize> =
-            input_seqs.iter().map(|s| s.prefix_cache_len()).collect();
-        let has_paged_attn = paged_attn_metadata.is_some();
         make_prompt_chunk(
             offset,
             toks,
@@ -896,12 +834,6 @@ pub mod text_models_inputs_processor {
             return_raw_logits,
             paged_attn_metadata,
             mapper,
-            if has_paged_attn {
-                Some(&prefix_cache_lens)
-            } else {
-                None
-            },
-            sliding_window,
         )
         .map(|inputs| InnerInputProcessorOutput {
             inputs,
@@ -919,7 +851,6 @@ pub mod text_models_inputs_processor {
         return_raw_logits: bool,
         paged_attn_metadata: Option<&mut PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
-        sliding_window: Option<usize>,
     ) -> Result<InnerInputProcessorOutput> {
         if no_kv_cache {
             return get_prompt_input(
@@ -934,17 +865,11 @@ pub mod text_models_inputs_processor {
             );
         }
 
-        make_completion_chunk(
-            toks,
-            input_seqs,
-            device,
-            paged_attn_metadata,
-            mapper,
-            sliding_window,
-        )
-        .map(|inputs| InnerInputProcessorOutput {
-            inputs,
-            seq_indices: (0..input_seqs.len()).collect(),
+        make_completion_chunk(toks, input_seqs, device, paged_attn_metadata, mapper).map(|inputs| {
+            InnerInputProcessorOutput {
+                inputs,
+                seq_indices: (0..input_seqs.len()).collect(),
+            }
         })
     }
 
@@ -979,7 +904,6 @@ pub mod text_models_inputs_processor {
             mut paged_attn_metadata: Option<PagedAttentionMeta>,
             mapper: Option<&dyn DeviceMapper>,
         ) -> Result<InputProcessorOutput> {
-            let flash_sliding_window = if no_kv_cache { None } else { sliding_window };
             if is_xlora && !is_prompt {
                 let prompt = get_prompt_input(
                     input_seqs
@@ -992,7 +916,6 @@ pub mod text_models_inputs_processor {
                     return_raw_logits,
                     paged_attn_metadata.as_mut(),
                     mapper,
-                    flash_sliding_window,
                 )?;
                 let completion = get_completion_input(
                     input_seqs
@@ -1006,7 +929,6 @@ pub mod text_models_inputs_processor {
                     return_raw_logits,
                     paged_attn_metadata.as_mut(),
                     mapper,
-                    flash_sliding_window,
                 )?;
                 let InnerInputProcessorOutput {
                     inputs:
@@ -1059,7 +981,6 @@ pub mod text_models_inputs_processor {
                     return_raw_logits,
                     paged_attn_metadata.as_mut(),
                     mapper,
-                    flash_sliding_window,
                 )?;
                 let InnerInputProcessorOutput {
                     inputs:
@@ -1100,7 +1021,6 @@ pub mod text_models_inputs_processor {
                     return_raw_logits,
                     paged_attn_metadata.as_mut(),
                     mapper,
-                    flash_sliding_window,
                 )?;
                 let InnerInputProcessorOutput {
                     inputs:
@@ -1142,7 +1062,6 @@ pub mod text_models_inputs_processor {
                     return_raw_logits,
                     paged_attn_metadata.as_mut(),
                     mapper,
-                    flash_sliding_window,
                 )?;
                 let InnerInputProcessorOutput {
                     inputs:

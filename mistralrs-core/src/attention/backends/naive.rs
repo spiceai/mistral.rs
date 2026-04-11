@@ -10,11 +10,7 @@ use crate::attention::{chunked_attention, SdpaParams};
 /// Not *really* sure why this is necessary but it is.
 pub(crate) fn maybe_synchronize(device: &Device) -> Result<()> {
     // If less that 4 GB available, synchronize
-    #[cfg(target_pointer_width = "64")]
-    const FOUR_GIB: usize = 4 * 1024 * 1024 * 1024;
-    #[cfg(not(target_pointer_width = "64"))]
-    const FOUR_GIB: usize = usize::MAX;
-    if MemoryUsage.get_memory_available(device)? < FOUR_GIB {
+    if MemoryUsage.get_memory_available(device)? < 4 * 1024 * (1024 * 1024) {
         device.synchronize()?;
     }
     Ok(())

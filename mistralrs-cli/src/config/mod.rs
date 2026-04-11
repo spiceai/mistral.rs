@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use crate::args::{
     AdapterOptions, CacheOptions, DeviceOptions, FormatOptions, GlobalOptions, ModelSourceOptions,
-    ModelType, MultimodalOptions, PagedAttentionOptions, QuantizationOptions, RuntimeOptions,
-    ServerOptions,
+    ModelType, PagedAttentionOptions, QuantizationOptions, RuntimeOptions, ServerOptions,
+    VisionOptions,
 };
 use mistralrs_core::{ModelDType, NormalLoaderType, TokenSource};
 
@@ -47,8 +47,8 @@ pub struct RunConfig {
     pub paged_attn: PagedAttentionOptions,
     #[serde(default)]
     pub models: Vec<ModelEntry>,
-    #[serde(default, alias = "enable_thinking")]
-    pub thinking: Option<bool>,
+    #[serde(default)]
+    pub enable_thinking: bool,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -66,7 +66,7 @@ pub struct GlobalOptionsToml {
 pub enum ModelKind {
     Auto,
     Text,
-    Multimodal,
+    Vision,
     Diffusion,
     Speech,
     Embedding,
@@ -91,7 +91,7 @@ pub struct ModelEntry {
     #[serde(default)]
     pub device: DeviceOptionsToml,
     #[serde(default)]
-    pub multimodal: MultimodalOptions,
+    pub vision: VisionOptions,
     #[serde(default)]
     pub chat_template: Option<PathBuf>,
     #[serde(default)]
@@ -226,7 +226,7 @@ impl ModelEntry {
                 quantization: self.quantization.clone(),
                 device,
                 cache,
-                multimodal: self.multimodal.clone(),
+                vision: self.vision.clone(),
             },
             ModelKind::Text => ModelType::Text {
                 model,
@@ -236,14 +236,14 @@ impl ModelEntry {
                 device,
                 cache,
             },
-            ModelKind::Multimodal => ModelType::Multimodal {
+            ModelKind::Vision => ModelType::Vision {
                 model,
                 format: self.format.clone(),
                 adapter: self.adapter.clone(),
                 quantization: self.quantization.clone(),
                 device,
                 cache,
-                multimodal: self.multimodal.clone(),
+                vision: self.vision.clone(),
             },
             ModelKind::Diffusion => ModelType::Diffusion { model, device },
             ModelKind::Speech => ModelType::Speech { model, device },

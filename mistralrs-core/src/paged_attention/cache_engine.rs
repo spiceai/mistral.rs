@@ -1,9 +1,12 @@
 use std::{
+    collections::HashMap,
     str::FromStr,
     sync::{Arc, Mutex, MutexGuard},
 };
 
 use candle_core::{DType, Device, Result, Tensor};
+#[cfg(any(all(feature = "cuda", target_family = "unix"), feature = "metal"))]
+use mistralrs_paged_attn::copy_blocks;
 use serde::{Deserialize, Serialize};
 
 use super::config::{KvCacheLayout, ModelConfigLike};
@@ -99,13 +102,9 @@ impl CacheEngine {
                         model_config,
                         dtype,
                         cache_config.block_size,
-                        layer_idx,
                     );
-                    let value_block_shape = Self::calculate_value_block_shape(
-                        model_config,
-                        cache_config.block_size,
-                        layer_idx,
-                    );
+                    let value_block_shape =
+                        Self::calculate_value_block_shape(model_config, cache_config.block_size);
                     #[allow(unused)]
                     let key_blocks = if let Device::Metal(dev) = &device {
                         #[cfg(feature = "metal")]
@@ -327,5 +326,34 @@ impl CacheEngine {
             model_config.v_head_dim_for_layer(layer_idx),
             block_size,
         )
+    }
+}
+
+impl CacheEngine {
+    pub fn execute_scheduler_ops(&self, blocks_to_copy: &HashMap<usize, Vec<usize>>) -> Result<()> {
+        if !blocks_to_copy.is_empty() {
+            self.copy(blocks_to_copy)?;
+        }
+        Ok(())
+    }
+
+    pub fn copy(&self, src_to_dst: &HashMap<usize, Vec<usize>>) -> Result<()> {
+        #[cfg(any(all(feature = "cuda", target_family = "unix"), feature = "metal"))]
+        {
+            let mut gpu_cache = self.get_kv_cache();
+            #[allow(clippy::map_identity)]
+            let caches: (Vec<&mut Tensor>, Vec<&mut Tensor>) =
+                gpu_cache.iter_mut().map(|(a, b)| (a, b)).unzip();
+            let (key_caches, value_caches) = caches;
+
+            // NOTE(EricLBuehler): This may synchronize the CPU and GPU
+            copy_blocks(key_caches, value_caches, src_to_dst)?;
+            Ok(())
+        }
+        #[cfg(not(any(all(feature = "cuda", target_family = "unix"), feature = "metal")))]
+        {
+            let _ = src_to_dst;
+            candle_core::bail!("Paged attention requires the CUDA or Metal feature flags.");
+        }
     }
 }

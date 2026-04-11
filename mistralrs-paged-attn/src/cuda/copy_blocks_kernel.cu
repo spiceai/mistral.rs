@@ -23,10 +23,8 @@ copy_blocks_internal_kernel(int64_t *key_cache_ptrs, int64_t *value_cache_ptrs,
     int64_t dst_offset = dst_block_offset_key + i;
     key_cache[dst_offset] = key_cache[src_offset];
   }
-  const int64_t src_block_offset_value =
-      src_block_number * numel_per_block_value;
-  const int64_t dst_block_offset_value =
-      dst_block_number * numel_per_block_value;
+  const int64_t src_block_offset_value = src_block_number * numel_per_block_value;
+  const int64_t dst_block_offset_value = dst_block_number * numel_per_block_value;
   for (int i = threadIdx.x; i < numel_per_block_value; i += blockDim.x) {
     int64_t src_offset = src_block_offset_value + i;
     int64_t dst_offset = dst_block_offset_value + i;
@@ -70,7 +68,8 @@ extern "C" void copy_blocks_f32(int64_t *key_cache_ptrs,
                                 const int64_t *__restrict__ block_mapping,
                                 const int num_layers, const int num_pairs,
                                 int numel_per_block_key,
-                                int numel_per_block_value, int64_t stream_) {
+                                int numel_per_block_value,
+                                int64_t stream_) {
   cudaStream_t stream = (cudaStream_t)stream_;
   int num_threads = numel_per_block_key;
   if (numel_per_block_value > num_threads) {
@@ -90,7 +89,8 @@ extern "C" void copy_blocks_f16(int64_t *key_cache_ptrs,
                                 const int64_t *__restrict__ block_mapping,
                                 const int num_layers, const int num_pairs,
                                 int numel_per_block_key,
-                                int numel_per_block_value, int64_t stream_) {
+                                int numel_per_block_value,
+                                int64_t stream_) {
   cudaStream_t stream = (cudaStream_t)stream_;
   int num_threads = numel_per_block_key;
   if (numel_per_block_value > num_threads) {
@@ -110,7 +110,8 @@ extern "C" void copy_blocks_bf16(int64_t *key_cache_ptrs,
                                  const int64_t *__restrict__ block_mapping,
                                  const int num_layers, const int num_pairs,
                                  int numel_per_block_key,
-                                 int numel_per_block_value, int64_t stream_) {
+                                 int numel_per_block_value,
+                                 int64_t stream_) {
   cudaStream_t stream = (cudaStream_t)stream_;
   int num_threads = numel_per_block_key;
   if (numel_per_block_value > num_threads) {
