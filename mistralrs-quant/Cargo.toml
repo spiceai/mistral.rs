@@ -69,4 +69,4 @@ cuda-12090 = []
 cuda-13000 = []
 
 [build-dependencies]
-bindgen_cuda = { workspace = true, optional = true }
+cudaforge = { workspace = true, optional = true }
