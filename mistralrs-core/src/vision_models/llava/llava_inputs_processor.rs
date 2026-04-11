@@ -20,7 +20,7 @@ use crate::pipeline::{
     text_models_inputs_processor, InputProcessorOutput, InputsProcessor, InputsProcessorType,
     MessagesAction, Processor,
 };
-use crate::sequence::Sequence;
+use crate::sequence::{build_mm_features_from_ranges, Sequence};
 use crate::vision_models::image_processor::{self, ImagePreProcessor, PreprocessedImages};
 use crate::vision_models::llava::config::Config as LLaVAConfig;
 use crate::vision_models::preprocessor_config::{PreProcessorConfig, ToFilter};
@@ -83,6 +83,7 @@ impl InputsProcessor for LLaVAInputProcessor {
         no_kv_cache: bool,
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
+        sliding_window: Option<usize>,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
@@ -240,6 +241,18 @@ impl InputsProcessor for LLaVAInputProcessor {
                 image_id_pad[0] = -(i as i64 + 1);
                 image_ids_pad.push(image_id_pad);
             }
+
+            // Compute image placeholder ranges from interleave structure
+            let mut img_ranges = Vec::new();
+            {
+                let mut offset = 0;
+                for (chunk, pad) in prompt_chunks.iter().zip(image_ids_pad.iter()) {
+                    offset += chunk.len();
+                    img_ranges.push((offset, pad.len()));
+                    offset += pad.len();
+                }
+            }
+
             let mut input_ids: Vec<i64> = Vec::new();
             for item in prompt_chunks
                 .iter()
@@ -272,6 +285,7 @@ impl InputsProcessor for LLaVAInputProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
         } else {
             get_completion_input(
@@ -283,6 +297,7 @@ impl InputsProcessor for LLaVAInputProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
         };
 
@@ -305,7 +320,7 @@ impl InputsProcessor for LLaVAInputProcessor {
                 context_lens,
                 position_ids,
                 pixel_values: pixel_values.clone(),
-                model_specific_args: Box::new(LLaVAVisionSpecificArgs {}),
+                model_specific_args: Box::new(LLaVAVisionSpecificArgs { image_hashes }),
                 paged_attn_meta,
                 flash_meta,
             });

@@ -49,15 +49,33 @@ macro_rules! get_paths {
             revision.clone(),
         )));
         let model_id = std::path::Path::new(&$this.model_id);
+        let dir_list = $crate::api_dir_list!(api, model_id, false).collect::<Vec<_>>();
         let tokenizer_filename = if let Some(ref p) = $this.tokenizer_json {
             info!("Using tokenizer.json at `{p}`");
             PathBuf::from_str(p)?
+        } else if dir_list.contains(&"tokenizer.json".to_string()) {
+            info!("Loading `tokenizer.json` at `{}`", $this.model_id);
+            $crate::api_get_file!(api, "tokenizer.json", model_id)
+        } else if dir_list.contains(&"tekken.json".to_string()) {
+            info!(
+                "Loading `tekken.json` (Mistral tokenizer) at `{}`",
+                $this.model_id
+            );
+            $crate::api_get_file!(api, "tekken.json", model_id)
         } else {
             info!("Loading `tokenizer.json` at `{}`", $this.model_id);
             $crate::api_get_file!(api, "tokenizer.json", model_id)
         };
-        info!("Loading `config.json` at `{}`", $this.model_id);
-        let config_filename = $crate::api_get_file!(api, "config.json", model_id);
+        let config_filename = if dir_list.contains(&"params.json".to_string()) {
+            info!(
+                "Loading `params.json` (Mistral config) at `{}`",
+                $this.model_id
+            );
+            $crate::api_get_file!(api, "params.json", model_id)
+        } else {
+            info!("Loading `config.json` at `{}`", $this.model_id);
+            $crate::api_get_file!(api, "config.json", model_id)
+        };
         let filenames = get_model_paths(
             revision.clone(),
             &$token_source,
@@ -120,6 +138,12 @@ macro_rules! get_paths {
                 "tokenizer_config.json",
                 model_id
             ))
+        } else {
+            info!(
+                "No chat template or `tokenizer_config.json` found at `{}`",
+                $this.model_id
+            );
+            None
         };
         let chat_template_json_filename = if dir_list.contains(&"chat_template.json".to_string()) {
             info!("Loading `chat_template.json` at `{}`", $this.model_id);
@@ -365,6 +389,9 @@ macro_rules! get_paths_gguf {
                     model_id
                 );
                 Some(res)
+            } else {
+                info!("No chat template or `tokenizer_config.json` found at `{}`", this_model_id);
+                None
             }
         };
 
@@ -545,7 +572,96 @@ macro_rules! normal_model_loader_sharded {
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! vision_normal_model_loader {
+macro_rules! multimodal_normal_model_loader {
+    (
+        $paths:expr,
+        $dtype:expr,
+        $device:expr,
+        $layer_devices:expr,
+        $config:expr,
+        $loader:expr,
+        $silent:expr,
+        $mapper:expr,
+        $loading_isq:expr,
+        $loading_uqff:expr,
+        $real_device:expr,
+        $attention_mechanism:expr,
+        $is_moqe:expr,
+        $multi_progress:expr,
+        $matformer_config:expr,
+    ) => {{
+        let regexes = if $loading_isq && $loading_uqff {
+            // Dummy weights for the layers which will be overwritten...
+            Some(std::sync::Arc::new(if $is_moqe {
+                $loader.isq_layer_regexes_moqe(&$config)?
+            } else {
+                $loader.isq_layer_regexes(&$config)?
+            }))
+        } else {
+            None
+        };
+        let get_device_for_tensor =
+            $loader.get_device_for_tensor(&$config, &*$mapper, $loading_isq)?;
+
+        let vb = from_mmaped_safetensors(
+            $paths.get_weight_filenames().to_vec(),
+            Vec::new(),
+            $dtype,
+            $device,
+            $layer_devices,
+            $silent,
+            regexes,
+            |_| true, // Will be overwritten...
+            get_device_for_tensor,
+        )?;
+
+        $loader.load(
+            &$config,
+            vb,
+            $crate::pipeline::NormalLoadingMetadata {
+                mapper: $mapper,
+                loading_isq: $loading_isq,
+                real_device: $real_device,
+                multi_progress: $multi_progress,
+                matformer_slicing_config: $matformer_config,
+            },
+            $attention_mechanism,
+        )?
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! multimodal_normal_model_loader_sharded {
+    (
+        $vb:expr,
+        $config:expr,
+        $loader:expr,
+        $mapper:expr,
+        $loading_isq:expr,
+        $real_device:expr,
+        $attention_mechanism:expr,
+        $multi_progress:expr,
+        $matformer_config:expr,
+    ) => {{
+        $loader.load(
+            &$config,
+            $vb,
+            $crate::pipeline::NormalLoadingMetadata {
+                mapper: $mapper,
+                loading_isq: $loading_isq,
+                real_device: $real_device,
+                multi_progress: $multi_progress,
+                matformer_slicing_config: $matformer_config,
+            },
+            $attention_mechanism,
+        )?
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! embedding_normal_model_loader {
     (
         $paths:expr,
         $dtype:expr,

@@ -21,6 +21,7 @@ mod blockwise_fp8;
 pub mod cublaslt;
 pub mod distributed;
 mod dummy;
+pub mod f8q8;
 mod fp8;
 pub mod gemv;
 mod gguf;
@@ -56,6 +57,7 @@ pub use distributed::{
     BarrierLike, Comm, Id, RingConfig, SumAllReduce,
 };
 pub use dummy::DummyLayer;
+pub use f8q8::F8Q8Linear;
 pub use fp8::FP8Linear;
 #[cfg(feature = "cuda")]
 pub use gemv::gemv;
@@ -478,6 +480,7 @@ impl Convolution {
     }
 }
 
+/// In-situ quantization type specifying the format to apply to model weights.
 #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq, Serialize, Deserialize)]
 pub enum IsqType {
     Q4_0,
@@ -538,6 +541,39 @@ impl IsqType {
             Self::HQQ4 => 4,
             Self::HQQ8 => 2,
             Self::F8E4M3 => 2,
+            // MXFP4: 4 bits per value + 1 byte scale per 32 values
+            // For BF16 (2 bytes): (2*32)/(16+1) ≈ 3.76 → 3
+            Self::MXFP4 => 3,
+        }
+    }
+
+    pub fn get_max_isq_cpu_threads(&self) -> Option<NonZeroUsize> {
+        match self {
+            /*IsqType::HQQ1 | IsqType::HQQ2 | IsqType::HQQ3 | */
+            IsqType::HQQ4
+            | IsqType::HQQ8
+            | IsqType::AFQ2
+            | IsqType::AFQ3
+            | IsqType::AFQ4
+            | IsqType::AFQ6
+            | IsqType::AFQ8
+            | IsqType::MXFP4 => {
+                // Use 1 because our HQQ quantizes on the GPU
+                Some(1.try_into().unwrap())
+            }
+            IsqType::F8E4M3 | IsqType::F8Q8 => None,
+            IsqType::Q2K
+            | IsqType::Q3K
+            | IsqType::Q4K
+            | IsqType::Q4_0
+            | IsqType::Q4_1
+            | IsqType::Q5K
+            | IsqType::Q5_0
+            | IsqType::Q5_1
+            | IsqType::Q6K
+            | IsqType::Q8K
+            | IsqType::Q8_0
+            | IsqType::Q8_1 => None,
         }
     }
 

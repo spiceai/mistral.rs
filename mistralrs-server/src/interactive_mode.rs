@@ -115,7 +115,7 @@ Welcome to interactive mode! Because this model is a text model, you can enter p
 "#;
 
 const VISION_INTERACTIVE_HELP: &str = r#"
-Welcome to interactive mode! Because this model is a vision model, you can enter prompts and chat with the model.
+Welcome to interactive mode! Because this model is a multimodal model, you can enter prompts and chat with the model.
 
 To specify a message with one or more images or audios, simply include the image/audio URL or path:
 
@@ -623,7 +623,7 @@ async fn vision_interactive_mode(
         // Set the handler to terminate all seqs, so allowing cancelling running
         *CTRLC_HANDLER.lock().unwrap() = &terminate_handler;
 
-        let request_messages = RequestMessage::VisionChat {
+        let request_messages = RequestMessage::MultimodalChat {
             images: images.clone(),
             audios: audios.clone(),
             messages: messages.clone(),
@@ -804,6 +804,7 @@ async fn diffusion_interactive_mode(mistralrs: Arc<MistralRs>, do_search: bool) 
                 prompt: prompt.to_string(),
                 format: ImageGenerationResponseFormat::Url,
                 generation_params: diffusion_params.clone(),
+                save_file: None,
             },
             sampling_params: SamplingParams::deterministic(),
             response: tx,

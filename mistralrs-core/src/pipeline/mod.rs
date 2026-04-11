@@ -11,6 +11,7 @@ mod isq;
 pub(crate) mod llg;
 mod loaders;
 mod macros;
+mod multimodal;
 mod normal;
 mod paths;
 mod processing;
@@ -81,6 +82,7 @@ pub(crate) fn get_device_layers_for_loader(
     )
 }
 use mistralrs_quant::IsqType;
+pub use multimodal::{MultimodalLoader, MultimodalLoaderBuilder, MultimodalSpecificConfig};
 pub use normal::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
 pub(crate) use paths::{get_chat_template, get_model_paths, get_xlora_paths};
 pub use paths::{AdapterPaths, LoraAdapterPaths};
@@ -96,7 +98,6 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
-pub use vision::{VisionLoader, VisionLoaderBuilder, VisionSpecificConfig};
 
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, Var};
@@ -162,6 +163,7 @@ impl GeneralMetadata {
     }
 }
 
+#[derive(Clone, Copy)]
 pub enum CacheInstruction {
     In,
     Out,
@@ -216,6 +218,9 @@ pub trait MetadataMixin {
     fn name(&self) -> String;
     fn reset_non_granular_state(&self);
     fn get_metadata(&self) -> Arc<GeneralMetadata>;
+    fn generation_defaults(&self) -> Option<crate::ModelGenerationDefaults> {
+        None
+    }
     fn device_mapper(&self) -> Option<&dyn DeviceMapper>;
 }
 
@@ -274,7 +279,7 @@ pub trait AnyMoePipelineMixin {
 }
 
 /// Category of the model. This can also be used to extract model-category specific tools,
-/// such as the vision model prompt prefixer.
+/// such as the multimodal model prompt prefixer.
 #[derive(Clone)]
 pub enum ModelCategory {
     Text,
@@ -880,6 +885,11 @@ pub trait Pipeline:
     ) -> Result<(), candle_core::Error>;
 
     fn category(&self) -> ModelCategory;
+
+    /// Return encoder cache hit/miss counters (hits, misses) if this pipeline has an encoder cache.
+    fn encoder_cache_counters(&self) -> Option<(Arc<AtomicUsize>, Arc<AtomicUsize>)> {
+        None
+    }
 }
 
 pub(crate) fn extract_logits(

@@ -1,4 +1,7 @@
-// Updated from MLX commit has f70764a
+// Portions of this file are adapted from Apple's MLX framework
+// (https://github.com/ml-explore/mlx)
+// Licensed under the Apache License 2.0
+// Copyright © 2023 Apple Inc.
 
 #include "utils.metal"
 #include <metal_simdgroup>
@@ -969,6 +972,12 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   // Broadcast the max qk value to all threads.
   qk_max = simd_shuffle(qk_max, 0);
 
+  // For non-partitioned (V1) mode, include the sink in the max.
+  // For V2 (partitioned), the sink is handled once in the reduce kernel.
+  if (!USE_PARTITIONING && use_sinks) {
+    qk_max = max(qk_max, sinks[head_idx]);
+  }
+
   // Get the sum of the exp values.
   float exp_sum = 0.f;
   for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
@@ -1152,7 +1161,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   const int seq_idx = threadgroup_position_in_grid.y;
   const uint32_t context_len = context_lens[seq_idx];
   const int num_partitions = DIVIDE_ROUND_UP(context_len, PARTITION_SIZE);
-  if (num_partitions == 1) {
+  if (num_partitions == 1 && !use_sinks) {
     // No need to reduce. Only copy tmp_out to out.
     device T *out_ptr =
         out + seq_idx * num_heads * HEAD_SIZE + head_idx * HEAD_SIZE;
@@ -1207,6 +1216,11 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   }
   // Broadcast the max value to all threads.
   max_logit = simd_shuffle(max_logit, 0);
+
+  // Include the sink in the global max before rescaling.
+  if (use_sinks) {
+    max_logit = max(max_logit, sinks[head_idx]);
+  }
 
   // Load rescaled exp sums to shared memory.
   threadgroup float *shared_exp_sums = reinterpret_cast<threadgroup float *>(

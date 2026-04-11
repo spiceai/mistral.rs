@@ -38,6 +38,7 @@ pub trait InputsProcessor {
         no_kv_cache: bool,
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
+        sliding_window: Option<usize>,
         other_config: Option<Arc<dyn Any>>,
         paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
@@ -89,10 +90,19 @@ pub mod text_models_inputs_processor {
     #[derive(Clone, Debug)]
     #[allow(dead_code)]
     pub struct PagedAttentionInputMetadata {
+        /// Block tables, windowed when a global sliding_window is set.
         pub block_tables: Option<HashMap<DeviceLocation, Tensor>>,
+        /// Context lens, capped by sliding_window when set.
         pub context_lens: Option<HashMap<DeviceLocation, Tensor>>,
         pub slot_mappings: HashMap<DeviceLocation, Tensor>,
         pub max_context_len: Option<usize>,
+        /// Full (unwindowed) block tables, always covering the entire context.
+        /// For models with per-layer sliding windows (GPT-OSS, Gemma2), layers
+        /// without a sliding window should use these instead of `block_tables`.
+        pub full_block_tables: Option<HashMap<DeviceLocation, Tensor>>,
+        /// Full context lens (not capped by sliding_window).
+        pub full_context_lens: Option<HashMap<DeviceLocation, Tensor>>,
+        pub full_max_context_len: Option<usize>,
         pub is_first_prompt_chunk: bool,
         pub paged_kv_indptr: Option<HashMap<DeviceLocation, Tensor>>,
         pub paged_kv_indices: Option<HashMap<DeviceLocation, Tensor>>,
@@ -111,6 +121,9 @@ pub mod text_models_inputs_processor {
                 block_tables: None,
                 context_lens: None,
                 max_context_len: None,
+                full_block_tables: None,
+                full_context_lens: None,
+                full_max_context_len: None,
                 slot_mappings: HashMap::from([(dev.location(), Tensor::new(&[0f32], dev)?)]),
                 is_first_prompt_chunk: true,
                 paged_kv_indptr: None,
@@ -124,10 +137,39 @@ pub mod text_models_inputs_processor {
         }
     }
 
+    /// Flash attention sequence length metadata.
+    ///
+    /// `cumulative_seqlens_q/k` use **padded** lengths (each sequence is padded to
+    /// `max_len` in the batch). This matches the padded Q tensor in the normal
+    /// prefill and decode paths.
+    ///
+    /// `logical_k` describes full logical K lengths. `sliding_k`, when present,
+    /// describes retained K lengths after a rotating/sliding KV cache has already
+    /// truncated K/V to the configured window.
+    ///
+    /// For the **prefix cache path**, K/V are gathered from the paged cache into a
+    /// packed (non-padded) layout via `gather_kv_cache`. The packed K/V lengths are
+    /// given by `PagedAttentionInputMetadata::cu_seqlens_kv`, NOT by the normal
+    /// `logical_k/sliding_k` metadata here. The prefix cache attention call must
+    /// build a local `FlashParams` matching the gathered KV layout.
+    #[derive(Clone, Debug)]
+    pub struct FlashKMeta {
+        pub max: u32,
+        pub cumulative_seqlens: HashMap<DeviceLocation, Tensor>,
+    }
+
+    impl FlashKMeta {
+        pub fn empty() -> Self {
+            Self {
+                max: 0,
+                cumulative_seqlens: HashMap::new(),
+            }
+        }
+    }
+
     #[derive(Clone, Debug)]
     pub struct FlashParams {
         pub max_q: u32,
-        pub max_k: u32,
         pub cumulative_seqlens_q: HashMap<DeviceLocation, Tensor>,
         pub cumulative_seqlens_k: HashMap<DeviceLocation, Tensor>,
         pub causal: bool,
@@ -147,8 +189,87 @@ pub mod text_models_inputs_processor {
         pub seq_indices: Vec<usize>,
     }
 
+    fn flash_param_devices(device: &Device, mapper: Option<&dyn DeviceMapper>) -> Vec<Device> {
+        mapper
+            .map(|mapper| mapper.get_unique_devices())
+            .unwrap_or_else(|| vec![device.clone()])
+    }
+
+    fn cumulative_seqlens_map(
+        lengths: &[u32],
+        devices: &[Device],
+    ) -> Result<(u32, HashMap<DeviceLocation, Tensor>)> {
+        let max = *lengths.iter().max().unwrap_or(&0);
+        if devices.is_empty() {
+            return Ok((max, HashMap::new()));
+        }
+
+        // Create tensors on CPU first to avoid CUDA context issues when copying
+        // between different GPU devices. Each GPU has its own CUDA context, and
+        // candle/cudarc doesn't properly switch contexts when doing GPU-to-GPU
+        // transfers (which go through CPU). By creating on CPU first, we avoid
+        // the cross-context memory access that causes CUDA_ERROR_INVALID_VALUE.
+        let cumulative_seqlens = Tensor::new(lengths, &Device::Cpu)?
+            .to_dtype(DType::F32)?
+            .cumsum(0)?
+            .to_dtype(DType::U32)?;
+
+        let mut cumulative_seqlens_map = HashMap::new();
+        for device in devices {
+            cumulative_seqlens_map.insert(device.location(), cumulative_seqlens.to_device(device)?);
+        }
+
+        Ok((max, cumulative_seqlens_map))
+    }
+
+    pub(crate) fn make_flash_params(
+        device: &Device,
+        mapper: Option<&dyn DeviceMapper>,
+        seqlens_q: &[u32],
+        seqlens_k: &[u32],
+        sliding_window: Option<usize>,
+        causal: bool,
+    ) -> Result<FlashParams> {
+        let devices = flash_param_devices(device, mapper);
+        let (max_q, cumulative_seqlens_q) = cumulative_seqlens_map(seqlens_q, &devices)?;
+        let (logical_max_k, logical_cumulative_seqlens_k) =
+            cumulative_seqlens_map(seqlens_k, &devices)?;
+        let logical_k = FlashKMeta {
+            max: logical_max_k,
+            cumulative_seqlens: logical_cumulative_seqlens_k,
+        };
+        let sliding_k = sliding_window
+            .map(|window| -> Result<FlashKMeta> {
+                let window = window as u32;
+                let sliding_seqlens_k = seqlens_k
+                    .iter()
+                    .map(|len| (*len).min(window))
+                    .collect::<Vec<_>>();
+                let (sliding_max_k, sliding_cumulative_seqlens_k) =
+                    cumulative_seqlens_map(&sliding_seqlens_k, &devices)?;
+                Ok(FlashKMeta {
+                    max: sliding_max_k,
+                    cumulative_seqlens: sliding_cumulative_seqlens_k,
+                })
+            })
+            .transpose()?;
+
+        Ok(FlashParams {
+            max_q,
+            cumulative_seqlens_q,
+            logical_k,
+            sliding_k,
+            causal,
+        })
+    }
+
     // chunk_offset_toks is the number of tokens by which the tokens are offset,
     // chunk_offset_toks / prompt_chunksize = number of batches
+    //
+    // prefix_cache_lens: when provided, indicates how many tokens per sequence are already
+    // cached in the paged KV cache. Only new (non-cached) tokens will be included in the
+    // input tensor, and slot_mappings will only cover new token slots. Block tables still
+    // cover the entire context so that context_attention_fwd can read cached blocks.
     #[allow(clippy::too_many_arguments)]
     pub fn make_prompt_chunk<T: WithDType + Debug>(
         chunk_offset_toks: usize,
@@ -159,12 +280,19 @@ pub mod text_models_inputs_processor {
         return_raw_logits: bool,
         mut paged_attn_metadata: Option<&mut PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
+        prefix_cache_lens: Option<&[usize]>,
+        sliding_window: Option<usize>,
     ) -> Result<InputMetadata> {
-        let max_len = toks
+        // Determine effective tokens per sequence after prefix cache trimming
+        let effective_lens: Vec<usize> = toks
             .iter()
-            .map(|seq| seq.len())
-            .max()
-            .expect("No sequences");
+            .enumerate()
+            .map(|(i, seq)| {
+                let cached = prefix_cache_lens.map_or(0, |lens| lens[i]);
+                seq.len().saturating_sub(cached)
+            })
+            .collect();
+        let max_len = *effective_lens.iter().max().expect("No sequences");
         let padding_tok = T::zero();
         // Pad each sequence by the padding token to the max len.
         let mut seqs_tensors = Vec::new();
@@ -194,7 +322,7 @@ pub mod text_models_inputs_processor {
                     anyhow::bail!("`return_raw_logits` is incompatible with `last_n_context_len`");
                 }
 
-                context_lens.push((0, ctxt.len()));
+                context_lens.push((0, padded.len()));
             } else {
                 context_lens.push((
                     ctxt.len()
@@ -208,15 +336,20 @@ pub mod text_models_inputs_processor {
                 seqlens_k.push((ctxt.len() + chunk_offset_toks) as u32);
             }
 
-            seqs_tensors.push(Tensor::new(ctxt, device).unwrap().unsqueeze(0).unwrap());
+            seqs_tensors.push(Tensor::new(padded, device).unwrap().unsqueeze(0).unwrap());
+
+            if has_any_cache_hit {
+                num_cached_tokens_vec.push(cached);
+                query_lens_vec.push(new_len);
+            }
 
             if let Some(paged_attn_metadata) = &mut paged_attn_metadata {
                 let block_engine = get_mut_arcmutex!(paged_attn_metadata.block_engine);
                 let table = block_engine.block_tables.get(seq_id);
 
-                if table.is_none() {
+                if block_ids.is_none() {
                     // Will be None during profiling.
-                    slot_mappings.push([_PAD_SLOT_ID].repeat(prompt_len));
+                    slot_mappings.push([_PAD_SLOT_ID].repeat(new_len));
                     continue;
                 }
                 let table = table
@@ -235,13 +368,12 @@ pub mod text_models_inputs_processor {
                     0
                 };
 
+                // Slot mappings only for new tokens (cached tokens are already in cache)
+                let slot_start = cached + chunk_offset_toks;
+                let slot_end = full_prompt_len + chunk_offset_toks;
                 let mut slot_mapping = Vec::new();
                 let mut ctxt_len = Vec::new();
-                for i in chunk_offset_toks..prompt_len + chunk_offset_toks {
-                    if i < start_idx {
-                        // Pad [0,start_idx) with _PAD_TOKEN_ID
-                        slot_mapping.push(_PAD_SLOT_ID);
-                    }
+                for i in slot_start..slot_end {
                     ctxt_len.push(i);
 
                     let block_number = if i / paged_attn_metadata.block_size >= table.len() {
@@ -370,6 +502,9 @@ pub mod text_models_inputs_processor {
                 block_tables: Some(block_tables_map),
                 context_lens: Some(context_lens_map),
                 max_context_len: Some(max_context_len),
+                full_block_tables: None,
+                full_context_lens: None,
+                full_max_context_len: None,
                 is_first_prompt_chunk: chunk_offset_toks == 0,
                 paged_kv_indptr: None,
                 paged_kv_indices: None,
@@ -405,6 +540,7 @@ pub mod text_models_inputs_processor {
         device: &Device,
         mut paged_attn_metadata: Option<&mut PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
+        sliding_window: Option<usize>,
     ) -> Result<InputMetadata> {
         // Pad each sequence by the padding token to the max len.
         let flash_attn = crate::using_flash_attn();
@@ -460,13 +596,13 @@ pub mod text_models_inputs_processor {
                     .expect("Slot value too large for target integer type");
                 slot_mappings.push(vec![slot]);
 
+                // Always collect the full (unwindowed) block tables.
+                full_block_tables.push(table.clone());
+                full_paged_attn_context_lens.push(seq.len());
+
                 if let Some(sliding_window) = paged_attn_metadata.sliding_window {
-                    let sliding_window_blocks = sliding_window / paged_attn_metadata.block_size;
-                    let slide_idx = if table.len() > sliding_window_blocks {
-                        table.len() - sliding_window_blocks
-                    } else {
-                        0
-                    };
+                    let window_start = seq.len().saturating_sub(sliding_window);
+                    let slide_idx = window_start / paged_attn_metadata.block_size;
                     block_tables.push(table.get(slide_idx..).unwrap().to_vec());
                 } else {
                     block_tables.push(table);
@@ -474,7 +610,10 @@ pub mod text_models_inputs_processor {
 
                 let paged_attn_context_len =
                     if let Some(sliding_window) = paged_attn_metadata.sliding_window {
-                        seq.len().min(sliding_window)
+                        let window_start = seq.len().saturating_sub(sliding_window);
+                        let block_aligned_start = (window_start / paged_attn_metadata.block_size)
+                            * paged_attn_metadata.block_size;
+                        seq.len() - block_aligned_start
                     } else {
                         seq.len()
                     };
@@ -643,6 +782,9 @@ pub mod text_models_inputs_processor {
                 block_tables: Some(block_tables_map),
                 context_lens: Some(context_lens_map),
                 max_context_len: Some(*max_context_len),
+                full_block_tables: Some(full_block_tables_map),
+                full_context_lens: Some(full_context_lens_map),
+                full_max_context_len: Some(full_max_context_len),
                 is_first_prompt_chunk: false,
                 paged_kv_indptr: Some(paged_kv_indptr_map),
                 paged_kv_indices: Some(paged_kv_indices_map),
@@ -719,6 +861,7 @@ pub mod text_models_inputs_processor {
                 return_raw_logits,
                 paged_attn_metadata,
                 mapper,
+                None,
             );
         }
 
@@ -756,6 +899,7 @@ pub mod text_models_inputs_processor {
             no_kv_cache: bool,
             last_n_context_len: Option<(usize, usize)>,
             return_raw_logits: bool,
+            sliding_window: Option<usize>,
             _: Option<Arc<dyn Any>>,
             mut paged_attn_metadata: Option<PagedAttentionMeta>,
             mapper: Option<&dyn DeviceMapper>,

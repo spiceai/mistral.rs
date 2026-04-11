@@ -68,16 +68,28 @@ The following quantization formats are supported in UQFF. One can, of course, be
 
 ## Loading a UQFF model
 
-To load a UQFF model, one should specify the filename. This will be located based on the model ID, and can
+To load a UQFF model, specify the filename of the first (or only) UQFF shard. This will be located based on the model ID, and can
 be loaded locally or from Hugging Face based on the model ID.
 
-- `phi3.5-mini-instruct-q4k.uqff`
-- `../UQFF/phi3.5-mini-instruct-q4k.uqff`
+- `phi3.5-mini-instruct-q4k-0.uqff`
+- `../UQFF/phi3.5-mini-instruct-q4k-0.uqff`
 
 You can find a [collection of UQFF models here](https://huggingface.co/collections/EricB/uqff-670e4a49d56ecdd3f7f0fd4c), which each include a simple
 command to get started.
 
 > Note: when loading an UQFF model, *any* ISQ setting will be ignored.
+
+### Shard auto-discovery
+
+Large models produce multiple shard files (e.g., `q4k-0.uqff`, `q4k-1.uqff`, `q4k-2.uqff`). You only need to specify **one** shard file -- the remaining shards are auto-discovered from the same directory or Hugging Face repository.
+
+For example, if a model has shards `q4k-0.uqff`, `q4k-1.uqff`, and `q4k-2.uqff`:
+```bash
+# Just specify the first shard -- the rest are found automatically
+mistralrs run -m EricB/MyModel-UQFF --from-uqff q4k-0.uqff
+```
+
+This also works when multiple quantizations exist in the same repo (e.g., `q4k-*` and `q8_0-*`). Only the shards matching the specified prefix are loaded.
 
 ### Running with the CLI
 
@@ -96,7 +108,7 @@ Modify the `Which` instantiation as follows:
 ```diff
 Which.Plain(
     model_id="EricB/Phi-3.5-mini-instruct-UQFF",
-+   from_uqff="phi3.5-mini-instruct-q4k.uqff"
++   from_uqff="phi3.5-mini-instruct-q4k-0.uqff"
 ),
 ```
 
@@ -151,7 +163,7 @@ runner = Runner(
 ## Creating a UQFF model
 
 Creating a UQFF model requires you to generate the UQFF file.
-- This means specifying a local path to a file ending in `.uqff`, where your new UQFF model will be created.
+- Specify an output path: either a `.uqff` file path or a directory where files will be auto-named.
 - The quantization of a UQFF model is determined from the ISQ or model topology (see the [topology docs](TOPOLOGY.md) for more details on how ISQ and the topology mix).
 
 Along with the UQFF file, the generation process will also output several `.json` configuration files and `residual.safetensors`. All of these files are considered the
@@ -173,12 +185,24 @@ After creating the UQFF file, you can upload the model to Hugging Face. To do th
 mistralrs quantize -m microsoft/Phi-3.5-mini-instruct --isq 4 -o phi3.5-mini-instruct-q4k.uqff
 ```
 
-### Upload with Git
-To upload a UQFF model using Git, you will most likely need to set up Git LFS:
+To skip model card generation entirely, use `--no-readme`:
+```bash
+mistralrs quantize -m microsoft/Phi-3.5-mini-instruct --isq q4k -o phi3.5-uqff/ --no-readme
+```
+
+### Uploading to Hugging Face
+
+After quantization completes in directory mode, the `quantize` command prints the `hf` CLI upload command you can use. The general form is:
+
+```bash
+hf upload <YOUR_USERNAME>/<MODEL_NAME>-UQFF <output_dir> --repo-type model --private
+```
+
+Alternatively, you can upload with Git LFS:
 
 1) Install [git-lfs](https://github.com/git-lfs/git-lfs?tab=readme-ov-file#installing)
 2) Run `git lfs install`
-3) (If the files are larger than **5GB**) Run `huggingface-cli lfs-enable-largefiles .` (you will need to `pip install huggingface_hub`)
+3) (If the files are larger than **5GB**) Run `hf lfs-enable-largefiles .` (you will need to `pip install huggingface_hub`)
 
 After this, you can use Git to track, commit, and push files.
 

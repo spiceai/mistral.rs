@@ -3,6 +3,23 @@ use sysinfo::System;
 
 pub struct MemoryUsage;
 
+/// Returns the memory fraction to use for integrated CUDA GPUs.
+/// Defaults to 0.75, configurable via MISTRALRS_IGPU_MEMORY_FRACTION.
+#[cfg(feature = "cuda")]
+fn igpu_memory_fraction() -> f64 {
+    std::env::var("MISTRALRS_IGPU_MEMORY_FRACTION")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .and_then(|f| {
+            if (0.0..=1.0).contains(&f) {
+                Some(f)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0.75)
+}
+
 impl MemoryUsage {
     /// Amount of available memory in bytes.
     #[allow(clippy::cast_possible_truncation)]

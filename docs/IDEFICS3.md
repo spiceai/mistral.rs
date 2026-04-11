@@ -1,6 +1,6 @@
 # Idefics 3 Vision: [`HuggingFaceM4/Idefics3-8B-Llama3`](https://huggingface.co/HuggingFaceM4/Idefics3-8B-Llama3)
 
-Mistral.rs supports the Idefics 3 vision model, with examples in the Rust, Python, and HTTP APIs. ISQ quantization is supported to allow running the model with less memory requirements.
+Mistral.rs supports the Idefics 3 multimodal model, with examples in the Rust, Python, and HTTP APIs. ISQ quantization is supported to allow running the model with less memory requirements.
 
 UQFF quantizations are also available.
 
@@ -29,7 +29,7 @@ Simply substitute the Idefics 3 model ID (`HuggingFaceM4/Idefics3-8B-Llama3`) wi
 
 ## Interactive mode
 
-Mistral.rs supports interactive mode for vision models! It is an easy way to interact with the model.
+Mistral.rs supports interactive mode for multimodal models! It is an easy way to interact with the model.
 
 1) Start up interactive mode with the Idefics 3 model
 
@@ -70,7 +70,7 @@ The mountain is Mount Washington.
 ## HTTP server
 You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/server/idefics3.py).
 
-We support an OpenAI compatible HTTP API for vision models. This example demonstrates sending a chat completion request with an image.
+We support an OpenAI compatible HTTP API for multimodal models. This example demonstrates sending a chat completion request with an image.
 
 > Note: The image_url may be either a path, URL, or a base64 encoded string.
 
@@ -171,12 +171,11 @@ async fn main() -> Result<()> {
     };
     let image = image::load_from_memory(&bytes)?;
 
-    let messages = VisionMessages::new().add_image_message(
+    let messages = MultimodalMessages::new().add_image_message(
         TextMessageRole::User,
         "What is depicted here? Please describe the scene in detail.",
-        image,
-        &model,
-    )?;
+        vec![image],
+    );
 
     let response = model.send_chat_request(messages).await?;
 
@@ -200,12 +199,12 @@ This example demonstrates loading and sending a chat completion request with an 
 > Note: the image_url may be either a path, URL, or a base64 encoded string.
 
 ```py
-from mistralrs import Runner, Which, ChatCompletionRequest, VisionArchitecture
+from mistralrs import Runner, Which, ChatCompletionRequest, MultimodalArchitecture
 
 runner = Runner(
-    which=Which.VisionPlain(
+    which=Which.MultimodalPlain(
         model_id="HuggingFaceM4/Idefics3-8B-Llama3",
-        arch=VisionArchitecture.Idefics3,
+        arch=MultimodalArchitecture.Idefics3,
     ),
 )
 

@@ -55,6 +55,17 @@ pub struct TextModelBuilder {
 }
 
 /// Builder for PagedAttention metadata.
+///
+/// # Example
+///
+/// ```no_run
+/// # use mistralrs::*;
+/// let config = PagedAttentionMetaBuilder::default()
+///     .with_block_size(32)
+///     .with_gpu_memory(MemoryGpuConfig::ContextSize(8192))
+///     .build()
+///     .unwrap();
+/// ```
 pub struct PagedAttentionMetaBuilder {
     block_size: Option<usize>,
     mem_gpu: MemoryGpuConfig,
@@ -72,11 +83,13 @@ impl Default for PagedAttentionMetaBuilder {
 }
 
 impl PagedAttentionMetaBuilder {
+    /// Set the block size for paged attention. If not specified, a default is chosen automatically.
     pub fn with_block_size(mut self, block_size: usize) -> Self {
         self.block_size = Some(block_size);
         self
     }
 
+    /// Set the GPU memory configuration for the KV cache. Defaults to `MemoryGpuConfig::ContextSize(4096)`.
     pub fn with_gpu_memory(mut self, mem_gpu: MemoryGpuConfig) -> Self {
         self.mem_gpu = mem_gpu;
         self
@@ -233,70 +246,6 @@ impl TextModelBuilder {
     /// determine the loader type.
     pub fn with_loader_type(mut self, loader_type: NormalLoaderType) -> Self {
         self.loader_type = Some(loader_type);
-        self
-    }
-
-    /// Load the model in a certain dtype.
-    pub fn with_dtype(mut self, dtype: ModelDType) -> Self {
-        self.dtype = dtype;
-        self
-    }
-
-    /// Force usage of the CPU device. Do not use PagedAttention with this.
-    pub fn with_force_cpu(mut self) -> Self {
-        self.force_cpu = true;
-        self
-    }
-
-    /// Source of the Hugging Face token.
-    pub fn with_token_source(mut self, token_source: TokenSource) -> Self {
-        self.token_source = token_source;
-        self
-    }
-
-    /// Set the revision to use for a Hugging Face remote model.
-    pub fn with_hf_revision(mut self, revision: impl ToString) -> Self {
-        self.hf_revision = Some(revision.to_string());
-        self
-    }
-
-    /// Use ISQ of a certain type. If there is an overlap, the topology type is used over the ISQ type.
-    pub fn with_isq(mut self, isq: IsqType) -> Self {
-        self.isq = Some(isq);
-        self
-    }
-
-    /// Utilise this imatrix file during ISQ. Incompatible with specifying a calibration file.
-    pub fn with_imatrix(mut self, path: PathBuf) -> Self {
-        self.imatrix = Some(path);
-        self
-    }
-
-    /// Utilise this calibration file to collcet an imatrix. Incompatible with specifying a calibration file.
-    pub fn with_calibration_file(mut self, path: PathBuf) -> Self {
-        self.calibration_file = Some(path);
-        self
-    }
-
-    /// Enable PagedAttention. Configure PagedAttention with a [`PagedAttentionConfig`] object, which
-    /// can be created with sensible values with a [`PagedAttentionMetaBuilder`].
-    ///
-    /// If PagedAttention is not supported (query with [`paged_attn_supported`]), this will do nothing.
-    pub fn with_paged_attn(
-        mut self,
-        paged_attn_cfg: impl FnOnce() -> anyhow::Result<PagedAttentionConfig>,
-    ) -> anyhow::Result<Self> {
-        if paged_attn_supported() {
-            self.paged_attn_cfg = Some(paged_attn_cfg()?);
-        } else {
-            self.paged_attn_cfg = None;
-        }
-        Ok(self)
-    }
-
-    /// Set the maximum number of sequences which can be run at once.
-    pub fn with_max_num_seqs(mut self, max_num_seqs: usize) -> Self {
-        self.max_num_seqs = max_num_seqs;
         self
     }
 

@@ -1,11 +1,15 @@
 use mistralrs_core::{
-    initialize_logging, AnyMoeConfig, AnyMoeLoader, AutoDeviceMapParams, DefaultSchedulerMethod,
-    DeviceMapSetting, Loader, MistralRsBuilder, NormalLoaderBuilder, NormalSpecificConfig,
-    SchedulerConfig,
+    AnyMoeConfig, AnyMoeLoader, Loader, NormalLoaderBuilder, NormalSpecificConfig,
 };
 
-use crate::{best_device, Model, TextModelBuilder};
+use crate::{
+    model_builder_trait::{
+        build_model_from_pipeline, build_pipeline_from_text_loader, maybe_initialize_logging,
+    },
+    Model, TextModelBuilder,
+};
 
+/// Configure and build an AnyMoE (Mixture of Experts) model on top of a text model.
 pub struct AnyMoeModelBuilder {
     base: TextModelBuilder,
     config: AnyMoeConfig,
@@ -17,6 +21,8 @@ pub struct AnyMoeModelBuilder {
 }
 
 impl AnyMoeModelBuilder {
+    /// Create from a base [`TextModelBuilder`] with AnyMoE config, gating model path, prefix,
+    /// MLP name, expert model IDs, and target layers.
     pub fn from_text_builder(
         base: TextModelBuilder,
         config: AnyMoeConfig,
@@ -40,7 +46,9 @@ impl AnyMoeModelBuilder {
         }
     }
 
+    /// Load the AnyMoE model and return a ready-to-use [`Model`].
     pub async fn build(self) -> anyhow::Result<Model> {
+        let base = self.base.clone();
         let config = NormalSpecificConfig {
             topology: self.base.topology,
             organization: self.base.organization,
@@ -53,9 +61,7 @@ impl AnyMoeModelBuilder {
             matformer_slice_name: None,
         };
 
-        if self.base.with_logging {
-            initialize_logging();
-        }
+        maybe_initialize_logging(self.base.with_logging);
 
         let loader = NormalLoaderBuilder::new(
             config,
@@ -77,19 +83,8 @@ impl AnyMoeModelBuilder {
             layers: self.layers,
         });
 
-        // Load, into a Pipeline
-        let pipeline = loader.load_model_from_hf(
-            self.base.hf_revision,
-            self.base.token_source,
-            &self.base.dtype,
-            &best_device(self.base.force_cpu)?,
-            !self.base.with_logging,
-            self.base
-                .device_mapping
-                .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
-            self.base.isq,
-            self.base.paged_attn_cfg,
-        )?;
+        let (pipeline, scheduler_config, add_model_config) =
+            build_pipeline_from_text_loader(base, loader).await?;
 
         let scheduler_method = match self.base.paged_attn_cfg {
             Some(_) => {

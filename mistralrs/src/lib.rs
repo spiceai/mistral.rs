@@ -1,58 +1,51 @@
 //! This crate is the Rust SDK for `mistral.rs`, providing an asynchronous interface for LLM inference.
 //!
-//! To get started loading a model, check out the following builders:
-//! - [`TextModelBuilder`]
-//! - [`LoraModelBuilder`]
-//! - [`XLoraModelBuilder`]
-//! - [`GgufModelBuilder`]
-//! - [`GgufLoraModelBuilder`]
-//! - [`GgufXLoraModelBuilder`]
-//! - [`VisionModelBuilder`]
-//! - [`AnyMoeModelBuilder`]
+//! The Rust SDK for [mistral.rs](https://github.com/EricLBuehler/mistral.rs), a high-performance
+//! LLM inference engine supporting text, multimodal, speech, image generation, and embedding models.
 //!
 //! For loading multiple models simultaneously, use [`MultiModelBuilder`].
 //! The returned [`Model`] supports `_with_model` method variants and runtime
 //! model management (unload/reload).
 //!
-//! ## Example
 //! ```no_run
-//! use anyhow::Result;
-//! use mistralrs::{
-//!     IsqType, PagedAttentionMetaBuilder, TextMessageRole, TextMessages, TextModelBuilder,
-//! };
+//! use mistralrs::{IsqBits, ModelBuilder, TextMessages, TextMessageRole};
 //!
 //! #[tokio::main]
-//! async fn main() -> Result<()> {
-//!     let model = TextModelBuilder::new("microsoft/Phi-3.5-mini-instruct".to_string())
-//!         .with_isq(IsqType::Q8_0)
-//!         .with_logging()
-//!         .with_paged_attn(|| PagedAttentionMetaBuilder::default().build())?
+//! async fn main() -> mistralrs::error::Result<()> {
+//!     let model = ModelBuilder::new("Qwen/Qwen3-4B")
+//!         .with_auto_isq(IsqBits::Four)
 //!         .build()
 //!         .await?;
 //!
-//!     let messages = TextMessages::new()
-//!         .add_message(
-//!             TextMessageRole::System,
-//!             "You are an AI agent with a specialty in programming.",
-//!         )
-//!         .add_message(
-//!             TextMessageRole::User,
-//!             "Hello! How are you? Please write generic binary search function in Rust.",
-//!         );
-//!
-//!     let response = model.send_chat_request(messages).await?;
-//!
-//!     println!("{}", response.choices[0].message.content.as_ref().unwrap());
-//!     dbg!(
-//!         response.usage.avg_prompt_tok_per_sec,
-//!         response.usage.avg_compl_tok_per_sec
-//!     );
-//!
+//!     let response = model.chat("What is Rust's ownership model?").await?;
+//!     println!("{response}");
 //!     Ok(())
 //! }
 //! ```
 //!
-//! ## Streaming example
+//! ## Capabilities
+//!
+//! | Capability | Builder | Example |
+//! |---|---|---|
+//! | Any model (auto-detect) | [`ModelBuilder`] | `examples/getting_started/text_generation/` |
+//! | Text generation | [`TextModelBuilder`] | `examples/getting_started/text_generation/` |
+//! | Multimodal (image+text) | [`MultimodalModelBuilder`] | `examples/getting_started/multimodal/` |
+//! | GGUF quantized models | [`GgufModelBuilder`] | `examples/getting_started/gguf/` |
+//! | Image generation | [`DiffusionModelBuilder`] | `examples/models/diffusion/` |
+//! | Speech synthesis | [`SpeechModelBuilder`] | `examples/models/speech/` |
+//! | Embeddings | [`EmbeddingModelBuilder`] | `examples/getting_started/embedding/` |
+//! | Structured output | [`Model::generate_structured`] | `examples/advanced/json_schema/` |
+//! | Tool calling | [`Tool`], [`ToolChoice`] | `examples/advanced/tools/` |
+//! | Agents | [`AgentBuilder`] | `examples/advanced/agent/` |
+//! | Multi-model | [`MultiModelBuilder`] | `examples/advanced/multi_model/` |
+//! | LoRA / X-LoRA | [`LoraModelBuilder`], [`XLoraModelBuilder`] | `examples/advanced/lora/` |
+//! | AnyMoE | [`AnyMoeModelBuilder`] | `examples/advanced/anymoe/` |
+//! | MCP client | [`McpClientConfig`] | `examples/advanced/mcp_client/` |
+//!
+//! ## Model Loading
+//!
+//! All models are created through builder structs that follow a consistent pattern:
+//!
 //! ```no_run
 //!    use anyhow::Result;
 //!    use mistralrs::{
@@ -60,24 +53,11 @@
 //!        Response, TextMessageRole, TextMessages, TextModelBuilder,
 //!    };
 //!
-//!    #[tokio::main]
-//!    async fn main() -> Result<()> {
-//!        let model = TextModelBuilder::new("microsoft/Phi-3.5-mini-instruct".to_string())
-//!            .with_isq(IsqType::Q8_0)
-//!            .with_logging()
-//!            .with_paged_attn(|| PagedAttentionMetaBuilder::default().build())?
-//!            .build()
-//!            .await?;
+//! Use [`ModelBuilder::with_auto_isq`] for automatic platform-optimal quantization (e.g., `with_auto_isq(IsqBits::Four)`),
+//! or [`ModelBuilder::with_isq`] with a specific [`IsqType`]: `Q4_0`, `Q4_1`, `Q4K`, `Q5_0`, `Q5_1`, `Q5K`,
+//! `Q6K`, `Q8_0`, `Q8_1`, `HQQ4`, `HQQ8`, and more.
 //!
-//!        let messages = TextMessages::new()
-//!            .add_message(
-//!                TextMessageRole::System,
-//!                "You are an AI agent with a specialty in programming.",
-//!            )
-//!            .add_message(
-//!                TextMessageRole::User,
-//!                "Hello! How are you? Please write generic binary search function in Rust.",
-//!            );
+//! ## Choosing a Request Type
 //!
 //!        let mut stream = model.stream_chat_request(messages).await?;
 
@@ -129,11 +109,14 @@
 
 mod agent;
 mod anymoe;
+mod auto_model;
+pub mod blocking;
 mod diffusion_model;
 mod embedding_model;
 mod gguf;
 mod gguf_lora_model;
 mod gguf_xlora_model;
+mod isq_setting;
 mod lora_model;
 mod messages;
 mod model;
@@ -141,7 +124,6 @@ pub mod model_builder_trait;
 mod speculative;
 mod speech_model;
 mod text_model;
-mod vision_model;
 mod xlora_model;
 
 pub use agent::{

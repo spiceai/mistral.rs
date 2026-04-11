@@ -3,6 +3,7 @@ use candle_core::{
     Result, Shape, Tensor, WithDType,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
 
 use std::{
     fmt::Display,

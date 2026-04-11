@@ -573,13 +573,11 @@ impl Engine {
                                 block_engine: scheduler.block_engine().unwrap(),
                             };
 
-                            let return_raw_logits = guards_mut[0].return_raw_logits;
-                            assert!(
-                                guards_mut
-                                    .iter()
-                                    .all(|seq| seq.return_raw_logits == return_raw_logits),
-                                "All sequences must either return raw logits, or not."
-                            );
+                                for seq in guards_mut.iter_mut() {
+                                    let cached_prefix_len = seq.prefix_cache_len();
+                                    if cached_prefix_len == 0 {
+                                        continue;
+                                    }
 
                             pipeline
                                 .step(

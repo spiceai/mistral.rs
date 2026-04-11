@@ -4,7 +4,10 @@ mod config;
 mod inputs_processor;
 mod vision;
 
-use std::any::Any;
+use std::{
+    any::Any,
+    sync::{Arc, Mutex},
+};
 
 use candle_core::{DType, Device, Result, Tensor, D};
 pub use config::Idefics3Config;
@@ -16,14 +19,21 @@ use crate::{
     amoe::{AnyMoeBaseModelMixin, MlpLayer},
     device_map::DeviceMapper,
     models::llama::Llama,
-    paged_attention::{AttentionImplementation, ModelConfigMetadata},
+    paged_attention::{
+        encoder_cache::EncoderCacheManager, AttentionImplementation, ModelConfigMetadata,
+    },
     pipeline::{
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, NormalLoadingMetadata, NormalModel, VisionModel,
+        EitherCache, IsqModel, MultimodalModel, NormalLoadingMetadata, NormalModel,
     },
     utils::unvarbuilder::UnVarBuilder,
     AnyMoeConfig, AnyMoeExpertType,
 };
+
+pub(crate) struct Idefics3SpecificArgs {
+    pub pixel_attention_mask: Option<Tensor>,
+    pub image_hashes: Vec<u64>,
+}
 
 pub struct Idefics3Model {
     text_model: Llama,
@@ -31,6 +41,7 @@ pub struct Idefics3Model {
     vision: Idefics3VisionTransformer,
     config: Idefics3Config,
     dtype: DType,
+    encoder_cache: Arc<Mutex<EncoderCacheManager>>,
 }
 
 impl Idefics3Model {
@@ -66,6 +77,7 @@ impl Idefics3Model {
             vision,
             config: cfg.clone(),
             dtype: vb.dtype(),
+            encoder_cache: Arc::new(Mutex::new(EncoderCacheManager::new(32))),
         })
     }
 
@@ -93,6 +105,7 @@ impl Idefics3Model {
         seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
         pixel_attention_mask: Option<Tensor>,
+        image_hashes: &[u64],
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
@@ -266,7 +279,7 @@ impl AnyMoeBaseModelMixin for Idefics3Model {
     }
 }
 
-impl VisionModel for Idefics3Model {
+impl MultimodalModel for Idefics3Model {
     fn forward(
         &self,
         input_ids: &Tensor,
@@ -278,15 +291,19 @@ impl VisionModel for Idefics3Model {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> candle_core::Result<Tensor> {
-        let pixel_attention_mask: Option<Tensor> = *model_specific_args
+        let Idefics3SpecificArgs {
+            pixel_attention_mask,
+            image_hashes,
+        } = *model_specific_args
             .downcast()
-            .expect("Cannot downcast into `Option<Tensor>`");
+            .expect("Cannot downcast into `Idefics3SpecificArgs`");
         self.forward_inner(
             input_ids,
             pixel_values,
             seqlen_offsets,
             context_lens,
             pixel_attention_mask,
+            &image_hashes,
             metadata,
             flash_params,
         )
@@ -307,7 +324,22 @@ impl VisionModel for Idefics3Model {
         self.text_model.config()
     }
     fn default_model_specific_args(&self, _input_ids: &Tensor) -> Box<dyn Any> {
-        let args: Option<Tensor> = None;
-        Box::new(args)
+        Box::new(Idefics3SpecificArgs {
+            pixel_attention_mask: None,
+            image_hashes: vec![],
+        })
+    }
+    fn encoder_cache_counters(
+        &self,
+    ) -> Option<(
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    )> {
+        Some(
+            self.encoder_cache
+                .lock()
+                .expect("encoder cache poisoned")
+                .counters(),
+        )
     }
 }

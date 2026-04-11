@@ -1,6 +1,11 @@
-use mistralrs_core::*;
+use mistralrs_core::{NormalLoaderBuilder, NormalSpecificConfig, Ordering};
 
-use crate::{best_device, Model, TextModelBuilder};
+use crate::{
+    model_builder_trait::{
+        build_model_from_pipeline, build_pipeline_from_text_loader, maybe_initialize_logging,
+    },
+    Model, TextModelBuilder,
+};
 
 /// Wrapper of [`TextModelBuilder`] for X-LoRA models.
 pub struct XLoraModelBuilder {
@@ -11,6 +16,7 @@ pub struct XLoraModelBuilder {
 }
 
 impl XLoraModelBuilder {
+    /// Create an X-LoRA builder from a [`TextModelBuilder`], X-LoRA model ID, and ordering.
     pub fn from_text_model_builder(
         text_model: TextModelBuilder,
         xlora_model_id: impl ToString,
@@ -24,12 +30,15 @@ impl XLoraModelBuilder {
         }
     }
 
+    /// Set the target non-granular index for X-LoRA scaling.
     pub fn tgt_non_granular_index(mut self, tgt_non_granular_idx: usize) -> Self {
         self.tgt_non_granular_index = Some(tgt_non_granular_idx);
         self
     }
 
+    /// Load the X-LoRA model and return a ready-to-use [`Model`].
     pub async fn build(self) -> anyhow::Result<Model> {
+        let text_model = self.text_model.clone();
         let config = NormalSpecificConfig {
             topology: self.text_model.topology,
             organization: self.text_model.organization,
@@ -42,9 +51,7 @@ impl XLoraModelBuilder {
             matformer_slice_name: None,
         };
 
-        if self.text_model.with_logging {
-            initialize_logging();
-        }
+        maybe_initialize_logging(self.text_model.with_logging);
 
         let loader = NormalLoaderBuilder::new(
             config,
@@ -62,19 +69,8 @@ impl XLoraModelBuilder {
         )
         .build(self.text_model.loader_type)?;
 
-        // Load, into a Pipeline
-        let pipeline = loader.load_model_from_hf(
-            self.text_model.hf_revision,
-            self.text_model.token_source,
-            &self.text_model.dtype,
-            &best_device(self.text_model.force_cpu)?,
-            !self.text_model.with_logging,
-            self.text_model
-                .device_mapping
-                .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
-            self.text_model.isq,
-            self.text_model.paged_attn_cfg,
-        )?;
+        let (pipeline, scheduler_config, add_model_config) =
+            build_pipeline_from_text_loader(text_model, loader).await?;
 
         let scheduler_method = match self.text_model.paged_attn_cfg {
             Some(_) => {

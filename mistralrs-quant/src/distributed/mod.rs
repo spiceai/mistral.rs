@@ -59,10 +59,8 @@ impl BarrierLike for Barrier {
 pub fn get_global_tp_size_from_devices() -> Result<usize> {
     #[cfg(all(feature = "cuda", feature = "ring"))]
     {
-        use candle_core::cuda::WrapErr;
-        candle_core::cuda::cudarc::driver::result::device::get_count()
-            .w()
-            .map(|x| x as usize)
+        let config = RingConfig::load();
+        Ok(config.world_size)
     }
     #[cfg(all(not(feature = "cuda"), feature = "ring"))]
     {

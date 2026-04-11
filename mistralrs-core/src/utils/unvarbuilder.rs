@@ -33,6 +33,12 @@ impl ToTensors for RmsNorm {
     }
 }
 
+impl ToTensors for GemmaRmsNorm {
+    fn to_tensors(&self) -> HashMap<String, Tensor> {
+        HashMap::from_iter([("weight".to_string(), self.original_weight().clone())])
+    }
+}
+
 impl ToTensors for F32RmsNorm {
     fn to_tensors(&self) -> HashMap<String, Tensor> {
         HashMap::from_iter([("weight".to_string(), self.weight().clone())])
@@ -150,7 +156,16 @@ impl UnVarBuilder {
         data.extend(
             item.to_tensors()
                 .into_iter()
-                .map(|(n, t)| (format!("{path}.{n}"), t))
+                .map(|(n, t)| {
+                    (
+                        if path.is_empty() {
+                            n
+                        } else {
+                            format!("{path}.{n}")
+                        },
+                        t,
+                    )
+                })
                 .collect::<Vec<(_, _)>>(),
         );
     }

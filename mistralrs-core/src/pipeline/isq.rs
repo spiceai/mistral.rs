@@ -158,11 +158,18 @@ pub fn parse_isq_value(s: &str, device: Option<&Device>) -> Result<IsqType, Stri
                 | IsqType::Q6K
                 | IsqType::HQQ8
                 | IsqType::HQQ4
-                | IsqType::F8E4M3 // | IsqType::HQQ3
-                                  // | IsqType::HQQ2
-                                  // | IsqType::HQQ1
+                | IsqType::F8E4M3
+                | IsqType::AFQ2
+                | IsqType::AFQ3
+                | IsqType::AFQ4
+                | IsqType::AFQ6
+                | IsqType::AFQ8
+                | IsqType::F8Q8
+                | IsqType::MXFP4 // | IsqType::HQQ3
+                                 // | IsqType::HQQ2
+                                 // | IsqType::HQQ1
         ) {
-            return Err("ISQ type on CUDA must be one of `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2K`, `Q3K`, `Q4K`, `Q5K`, `Q6K`, `HQQ8`, `HQQ4`, `FP8`".to_string());
+            return Err("ISQ type on CUDA must be one of `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`, `Q2K`, `Q3K`, `Q4K`, `Q5K`, `Q6K`, `HQQ8`, `HQQ4`, `FP8`, `AFQ8`, `AFQ6`, `AFQ4`, `AFQ3`, `AFQ2`, `F8Q8`, `MXFP4`".to_string());
         }
     }
     Ok(tp)
@@ -1110,6 +1117,18 @@ pub trait IsqModel {
                 .collect::<candle_core::Result<Vec<_>>>()?;
         }
 
+        // Verify no DummyLayers remain after deserialization
+        {
+            let (check_tensors, _) = self.get_layers();
+            for (i, (tensor, layer_num)) in check_tensors.iter().enumerate() {
+                if tensor.name() == "dummy" {
+                    candle_core::bail!(
+                        "DummyLayer not replaced at index {i}, layer {layer_num:?} after load_from_artifacts"
+                    );
+                }
+            }
+        }
+
         let delta = Instant::now().duration_since(t_start).as_secs_f32();
         info!("Loaded in-situ quantization artifacts into {total_tensors} total tensors. Took {delta:.2}s", );
 
@@ -1145,5 +1164,83 @@ pub(crate) trait IsqModelLoader {
     /// Only called on non-adapter models!
     fn isq_layer_regexes_moqe(&self, config: &str) -> Result<Vec<Regex>> {
         self.isq_layer_regexes(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_uqff_shorthand_numeric_q8() {
+        let files = vec!["q8_0-0.uqff".to_string(), "config.json".to_string()];
+        assert_eq!(
+            resolve_uqff_shorthand("8", &files),
+            Some("q8_0-0.uqff".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_uqff_shorthand_numeric_afq8() {
+        let files = vec!["afq8-0.uqff".to_string(), "config.json".to_string()];
+        assert_eq!(
+            resolve_uqff_shorthand("8", &files),
+            Some("afq8-0.uqff".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_uqff_shorthand_prefers_platform_variant() {
+        // expand() returns platform-preferred variant first:
+        // Metal: [AFQ8, Q8_0], non-Metal: [Q8_0, AFQ8]
+        let files = vec!["q8_0-0.uqff".to_string(), "afq8-0.uqff".to_string()];
+        let expected = if cfg!(feature = "metal") {
+            "afq8-0.uqff"
+        } else {
+            "q8_0-0.uqff"
+        };
+        assert_eq!(
+            resolve_uqff_shorthand("8", &files),
+            Some(expected.to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_uqff_shorthand_numeric_q4() {
+        let files = vec!["q4k-0.uqff".to_string()];
+        assert_eq!(
+            resolve_uqff_shorthand("4", &files),
+            Some("q4k-0.uqff".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_uqff_shorthand_numeric_q5() {
+        let files = vec!["q5k-0.uqff".to_string()];
+        assert_eq!(
+            resolve_uqff_shorthand("5", &files),
+            Some("q5k-0.uqff".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_uqff_shorthand_isq_name() {
+        let files = vec!["q4k-0.uqff".to_string(), "q8_0-0.uqff".to_string()];
+        assert_eq!(
+            resolve_uqff_shorthand("q4k", &files),
+            Some("q4k-0.uqff".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_uqff_shorthand_explicit_filename_returns_none() {
+        let files = vec!["q8_0-0.uqff".to_string()];
+        assert_eq!(resolve_uqff_shorthand("q8_0-0.uqff", &files), None);
+    }
+
+    #[test]
+    fn test_resolve_uqff_shorthand_no_match() {
+        let files = vec!["config.json".to_string()];
+        assert_eq!(resolve_uqff_shorthand("8", &files), None);
     }
 }

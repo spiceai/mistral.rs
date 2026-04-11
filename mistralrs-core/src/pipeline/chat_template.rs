@@ -10,13 +10,16 @@ use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
 
-use crate::{MessageContent, Tool};
+use crate::{MessageContent, ModelGenerationDefaults, Tool};
 
 const SUPPORTED_ALTERNATE_EOS: &[&str] = &[
     "<|im_end|>",      // Handle ChatML case
     "<end_of_turn>",   // Handle Gemma2 chat case
     "<|end_of_text|>", // Hermes
 ];
+
+/// Repository default for templates that support an explicit thinking toggle.
+const DEFAULT_ENABLE_THINKING: bool = true;
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -146,14 +149,18 @@ impl ChatTemplate {
 
 pub fn calculate_eos_tokens(
     chat_template: &ChatTemplate,
-    gen_conf: Option<GenerationConfig>,
+    gen_conf: Option<&GenerationConfig>,
     tokenizer: &Tokenizer,
 ) -> Vec<u32> {
     let mut eos_tok_ids = chat_template.eos_tok().map(|x| vec![x]).unwrap_or_default();
     let mut bos_tok_ids = chat_template.bos_tok().map(|b| vec![b]).unwrap_or_default();
 
+    let templates = chat_template.get_template_contents();
+
     for alternate in SUPPORTED_ALTERNATE_EOS {
-        if tokenizer.get_vocab(true).contains_key(*alternate) {
+        if tokenizer.get_vocab(true).contains_key(*alternate)
+            && templates.iter().any(|t| t.contains(*alternate))
+        {
             eos_tok_ids.push(alternate.to_string())
         }
     }
@@ -223,7 +230,7 @@ pub fn calculate_eos_tokens(
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct GenerationConfig {
     #[serde(default)]
     #[serde(with = "either::serde_untagged_optional")]
@@ -277,7 +284,7 @@ use crate::request::ReasoningEffort;
 
 #[allow(clippy::too_many_arguments)]
 pub fn apply_chat_template_to(
-    messages: Vec<IndexMap<String, MessageContent>>,
+    mut messages: Vec<IndexMap<String, MessageContent>>,
     add_generation_prompt: bool,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<ReasoningEffort>,
@@ -298,6 +305,52 @@ pub fn apply_chat_template_to(
 
     #[derive(Serialize, Deserialize)]
     struct UntaggedContent(#[serde(with = "either::serde_untagged")] MessageContent);
+
+    // Resolve template string early so we can check for Gemma 4 format
+    let resolved_template = match &template.0 {
+        Either::Left(x) => x.clone(),
+        Either::Right(map) => {
+            let has_tool_use = map.iter().any(|t| {
+                t.get("name").is_some_and(|name| name == "tool_use") || t.contains_key("tool_use")
+            });
+            let must_use_tool_template = !tools.is_empty();
+
+            if must_use_tool_template && !has_tool_use {
+                anyhow::bail!(
+                    "Tools were provided but this chat template does not handle tool usage"
+                );
+            }
+
+            let mut found_template = None;
+            for t in map {
+                let name = t.get("name");
+                if let Some(name) = name {
+                    found_template = Some(t["template"].clone());
+                    #[allow(clippy::if_same_then_else)]
+                    if name == "tool_use" && !tools.is_empty() {
+                        break;
+                    } else if name == "default" && !must_use_tool_template {
+                        break;
+                    }
+                } else if t.contains_key("tool_use") && !tools.is_empty() {
+                    found_template = Some(t["tool_use"].clone());
+                    break;
+                } else if t.contains_key("default") && !must_use_tool_template {
+                    found_template = Some(t["default"].clone());
+                    break;
+                }
+            }
+
+            found_template.ok_or_else(|| anyhow::anyhow!("Chat template does not contain a `tool_use` or `default` key. Please ensure it contains at least a `default` key, although `tool_use` should be specified for using tools."))?
+        }
+    };
+
+    // Pre-process messages for Gemma 4 tool templates: merge role:"tool"
+    // messages into tool_responses on the preceding assistant message.
+    if is_gemma4_tool_template(&resolved_template) {
+        preprocess_gemma4_tool_messages(&mut messages);
+    }
+
     let mut new_messages = Vec::new();
     for message in messages {
         let mut new_message = IndexMap::new();

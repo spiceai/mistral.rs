@@ -390,8 +390,8 @@ pub enum TomlModelSelected {
         max_batch_size: usize,
     },
 
-    /// Select a vision plain model, without quantization or adapters
-    VisionPlain {
+    /// Select a multimodal plain model, without quantization or adapters
+    MultimodalPlain {
         /// Model ID to load from. This may be a HF hub repo or a local path.
         model_id: String,
 
@@ -542,7 +542,7 @@ pub fn get_toml_selected_model_dtype(model: &TomlSelector) -> ModelDType {
         TomlModelSelected::Plain { dtype, .. }
         | TomlModelSelected::Lora { dtype, .. }
         | TomlModelSelected::XLora { dtype, .. }
-        | TomlModelSelected::VisionPlain { dtype, .. }
+        | TomlModelSelected::MultimodalPlain { dtype, .. }
         | TomlModelSelected::GGUF { dtype, .. }
         | TomlModelSelected::GGML { dtype, .. }
         | TomlModelSelected::XLoraGGUF { dtype, .. }
@@ -612,7 +612,7 @@ pub fn get_toml_selected_model_device_map_params(
             max_image_length,
             max_num_images,
             ..
-        } => Ok(AutoDeviceMapParams::Vision {
+        } => Ok(AutoDeviceMapParams::Multimodal {
             max_seq_len,
             max_batch_size,
             max_image_shape: (max_image_length, max_image_length),
@@ -928,7 +928,7 @@ fn loader_from_selected(
             )?,
         )
         .build(),
-        TomlModelSelected::VisionPlain {
+        TomlModelSelected::MultimodalPlain {
             model_id,
             arch,
             dtype: _,

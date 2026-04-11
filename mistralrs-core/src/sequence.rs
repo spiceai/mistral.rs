@@ -9,7 +9,6 @@ use crate::{
     AudioInput, ChatCompletionResponse, Usage,
 };
 use crate::{
-    paged_attention::{BlockEngineSequence, LogicalTokenBlock},
     pipeline::{DiffusionGenerationParams, KvCache},
     response::CompletionChoice,
     tools::ToolCallingMatcher,
@@ -27,6 +26,8 @@ use tokio::sync::{
     mpsc::{error::SendError, Sender},
     Mutex, MutexGuard,
 };
+
+pub type SeqPreallocatedCache = Vec<Option<(Tensor, Tensor)>>;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum StopReason {
@@ -429,8 +430,8 @@ pub struct Sequence {
     /// For hybrid models: index into the Mamba state pool
     mamba_state_idx: Option<usize>,
 
-    // Preallocated KV cache (k,v)
-    seq_preallocated_cache: Option<(Tensor, Tensor)>,
+    // Preallocated KV cache templates, keyed by layer.
+    seq_preallocated_cache: Option<SeqPreallocatedCache>,
 
     // Mutables
     tokens: Vec<u32>,
@@ -452,9 +453,6 @@ pub struct Sequence {
     pub step_start_instant: Option<Instant>,
     group: Arc<Mutex<SequenceGroup>>,
     state: RwLock<SequenceState>,
-
-    // Custom backend metadata
-    custom_metadata: SequenceCustomMetadata,
 
     // Tool calls
     pub tools: Option<Arc<ToolCallingMatcher>>,
@@ -554,8 +552,9 @@ impl Sequence {
         image_gen_response_format: Option<ImageGenerationResponseFormat>,
         sequence_stepping_type: SeqStepType,
         diffusion_params: Option<DiffusionGenerationParams>,
-        // Preallocated KV cache (k,v)
-        seq_preallocated_cache: Option<(Tensor, Tensor)>,
+        image_gen_save_file: Option<PathBuf>,
+        // Preallocated KV cache templates, keyed by layer.
+        seq_preallocated_cache: Option<SeqPreallocatedCache>,
         //
         return_raw_logits: bool,
         eos_tokens: Vec<u32>,
@@ -665,6 +664,7 @@ impl Sequence {
         self.prefill_prompt_toks = Some(toks);
         self.set_state(SequenceState::RunningPrefillPrompt);
         self.token_offset = offset;
+        self.prefix_cache_len = offset;
         self
     }
 
@@ -800,7 +800,6 @@ impl Sequence {
             } => {
                 logical_token_blocks.clear();
             }
-            SequenceCustomMetadata::None => (),
         }
         self.custom_metadata
             .append_tokens_to_blocks(toks.iter().map(|x| *x as usize).collect::<Vec<_>>());
@@ -816,7 +815,7 @@ impl Sequence {
         &self.completion_bytes
     }
 
-    pub fn preallocated_cache(&self) -> Option<&(Tensor, Tensor)> {
+    pub fn preallocated_cache(&self) -> Option<&SeqPreallocatedCache> {
         self.seq_preallocated_cache.as_ref()
     }
 
@@ -874,16 +873,12 @@ impl Sequence {
     pub(crate) fn add_tmp_tok(&mut self, tok: u32) {
         self.is_tmp = true;
         self.tokens.push(tok);
-        // Handle possible block engine
-        self.custom_metadata.append_token_to_blocks(tok as usize);
     }
 
     /// Internal api to remove n raw tokens.
     pub(crate) fn remove_tmp_tok(&mut self, n: usize) {
         self.is_tmp = false;
         self.tokens.truncate(self.tokens.len() - n);
-        // Handle possible block engine
-        self.custom_metadata.remove_tokens_from_blocks(n);
     }
 
     pub fn add_token(
@@ -906,8 +901,15 @@ impl Sequence {
         self.last_logprob = tok.logprob;
         self.last_is_done = *is_done;
 
-        self.custom_metadata
-            .append_token_to_blocks(tok.token as usize);
+        // Process token through reasoning parser if enabled
+        if let Some(ref mut parser) = self.reasoning_parser {
+            if self.reasoning_mode == Some(ReasoningMode::Harmony) {
+                parser.process_token(tok.token);
+            }
+            if !stopped_by_token {
+                parser.process_bytes(&completion_bytes);
+            }
+        }
 
         // Process token through Harmony parser if in Harmony mode
         if let Some(ref mut harmony_ctx) = self.harmony_context {
@@ -1549,7 +1551,7 @@ impl SequenceGroup {
                 .send(Response::Chunk(ChatCompletionChunkResponse {
                     id: seq.id.to_string(),
                     choices: swap_streaming_chunks,
-                    created: seq.timestamp,
+                    created: seq.creation_time() as u128,
                     model: model.clone(),
                     system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
                     object: "chat.completion.chunk".to_string(),
@@ -1568,7 +1570,7 @@ impl SequenceGroup {
                 .send(Response::CompletionChunk(CompletionChunkResponse {
                     id: seq.id.to_string(),
                     choices: swap_streaming_chunks,
-                    created: seq.timestamp,
+                    created: seq.creation_time() as u128,
                     model: model.clone(),
                     system_fingerprint: SYSTEM_FINGERPRINT.to_string(),
                     object: "text_completion".to_string(),
@@ -1587,5 +1589,79 @@ impl SequenceGroup {
             sender.send(Response::CompletionDone(response)).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc::channel;
+
+    fn make_test_sequence() -> Sequence {
+        let (tx, _rx) = channel(1);
+        let sampler =
+            Sampler::new(None, 0, None, None, None, None, None, 32, 1.0, 0.0, vec![]).unwrap();
+        let group = Arc::new(Mutex::new(SequenceGroup::new(1, false, true, None)));
+
+        Sequence::new_waiting(
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            "prompt".to_string(),
+            0,
+            0,
+            0,
+            tx,
+            sampler,
+            vec![],
+            vec![],
+            None,
+            false,
+            false,
+            group,
+            0,
+            0,
+            SequenceRecognizer::None,
+            None,
+            None,
+            None,
+            None,
+            None, // input_videos
+            None,
+            None,
+            None,
+            SeqStepType::PromptAndDecode,
+            None,
+            None,
+            None,
+            false,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn prefill_v2_normal_sets_prefix_cache_len_for_multimodal_trimming() {
+        let mut seq = make_test_sequence();
+        seq.set_mm_features(vec![
+            MultiModalFeature {
+                identifier: "img:123".to_string(),
+                offset: 0,
+                length: 3,
+            },
+            MultiModalFeature {
+                identifier: "img:456".to_string(),
+                offset: 4,
+                length: 3,
+            },
+            MultiModalFeature {
+                identifier: "audio:789".to_string(),
+                offset: 7,
+                length: 1,
+            },
+        ]);
+
+        let seq = seq.prefill_v2_normal(vec![], vec![7, 8], 4);
+
+        assert_eq!(seq.prefix_cache_len(), 4);
+        assert_eq!(seq.count_prefix_cached_mm_items_by_kind("img"), 1);
+        assert_eq!(seq.count_prefix_cached_mm_items_by_kind("audio"), 0);
     }
 }

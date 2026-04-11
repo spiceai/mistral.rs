@@ -49,6 +49,30 @@ impl SamplingParams {
     /// - No temperature, topk, topp, minp
     /// - No penalties, stop tokens, or logit bias
     /// - No maximum length
+    ///
+    /// Unlike [`Self::deterministic`], this does not force `top_k = 1`.
+    pub fn neutral() -> Self {
+        Self {
+            temperature: None,
+            top_k: Some(1),
+            top_p: None,
+            min_p: None,
+            top_n_logprobs: 0,
+            frequency_penalty: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            stop_toks: None,
+            max_len: None,
+            logits_bias: None,
+            n_choices: 1,
+            dry_params: None,
+        }
+    }
+
+    /// This sets up the parameters so that there is:
+    /// - No temperature, topk, topp, minp
+    /// - No penalties, stop tokens, or logit bias
+    /// - No maximum length
     pub fn deterministic() -> Self {
         Self {
             temperature: None,
@@ -66,8 +90,44 @@ impl SamplingParams {
             dry_params: None,
         }
     }
+
+    /// Applies model-level generation defaults onto this request-local sampler config.
+    ///
+    /// This is opt-in and only updates fields that the model default explicitly provides.
+    pub fn apply_model_defaults(&mut self, defaults: &ModelGenerationDefaults) {
+        if defaults.do_sample == Some(false) {
+            self.temperature = None;
+            self.top_k = Some(1);
+            self.top_p = None;
+            self.min_p = None;
+        }
+
+        if let Some(temperature) = defaults.temperature {
+            self.temperature = if temperature == 0.0 {
+                None
+            } else {
+                Some(temperature)
+            };
+        }
+        if let Some(top_k) = defaults.top_k {
+            self.top_k = if top_k == 0 { None } else { Some(top_k) };
+        }
+        if let Some(top_p) = defaults.top_p {
+            self.top_p = Some(top_p);
+        }
+        if let Some(min_p) = defaults.min_p {
+            self.min_p = Some(min_p);
+        }
+        if let Some(repetition_penalty) = defaults.repetition_penalty {
+            self.repetition_penalty = Some(repetition_penalty);
+        }
+        if let Some(max_new_tokens) = defaults.max_new_tokens {
+            self.max_len = Some(max_new_tokens);
+        }
+    }
 }
 
+/// Parameters for DRY (Don't Repeat Yourself) sampling to reduce repetition.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DrySamplingParams {
     pub sequence_breakers: Vec<String>,
@@ -970,7 +1030,10 @@ impl Sampler {
     }
 }
 
+#[cfg(test)]
 mod tests {
+    use super::{ModelGenerationDefaults, SamplingParams};
+
     #[test]
     fn test_argmax() {
         use super::Sampler;
@@ -1049,5 +1112,47 @@ mod tests {
         assert_eq!(res.token, 1023);
         assert_eq!(res.top_logprobs, None);
         assert_eq!(res.logprob, 1023f64.log(10.) as f32)
+    }
+
+    #[test]
+    fn test_apply_model_defaults() {
+        let mut params = SamplingParams::neutral();
+        params.apply_model_defaults(&ModelGenerationDefaults {
+            do_sample: Some(true),
+            temperature: Some(1.0),
+            top_k: Some(32),
+            top_p: Some(0.9),
+            min_p: Some(0.05),
+            repetition_penalty: Some(1.1),
+            max_new_tokens: Some(256),
+            max_length: None,
+        });
+
+        assert_eq!(params.temperature, Some(1.0));
+        assert_eq!(params.top_k, Some(32));
+        assert_eq!(params.top_p, Some(0.9));
+        assert_eq!(params.min_p, Some(0.05));
+        assert_eq!(params.repetition_penalty, Some(1.1));
+        assert_eq!(params.max_len, Some(256));
+    }
+
+    #[test]
+    fn test_apply_model_defaults_disables_sampling_when_requested() {
+        let mut params = SamplingParams {
+            temperature: Some(0.7),
+            top_k: Some(40),
+            top_p: Some(0.9),
+            min_p: Some(0.1),
+            ..SamplingParams::neutral()
+        };
+        params.apply_model_defaults(&ModelGenerationDefaults {
+            do_sample: Some(false),
+            ..Default::default()
+        });
+
+        assert_eq!(params.temperature, None);
+        assert_eq!(params.top_k, Some(1));
+        assert_eq!(params.top_p, None);
+        assert_eq!(params.min_p, None);
     }
 }

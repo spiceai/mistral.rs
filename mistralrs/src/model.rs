@@ -1,9 +1,10 @@
-use anyhow::Context;
 use candle_core::{Device, Result, Tensor};
 use either::Either;
 use futures::future::join_all;
 use mistralrs_core::*;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
+use std::{path::PathBuf, sync::Arc};
 use tokio::sync::mpsc::{channel, Receiver};
 
 use crate::{EmbeddingRequest, EmbeddingRequestBuilder, RequestLike, TextMessages};
@@ -26,43 +27,72 @@ pub fn best_device(force_cpu: bool) -> Result<Device> {
     }
 }
 
-/// The object used to interact with the model. This can be used with many varietes of models, \
+/// The object used to interact with the model. This can be used with many varieties of models, \
 /// and as such may be created with one of:
+/// - [`ModelBuilder`] (auto-detecting)
 /// - [`TextModelBuilder`]
+/// - [`MultimodalModelBuilder`]
+/// - [`GgufModelBuilder`]
+/// - [`EmbeddingModelBuilder`]
+/// - [`DiffusionModelBuilder`]
+/// - [`SpeechModelBuilder`]
 /// - [`LoraModelBuilder`]
 /// - [`XLoraModelBuilder`]
-/// - [`GgufModelBuilder`]
 /// - [`GgufLoraModelBuilder`]
 /// - [`GgufXLoraModelBuilder`]
-/// - [`VisionModelBuilder`]
 /// - [`AnyMoeModelBuilder`]
+/// - [`TextSpeculativeBuilder`]
 ///
+/// [`ModelBuilder`]: crate::ModelBuilder
 /// [`TextModelBuilder`]: crate::TextModelBuilder
+/// [`MultimodalModelBuilder`]: crate::MultimodalModelBuilder
+/// [`GgufModelBuilder`]: crate::GgufModelBuilder
+/// [`EmbeddingModelBuilder`]: crate::EmbeddingModelBuilder
+/// [`DiffusionModelBuilder`]: crate::DiffusionModelBuilder
+/// [`SpeechModelBuilder`]: crate::SpeechModelBuilder
 /// [`LoraModelBuilder`]: crate::LoraModelBuilder
 /// [`XLoraModelBuilder`]: crate::XLoraModelBuilder
-/// [`GgufModelBuilder`]: crate::GgufModelBuilder
-/// [`GgufModelBuilder`]: crate::GgufModelBuilder
 /// [`GgufLoraModelBuilder`]: crate::GgufLoraModelBuilder
 /// [`GgufXLoraModelBuilder`]: crate::GgufXLoraModelBuilder
-/// [`VisionModelBuilder`]: crate::VisionModelBuilder
 /// [`AnyMoeModelBuilder`]: crate::AnyMoeModelBuilder
+/// [`TextSpeculativeBuilder`]: crate::TextSpeculativeBuilder
 ///
 pub struct Model {
     pub(crate) runner: Arc<MistralRs>,
 }
 
+/// Token-by-token stream returned by [`Model::stream_chat_request`].
+///
+/// Implements [`futures::Stream`], so you can use `StreamExt` combinators
+/// (e.g., `stream.next().await`).
 pub struct Stream<'a> {
     _server: &'a Model,
     rx: Receiver<Response>,
 }
 
 impl Stream<'_> {
+    /// Receive the next response chunk, or `None` when the stream is exhausted.
     pub async fn next(&mut self) -> Option<Response> {
         self.rx.recv().await
+    }
+
+    /// Consume this stream, returning the underlying receiver.
+    pub(crate) fn into_receiver(self) -> Receiver<Response> {
+        self.rx
+    }
+}
+
+impl futures::Stream for Stream<'_> {
+    type Item = Response;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
     }
 }
 
 impl Model {
+    /// Wrap an existing [`MistralRs`] engine instance.
+    /// Prefer using a builder (e.g., [`ModelBuilder`](crate::ModelBuilder)) instead.
     pub fn new(runner: Arc<MistralRs>) -> Self {
         Self { runner }
     }
@@ -165,10 +195,10 @@ impl Model {
         let ResponseOk::Done(response) = rx
             .recv()
             .await
-            .context("Channel was erroneously closed!")?
+            .ok_or(SdkError::Channel("channel closed unexpectedly".into()))?
             .as_result()?
         else {
-            anyhow::bail!("Got unexpected response type.")
+            return Err(SdkError::UnexpectedResponse { expected: "Done" });
         };
 
         Ok(response)
@@ -225,10 +255,10 @@ impl Model {
         } = rx
             .recv()
             .await
-            .context("Channel was erroneously closed!")?
+            .ok_or(SdkError::Channel("channel closed unexpectedly".into()))?
             .as_result()?
         else {
-            anyhow::bail!("Got unexpected response type.")
+            return Err(SdkError::UnexpectedResponse { expected: "Raw" });
         };
 
         Ok((logits_chunks, tokens))
@@ -266,6 +296,7 @@ impl Model {
                 prompt: prompt.to_string(),
                 format: response_format,
                 generation_params,
+                save_file,
             },
             sampling_params: SamplingParams::deterministic(),
             response: tx,
@@ -287,10 +318,12 @@ impl Model {
         let ResponseOk::ImageGeneration(response) = rx
             .recv()
             .await
-            .context("Channel was erroneously closed!")?
+            .ok_or(SdkError::Channel("channel closed unexpectedly".into()))?
             .as_result()?
         else {
-            anyhow::bail!("Got unexpected response type.")
+            return Err(SdkError::UnexpectedResponse {
+                expected: "ImageGeneration",
+            });
         };
 
         Ok(response)
@@ -536,7 +569,10 @@ impl Model {
         });
         self.runner.get_sender(model_id)?.send(request).await?;
 
-        rx.recv().await.context("Channel was erroneously closed!")?
+        rx.recv()
+            .await
+            .ok_or(SdkError::Channel("channel closed unexpectedly".into()))?
+            .map_err(|e| SdkError::Inference(e.into()))
     }
 
     /// Detokenize some tokens.
@@ -565,7 +601,10 @@ impl Model {
         });
         self.runner.get_sender(model_id)?.send(request).await?;
 
-        rx.recv().await.context("Channel was erroneously closed!")?
+        rx.recv()
+            .await
+            .ok_or(SdkError::Channel("channel closed unexpectedly".into()))?
+            .map_err(|e| SdkError::Inference(e.into()))
     }
 
     // ========================================================================

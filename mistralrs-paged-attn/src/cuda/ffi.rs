@@ -1,4 +1,6 @@
-use core::ffi::{c_int, c_long, c_void};
+use core::ffi::{c_int, c_long, c_uint, c_void};
+
+use candle_core::cuda::cudarc::driver::sys::CUstream;
 
 use candle_core::cuda::cudarc::driver::sys::CUstream;
 

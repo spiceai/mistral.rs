@@ -1,6 +1,6 @@
 use std::{
     fmt::Debug,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use candle_core::{shape::ShapeWithOneHole, DType, Device, IndexOp, Result, Shape, Tensor, D};
@@ -384,6 +384,8 @@ impl ImageEmbedding {
         input_embeds: &Tensor,
         image_attention_mask: Option<&Tensor>,
         image_sizes: Option<Vec<(u32, u32)>>,
+        image_hashes: &[u64],
+        encoder_cache: &Mutex<EncoderCacheManager>,
     ) -> Result<Tensor> {
         let input_ids = input_ids.reshape(((), input_ids.dim(D::Minus1)?))?;
 
@@ -469,6 +471,8 @@ impl ImageEmbedding {
                             (),
                             base_feat_height_reduction * base_feat_height_reduction * C,
                         ))?;
+                        let C = self.image_dim_out;
+                        let H = base_feat_height;
 
                         // (max_num_crops-1) x (12x12) x C
                         let mut sub_img = img_features.i((bs_, 1..))?;

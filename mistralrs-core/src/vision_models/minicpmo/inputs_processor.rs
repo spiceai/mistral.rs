@@ -2,7 +2,7 @@
 
 use std::{any::Any, sync::Arc};
 
-use candle_core::{Device, IndexOp, Result, Tensor};
+use candle_core::{DType, Device, IndexOp, Result, Tensor};
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use mistralrs_vision::{ApplyTransforms, Normalize, ToTensor, Transforms};
 use regex::Regex;
@@ -16,7 +16,7 @@ use crate::{
         },
         InputProcessorOutput, InputsProcessor, InputsProcessorType, MessagesAction, Processor,
     },
-    sequence::Sequence,
+    sequence::{build_mm_features_from_ranges, find_image_delimited_ranges, Sequence},
     vision_models::ModelInputs,
 };
 
@@ -98,6 +98,7 @@ impl InputsProcessor for MiniCpmOImageProcessor {
         no_kv_cache: bool,
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
+        sliding_window: Option<usize>,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
@@ -366,6 +367,7 @@ impl InputsProcessor for MiniCpmOImageProcessor {
             pixel_values_all,
             tgt_sizes,
             image_bound,
+            image_hashes,
         };
 
         // Dummy pixel values - real ones are in model specific args

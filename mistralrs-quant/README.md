@@ -13,7 +13,8 @@ Currently supported:
 - GGUF: `GgufMatMul`(2-8 bit quantization, with imatrix)
 - Gptq/Awq: `GptqAwqLayer`(with CUDA marlin kernel)
 - Hqq: `HqqLayer` (4, 8 bit quantization)
-- FP8: `FP8Linear`(optimized on CUDA)
+- FP8: `FP8Linear`
+- F8Q8: `F8Q8Linear`
 - Unquantized (used for ISQ): `UnquantLinear`
 - Bnb: `BnbLinear` (int8, fp4, nf4)
 

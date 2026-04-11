@@ -16,7 +16,7 @@ use mistralrs_quant::{MatMul, ShardedVarBuilder};
 use tqdm::Iter;
 use tracing::info;
 
-use crate::device_map::DeviceMapper;
+use crate::device_map::{DeviceMappedMask, DeviceMapper};
 use crate::layers::{CausalMasker, QRmsNorm, RotaryEmbedding, Sdpa};
 use crate::pipeline::{extract_logits, Cache, EitherCache};
 
@@ -397,6 +397,7 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
                     softcap: None,
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: None,
+                    sinks: None,
                 },
                 dtype,
             })
@@ -698,6 +699,7 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
                     softcap: None,
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: None,
+                    sinks: None,
                 },
                 dtype,
             })
@@ -791,6 +793,10 @@ impl ModelWeights {
         };
         let mask =
             CausalMasker.make_causal_mask_matrix(x, &*cache, self.dtype, self.layers[0].n_head)?;
+        let mask = match self.mapper {
+            Some(ref mapper) => DeviceMappedMask::new(mask, &**mapper)?,
+            None => DeviceMappedMask::from_single(mask),
+        };
         for (i, layer) in self.layers.iter().enumerate() {
             if let Some(ref mapper) = self.mapper {
                 layer_in = mapper.map(layer_in, i)?;
@@ -800,7 +806,7 @@ impl ModelWeights {
             let x = layer.attention_norm.forward(&x)?;
             let attn = layer.forward_attn(
                 &x,
-                &mask.as_ref().map(|m| m.to_device(x.device()).unwrap()),
+                &mask.as_ref().map(|m| m.get(x.device()).clone()),
                 start_offsets,
                 &mut cache[i],
                 scalings.clone(),

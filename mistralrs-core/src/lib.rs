@@ -37,9 +37,11 @@ mod cuda;
 mod device_map;
 mod engine;
 mod lora;
+mod metal;
 mod model_loader;
 mod moe;
 mod ops;
+mod video_input;
 pub use model_loader::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, LoaderBuilder,
 };
@@ -126,7 +128,8 @@ pub use request::{
 };
 pub use response::*;
 pub use sampler::{
-    CustomLogitsProcessor, DrySamplingParams, SamplingParams, StopTokens, TopLogprob,
+    CustomLogitsProcessor, DrySamplingParams, ModelGenerationDefaults, SamplingParams, StopTokens,
+    TopLogprob,
 };
 pub use scheduler::{DefaultSchedulerMethod, SchedulerConfig};
 pub use search::{SearchCallback, SearchFunctionParameters, SearchResult};
@@ -813,6 +816,9 @@ impl MistralRs {
                     warn!("Dummy run failed!");
                 }
             });
+
+            // Reset logger counters so the dummy run doesn't pollute stats
+            engine_instance.logger.reset();
         }
 
         // Create engines map with the first engine

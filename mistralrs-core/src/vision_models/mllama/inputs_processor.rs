@@ -23,7 +23,7 @@ use crate::{
         },
         InputProcessorOutput, InputsProcessor, InputsProcessorType, MessagesAction, Processor,
     },
-    sequence::Sequence,
+    sequence::{build_mm_features_from_ranges, find_image_placeholder_ranges, Sequence},
     vision_models::{
         image_processor::{ImagePreProcessor, PreprocessedImages},
         preprocessor_config::{PreProcessorConfig, ToFilter},
@@ -177,6 +177,7 @@ impl InputsProcessor for MLlamaImageProcessor {
         no_kv_cache: bool,
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
+        sliding_window: Option<usize>,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
@@ -218,6 +219,7 @@ impl InputsProcessor for MLlamaImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
             .unwrap()
         } else {
@@ -233,6 +235,7 @@ impl InputsProcessor for MLlamaImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
             .unwrap()
         };
@@ -416,6 +419,7 @@ impl InputsProcessor for MLlamaImageProcessor {
                 aspect_ratio_ids,
                 aspect_ratio_mask,
                 cross_attn_mask,
+                image_hashes,
             }),
             paged_attn_meta,
             flash_meta,

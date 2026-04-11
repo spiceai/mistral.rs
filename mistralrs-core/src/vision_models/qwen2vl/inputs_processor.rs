@@ -16,7 +16,7 @@ use crate::{
         },
         InputProcessorOutput, InputsProcessor, InputsProcessorType, MessagesAction, Processor,
     },
-    sequence::Sequence,
+    sequence::{build_mm_features_from_ranges, find_image_placeholder_ranges, Sequence},
     vision_models::{
         image_processor::{ImagePreProcessor, PreprocessedImages},
         preprocessor_config::{PreProcessorConfig, ToFilter},
@@ -123,6 +123,7 @@ impl InputsProcessor for Qwen2VLImageProcessor {
         no_kv_cache: bool,
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
+        sliding_window: Option<usize>,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
@@ -164,6 +165,7 @@ impl InputsProcessor for Qwen2VLImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
             .unwrap()
         } else {
@@ -179,6 +181,7 @@ impl InputsProcessor for Qwen2VLImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
             .unwrap()
         };
@@ -190,10 +193,10 @@ impl InputsProcessor for Qwen2VLImageProcessor {
         let (
             new_input,
             pixel_values,
-            image_grid_thw,
-            video_grid_thw,
-            continuous_img_pad,
-            continuous_vid_pad,
+            mut image_grid_thw,
+            mut video_grid_thw,
+            mut continuous_img_pad,
+            mut continuous_vid_pad,
             input_ids_searching,
             image_nums,
             video_nums,
@@ -257,6 +260,19 @@ impl InputsProcessor for Qwen2VLImageProcessor {
                 pixel_values_accum.push(pixel_values.unsqueeze(0).unwrap());
                 image_grid_thw_accum.push(image_grid_thw); //.map(|img| img.unsqueeze(0).unwrap()));
                 video_grid_thw_accum.push(video_grid_thw); //.map(|vid| vid.unsqueeze(0).unwrap()));
+            }
+
+            // Cache the complete grid_thw for MRoPE position computation.
+            // Set once during the first inputs processor call when ALL images are present.
+            // Unlike cached_img_thw, this is never cleared by keep_num_images, so it
+            // remains valid even after prefix caching trims the image set.
+            for (idx, seq) in input_seqs.iter_mut().enumerate() {
+                if seq.multimodal.rope_img_grid_thw.is_none() {
+                    seq.multimodal.rope_img_grid_thw = image_grid_thw_accum[idx].clone();
+                }
+                if seq.multimodal.rope_vid_grid_thw.is_none() {
+                    seq.multimodal.rope_vid_grid_thw = video_grid_thw_accum[idx].clone();
+                }
             }
 
             let image_grid_thw_accum = if image_grid_thw_accum.iter().any(|img| img.is_none()) {
@@ -443,12 +459,12 @@ impl InputsProcessor for Qwen2VLImageProcessor {
         };
 
         let (input, input_ids_full) = match (new_input, is_prompt) {
-            (Some(new_input), true) => (new_input.clone(), new_input),
+            (Some(new_input), true) => (input, new_input),
             (Some(new_input), false) => (input, new_input),
             (None, _) => (input.clone(), input.clone()),
         };
 
-        let pixel_values = if is_prompt { pixel_values } else { None };
+        let mut pixel_values = if is_prompt { pixel_values } else { None };
 
         let seqlens = input_seqs.iter().map(|seq| seq.len()).collect::<Vec<_>>();
 
@@ -462,12 +478,15 @@ impl InputsProcessor for Qwen2VLImageProcessor {
                 input_ids_full,
                 image_grid_thw,
                 video_grid_thw,
+                rope_img_grid_thw,
+                rope_vid_grid_thw,
                 seqlens,
                 continuous_img_pad,
                 continuous_vid_pad,
                 input_ids_searching,
                 image_nums,
                 video_nums,
+                image_hashes,
             }),
             paged_attn_meta,
             flash_meta,
@@ -530,8 +549,8 @@ impl Qwen2VLImageProcessor {
 
         for mut image in images {
             image = image.resize_exact(
-                height,
                 width,
+                height,
                 config
                     .resampling
                     .map(|resample| Some(resample).to_filter())
@@ -634,25 +653,14 @@ impl ImagePreProcessor for Qwen2VLImageProcessor {
                 images = mistralrs_vision::pad_to_max_edge(&images, max_edge);
             }
 
-            let mut height = 0;
-            let mut width = 0;
-            for image in &images {
-                let (w, h) = image.dimensions();
-                if w > width {
-                    width = w;
-                }
-                if h > height {
-                    height = h;
-                }
-            }
-
             for image in images {
-                let (patches, (t, h, w)) =
-                    self.preprocess_inner(vec![image], config, device, (height, width))?;
+                let (w, h) = image.dimensions();
+                let (patches, (t, gh, gw)) =
+                    self.preprocess_inner(vec![image], config, device, (h, w))?;
                 pixel_values.push(patches);
-                vision_grid_thw.push(Tensor::new(&[t, h, w], &Device::Cpu)?);
+                vision_grid_thw.push(Tensor::new(&[t, gh, gw], &Device::Cpu)?);
             }
-            let pixel_values = Tensor::stack(&pixel_values, 0)?;
+            let pixel_values = Tensor::cat(&pixel_values, 0)?;
             let vision_grid_thw = Tensor::stack(&vision_grid_thw, 0)?;
             return Ok(PreprocessedImages {
                 pixel_values,
@@ -674,25 +682,14 @@ impl ImagePreProcessor for Qwen2VLImageProcessor {
         }
 
         if !videos.is_empty() {
-            let mut height = 0;
-            let mut width = 0;
-            for image in &videos {
-                let (w, h) = image[0].dimensions();
-                if w > width {
-                    width = w;
-                }
-                if h > height {
-                    height = h;
-                }
-            }
-
             for images in videos {
-                let (patches, (t, h, w)) =
-                    self.preprocess_inner(images, config, device, (height, width))?;
+                let (w, h) = images[0].dimensions();
+                let (patches, (t, gh, gw)) =
+                    self.preprocess_inner(images, config, device, (h, w))?;
                 pixel_values.push(patches);
-                vision_grid_thw.push(Tensor::new(&[t, h, w], &Device::Cpu)?);
+                vision_grid_thw.push(Tensor::new(&[t, gh, gw], &Device::Cpu)?);
             }
-            let pixel_values = Tensor::stack(&pixel_values, 0)?;
+            let pixel_values = Tensor::cat(&pixel_values, 0)?;
             let vision_grid_thw = Tensor::stack(&vision_grid_thw, 0)?;
             return Ok(PreprocessedImages {
                 pixel_values,

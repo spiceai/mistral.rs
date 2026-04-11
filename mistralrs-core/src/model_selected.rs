@@ -27,7 +27,11 @@ fn parse_arch(x: &str) -> Result<NormalLoaderType, String> {
     x.parse()
 }
 
-fn parse_vision_arch(x: &str) -> Result<VisionLoaderType, String> {
+fn parse_multimodal_arch(x: &str) -> Result<MultimodalLoaderType, String> {
+    x.parse()
+}
+
+fn parse_embedding_arch(x: &str) -> Result<EmbeddingLoaderType, String> {
     x.parse()
 }
 
@@ -581,8 +585,8 @@ pub enum ModelSelected {
         max_batch_size: usize,
     },
 
-    /// Select a vision plain model, without quantization or adapters
-    VisionPlain {
+    /// Select a multimodal plain model, without quantization or adapters
+    MultimodalPlain {
         /// Model ID to load from. This may be a HF hub repo or a local path.
         #[arg(short, long)]
         model_id: String,

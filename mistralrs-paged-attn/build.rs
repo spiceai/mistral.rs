@@ -105,7 +105,9 @@ fn main() -> Result<()> {
     } else {
         build_dir.join("libmistralrspagedattention.a")
     };
-    builder.build_lib(out_file);
+    builder
+        .build_lib(out_file)
+        .expect("Build paged attention lib failed!");
 
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=mistralrspagedattention");

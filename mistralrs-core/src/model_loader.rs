@@ -92,7 +92,7 @@ pub fn get_model_dtype(model: &ModelSelected) -> anyhow::Result<ModelDType> {
         ModelSelected::Plain { dtype, .. }
         | ModelSelected::Lora { dtype, .. }
         | ModelSelected::XLora { dtype, .. }
-        | ModelSelected::VisionPlain { dtype, .. }
+        | ModelSelected::MultimodalPlain { dtype, .. }
         | ModelSelected::DiffusionPlain { dtype, .. }
         | ModelSelected::GGML { dtype, .. }
         | ModelSelected::GGUF { dtype, .. }
@@ -196,7 +196,31 @@ pub fn get_auto_device_map_params(model: &ModelSelected) -> anyhow::Result<AutoD
             max_image_length,
             max_num_images,
             ..
-        } => Ok(AutoDeviceMapParams::Vision {
+        } => {
+            if max_num_images.is_some() || max_image_length.is_some() {
+                let max_image_length =
+                    max_image_length.unwrap_or(AutoDeviceMapParams::DEFAULT_MAX_IMAGE_LENGTH);
+                Ok(AutoDeviceMapParams::Multimodal {
+                    max_seq_len: *max_seq_len,
+                    max_batch_size: *max_batch_size,
+                    max_image_shape: (max_image_length, max_image_length),
+                    max_num_images: max_num_images
+                        .unwrap_or(AutoDeviceMapParams::DEFAULT_MAX_NUM_IMAGES),
+                })
+            } else {
+                Ok(AutoDeviceMapParams::Text {
+                    max_seq_len: *max_seq_len,
+                    max_batch_size: *max_batch_size,
+                })
+            }
+        }
+        ModelSelected::MultimodalPlain {
+            max_seq_len,
+            max_batch_size,
+            max_image_length,
+            max_num_images,
+            ..
+        } => Ok(AutoDeviceMapParams::Multimodal {
             max_seq_len: *max_seq_len,
             max_batch_size: *max_batch_size,
             max_image_shape: (*max_image_length, *max_image_length),

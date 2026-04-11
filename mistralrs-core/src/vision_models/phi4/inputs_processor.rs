@@ -23,7 +23,7 @@ use crate::{
         InputProcessorOutput, InputsProcessor, InputsProcessorType, MessagesAction, Processor,
         ProcessorCreator,
     },
-    sequence::Sequence,
+    sequence::{build_mm_features_from_ranges, find_image_placeholder_ranges, Sequence},
 };
 
 use crate::vision_models::{
@@ -108,6 +108,7 @@ impl InputsProcessor for Phi4MMInputsProcessor {
         no_kv_cache: bool,
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
+        sliding_window: Option<usize>,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
@@ -140,6 +141,7 @@ impl InputsProcessor for Phi4MMInputsProcessor {
             let mut image_sizes_accum = Vec::new();
             let mut num_img_tokens_accum = Vec::new();
             for seq in input_seqs.iter_mut() {
+                let cached = seq.count_prefix_cached_mm_items();
                 let imgs = seq
                     .take_images()
                     .expect("Need to have images by this point.");
@@ -170,10 +172,24 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                     .expect("Preprocessor failed");
                 let image_sizes = image_sizes_all.unwrap();
                 let pixel_attention_mask = pixel_attention_mask.unwrap();
-                pixel_values_accum.push(pixel_values);
-                pixel_attention_masks_accum.push(pixel_attention_mask);
-                // Using extend on purpose
-                image_sizes_accum.extend(image_sizes);
+                // Trim cached images per-sequence before pushing.
+                let n_images = pixel_values.dim(0).unwrap_or(0);
+                if cached < n_images {
+                    if cached > 0 {
+                        pixel_values_accum
+                            .push(pixel_values.narrow(0, cached, n_images - cached).unwrap());
+                        pixel_attention_masks_accum.push(
+                            pixel_attention_mask
+                                .narrow(0, cached, n_images - cached)
+                                .unwrap(),
+                        );
+                    } else {
+                        pixel_values_accum.push(pixel_values);
+                        pixel_attention_masks_accum.push(pixel_attention_mask);
+                    }
+                    // Using extend on purpose
+                    image_sizes_accum.extend(image_sizes[cached..].to_vec());
+                }
                 num_img_tokens_accum.push(num_img_tokens.unwrap());
             }
             (
@@ -328,6 +344,7 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
         } else {
             get_completion_input(
@@ -339,12 +356,15 @@ impl InputsProcessor for Phi4MMInputsProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
         };
 
         result.map(move |metadata| {
             let pixel_values = pixel_values.clone();
             let pixel_attention_mask = pixel_attention_mask.clone();
+            let image_sizes = image_sizes.clone();
+
             let text_models_inputs_processor::InnerInputProcessorOutput {
                 inputs:
                     text_models_inputs_processor::InputMetadata {

@@ -256,3 +256,40 @@ fn bytes_to_data<T: WithDType>(
         Tensor::from_slice(&c, shape, device)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Guard against candle adding new `DType` variants without updating our match arms.
+    /// `DType` is `#[non_exhaustive]` now.
+    #[test]
+    fn dtype_variant_count_unchanged() {
+        assert_eq!(
+            std::mem::size_of::<candle_core::DType>(),
+            1,
+            "DType repr size changed, check if the discriminant size is the same"
+        );
+        // If DType grows beyond 14 variants its discriminant may still fit in 1 byte, so also verify the exact count.
+        const EXPECTED_VARIANTS: usize = 14;
+        let count = [
+            candle_core::DType::U8,
+            candle_core::DType::U32,
+            candle_core::DType::I16,
+            candle_core::DType::I32,
+            candle_core::DType::I64,
+            candle_core::DType::BF16,
+            candle_core::DType::F16,
+            candle_core::DType::F32,
+            candle_core::DType::F64,
+            candle_core::DType::F8E4M3,
+            candle_core::DType::F6E2M3,
+            candle_core::DType::F6E3M2,
+            candle_core::DType::F4,
+            candle_core::DType::F8E8M0,
+        ]
+        .len();
+        assert_eq!(
+            count, EXPECTED_VARIANTS,
+            "Update this list and the UQFF match arms when DType variants change"
+        );
+    }
+}

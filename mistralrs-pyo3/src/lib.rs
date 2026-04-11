@@ -13,7 +13,7 @@ use std::{
     cell::RefCell,
     path::PathBuf,
     str::FromStr,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
 };
 use stream::ChatCompletionStreamer;
 use tokio::{runtime::Runtime, sync::mpsc::channel};
@@ -106,7 +106,62 @@ struct Runner {
     runner: Arc<MistralRs>,
 }
 
-static NEXT_REQUEST_ID: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
+fn wrap_search_callback(cb: PyObject) -> Arc<SearchCallback> {
+    Arc::new(move |params: &SearchFunctionParameters| {
+        Python::with_gil(|py| {
+            let obj = cb.call1(py, (params.query.clone(),))?;
+            let list = obj.downcast_bound::<PyList>(py)?;
+            let mut results = Vec::new();
+            for item in list.iter() {
+                let title: String = item.get_item("title")?.extract()?;
+                let description: String = item.get_item("description")?.extract()?;
+                let url: String = item.get_item("url")?.extract()?;
+                let content: String = item.get_item("content")?.extract()?;
+                results.push(SearchResult {
+                    title,
+                    description,
+                    url,
+                    content,
+                });
+            }
+            Ok(results)
+        })
+        .map_err(|e: PyErr| anyhow::anyhow!(e.to_string()))
+    })
+}
+
+fn wrap_tool_callback(cb: PyObject) -> Arc<ToolCallback> {
+    Arc::new(move |func: &CalledFunction| {
+        Python::with_gil(|py| {
+            let json = py.import("json")?;
+            let args: Py<PyAny> = json
+                .call_method1("loads", (func.arguments.clone(),))?
+                .into();
+            let obj = cb.call1(py, (func.name.clone(), args))?;
+            obj.extract::<String>(py)
+        })
+        .map_err(|e: PyErr| anyhow::anyhow!(e.to_string()))
+    })
+}
+
+fn wrap_tool_callbacks(obj: PyObject) -> anyhow::Result<ToolCallbacks> {
+    Python::with_gil(|py| {
+        let dict = obj
+            .downcast_bound::<pyo3::types::PyDict>(py)
+            .map_err(|e| anyhow::anyhow!("Failed to downcast to PyDict: {}", e))?;
+
+        let mut map = ToolCallbacks::new();
+
+        for (name, cb) in dict.iter() {
+            let name: String = name
+                .extract()
+                .map_err(|e: PyErr| anyhow::anyhow!(e.to_string()))?;
+            let cb_obj: PyObject = cb.into();
+            map.insert(name, wrap_tool_callback(cb_obj));
+        }
+        Ok(map)
+    })
+}
 
 fn wrap_search_callback(cb: PyObject) -> Arc<SearchCallback> {
     Arc::new(move |params: &SearchFunctionParameters| {
@@ -486,7 +541,7 @@ fn parse_which(
             )?,
         )
         .build(),
-        Which::VisionPlain {
+        Which::MultimodalPlain {
             model_id,
             tokenizer_json,
             arch,
@@ -707,11 +762,11 @@ impl Runner {
                     max_batch_size: p.max_batch_size,
                 })
                 .unwrap_or(AutoDeviceMapParams::default_text()),
-            Which::VisionPlain {
+            Which::MultimodalPlain {
                 auto_map_params, ..
             } => auto_map_params
                 .clone()
-                .map(|p| AutoDeviceMapParams::Vision {
+                .map(|p| AutoDeviceMapParams::Multimodal {
                     max_seq_len: p.max_seq_len,
                     max_batch_size: p.max_batch_size,
                     max_image_shape: (p.max_image_length, p.max_image_length),
@@ -958,7 +1013,7 @@ impl Runner {
         request: Py<ChatCompletionRequest>,
         model_id: Option<String>,
     ) -> PyApiResult<Either<ChatCompletionResponse, ChatCompletionStreamer>> {
-        let (tx, mut rx) = channel(10_000);
+        let (tx, rx) = channel(10_000);
         Python::with_gil(|py| {
             let request = request.bind(py).borrow();
             let stop_toks = request
@@ -1246,10 +1301,19 @@ impl Runner {
             let sender = self.runner.get_sender(model_id.as_deref())?;
             sender.blocking_send(model_request).unwrap();
 
-            if request.stream {
-                Ok(Either::Right(ChatCompletionStreamer::from_rx(rx)))
-            } else {
-                let response = rx.blocking_recv().unwrap();
+            let runner = self.runner.clone();
+            let send_recv_result = py
+                .allow_threads(move || -> std::result::Result<either::Either<Response, Receiver<Response>>, String> {
+                    send_request_with_optional_stream(
+                        runner,
+                        model_id,
+                        model_request,
+                        rx,
+                        debug_repr,
+                        is_streaming,
+                    )
+                })
+                .map_err(PyApiErr::from)?;
 
                 match response {
                     Response::ValidationError(e) | Response::InternalError(e) => {
@@ -1413,7 +1477,7 @@ impl Runner {
         request: Py<CompletionRequest>,
         model_id: Option<String>,
     ) -> PyApiResult<CompletionResponse> {
-        let (tx, mut rx) = channel(10_000);
+        let (tx, rx) = channel(10_000);
         Python::with_gil(|py| {
             let request = request.bind(py).borrow();
             let stop_toks = request
@@ -1524,6 +1588,7 @@ impl Runner {
     ))]
     fn generate_image(
         &self,
+        py: Python<'_>,
         prompt: String,
         response_format: ImageGenerationResponseFormat,
         height: usize,
@@ -1538,6 +1603,7 @@ impl Runner {
                 prompt: prompt.to_string(),
                 format: response_format,
                 generation_params: DiffusionGenerationParams { height, width },
+                save_file,
             },
             sampling_params: SamplingParams::deterministic(),
             response: tx,
@@ -1557,11 +1623,7 @@ impl Runner {
         let sender = self.runner.get_sender(model_id.as_deref())?;
         sender.blocking_send(request).unwrap();
 
-        let ResponseOk::ImageGeneration(response) = rx
-            .blocking_recv()
-            .context("Channel was erroneously closed!")?
-            .as_result()?
-        else {
+        let ResponseOk::ImageGeneration(response) = response.as_result()? else {
             return Err(PyApiErr::from("Got unexpected response type."));
         };
 
@@ -1682,8 +1744,16 @@ impl Runner {
             .blocking_send(request)
             .unwrap();
 
-        rx.blocking_recv()
-            .context("Channel was erroneously closed!")?
+    /// List all available model IDs in multi-model mode (aliases if configured).
+    fn list_models(&self) -> PyApiResult<Vec<String>> {
+        self.runner.list_models().map_err(PyApiErr::from)
+    }
+
+    /// Return the maximum supported sequence length for the requested model, if available.
+    #[pyo3(signature = (model_id = None))]
+    fn max_sequence_length(&self, model_id: Option<String>) -> PyApiResult<Option<usize>> {
+        self.runner
+            .max_sequence_length(model_id.as_deref())
             .map_err(PyApiErr::from)
     }
 

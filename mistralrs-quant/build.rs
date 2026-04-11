@@ -162,7 +162,9 @@ fn main() -> Result<(), String> {
         } else {
             build_dir.join("libmistralrsquant.a")
         };
-        builder.build_lib(out_file);
+        builder
+            .build_lib(out_file)
+            .expect("Build mistral quant lib failed!");
         println!("cargo:rustc-link-search={}", build_dir.display());
         println!("cargo:rustc-link-lib=mistralrsquant");
         println!("cargo:rustc-link-lib=dylib=cudart");

@@ -77,7 +77,23 @@ impl From<EmbeddingArchitecture> for EmbeddingLoaderType {
 
 #[pyclass(eq, eq_int)]
 #[derive(Debug, Clone, PartialEq)]
-pub enum VisionArchitecture {
+pub enum EmbeddingArchitecture {
+    EmbeddingGemma,
+    Qwen3Embedding,
+}
+
+impl From<EmbeddingArchitecture> for EmbeddingLoaderType {
+    fn from(value: EmbeddingArchitecture) -> Self {
+        match value {
+            EmbeddingArchitecture::EmbeddingGemma => EmbeddingLoaderType::EmbeddingGemma,
+            EmbeddingArchitecture::Qwen3Embedding => EmbeddingLoaderType::Qwen3Embedding,
+        }
+    }
+}
+
+#[pyclass(eq, eq_int)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum MultimodalArchitecture {
     Phi3V,
     Idefics2,
     LLaVANext,
@@ -95,8 +111,8 @@ pub enum VisionArchitecture {
     Qwen3VL,
 }
 
-impl From<VisionArchitecture> for VisionLoaderType {
-    fn from(value: VisionArchitecture) -> Self {
+impl From<MultimodalArchitecture> for MultimodalLoaderType {
+    fn from(value: MultimodalArchitecture) -> Self {
         match value {
             VisionArchitecture::Phi3V => VisionLoaderType::Phi3V,
             VisionArchitecture::Idefics2 => VisionLoaderType::Idefics2,
@@ -189,7 +205,7 @@ impl TextAutoMapParams {
 #[pyclass]
 #[pyo3(get_all)]
 #[derive(Debug, Clone, PartialEq)]
-pub struct VisionAutoMapParams {
+pub struct MultimodalAutoMapParams {
     pub max_seq_len: usize,
     pub max_batch_size: usize,
     pub max_num_images: usize,
@@ -197,7 +213,7 @@ pub struct VisionAutoMapParams {
 }
 
 #[pymethods]
-impl VisionAutoMapParams {
+impl MultimodalAutoMapParams {
     #[new]
     #[pyo3(signature = (
         max_seq_len = AutoDeviceMapParams::DEFAULT_MAX_SEQ_LEN,
@@ -483,7 +499,7 @@ pub enum Which {
         matformer_config_path = None,
         matformer_slice_name = None,
     ))]
-    VisionPlain {
+    MultimodalPlain {
         model_id: String,
         arch: Option<VisionArchitecture>,
         tokenizer_json: Option<String>,

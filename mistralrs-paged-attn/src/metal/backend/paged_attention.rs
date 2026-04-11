@@ -117,9 +117,10 @@ impl candle_core::CustomOp1 for PagedAttention {
             || head_size == 112
             || head_size == 128
             || head_size == 192
-            || head_size == 256)
+            || head_size == 256
+            || head_size == 512)
         {
-            candle_core::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 192 or 256");
+            candle_core::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 192, 256 or 512");
         }
 
         let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
@@ -230,6 +231,9 @@ impl candle_core::CustomOp1 for PagedAttention {
                 q_stride as i32,
                 kv_block_stride as i32,
                 kv_head_stride as i32,
+                sinks_storage_and_offset
+                    .as_ref()
+                    .map(|(b, o)| (b as &_, *o)),
             )
             .map_err(candle_core::Error::wrap)?;
         } else {
@@ -285,6 +289,9 @@ impl candle_core::CustomOp1 for PagedAttention {
                 q_stride as i32,
                 kv_block_stride as i32,
                 kv_head_stride as i32,
+                sinks_storage_and_offset
+                    .as_ref()
+                    .map(|(b, o)| (b as &_, *o)),
             )
             .map_err(candle_core::Error::wrap)?;
         }
@@ -328,6 +335,7 @@ pub fn paged_attention(
     max_context_len: usize,
     softmax_scale: f32,
     softcapping: f32,
+    sinks: Option<&Tensor>,
 ) -> Result<Tensor> {
     let op = PagedAttention {
         softmax_scale,

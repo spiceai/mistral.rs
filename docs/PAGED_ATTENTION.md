@@ -92,7 +92,7 @@ The prefix cache operates at the block level (not token level) for efficiency:
 **Supported models:**
 - Normal models
 - GGUF models
-- Vision models
+- Multimodal models
 
 > Note: Prefix caching is supported when using PagedAttention. Configure the number of sequences to cache on the device with:
 > - CLI: `--prefix-cache-n <N>` (default 16)
@@ -138,12 +138,12 @@ async fn main() -> Result<()> {
     let model = TextModelBuilder::new("microsoft/Phi-3.5-mini-instruct")
         .with_isq(IsqType::Q8_0)
         .with_logging()
-        .with_paged_attn(|| {
+        .with_paged_attn(
             PagedAttentionMetaBuilder::default()
                 .with_block_size(32)
                 .with_gpu_memory(MemoryGpuConfig::ContextSize(1024))
-                .build()
-        })?
+                .build()?,
+        )
         .build()
         .await?;
 

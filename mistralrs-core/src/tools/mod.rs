@@ -280,3 +280,280 @@ pub fn parse_text_tools<'a>(
     };
     Ok((text_new, tool_calls))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gemma4_single_tool_call() {
+        let msg = "<|tool_call>call:get_weather{city:<|\"|\x3eLondon<|\"|\x3e,units:<|\"|\x3ecelsius<|\"|\x3e}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "get_weather");
+        assert_eq!(parsed[0].parameters["city"], "London");
+        assert_eq!(parsed[0].parameters["units"], "celsius");
+    }
+
+    #[test]
+    fn gemma4_tool_call_with_number() {
+        let msg = "<|tool_call>call:set_temp{value:42}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed[0].name, "set_temp");
+        assert_eq!(parsed[0].parameters["value"], 42);
+    }
+
+    #[test]
+    fn gemma4_tool_call_with_boolean() {
+        let msg = "<|tool_call>call:toggle{enabled:true}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed[0].parameters["enabled"], true);
+    }
+
+    #[test]
+    fn gemma4_tool_call_nested_object() {
+        let msg = "<|tool_call>call:api{config:{url:<|\"|\x3ehttps://example.com<|\"|\x3e,retries:3}}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed[0].name, "api");
+        assert_eq!(parsed[0].parameters["config"]["url"], "https://example.com");
+        assert_eq!(parsed[0].parameters["config"]["retries"], 3);
+    }
+
+    #[test]
+    fn gemma4_tool_call_strips_tool_response() {
+        let msg =
+            "<|tool_call>call:search{query:<|\"|\x3eweather<|\"|\x3e}<tool_call|><|tool_response>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "search");
+        assert_eq!(parsed[0].parameters["query"], "weather");
+    }
+
+    #[test]
+    fn gemma4_multiple_tool_calls() {
+        let msg = "<|tool_call>call:func_a{x:1}<tool_call|><|tool_call>call:func_b{y:<|\"|\x3ehello<|\"|\x3e}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "func_a");
+        assert_eq!(parsed[0].parameters["x"], 1);
+        assert_eq!(parsed[1].name, "func_b");
+        assert_eq!(parsed[1].parameters["y"], "hello");
+    }
+
+    #[test]
+    fn gemma4_tool_call_with_thinking_prefix() {
+        let msg = "<|channel>thought\nLet me search.\n<channel|><|tool_call>call:search{q:<|\"|\x3etest<|\"|\x3e}<tool_call|><|tool_response>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "search");
+    }
+
+    #[test]
+    fn gemma4_incomplete_tool_call_no_brace() {
+        // Model has only generated the prefix — should return original, not error
+        let msg = "<|tool_call>call:";
+        let result = process_model_specific_message(msg).unwrap();
+        assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn gemma4_incomplete_tool_call_unmatched_braces() {
+        let msg = "<|tool_call>call:func{key:<|\"|\x3evalue";
+        let result = process_model_specific_message(msg).unwrap();
+        assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn gemma4_contains_prefix_detects_pipe_variant() {
+        assert!(contains_tool_call_prefix(
+            "<|tool_call>call:test{}<tool_call|>"
+        ));
+        assert!(!contains_tool_call_prefix("some random text"));
+    }
+
+    #[test]
+    fn gemma4_quote_unquoted_keys() {
+        assert_eq!(
+            quote_unquoted_keys(r#"{key:"value",num:42}"#),
+            r#"{"key":"value","num":42}"#
+        );
+    }
+
+    #[test]
+    fn gemma4_quote_unquoted_keys_nested() {
+        assert_eq!(
+            quote_unquoted_keys(r#"{outer:{inner:"val"}}"#),
+            r#"{"outer":{"inner":"val"}}"#
+        );
+    }
+
+    #[test]
+    fn gemma4_quote_keys_preserves_strings() {
+        assert_eq!(
+            quote_unquoted_keys(r#"{key:"has:colon,and{brace}"}"#),
+            r#"{"key":"has:colon,and{brace}"}"#
+        );
+    }
+
+    #[test]
+    fn gemma4_extract_matched_braces() {
+        let s = "{a:1,b:{c:2}}rest";
+        let (inner, pos) = extract_matched_braces(s, 0).unwrap();
+        assert_eq!(inner, "a:1,b:{c:2}");
+        assert_eq!(pos, 13);
+    }
+
+    #[test]
+    fn gemma4_extract_braces_with_strings() {
+        let s = "{key:<|\"|\x3e{not a brace}<|\"|\x3e}after";
+        let (inner, _) = extract_matched_braces(s, 0).unwrap();
+        assert_eq!(inner, "key:<|\"|\x3e{not a brace}<|\"|\x3e");
+    }
+
+    #[test]
+    fn gemma4_tool_call_with_array() {
+        let msg = "<|tool_call>call:multi{items:[1,2,3]}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed[0].name, "multi");
+        assert_eq!(parsed[0].parameters["items"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn gemma4_tool_call_empty_args() {
+        let msg = "<|tool_call>call:no_args{}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed[0].name, "no_args");
+        assert_eq!(parsed[0].parameters, serde_json::json!({}));
+    }
+
+    #[test]
+    fn gemma4_tool_call_string_with_special_chars() {
+        // String containing commas, colons, and braces — must be preserved
+        let msg = "<|tool_call>call:test{query:<|\"|\x3ekey:val, {nested}<|\"|\x3e}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed[0].parameters["query"], "key:val, {nested}");
+    }
+
+    #[test]
+    fn gemma4_tool_call_negative_number() {
+        let msg = "<|tool_call>call:offset{x:-5,y:3.14}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed[0].parameters["x"], -5);
+        assert_eq!(parsed[0].parameters["y"], 3.14);
+    }
+
+    #[test]
+    fn gemma4_tool_call_null_value() {
+        let msg = "<|tool_call>call:test{val:null}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert!(parsed[0].parameters["val"].is_null());
+    }
+
+    #[test]
+    fn gemma4_incomplete_just_prefix_token() {
+        // Just the <|tool_call> token, no "call:" yet
+        let msg = "<|tool_call>";
+        let result = process_model_specific_message(msg).unwrap();
+        assert_eq!(result, msg); // No "call:" prefix found → falls through
+    }
+
+    #[test]
+    fn gemma4_incomplete_name_no_closing() {
+        // Function name started but no closing brace yet
+        let msg = "<|tool_call>call:search_the_web{query:<|\"|\x3etest<|\"|\x3e";
+        let result = process_model_specific_message(msg).unwrap();
+        assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn gemma4_non_tool_message_unchanged() {
+        let msg = "Hello, how can I help you?";
+        let result = process_model_specific_message(msg).unwrap();
+        assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn gemma4_args_to_json_mixed_types() {
+        let raw = "name:<|\"|\x3eAlice<|\"|\x3e,age:30,active:true,data:{score:9.5}";
+        let val = gemma4_args_to_json(raw).unwrap();
+        assert_eq!(val["name"], "Alice");
+        assert_eq!(val["age"], 30);
+        assert_eq!(val["active"], true);
+        assert_eq!(val["data"]["score"], 9.5);
+    }
+
+    #[test]
+    fn gemma4_quote_keys_with_array_of_strings() {
+        assert_eq!(
+            quote_unquoted_keys(r#"{items:["a","b"]}"#),
+            r#"{"items":["a","b"]}"#
+        );
+    }
+
+    #[test]
+    fn gemma4_quote_keys_with_multibyte_string_value() {
+        // Multi-byte chars in a string value must not corrupt byte offsets for
+        // keys that appear later in the input.
+        assert_eq!(
+            quote_unquoted_keys(r#"{first:"café",second:42}"#),
+            r#"{"first":"café","second":42}"#
+        );
+    }
+
+    #[test]
+    fn gemma4_quote_keys_boolean_values_not_quoted() {
+        // true/false/null should NOT get quotes since they're not followed by ':'
+        assert_eq!(
+            quote_unquoted_keys(r#"{a:true,b:false,c:null}"#),
+            r#"{"a":true,"b":false,"c":null}"#
+        );
+    }
+
+    #[test]
+    fn gemma4_tool_call_inner_quotes_escaped() {
+        // Model generates literal " inside <|"|>…<|"|> delimiters — must survive as \"
+        let msg = "<|tool_call>call:google_search{queries:[<|\"|\x3e\"Review\" stuff<|\"|\x3e,<|\"|\x3eplain<|\"|\x3e]}<tool_call|>";
+        let result = process_model_specific_message(msg).unwrap();
+        let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed[0].name, "google_search");
+        let queries = parsed[0].parameters["queries"].as_array().unwrap();
+        assert_eq!(queries[0], "\"Review\" stuff");
+        assert_eq!(queries[1], "plain");
+    }
+
+    #[test]
+    fn gemma4_escape_inner_quotes_basic() {
+        let input = r#"<|"|>hello "world"<|"|>"#;
+        let escaped = escape_inner_quotes(input);
+        assert_eq!(escaped, r#"<|"|>hello \"world\"<|"|>"#);
+    }
+
+    #[test]
+    fn gemma4_escape_inner_quotes_no_quotes() {
+        let input = r#"<|"|>hello world<|"|>"#;
+        let escaped = escape_inner_quotes(input);
+        assert_eq!(escaped, input);
+    }
+
+    #[test]
+    fn gemma4_escape_inner_quotes_multiple_strings() {
+        let input = r#"key:<|"|>"a" and "b"<|"|>,other:<|"|>no quotes<|"|>"#;
+        let escaped = escape_inner_quotes(input);
+        assert_eq!(
+            escaped,
+            r#"key:<|"|>\"a\" and \"b\"<|"|>,other:<|"|>no quotes<|"|>"#
+        );
+    }
+}

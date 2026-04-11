@@ -5,11 +5,13 @@ use mistralrs_quant::IsqType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::VideoInput;
+
 use crate::{
     response::Response, sampler::SamplingParams, tools::ToolChoice, CustomLogitsProcessor,
     DiffusionGenerationParams, Tool,
 };
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc::Sender;
 
 pub type LlguidanceGrammar = llguidance::api::TopLevelGrammar;
@@ -91,6 +93,16 @@ pub enum RequestMessage {
         prompt: String,
         format: ImageGenerationResponseFormat,
         generation_params: DiffusionGenerationParams,
+        save_file: Option<PathBuf>,
+    },
+    SpeechGeneration {
+        prompt: String,
+    },
+    Embedding {
+        prompt: String,
+    },
+    EmbeddingTokens {
+        prompt: Vec<u32>,
     },
     SpeechGeneration {
         prompt: String,

@@ -18,7 +18,7 @@ use crate::{
         InputProcessorOutput, InputsProcessor, InputsProcessorType, MessagesAction, Processor,
         ProcessorCreator,
     },
-    sequence::Sequence,
+    sequence::{build_mm_features_from_ranges, Sequence},
 };
 
 use crate::vision_models::{
@@ -78,6 +78,7 @@ impl InputsProcessor for Phi3InputsProcessor {
         no_kv_cache: bool,
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
+        sliding_window: Option<usize>,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
@@ -312,6 +313,7 @@ impl InputsProcessor for Phi3InputsProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
         } else {
             get_completion_input(
@@ -323,6 +325,7 @@ impl InputsProcessor for Phi3InputsProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
         };
 
@@ -347,6 +350,7 @@ impl InputsProcessor for Phi3InputsProcessor {
                 pixel_values: pixel_values.clone(),
                 model_specific_args: Box::new(Phi3VisionSpecificArgs {
                     image_sizes: image_sizes.clone(),
+                    image_hashes,
                 }),
                 paged_attn_meta,
                 flash_meta,

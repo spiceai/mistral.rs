@@ -6,7 +6,7 @@ fn main() {
 
     #[cfg(feature = "cuda")]
     {
-        use std::{path::PathBuf, vec};
+        use std::path::PathBuf;
         println!("cargo:rerun-if-changed=build.rs");
         let build_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
         let lib_files = vec![
@@ -60,7 +60,9 @@ fn main() {
             build_dir.join("libmistralrscuda.a")
         };
 
-        builder.build_lib(out_file);
+        builder
+            .build_lib(out_file)
+            .expect("Build mistral-core failed!");
         println!("cargo:rustc-link-search={}", build_dir.display());
         println!("cargo:rustc-link-lib=mistralrscuda");
         println!("cargo:rustc-link-lib=dylib=cudart");

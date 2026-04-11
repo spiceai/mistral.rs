@@ -1,6 +1,6 @@
 # Qwen 2 Vision Model: [`Qwen2-VL Collection`](https://huggingface.co/collections/Qwen/qwen2-vl-66cee7455501d7126940800d)
 
-Mistral.rs supports the Qwen2-VL vision model family, with examples in the Rust, Python, and HTTP APIs. ISQ quantization is supported to allow running the model with less memory requirements.
+Mistral.rs supports the Qwen2-VL multimodal model family, with examples in the Rust, Python, and HTTP APIs. ISQ quantization is supported to allow running the model with less memory requirements.
 
 UQFF quantizations are also available.
 
@@ -23,7 +23,7 @@ The Rust SDK takes an image from the [image](https://docs.rs/image/latest/image/
 
 ## Interactive mode
 
-Mistral.rs supports interactive mode for vision models! It is an easy way to interact with the model.
+Mistral.rs supports interactive mode for multimodal models! It is an easy way to interact with the model.
 
 1) Start up interactive mode with the Qwen2-VL model
 
@@ -57,7 +57,7 @@ camellias are also known for their resilience and ability to thrive in a variety
 ## HTTP server
 You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/server/qwen2vl.py).
 
-We support an OpenAI compatible HTTP API for vision models. This example demonstrates sending a chat completion request with an image.
+We support an OpenAI compatible HTTP API for multimodal models. This example demonstrates sending a chat completion request with an image.
 
 > Note: The image_url may be either a path, URL, or a base64 encoded string.
 
@@ -156,12 +156,11 @@ async fn main() -> Result<()> {
     };
     let image = image::load_from_memory(&bytes)?;
 
-    let messages = VisionMessages::new().add_image_message(
+    let messages = MultimodalMessages::new().add_image_message(
         TextMessageRole::User,
         "What type of flower is this? Give some fun facts.",
-        image,
-        &model
-    )?;
+        vec![image],
+    );
 
     let response = model.send_chat_request(messages).await?;
 
@@ -185,14 +184,14 @@ This example demonstrates loading and sending a chat completion request with an 
 > Note: the image_url may be either a path, URL, or a base64 encoded string.
 
 ```py
-from mistralrs import Runner, Which, ChatCompletionRequest, VisionArchitecture
+from mistralrs import Runner, Which, ChatCompletionRequest, MultimodalArchitecture
 
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 
 runner = Runner(
-    which=Which.VisionPlain(
+    which=Which.MultimodalPlain(
         model_id=MODEL_ID,
-        arch=VisionArchitecture.Qwen2VL,
+        arch=MultimodalArchitecture.Qwen2VL,
     ),
 )
 

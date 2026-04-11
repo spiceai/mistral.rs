@@ -8,6 +8,7 @@ use std::{ops::Mul, sync::Arc};
 use crate::{
     attention::SdpaParams,
     layers::{conv2d, embedding, layer_norm, Activation, CausalMasker, Sdpa},
+    pipeline::text_models_inputs_processor::FlashParams,
     serde_default_fn,
     utils::unvarbuilder::UnVarBuilder,
 };
@@ -88,7 +89,7 @@ fn bucketize_right(xs: &[f32], boundaries: &[f32], device: &Device) -> Result<Te
             // For robust handling of NaNs, you might need a custom comparison.
             val.partial_cmp(&x).unwrap_or(Ordering::Less)
         }) {
-            Ok(i) => i,
+            Ok(i) => i + 1, // right=True: insert after equal elements
             Err(i) => i,
         };
 
@@ -214,7 +215,10 @@ impl VisionEmbeddings {
         }
         let position_ids = Tensor::stack(&new_position_ids, 0)?;
         let position_ids = position_ids.to_device(self.position_embedding.embeddings().device())?;
-        embeddings.broadcast_add(&self.position_embedding.forward(&position_ids)?)
+
+        let pos_emb = self.position_embedding.forward(&position_ids)?;
+        let combined = embeddings.broadcast_add(&pos_emb)?;
+        Ok(combined)
     }
 
     fn residual_tensors(&self) -> Vec<(String, Tensor)> {

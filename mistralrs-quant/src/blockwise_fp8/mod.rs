@@ -333,6 +333,35 @@ impl QuantMethod for BlockwiseFP8Linear {
                     dtype: DType::F8E4M3,
                 })?))
             }
+            Some(IsqType::F8Q8) => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("F8Q8 does not support imatrix.");
+                }
+
+                let w = weight.to_device(&device)?;
+                let b = if let Some(b) = &self.bias {
+                    Some(b.to_device(&device)?)
+                } else {
+                    None
+                };
+                Ok(Arc::new(crate::F8Q8Linear::from_weight(&w, b)?))
+            }
+            Some(IsqType::MXFP4) => {
+                let _acquired_quantize_guard = guard.acquire(&device);
+                if imatrix_weight.is_some() {
+                    candle_core::bail!("MXFP4 does not support imatrix.");
+                }
+
+                n_quantized.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let w = weight.to_device(&device)?;
+                let b = self
+                    .bias
+                    .as_ref()
+                    .map(|b| b.to_device(&device))
+                    .transpose()?;
+                crate::MXFP4Layer::quantize(&w, b, &device)
+            }
             None => {
                 let _acquired_quantize_guard = guard.acquire(&device);
                 // Ignore imatrix altogether

@@ -7,16 +7,24 @@ use indexmap::IndexMap;
 use serde_json::{json, Value};
 
 /// A type which can be used as a chat request.
+///
+/// Implemented by [`TextMessages`], [`MultimodalMessages`], and [`RequestBuilder`].
 pub trait RequestLike {
+    /// Borrow the current list of chat messages.
     fn messages_ref(&self) -> &[IndexMap<String, MessageContent>];
     fn images_ref(&self) -> &[DynamicImage];
     fn take_messages(&mut self) -> RequestMessage;
+    /// Take any custom logits processors, if configured.
     fn take_logits_processors(&mut self) -> Option<Vec<Arc<dyn CustomLogitsProcessor>>>;
+    /// Take any active adapter names (LoRA / X-LoRA), if configured.
     fn take_adapters(&mut self) -> Option<Vec<String>>;
+    /// Whether log-probabilities should be returned.
     fn return_logprobs(&self) -> bool;
     fn enable_search(&self) -> Option<bool>;
     fn take_constraint(&mut self) -> Constraint;
+    /// Take the tools and tool-choice policy, if any.
     fn take_tools(&mut self) -> Option<(Vec<Tool>, ToolChoice)>;
+    /// Take the sampling parameters.
     fn take_sampling_params(&mut self) -> SamplingParams;
     fn take_web_search_options(&mut self) -> Option<WebSearchOptions>;
     fn truncate_sequence(&self) -> bool {
@@ -44,10 +52,15 @@ impl From<TextMessages> for Vec<IndexMap<String, MessageContent>> {
 #[derive(Debug, Clone, PartialEq)]
 /// A chat message role.
 pub enum TextMessageRole {
+    /// The human user.
     User,
+    /// The model / assistant.
     Assistant,
+    /// System prompt providing instructions to the model.
     System,
+    /// Output from a tool call.
     Tool,
+    /// A custom role string.
     Custom(String),
 }
 
@@ -70,6 +83,7 @@ impl Default for TextMessages {
 }
 
 impl TextMessages {
+    /// Create an empty text message list.
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
@@ -77,6 +91,7 @@ impl TextMessages {
         }
     }
 
+    /// Append a message with the given role and text content.
     pub fn add_message(mut self, role: TextMessageRole, text: impl ToString) -> Self {
         self.messages.push(IndexMap::from([
             ("role".to_string(), Either::Left(role.to_string())),
@@ -85,6 +100,7 @@ impl TextMessages {
         self
     }
 
+    /// Remove all messages.
     pub fn clear(mut self) -> Self {
         self.messages.clear();
         self
@@ -144,20 +160,21 @@ impl RequestLike for TextMessages {
 /// No constraints, logits processors, logprobs, tools, or adapters.
 ///
 /// Sampling is deterministic.
-pub struct VisionMessages {
+pub struct MultimodalMessages {
     messages: Vec<IndexMap<String, MessageContent>>,
     images: Vec<DynamicImage>,
     audios: Vec<AudioInput>,
     enable_thinking: Option<bool>,
 }
 
-impl Default for VisionMessages {
+impl Default for MultimodalMessages {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl VisionMessages {
+impl MultimodalMessages {
+    /// Create an empty multimodal message list.
     pub fn new() -> Self {
         Self {
             images: Vec::new(),
@@ -167,6 +184,7 @@ impl VisionMessages {
         }
     }
 
+    /// Append a text-only message with the given role and content.
     pub fn add_message(mut self, role: TextMessageRole, text: impl ToString) -> Self {
         self.messages.push(IndexMap::from([
             ("role".to_string(), Either::Left(role.to_string())),
@@ -265,11 +283,15 @@ impl VisionMessages {
         Ok(self)
     }
 
+    /// Remove all messages, images, audio, and video.
     pub fn clear(mut self) -> Self {
         self.messages.clear();
         self.images.clear();
         self.audios.clear();
 
+    /// Enable extended thinking (chain-of-thought) for models that support it.
+    pub fn enable_thinking(mut self, enable_thinking: bool) -> Self {
+        self.enable_thinking = Some(enable_thinking);
         self
     }
 
@@ -279,7 +301,7 @@ impl VisionMessages {
     }
 }
 
-impl RequestLike for VisionMessages {
+impl RequestLike for MultimodalMessages {
     fn messages_ref(&self) -> &[IndexMap<String, MessageContent>] {
         &self.messages
     }
@@ -379,8 +401,8 @@ impl From<TextMessages> for RequestBuilder {
     }
 }
 
-impl From<VisionMessages> for RequestBuilder {
-    fn from(value: VisionMessages) -> Self {
+impl From<MultimodalMessages> for RequestBuilder {
+    fn from(value: MultimodalMessages) -> Self {
         Self {
             messages: value.messages,
             images: value.images,
@@ -400,6 +422,7 @@ impl From<VisionMessages> for RequestBuilder {
 }
 
 impl RequestBuilder {
+    /// Create an empty request builder with deterministic sampling defaults.
     pub fn new() -> Self {
         Self {
             messages: Vec::new(),
@@ -454,6 +477,7 @@ impl RequestBuilder {
         self
     }
 
+    /// Append an assistant message that includes tool call results.
     pub fn add_message_with_tool_call(
         mut self,
         role: TextMessageRole,
@@ -484,6 +508,11 @@ impl RequestBuilder {
         self
     }
 
+    /// Append a message containing images.
+    ///
+    /// Model-specific prefix tokens are applied automatically when the
+    /// request is sent via [`Model::send_chat_request`](crate::Model::send_chat_request)
+    /// or [`Model::stream_chat_request`](crate::Model::stream_chat_request).
     pub fn add_image_message(
         self,
         role: TextMessageRole,
@@ -575,11 +604,13 @@ impl RequestBuilder {
         Ok(self)
     }
 
+    /// Add a custom logits processor applied during token sampling.
     pub fn add_logits_processor(mut self, processor: Arc<dyn CustomLogitsProcessor>) -> Self {
         self.logits_processors.push(processor);
         self
     }
 
+    /// Activate the given LoRA/X-LoRA adapter layers by name.
     pub fn set_adapters(mut self, adapters: Vec<String>) -> Self {
         self.adapters = adapters;
         self
@@ -591,16 +622,19 @@ impl RequestBuilder {
         self
     }
 
+    /// Control how the model selects tools (auto, required, none, or a specific tool).
     pub fn set_tool_choice(mut self, tool_choice: ToolChoice) -> Self {
         self.tool_choice = tool_choice;
         self
     }
 
+    /// Request log-probabilities for each generated token.
     pub fn return_logprobs(mut self, return_logprobs: bool) -> Self {
         self.return_logprobs = return_logprobs;
         self
     }
 
+    /// Apply a generation constraint (regex, JSON schema, or grammar).
     pub fn set_constraint(mut self, constraint: Constraint) -> Self {
         self.constraint = constraint;
         self
@@ -622,61 +656,73 @@ impl RequestBuilder {
         self
     }
 
+    /// Set the sampling temperature. Higher values increase randomness.
     pub fn set_sampler_temperature(mut self, temperature: f64) -> Self {
         self.sampling_params.temperature = Some(temperature);
         self
     }
 
+    /// Limit sampling to the top-k most probable tokens.
     pub fn set_sampler_topk(mut self, topk: usize) -> Self {
         self.sampling_params.top_k = Some(topk);
         self
     }
 
+    /// Nucleus sampling: only consider tokens whose cumulative probability exceeds this threshold.
     pub fn set_sampler_topp(mut self, topp: f64) -> Self {
         self.sampling_params.top_p = Some(topp);
         self
     }
 
+    /// Min-p sampling: filter tokens below this fraction of the top token's probability.
     pub fn set_sampler_minp(mut self, minp: f64) -> Self {
         self.sampling_params.min_p = Some(minp);
         self
     }
 
+    /// Return the top-n log-probabilities per token position.
     pub fn set_sampler_topn_logprobs(mut self, top_n_logprobs: usize) -> Self {
         self.sampling_params.top_n_logprobs = top_n_logprobs;
         self
     }
 
+    /// Penalize tokens proportionally to how often they have appeared so far.
     pub fn set_sampler_frequency_penalty(mut self, frequency_penalty: f32) -> Self {
         self.sampling_params.frequency_penalty = Some(frequency_penalty);
         self
     }
 
+    /// Penalize tokens that have appeared at all, regardless of frequency.
     pub fn set_sampler_presence_penalty(mut self, presence_penalty: f32) -> Self {
         self.sampling_params.presence_penalty = Some(presence_penalty);
         self
     }
 
+    /// Set stop tokens that terminate generation when produced.
     pub fn set_sampler_stop_toks(mut self, stop_toks: StopTokens) -> Self {
         self.sampling_params.stop_toks = Some(stop_toks);
         self
     }
 
+    /// Set the maximum number of tokens to generate.
     pub fn set_sampler_max_len(mut self, max_len: usize) -> Self {
         self.sampling_params.max_len = Some(max_len);
         self
     }
 
+    /// Apply a bias to specific token IDs during sampling.
     pub fn set_sampler_logits_bias(mut self, logits_bias: HashMap<u32, f32>) -> Self {
         self.sampling_params.logits_bias = Some(logits_bias);
         self
     }
 
+    /// Generate multiple independent completions for the same prompt.
     pub fn set_sampler_n_choices(mut self, n_choices: usize) -> Self {
         self.sampling_params.n_choices = n_choices;
         self
     }
 
+    /// Configure DRY (Don't Repeat Yourself) sampling parameters.
     pub fn set_sampler_dry_params(mut self, dry_params: DrySamplingParams) -> Self {
         self.sampling_params.dry_params = Some(dry_params);
         self

@@ -1,4 +1,7 @@
 # Generate a UQFF Hugging Face model card .md file.
+# NOTE: This script is deprecated. The `mistralrs quantize` command now
+# automatically generates a README.md model card when using directory output mode.
+# Use `mistralrs quantize -m <model> --isq <level> -o <dir>/` instead.
 
 msg = "This script is used to generate a Hugging Face model card."
 print("-" * len(msg))
@@ -69,8 +72,8 @@ try:
         else:
             output += f"|{quants.strip().upper()}|"
 
-        if is_vision:
-            cmd = "vision-plain"
+        if is_multimodal:
+            cmd = "multimodal-plain"
         else:
             cmd = "plain"
 

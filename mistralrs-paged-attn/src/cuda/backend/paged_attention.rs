@@ -163,9 +163,10 @@ impl PagedAttention {
             || head_size == 112
             || head_size == 128
             || head_size == 192
-            || head_size == 256)
+            || head_size == 256
+            || head_size == 512)
         {
-            candle_core::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 192 or 256");
+            candle_core::bail!("`head_size` must be one of 64, 80, 96, 112, 128, 192, 256 or 512");
         }
 
         let (num_seqs_bt, max_num_blocks_per_seq) = bt_l.shape().dims2()?;
@@ -362,6 +363,7 @@ pub fn paged_attention(
     max_context_len: usize,
     softmax_scale: f32,
     softcapping: f32,
+    sinks: Option<&Tensor>,
 ) -> Result<Tensor> {
     let op = PagedAttention {
         softmax_scale,

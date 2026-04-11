@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use candle_core::{Result, Tensor, D};
 use candle_nn::Module;
 use mistralrs_quant::ShardedVarBuilder;

@@ -8,8 +8,8 @@ use tokio::sync::Mutex;
 use crate::{
     engine::IntervalLogger,
     paged_attention::{
-        BlockEngine, BlockTables, CacheConfig, PagedAttentionScheduler,
-        PagedAttentionSchedulerConfig, PagedAttentionSchedulerOutput,
+        CacheConfig, KVCacheManager, PagedAttentionScheduler, PagedAttentionSchedulerConfig,
+        PagedAttentionSchedulerOutput,
     },
     sequence::Sequence,
 };

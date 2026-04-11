@@ -16,7 +16,7 @@ use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
 use crate::{
     amoe::{AnyMoeBaseModelMixin, AnyMoeTrainableLayer, MlpLayer, MoeMlp},
     attention::SdpaParams,
-    device_map::DeviceMapper,
+    device_map::{DeviceMappedMask, DeviceMapper},
     get_delta_from_lora_ab,
     layers::{
         self, Activation, CausalMasker, MatMul, PhiRopeConfig, PhiRopeScalingConfig,
@@ -27,7 +27,7 @@ use crate::{
     pipeline::{
         extract_logits,
         text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata},
-        EitherCache, IsqModel, KvCache, NormalCache, NormalLoadingMetadata, VisionModel,
+        EitherCache, IsqModel, KvCache, MultimodalModel, NormalCache, NormalLoadingMetadata,
     },
     serde_default_fn,
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
@@ -206,6 +206,7 @@ impl Attention {
                 softcap: None,
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: cfg.sliding_window,
+                sinks: None,
             },
         })
     }
@@ -720,6 +721,8 @@ impl ImageEmbedding {
         input_ids: &Tensor,
         pixel_values: &Tensor,
         image_sizes: Option<Vec<(usize, usize)>>,
+        image_hashes: &[u64],
+        encoder_cache: &Mutex<EncoderCacheManager>,
     ) -> Result<Tensor> {
         let input_ids = input_ids.reshape(((), input_ids.dim(D::Minus1)?))?;
 
@@ -734,6 +737,7 @@ impl ImageEmbedding {
         // If some, use hd transform case and it contains num_img_toks
         let mut hd_transform = None;
         let mut image_set_tensor = None;
+        let n_hashes = image_hashes.len();
         if positions.dim(0)? > 0 {
             select = true;
             // input_ids[positions[:, 0], positions[:, 1]]
@@ -857,13 +861,53 @@ impl ImageEmbedding {
                     image_set_tensor = Some(Either::Left(image_set_tensor_inner));
                 }
             } else if pixel_values.dims().len() == 4 {
-                let tt = self
-                    .get_image_features(pixel_values)?
-                    .to_device(&target_dev)?
-                    .to_dtype(target_dtype)?
-                    .reshape(((), self.image_dim_out))?;
-                let image_set_tensor_inner = self.layers.forward(&tt)?;
-                image_set_tensor = Some(Either::Right(image_set_tensor_inner));
+                let n_imgs = pixel_values.dim(0)?;
+                if n_hashes > 0 && n_hashes == n_imgs {
+                    // Per-image caching for non-HD path
+                    let mut per_image_features: Vec<Option<Tensor>> = vec![None; n_imgs];
+                    let mut miss_indices = Vec::new();
+                    {
+                        let mut guard = encoder_cache.lock().expect("encoder cache lock poisoned");
+                        for (i, &hash) in image_hashes.iter().enumerate() {
+                            if let Some(cached) = guard.get(hash) {
+                                per_image_features[i] = Some(cached[0].clone());
+                            } else {
+                                miss_indices.push(i);
+                            }
+                        }
+                    }
+                    if !miss_indices.is_empty() {
+                        for &idx in &miss_indices {
+                            let single_pv = pixel_values.get(idx)?.unsqueeze(0)?;
+                            let tt = self
+                                .get_image_features(&single_pv)?
+                                .to_device(&target_dev)?
+                                .to_dtype(target_dtype)?
+                                .reshape(((), self.image_dim_out))?;
+                            let feats = self.layers.forward(&tt)?;
+                            {
+                                let mut guard =
+                                    encoder_cache.lock().expect("encoder cache lock poisoned");
+                                guard.insert(image_hashes[idx], vec![feats.clone()]);
+                            }
+                            per_image_features[idx] = Some(feats);
+                        }
+                    }
+                    let all_feats: Vec<Tensor> = per_image_features
+                        .into_iter()
+                        .map(|f| f.expect("all images should be resolved"))
+                        .collect();
+                    let image_set_tensor_inner = Tensor::cat(&all_feats, 0)?;
+                    image_set_tensor = Some(Either::Right(image_set_tensor_inner));
+                } else {
+                    let tt = self
+                        .get_image_features(pixel_values)?
+                        .to_device(&target_dev)?
+                        .to_dtype(target_dtype)?
+                        .reshape(((), self.image_dim_out))?;
+                    let image_set_tensor_inner = self.layers.forward(&tt)?;
+                    image_set_tensor = Some(Either::Right(image_set_tensor_inner));
+                }
             } else if pixel_values.dims().len() == 3 {
                 let tt = pixel_values
                     .to_device(&target_dev)?
@@ -954,6 +998,7 @@ pub struct Model {
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     sliding_window: Option<usize>,
     cfg: ModelConfigMetadata,
+    encoder_cache: Arc<Mutex<EncoderCacheManager>>,
 }
 
 impl Model {
@@ -1069,6 +1114,7 @@ impl Model {
                 kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             mapper,
+            encoder_cache: Arc::new(Mutex::new(EncoderCacheManager::new(32))),
         })
     }
 
@@ -1081,12 +1127,18 @@ impl Model {
         position_ids: &[usize],
         context_lens: Vec<(usize, usize)>,
         image_sizes: Option<Vec<(usize, usize)>>,
+        image_hashes: &[u64],
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let mut xs = if let Some(ref pixel_values) = pixel_values {
-            self.vision_embed_tokens
-                .forward(input_ids, pixel_values, image_sizes)?
+            self.vision_embed_tokens.forward(
+                input_ids,
+                pixel_values,
+                image_sizes,
+                image_hashes,
+                &self.encoder_cache,
+            )?
         } else {
             self.embed_tokens.forward(input_ids)?
         };
@@ -1107,15 +1159,13 @@ impl Model {
                 .map(|(_, meta)| meta.is_first_prompt_chunk)
                 .unwrap_or(true)
         });
+        let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(
                 &xs,
-                attention_mask
-                    .as_ref()
-                    .map(|m| m.to_device(xs.device()).unwrap())
-                    .as_ref(),
+                attention_mask.as_ref().map(|m| m.get(xs.device())),
                 seqlen_offsets,
                 position_ids,
                 &mut cache[i],
@@ -1184,9 +1234,10 @@ impl IsqModel for Model {
 #[derive(Default)]
 pub(crate) struct Phi3VisionSpecificArgs {
     pub image_sizes: Option<Vec<(usize, usize)>>,
+    pub image_hashes: Vec<u64>,
 }
 
-impl VisionModel for Model {
+impl MultimodalModel for Model {
     fn forward(
         &self,
         input_ids: &Tensor,
@@ -1198,7 +1249,10 @@ impl VisionModel for Model {
         metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
-        let Phi3VisionSpecificArgs { image_sizes } = *model_specific_args
+        let Phi3VisionSpecificArgs {
+            image_sizes,
+            image_hashes,
+        } = *model_specific_args
             .downcast()
             .expect("Cannot downcast into `Phi3VisionSpecificArgs`");
         self.forward(
@@ -1208,6 +1262,7 @@ impl VisionModel for Model {
             &position_ids,
             context_lens,
             image_sizes,
+            &image_hashes,
             metadata,
             flash_params,
         )
@@ -1229,6 +1284,19 @@ impl VisionModel for Model {
     }
     fn default_model_specific_args(&self, _input_ids: &Tensor) -> Box<dyn Any> {
         Box::new(Phi3VisionSpecificArgs::default())
+    }
+    fn encoder_cache_counters(
+        &self,
+    ) -> Option<(
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    )> {
+        Some(
+            self.encoder_cache
+                .lock()
+                .expect("encoder cache poisoned")
+                .counters(),
+        )
     }
 }
 

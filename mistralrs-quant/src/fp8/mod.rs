@@ -150,8 +150,8 @@ impl QuantMethod for FP8Linear {
 
     fn apply_isq(
         self: Arc<Self>,
-        _dtype: Option<IsqType>,
-        _device: Device,
+        dtype: Option<IsqType>,
+        device: Device,
         _n_quantized: &AtomicUsize,
         _imatrix_weight: Option<Vec<f32>>,
         _guard: QuantizeOntoGuard,

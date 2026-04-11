@@ -80,7 +80,7 @@ pub trait ModelPaths: AsAny + Debug + Send + Sync {
     /// Get the preprocessor config (for the vision models). This is used to pre process images.
     fn get_preprocessor_config(&self) -> &Option<PathBuf>;
 
-    /// Get the processor config (for the vision models). This is primarily used for the chat template.
+    /// Get the processor config (for the multimodal models). This is primarily used for the chat template.
     fn get_processor_config(&self) -> &Option<PathBuf>;
 
     /// Get the explicit chat template.
@@ -415,7 +415,7 @@ impl QuantizationConfigShim {
 
 pub trait DeviceMappedModelLoader {
     /// Maximum activation size of non-mapped parts of this model.
-    /// Useful for the vision models which may prefer to keep the vison components on the GPU.
+    /// Useful for the multimodal models which may prefer to keep the vison components on the GPU.
     fn non_mapped_max_act_size_elems(
         &self,
         config: &str,

@@ -34,8 +34,7 @@ impl PastKvLenCache for NotACache {
 
 impl PastKvLenCache for Vec<KvCache> {
     fn get_past_kv_len(&self) -> Result<usize> {
-        let kv_cache_1 = &self[0];
-        Ok(kv_cache_1.current_seq_len())
+        Ok(self.iter().map(KvCache::current_seq_len).max().unwrap_or(0))
     }
 }
 

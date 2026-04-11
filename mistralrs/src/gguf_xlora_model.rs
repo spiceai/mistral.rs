@@ -1,6 +1,11 @@
-use mistralrs_core::*;
+use mistralrs_core::{GGUFLoaderBuilder, GGUFSpecificConfig, Ordering};
 
-use crate::{best_device, GgufModelBuilder, Model};
+use crate::{
+    model_builder_trait::{
+        build_model_from_pipeline, build_pipeline_from_gguf_loader, maybe_initialize_logging,
+    },
+    GgufModelBuilder, Model,
+};
 
 /// Wrapper of [`GgufModelBuilder`] for X-LoRA models.
 pub struct GgufXLoraModelBuilder {
@@ -11,6 +16,7 @@ pub struct GgufXLoraModelBuilder {
 }
 
 impl GgufXLoraModelBuilder {
+    /// Create a GGUF X-LoRA builder from a [`GgufModelBuilder`], X-LoRA model ID, and ordering.
     pub fn from_gguf_model_builder(
         gguf_model: GgufModelBuilder,
         xlora_model_id: impl ToString,
@@ -24,19 +30,20 @@ impl GgufXLoraModelBuilder {
         }
     }
 
+    /// Set the target non-granular index for X-LoRA scaling.
     pub fn tgt_non_granular_index(mut self, tgt_non_granular_idx: usize) -> Self {
         self.tgt_non_granular_index = Some(tgt_non_granular_idx);
         self
     }
 
+    /// Load the GGUF X-LoRA model and return a ready-to-use [`Model`].
     pub async fn build(self) -> anyhow::Result<Model> {
+        let gguf_model = self.gguf_model.clone();
         let config = GGUFSpecificConfig {
             topology: self.gguf_model.topology,
         };
 
-        if self.gguf_model.with_logging {
-            initialize_logging();
-        }
+        maybe_initialize_logging(self.gguf_model.with_logging);
 
         let loader = GGUFLoaderBuilder::new(
             self.gguf_model.chat_template,
@@ -55,19 +62,8 @@ impl GgufXLoraModelBuilder {
         )
         .build();
 
-        // Load, into a Pipeline
-        let pipeline = loader.load_model_from_hf(
-            self.gguf_model.hf_revision,
-            self.gguf_model.token_source,
-            &ModelDType::Auto,
-            &best_device(self.gguf_model.force_cpu)?,
-            !self.gguf_model.with_logging,
-            self.gguf_model
-                .device_mapping
-                .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
-            None,
-            self.gguf_model.paged_attn_cfg,
-        )?;
+        let (pipeline, scheduler_config, add_model_config) =
+            build_pipeline_from_gguf_loader(gguf_model, loader).await?;
 
         let scheduler_method = match self.gguf_model.paged_attn_cfg {
             Some(_) => {
