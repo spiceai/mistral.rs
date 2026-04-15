@@ -59,47 +59,6 @@ impl LoraModelBuilder {
         let (pipeline, scheduler_config, add_model_config) =
             build_pipeline_from_text_loader(text_model, loader).await?;
 
-        let scheduler_method = match self.text_model.paged_attn_cfg {
-            Some(_) => {
-                let config = pipeline
-                    .lock()
-                    .await
-                    .get_metadata()
-                    .cache_config
-                    .as_ref()
-                    .unwrap()
-                    .clone();
-
-                SchedulerConfig::PagedAttentionMeta {
-                    max_num_seqs: self.text_model.max_num_seqs,
-                    config,
-                }
-            }
-            None => SchedulerConfig::DefaultScheduler {
-                method: DefaultSchedulerMethod::Fixed(self.text_model.max_num_seqs.try_into()?),
-            },
-        };
-
-        let mut runner = MistralRsBuilder::new(
-            pipeline,
-            scheduler_method,
-            self.text_model.throughput_logging,
-            self.text_model.search_embedding_model,
-        );
-        if let Some(cb) = self.text_model.search_callback.clone() {
-            runner = runner.with_search_callback(cb);
-        }
-        for (name, cb) in &self.text_model.tool_callbacks {
-            runner = runner.with_tool_callback(name.clone(), cb.clone());
-        }
-        runner = runner
-            .with_no_kv_cache(self.text_model.no_kv_cache)
-            .with_no_prefix_cache(self.text_model.prefix_cache_n.is_none());
-
-        if let Some(n) = self.text_model.prefix_cache_n {
-            runner = runner.with_prefix_cache_n(n)
-        }
-
-        Ok(Model::new(runner.build().await))
+        Ok(build_model_from_pipeline(pipeline, scheduler_config, add_model_config).await)
     }
 }

@@ -1178,16 +1178,55 @@ impl Idefics2 {
 
             let pixel_values = pixel_values.to_dtype(self.dtype)?;
 
-            // Get seq from vision encoder
-            let image_hidden_states = self
-                .vision_model
-                .forward(&pixel_values, Some(&patch_attention_mask))?;
-
-            // Modality proj and perceiver resampling
-            let image_hidden_states = self.connector.forward(
-                &image_hidden_states,
-                &patch_attention_mask.reshape((pixel_values.dim(0)?, ()))?,
-            )?;
+            // Get seq from vision encoder + connector, with per-image caching
+            let image_hidden_states = if !image_hashes.is_empty() {
+                let n = pixel_values.dim(0)?;
+                let mut per_image: Vec<Option<Tensor>> = vec![None; n];
+                let mut miss_indices: Vec<usize> = Vec::new();
+                {
+                    let mut guard = self
+                        .encoder_cache
+                        .lock()
+                        .expect("encoder cache lock poisoned");
+                    for (i, &hash) in image_hashes.iter().enumerate() {
+                        if let Some(cached) = guard.get(hash) {
+                            per_image[i] = Some(cached[0].clone());
+                        } else {
+                            miss_indices.push(i);
+                        }
+                    }
+                }
+                if !miss_indices.is_empty() {
+                    for &i in &miss_indices {
+                        let pv = pixel_values.get(i)?.unsqueeze(0)?;
+                        let mask = patch_attention_mask.get(i)?.unsqueeze(0)?;
+                        let hidden = self.vision_model.forward(&pv, Some(&mask))?;
+                        let hidden = self
+                            .connector
+                            .forward(&hidden, &mask.reshape((1_usize, ()))?)?;
+                        let result = hidden.squeeze(0)?;
+                        {
+                            let mut guard = self
+                                .encoder_cache
+                                .lock()
+                                .expect("encoder cache lock poisoned");
+                            guard.insert(image_hashes[i], vec![result.clone()]);
+                        }
+                        per_image[i] = Some(result);
+                    }
+                }
+                let slices: Vec<Tensor> = per_image.into_iter().map(|t| t.unwrap()).collect();
+                Tensor::stack(&slices, 0)?
+            } else {
+                // No caching: original path
+                let image_hidden_states = self
+                    .vision_model
+                    .forward(&pixel_values, Some(&patch_attention_mask))?;
+                self.connector.forward(
+                    &image_hidden_states,
+                    &patch_attention_mask.reshape((pixel_values.dim(0)?, ()))?,
+                )?
+            };
 
             self.inputs_merger(
                 input_ids,

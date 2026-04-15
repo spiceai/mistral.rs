@@ -8,9 +8,9 @@ use crate::{
     pipeline::{EmbeddingLoaderType, IsqOrganization},
     AnyMoeLoader, AutoDeviceMapParams, EmbeddingLoaderBuilder, EmbeddingSpecificConfig,
     GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader,
-    ModelDType, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, SpeculativeConfig,
-    SpeculativeLoader, Topology, VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig,
-    GGUF_MULTI_FILE_DELIMITER, UQFF_MULTI_FILE_DELIMITER,
+    ModelDType, MultimodalLoaderBuilder, MultimodalLoaderType, MultimodalSpecificConfig,
+    NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, SpeculativeConfig,
+    SpeculativeLoader, Topology, GGUF_MULTI_FILE_DELIMITER, UQFF_MULTI_FILE_DELIMITER,
 };
 
 fn default_one() -> usize {
@@ -396,7 +396,7 @@ pub enum TomlModelSelected {
         model_id: String,
 
         /// The architecture of the model.
-        arch: Option<VisionLoaderType>,
+        arch: Option<MultimodalLoaderType>,
 
         /// Model data type. Defaults to `auto`.
         #[serde(default = "default_dtype")]
@@ -440,6 +440,9 @@ pub enum TomlModelSelected {
 
         /// Cache path for Hugging Face models downloaded locally
         hf_cache_path: Option<PathBuf>,
+
+        /// ISQ organization: `default` or `moqe`.
+        organization: Option<IsqOrganization>,
     },
 
     /// Select an embedding model, without quantization or adapters
@@ -606,7 +609,7 @@ pub fn get_toml_selected_model_device_map_params(
             max_batch_size,
         }),
         TomlModelSelected::Embedding { .. } => Ok(AutoDeviceMapParams::default_text()),
-        TomlModelSelected::VisionPlain {
+        TomlModelSelected::MultimodalPlain {
             max_seq_len,
             max_batch_size,
             max_image_length,
@@ -943,8 +946,9 @@ fn loader_from_selected(
             max_image_length: _,
             imatrix,
             hf_cache_path,
-        } => VisionLoaderBuilder::new(
-            VisionSpecificConfig {
+            organization,
+        } => MultimodalLoaderBuilder::new(
+            MultimodalSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
                 write_uqff,
                 from_uqff: from_uqff.map(|x| {
@@ -959,6 +963,7 @@ fn loader_from_selected(
                 hf_cache_path,
                 matformer_config_path: None,
                 matformer_slice_name: None,
+                organization: organization.unwrap_or_default(),
             },
             args.chat_template,
             args.tokenizer_json,

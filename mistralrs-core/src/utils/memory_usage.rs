@@ -22,7 +22,7 @@ fn igpu_memory_fraction() -> f64 {
 
 impl MemoryUsage {
     /// Amount of available memory in bytes.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn get_memory_available(&self, device: &Device) -> Result<usize> {
         match device {
             Device::Cpu => {
@@ -32,31 +32,19 @@ impl MemoryUsage {
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(dev) => {
-                use candle_core::cuda::cudarc::driver::{result, sys};
-                use candle_core::cuda_backend::WrapErr;
-
-                dev.cuda_stream().context().bind_to_thread().w()?;
-
-                // Check if this is an integrated GPU (unified memory, e.g., NVIDIA GB10)
-                let ordinal = dev.cuda_stream().context().ordinal();
-                let cu_device = result::device::get(ordinal as i32).w()?;
-                let is_integrated = unsafe {
-                    result::device::get_attribute(
-                        cu_device,
-                        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED,
-                    )
-                    .map(|v| v != 0)
-                    .unwrap_or(false)
-                };
-
-                if is_integrated {
+                if super::normal::is_integrated_gpu(device) {
                     // For integrated GPUs with unified memory, use system memory
-                    // Apply 3/4 fraction to leave room for OS and other processes
+                    // scaled by a configurable fraction (default 75%)
                     let mut sys = System::new_all();
                     sys.refresh_cpu_all();
                     let avail = usize::try_from(sys.available_memory())?;
-                    Ok((avail * 3) / 4)
+                    let fraction = igpu_memory_fraction();
+                    Ok((avail as f64 * fraction) as usize)
                 } else {
+                    use candle_core::cuda::cudarc::driver::result;
+                    use candle_core::cuda_backend::WrapErr;
+
+                    dev.cuda_stream().context().bind_to_thread().w()?;
                     let (free, _total) = result::mem_get_info().w()?;
                     Ok(free)
                 }
@@ -82,7 +70,7 @@ impl MemoryUsage {
     }
 
     /// Amount of total memory in bytes.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn get_total_memory(&self, device: &Device) -> Result<usize> {
         match device {
             Device::Cpu => {
@@ -92,31 +80,19 @@ impl MemoryUsage {
             }
             #[cfg(feature = "cuda")]
             Device::Cuda(dev) => {
-                use candle_core::cuda::cudarc::driver::{result, sys};
-                use candle_core::cuda_backend::WrapErr;
-
-                dev.cuda_stream().context().bind_to_thread().w()?;
-
-                // Check if this is an integrated GPU (unified memory, e.g., NVIDIA GB10)
-                let ordinal = dev.cuda_stream().context().ordinal();
-                let cu_device = result::device::get(ordinal as i32).w()?;
-                let is_integrated = unsafe {
-                    result::device::get_attribute(
-                        cu_device,
-                        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED,
-                    )
-                    .map(|v| v != 0)
-                    .unwrap_or(false)
-                };
-
-                if is_integrated {
+                if super::normal::is_integrated_gpu(device) {
                     // For integrated GPUs with unified memory, use system total memory
-                    // Apply 3/4 fraction similar to Metal's approach
+                    // scaled by a configurable fraction (default 75%)
                     let mut sys = System::new_all();
                     sys.refresh_cpu_all();
                     let total = usize::try_from(sys.total_memory())?;
-                    Ok((total * 3) / 4)
+                    let fraction = igpu_memory_fraction();
+                    Ok((total as f64 * fraction) as usize)
                 } else {
+                    use candle_core::cuda::cudarc::driver::result;
+                    use candle_core::cuda_backend::WrapErr;
+
+                    dev.cuda_stream().context().bind_to_thread().w()?;
                     let (_free, total) = result::mem_get_info().w()?;
                     Ok(total)
                 }

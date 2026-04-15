@@ -502,6 +502,8 @@ impl Phi4MMModel {
                 audio_embed_sizes,
                 audio_attention_mask.as_ref(),
                 projection_mode,
+                image_hashes,
+                &self.encoder_cache,
             )?
         } else {
             self.embed_tokens.forward(input_ids)?
@@ -557,6 +559,7 @@ pub(crate) struct Phi4MMVisionSpecificArgs {
     pub input_audio_embeds: Option<Tensor>,
     pub audio_embed_sizes: Option<Vec<usize>>,
     pub audio_attention_mask: Option<Tensor>,
+    pub image_hashes: Vec<u64>,
 }
 
 impl MultimodalModel for Phi4MMModel {
@@ -578,6 +581,7 @@ impl MultimodalModel for Phi4MMModel {
             input_audio_embeds,
             audio_attention_mask,
             audio_embed_sizes,
+            image_hashes,
         } = *model_specific_args
             .downcast()
             .expect("Cannot downcast into `Phi4MMVisionSpecificArgs`");

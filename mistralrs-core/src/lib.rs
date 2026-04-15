@@ -3,7 +3,8 @@ use candle_core::Device;
 use engine::Engine;
 pub use engine::{
     get_engine_terminate_flag, reset_engine_terminate_flag, should_terminate_engine_sequences,
-    EngineInstruction, SearchEmbeddingModel, ENGINE_INSTRUCTIONS, TERMINATE_ALL_NEXT_STEP,
+    EngineInstruction, IntervalLogger, SearchEmbeddingModel, ENGINE_INSTRUCTIONS,
+    TERMINATE_ALL_NEXT_STEP,
 };
 use hf_hub::Cache;
 pub use lora::Ordering;
@@ -12,9 +13,8 @@ pub use pipeline::Pipeline;
 #[cfg(feature = "pyo3_macros")]
 use pyo3::exceptions::PyValueError;
 use std::collections::{HashMap, HashSet};
-use std::num::NonZeroUsize;
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{
     cell::RefCell,
     error::Error,
@@ -45,6 +45,7 @@ mod video_input;
 pub use model_loader::{
     get_auto_device_map_params, get_model_dtype, get_tgt_non_granular_index, LoaderBuilder,
 };
+pub use video_input::{sample_frame_indices, VideoInput};
 mod embedding_models;
 mod kv_cache;
 mod search;
@@ -59,7 +60,6 @@ mod diagnostics;
 mod diffusion_models;
 pub mod distributed;
 mod gguf;
-pub mod harmony;
 pub mod layers;
 mod layers_masker;
 mod layers_utils;
@@ -69,13 +69,13 @@ mod models;
 mod paged_attention;
 mod pipeline;
 mod prefix_cacher;
+pub mod reasoning_parsers;
 mod request;
 mod response;
 mod sampler;
 mod scheduler;
 mod sequence;
 mod speech_models;
-pub mod think_tags;
 mod toml_selector;
 mod tools;
 mod topology;
@@ -104,22 +104,23 @@ pub use mistralrs_mcp::{
 pub use mistralrs_mcp::{
     McpClient, McpClientConfig, McpServerConfig, McpServerSource, McpToolInfo,
 };
-pub use mistralrs_quant::{IsqType, MULTI_LORA_DELIMITER};
+pub use mistralrs_quant::{IsqBits, IsqType, MULTI_LORA_DELIMITER};
 pub use paged_attention::{MemoryGpuConfig, PagedAttentionConfig, PagedCacheType};
 pub use pipeline::hf::{hf_home_dir, hf_hub_cache_dir, hf_token_path};
 pub use pipeline::{
-    chat_template::ChatTemplate, parse_isq_value, AdapterPaths, AnyMoeLoader, AnyMoePipeline,
-    AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, DiffusionGenerationParams, DiffusionLoader,
-    DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader, EmbeddingLoaderBuilder,
-    EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig, GGMLLoader,
-    GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig,
-    GemmaLoader, Idefics2Loader, IsqOrganization, LLaVALoader, LLaVANextLoader, LlamaLoader,
-    Loader, LocalModelPaths, LoraAdapterPaths, MistralLoader, MixtralLoader, Modalities, ModelKind,
-    ModelPaths, MultimodalPromptPrefixer, NormalLoader, NormalLoaderBuilder, NormalLoaderType,
-    NormalSpecificConfig, Phi2Loader, Phi3Loader, Phi3VLoader, Qwen2Loader, SpeculativeConfig,
-    SpeculativeLoader, SpeculativePipeline, SpeechLoader, SpeechPipeline, Starcoder2Loader,
-    SupportedModality, TokenSource, VisionLoader, VisionLoaderBuilder, VisionLoaderType,
-    VisionSpecificConfig, UQFF_MULTI_FILE_DELIMITER,
+    chat_template::ChatTemplate, expand_isq_value, parse_isq_value, AdapterPaths, AnyMoeLoader,
+    AnyMoePipeline, AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, DiffusionGenerationParams,
+    DiffusionLoader, DiffusionLoaderBuilder, DiffusionLoaderType, EmbeddingLoader,
+    EmbeddingLoaderBuilder, EmbeddingLoaderType, EmbeddingModelPaths, EmbeddingSpecificConfig,
+    GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoader, GGUFLoaderBuilder,
+    GGUFSpecificConfig, GemmaLoader, Idefics2Loader, IsqOrganization, LLaVALoader, LLaVANextLoader,
+    LlamaLoader, Loader, LocalModelPaths, LoraAdapterPaths, MistralLoader, MixtralLoader,
+    Modalities, ModelKind, ModelPaths, MultimodalLoader, MultimodalLoaderBuilder,
+    MultimodalLoaderType, MultimodalPromptPrefixer, MultimodalSpecificConfig, NormalLoader,
+    NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, Phi2Loader, Phi3Loader,
+    Phi3VLoader, Qwen2Loader, SpeculativeConfig, SpeculativeLoader, SpeculativePipeline,
+    SpeechLoader, SpeechPipeline, Starcoder2Loader, SupportedModality, TokenSource,
+    UQFF_MULTI_FILE_DELIMITER,
 };
 pub use request::{
     ApproximateUserLocation, Constraint, DetokenizationRequest, ImageGenerationResponseFormat,
@@ -220,13 +221,14 @@ pub struct MistralRsConfig {
     pub category: ModelCategory,
     pub modalities: Modalities,
     pub max_seq_len: Option<usize>,
+    pub generation_defaults: Option<ModelGenerationDefaults>,
 }
 
 /// Configuration for recreating a model loader when reloading an unloaded model.
 /// This captures the essential parameters needed to reconstruct a loader.
 #[derive(Clone)]
 pub struct ModelLoaderConfig {
-    /// The model selection configuration (Plain, GGUF, Vision, etc.)
+    /// The model selection configuration (Plain, GGUF, Multimodal, etc.)
     pub model_selected: ModelSelected,
     /// Source of the HF token
     pub token_source: TokenSource,
@@ -262,7 +264,7 @@ pub struct UnloadedModelState {
     pub engine_config: EngineConfig,
     /// MCP client configuration
     pub mcp_client_config: Option<McpClientConfig>,
-    /// Model category (Text, Vision, etc.)
+    /// Model category (Text, Multimodal, etc.)
     pub category: ModelCategory,
     /// Model metadata configuration
     pub mistralrs_config: MistralRsConfig,
@@ -275,6 +277,7 @@ struct EngineInstance {
     reboot_state: RebootState,
     config: MistralRsConfig,
     category: ModelCategory,
+    logger: Arc<IntervalLogger>,
 }
 
 /// The MistralRs struct handles sending requests to multiple engines.
@@ -542,7 +545,15 @@ impl MistralRs {
             ModelCategory::Diffusion | ModelCategory::Speech => None,
             _ => Some(metadata.max_seq_len),
         };
+        let generation_defaults = pipeline_guard.generation_defaults();
+        let encoder_cache_counters = pipeline_guard.encoder_cache_counters();
         drop(pipeline_guard);
+
+        let logger = Arc::new(IntervalLogger::new(
+            Duration::from_secs(5),
+            encoder_cache_counters,
+        ));
+        let logger_for_engine = logger.clone();
 
         info!("Pipeline input modalities are {:?}", &modalities.input);
         info!("Pipeline output modalities are {:?}", &modalities.output);
@@ -553,6 +564,7 @@ impl MistralRs {
             category: category.clone(),
             modalities,
             max_seq_len,
+            generation_defaults,
         };
 
         let tx_for_engine = tx.clone();
@@ -575,6 +587,7 @@ impl MistralRs {
                         config.search_callback.clone(),
                         config.tool_callbacks.clone(),
                         config.tool_callbacks_with_tools.clone(),
+                        logger_for_engine,
                     )
                     .expect("Engine creation failed.");
                     Arc::new(engine).run().await;
@@ -599,6 +612,7 @@ impl MistralRs {
                         config.search_callback.clone(),
                         config.tool_callbacks.clone(),
                         config.tool_callbacks_with_tools.clone(),
+                        logger_for_engine,
                     )
                     .expect("Engine creation failed.");
                     Arc::new(engine).run().await;
@@ -612,6 +626,7 @@ impl MistralRs {
             reboot_state,
             config: mistralrs_config,
             category,
+            logger,
         })
     }
 
@@ -638,21 +653,6 @@ impl MistralRs {
         mistralrs_quant::cublaslt::maybe_init_cublas_lt_wrapper(
             get_mut_arcmutex!(pipeline).device(),
         );
-
-        // For hybrid models (Mamba-Attention), force batch_size=1 to prevent state bleeding
-        // Mamba's stateful nature makes batched inference complex; this ensures correctness
-        let method = if !get_mut_arcmutex!(pipeline).get_metadata().no_kv_cache
-            && get_mut_arcmutex!(pipeline).cache().is_hybrid()
-        {
-            info!(
-                "Hybrid model detected (Mamba-Attention), enforcing batch_size=1 for correctness"
-            );
-            SchedulerConfig::DefaultScheduler {
-                method: DefaultSchedulerMethod::Fixed(NonZeroUsize::new(1).unwrap()),
-            }
-        } else {
-            method
-        };
 
         let no_kv_cache = no_kv_cache.unwrap_or(false);
         let no_prefix_cache = no_prefix_cache.unwrap_or(false);
@@ -766,7 +766,7 @@ impl MistralRs {
             && is_multi_threaded
             && matches!(
                 engine_instance.category,
-                ModelCategory::Text | ModelCategory::Vision { .. }
+                ModelCategory::Text | ModelCategory::Multimodal { .. }
             )
         {
             let clone_sender = engine_instance.sender.clone();
@@ -1091,6 +1091,24 @@ impl MistralRs {
         Ok(false)
     }
 
+    /// Get the interval logger for a specific model. If model_id is None, uses default engine.
+    pub fn get_logger(
+        &self,
+        model_id: Option<&str>,
+    ) -> Result<Arc<IntervalLogger>, MistralRsError> {
+        let resolved_model_id = self.resolve_alias_or_default(model_id)?;
+
+        let engines = self
+            .engines
+            .read()
+            .map_err(|_| MistralRsError::SenderPoisoned)?;
+        if let Some(engine_instance) = engines.get(&resolved_model_id) {
+            Ok(engine_instance.logger.clone())
+        } else {
+            Err(MistralRsError::EnginePoisoned)
+        }
+    }
+
     /// Get model category for a specific model. If model_id is None, uses default engine.
     pub fn get_model_category(
         &self,
@@ -1182,21 +1200,6 @@ impl MistralRs {
                 ));
             }
         }
-
-        // For hybrid models (Mamba-Attention), force batch_size=1 to prevent state bleeding
-        let method = {
-            let pipeline_guard = pipeline.try_lock().unwrap();
-            if !pipeline_guard.get_metadata().no_kv_cache && pipeline_guard.cache().is_hybrid() {
-                info!(
-                    "Hybrid model detected (Mamba-Attention), enforcing batch_size=1 for correctness"
-                );
-                SchedulerConfig::DefaultScheduler {
-                    method: DefaultSchedulerMethod::Fixed(NonZeroUsize::new(1).unwrap()),
-                }
-            } else {
-                method
-            }
-        };
 
         let reboot_state = RebootState {
             pipeline: pipeline.clone(),

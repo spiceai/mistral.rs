@@ -6,7 +6,7 @@ use super::{
     PreProcessingMixin, Processor, TokenSource,
 };
 use crate::device_map::{self, DeviceMapper};
-use crate::distributed::WorkerTransferData;
+use crate::distributed::{use_ring, WorkerTransferData};
 use crate::pipeline::{ChatTemplate, EmbeddingModulePaths, Modalities, SupportedModality};
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
@@ -123,6 +123,7 @@ impl InputsProcessor for SpeechInputsProcessor {
         _no_kv_cache: bool,
         _last_n_context_len: Option<(usize, usize)>,
         _return_raw_logits: bool,
+        _sliding_window: Option<usize>,
         _other_config: Option<Arc<dyn Any>>,
         _paged_attn_metadata: Option<PagedAttentionMeta>,
         _mapper: Option<&dyn DeviceMapper>,
@@ -180,11 +181,11 @@ impl Loader for SpeechLoader {
                     .with_token(get_token(&token_source)?)
                     .build()?;
                 let revision = revision.clone().unwrap_or("main".to_string());
-                let api = std::sync::Arc::new(api.repo(Repo::with_revision(
+                let api = api.repo(Repo::with_revision(
                     self.model_id.to_string(),
                     RepoType::Model,
                     revision.clone(),
-                )));
+                ));
                 let model_id = std::path::Path::new(&self.model_id);
 
                 let weight = api_get_file!(api, "model.safetensors", &model_id);
@@ -209,11 +210,11 @@ impl Loader for SpeechLoader {
                         SpeechLoaderType::Dia => "EricB/dac_44khz".to_string(),
                     });
 
-                let api = std::sync::Arc::new(api.repo(Repo::with_revision(
+                let api = api.repo(Repo::with_revision(
                     dac_model.clone(),
                     RepoType::Model,
                     revision.clone(),
-                )));
+                ));
                 let model_id = std::path::Path::new(&dac_model);
 
                 let weight = api_get_file!(api, "model.safetensors", &model_id);
@@ -268,7 +269,7 @@ impl Loader for SpeechLoader {
             let payload: WorkerTransferData = serde_json::from_str(&payload)?;
             let WorkerTransferData::Init { id: _, worker_rank } = payload;
             vec![candle_core::Device::new_cuda(worker_rank + 1)?]
-        } else if use_nccl {
+        } else if use_nccl || use_ring() {
             vec![candle_core::Device::new_cuda(0)?]
         } else {
             device_map::get_all_similar_devices(device)?

@@ -1,8 +1,8 @@
 pub(crate) mod auto_device_map;
 mod diffusion_loaders;
 mod embedding_loaders;
+mod multimodal_loaders;
 mod normal_loaders;
-mod vision_loaders;
 pub use auto_device_map::AutoDeviceMapParams;
 use auto_device_map::NonMappedSubModel;
 
@@ -25,14 +25,15 @@ pub use normal_loaders::{
     GLM4MoeLoader, Gemma2Loader, GemmaLoader, GptOssLoader, GraniteMoeHybridLoader, LlamaLoader,
     MistralLoader, MixtralLoader, NormalLoaderType, NormalLoadingMetadata, NormalModel,
     NormalModelLoader, Phi2Loader, Phi3Loader, Phi3_5MoELoader, Qwen2Loader, Qwen3Loader,
-    Qwen3MoELoader, SmolLm3Loader, Starcoder2Loader,
+    Qwen3MoELoader, Qwen3NextLoader, SmolLm3Loader, Starcoder2Loader,
 };
 
-pub use vision_loaders::{
-    AutoVisionLoader, Gemma3Loader, Gemma3nLoader, Idefics2Loader, Idefics3Loader, LLaVALoader,
-    LLaVANextLoader, MiniCpmOLoader, Mistral3Loader, Phi3VLoader, Phi4MMLoader, Qwen2VLLoader,
-    Qwen2_5VLLoader, Qwen3VLLoader, Qwen3VLMoELoader, VLlama4Loader, VLlamaLoader,
-    VisionLoaderType, VisionModel, VisionModelLoader,
+pub use multimodal_loaders::{
+    AutoMultimodalLoader, Gemma3Loader, Gemma3nLoader, Gemma4Loader, Idefics2Loader,
+    Idefics3Loader, LLaVALoader, LLaVANextLoader, MiniCpmOLoader, Mistral3Loader,
+    MultimodalLoaderType, MultimodalModel, MultimodalModelLoader, Phi3VLoader, Phi4MMLoader,
+    Qwen2VLLoader, Qwen2_5VLLoader, Qwen3VLLoader, Qwen3VLMoELoader, Qwen3_5Loader,
+    Qwen3_5MoeLoader, VLlama4Loader, VLlamaLoader, VoxtralLoader,
 };
 
 pub use embedding_loaders::{
@@ -77,7 +78,7 @@ pub trait ModelPaths: AsAny + Debug + Send + Sync {
     /// Filepath for general model configuration.
     fn get_gen_conf_filename(&self) -> Option<&PathBuf>;
 
-    /// Get the preprocessor config (for the vision models). This is used to pre process images.
+    /// Get the preprocessor config (for the multimodal models). This is used to pre process images.
     fn get_preprocessor_config(&self) -> &Option<PathBuf>;
 
     /// Get the processor config (for the multimodal models). This is primarily used for the chat template.

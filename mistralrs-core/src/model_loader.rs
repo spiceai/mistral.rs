@@ -10,8 +10,8 @@ use crate::{
     get_toml_selected_model_dtype,
     pipeline::{
         AutoLoaderBuilder, DiffusionLoaderBuilder, GGMLLoaderBuilder, GGMLSpecificConfig,
-        GGUFLoaderBuilder, GGUFSpecificConfig, NormalLoaderBuilder, NormalSpecificConfig,
-        VisionLoaderBuilder, VisionSpecificConfig,
+        GGUFLoaderBuilder, GGUFSpecificConfig, MultimodalLoaderBuilder, MultimodalSpecificConfig,
+        NormalLoaderBuilder, NormalSpecificConfig,
     },
     toml_selector::get_toml_selected_model_device_map_params,
     AutoDeviceMapParams, EmbeddingLoaderBuilder, EmbeddingSpecificConfig, Loader, ModelDType,
@@ -65,7 +65,7 @@ pub fn get_tgt_non_granular_index(model: &ModelSelected) -> Option<usize> {
         | ModelSelected::GGML { .. }
         | ModelSelected::LoraGGML { .. }
         | ModelSelected::Toml { .. }
-        | ModelSelected::VisionPlain { .. }
+        | ModelSelected::MultimodalPlain { .. }
         | ModelSelected::DiffusionPlain { .. }
         | ModelSelected::Speech { .. }
         | ModelSelected::Embedding { .. } => None,
@@ -167,30 +167,6 @@ pub fn get_auto_device_map_params(model: &ModelSelected) -> anyhow::Result<AutoD
             max_batch_size: *max_batch_size,
         }),
         ModelSelected::Run {
-            max_seq_len,
-            max_batch_size,
-            max_image_length,
-            max_num_images,
-            ..
-        } => {
-            if max_num_images.is_some() || max_image_length.is_some() {
-                let max_image_length =
-                    max_image_length.unwrap_or(AutoDeviceMapParams::DEFAULT_MAX_IMAGE_LENGTH);
-                Ok(AutoDeviceMapParams::Vision {
-                    max_seq_len: *max_seq_len,
-                    max_batch_size: *max_batch_size,
-                    max_image_shape: (max_image_length, max_image_length),
-                    max_num_images: max_num_images
-                        .unwrap_or(AutoDeviceMapParams::DEFAULT_MAX_NUM_IMAGES),
-                })
-            } else {
-                Ok(AutoDeviceMapParams::Text {
-                    max_seq_len: *max_seq_len,
-                    max_batch_size: *max_batch_size,
-                })
-            }
-        }
-        ModelSelected::VisionPlain {
             max_seq_len,
             max_batch_size,
             max_image_length,
@@ -332,7 +308,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                     matformer_config_path: matformer_config_path.clone(),
                     matformer_slice_name: matformer_slice_name.clone(),
                 },
-                VisionSpecificConfig {
+                MultimodalSpecificConfig {
                     topology: Topology::from_option_path(topology.clone())?,
                     write_uqff: write_uqff.clone(),
                     from_uqff: from_uqff.clone().map(|x| {
@@ -347,6 +323,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                     hf_cache_path: hf_cache_path.clone(),
                     matformer_config_path,
                     matformer_slice_name,
+                    organization: organization.unwrap_or_default(),
                 },
                 EmbeddingSpecificConfig {
                     topology: Topology::from_option_path(topology)?,
@@ -372,7 +349,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             };
             builder.build()
         }
-        ModelSelected::VisionPlain {
+        ModelSelected::MultimodalPlain {
             model_id,
             tokenizer_json,
             arch,
@@ -390,8 +367,9 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
             imatrix,
             matformer_config_path,
             matformer_slice_name,
-        } => VisionLoaderBuilder::new(
-            VisionSpecificConfig {
+            organization,
+        } => MultimodalLoaderBuilder::new(
+            MultimodalSpecificConfig {
                 topology: Topology::from_option_path(topology)?,
                 write_uqff,
                 from_uqff: from_uqff.map(|x| {
@@ -406,6 +384,7 @@ fn loader_from_model_selected(args: LoaderBuilder) -> anyhow::Result<Box<dyn Loa
                 hf_cache_path,
                 matformer_config_path,
                 matformer_slice_name,
+                organization: organization.unwrap_or_default(),
             },
             args.chat_template,
             tokenizer_json,

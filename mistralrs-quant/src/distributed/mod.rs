@@ -92,6 +92,10 @@ pub fn use_nccl() -> bool {
         && (cfg!(feature = "nccl") && cfg!(feature = "cuda"))
 }
 
+pub fn use_ring() -> bool {
+    cfg!(feature = "ring") && std::env::var("RING_CONFIG").is_ok()
+}
+
 // Unified Comm enum
 #[derive(Debug)]
 pub enum Comm {

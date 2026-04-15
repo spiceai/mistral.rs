@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use anyhow::Result;
@@ -74,11 +73,11 @@ pub fn get_xlora_paths(
                 }
                 api.build().map_err(candle_core::Error::msg)?
             };
-            let api = Arc::new(api.repo(Repo::with_revision(
+            let api = api.repo(Repo::with_revision(
                 xlora_id.clone(),
                 RepoType::Model,
                 revision,
-            )));
+            ));
             let model_id = Path::new(&xlora_id);
             let dir_list = api_dir_list!(api, model_id, true).collect::<Vec<_>>();
             // Get the path for the xlora classifier
@@ -318,7 +317,7 @@ pub fn get_model_paths(
     token_source: &TokenSource,
     quantized_model_id: Option<&String>,
     quantized_filename: Option<&Vec<String>>,
-    api: &Arc<ApiRepo>,
+    api: &ApiRepo,
     model_id: &Path,
     loading_from_uqff: bool,
 ) -> Result<Vec<PathBuf>> {
@@ -338,11 +337,11 @@ pub fn get_model_paths(
                     }
                     api.build().map_err(candle_core::Error::msg)?
                 };
-                let qapi = Arc::new(qapi.repo(Repo::with_revision(
+                let qapi = qapi.repo(Repo::with_revision(
                     id.to_string(),
                     RepoType::Model,
                     revision.clone(),
-                )));
+                ));
                 let model_id = Path::new(&id);
                 files.push(api_get_file!(qapi, name, model_id));
             }
@@ -454,20 +453,34 @@ pub(crate) fn get_chat_template(
             template
         }
         None => {
-            // Check if template_filename is a .jinja file
-            if let Some(template_filename) = paths.get_template_filename() {
-                if template_filename.extension().map(|e| e.to_str()) == Some(Some("jinja")) {
-                    info!("Using chat template from .jinja file.");
-                    let mut template = ChatTemplate::default();
-                    template.chat_template = Some(ChatTemplateValue(Either::Left(
-                        template_content.as_ref().unwrap().clone(),
-                    )));
-                    template
+            if let Some(ref content) = template_content {
+                // Check if template_filename is a .jinja file
+                if let Some(template_filename) = paths.get_template_filename() {
+                    if template_filename.extension().map(|e| e.to_str()) == Some(Some("jinja")) {
+                        info!("Using chat template from .jinja file.");
+                        // Load special tokens (bos/eos/unk) from tokenizer_config.json
+                        // in the same directory, matching HF's behavior where
+                        // apply_chat_template passes self.special_tokens_map to the template.
+                        let mut template = template_filename
+                            .parent()
+                            .map(|dir| dir.join("tokenizer_config.json"))
+                            .filter(|p| p.exists())
+                            .and_then(|p| fs::read_to_string(p).ok())
+                            .and_then(|s| serde_json::from_str::<ChatTemplate>(&s).ok())
+                            .unwrap_or_default();
+                        template.chat_template =
+                            Some(ChatTemplateValue(Either::Left(content.clone())));
+                        template
+                    } else {
+                        serde_json::from_str(content).unwrap()
+                    }
                 } else {
-                    serde_json::from_str(&template_content.as_ref().unwrap().clone()).unwrap()
+                    serde_json::from_str(content).unwrap()
                 }
             } else {
-                serde_json::from_str(&template_content.as_ref().unwrap().clone()).unwrap()
+                // No template content available; downstream code may fill in from
+                // chat_template.json, processor_config, or jinja_explicit.
+                ChatTemplate::default()
             }
         }
     };
@@ -535,29 +548,37 @@ pub(crate) fn get_chat_template(
                 let mut deser: HashMap<String, Value> =
                     serde_json::from_str(&template_content).unwrap();
 
-            match chat_template_fallback.cloned() {
-                Some(t) => {
-                    info!("Loading specified loading chat template file at `{t}`.");
-                    let templ: SpecifiedTemplate =
-                        serde_json::from_str(&fs::read_to_string(t.clone()).unwrap()).unwrap();
-                    deser.insert(
-                        "chat_template".to_string(),
-                        Value::String(templ.chat_template),
-                    );
-                    if let Some(bos_token) = templ.bos_token {
-                        deser.insert("bos_token".to_string(), Value::String(bos_token));
+                match chat_template_fallback.cloned() {
+                    Some(t) => {
+                        info!("Loading specified loading chat template file at `{t}`.");
+                        let templ: SpecifiedTemplate =
+                            serde_json::from_str(&fs::read_to_string(t.clone()).unwrap()).unwrap();
+                        deser.insert(
+                            "chat_template".to_string(),
+                            Value::String(templ.chat_template),
+                        );
+                        if let Some(bos_token) = templ.bos_token {
+                            deser.insert("bos_token".to_string(), Value::String(bos_token));
+                        }
+                        if let Some(eos_token) = templ.eos_token {
+                            deser.insert("eos_token".to_string(), Value::String(eos_token));
+                        }
+                        if let Some(unk_token) = templ.unk_token {
+                            deser.insert("unk_token".to_string(), Value::String(unk_token));
+                        }
                     }
-                    if let Some(eos_token) = templ.eos_token {
-                        deser.insert("eos_token".to_string(), Value::String(eos_token));
-                    }
-                    if let Some(unk_token) = templ.unk_token {
-                        deser.insert("unk_token".to_string(), Value::String(unk_token));
+                    None => {
+                        warn!("No specified chat template. No chat template will be used. Only prompts will be accepted, not messages.");
+                        deser.insert("chat_template".to_string(), Value::Null);
                     }
                 }
-                None => {
-                    warn!("No specified chat template. No chat template will be used. Only prompts will be accepted, not messages.");
-                    deser.insert("chat_template".to_string(), Value::Null);
-                }
+
+                let ser = serde_json::to_string_pretty(&deser)
+                    .expect("Serialization of modified chat template failed.");
+                serde_json::from_str(&ser).unwrap()
+            } else {
+                warn!("No chat template source found. No chat template will be used. Only prompts will be accepted, not messages.");
+                template
             }
         }
     }

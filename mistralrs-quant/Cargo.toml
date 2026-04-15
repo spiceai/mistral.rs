@@ -51,6 +51,7 @@ metal = [
 ]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 ring = []
+arm-nightly-feat = []
 
 cuda-11040 = []
 cuda-11050 = []

@@ -4,8 +4,8 @@ use clap::Subcommand;
 
 use crate::{
     pipeline::{
-        AutoDeviceMapParams, EmbeddingLoaderType, IsqOrganization, NormalLoaderType,
-        VisionLoaderType,
+        AutoDeviceMapParams, EmbeddingLoaderType, IsqOrganization, MultimodalLoaderType,
+        NormalLoaderType,
     },
     DiffusionLoaderType, ModelDType, SpeechLoaderType,
 };
@@ -28,10 +28,6 @@ fn parse_arch(x: &str) -> Result<NormalLoaderType, String> {
 }
 
 fn parse_multimodal_arch(x: &str) -> Result<MultimodalLoaderType, String> {
-    x.parse()
-}
-
-fn parse_embedding_arch(x: &str) -> Result<EmbeddingLoaderType, String> {
     x.parse()
 }
 
@@ -99,7 +95,7 @@ pub enum ModelSelected {
         calibration_file: Option<PathBuf>,
 
         /// Automatically resize and pad images to this maximum edge length. Aspect ratio is preserved.
-        /// Only supported on specific vision models.
+        /// Only supported on specific multimodal models.
         #[arg(short = 'e', long)]
         max_edge: Option<u32>,
 
@@ -112,13 +108,13 @@ pub enum ModelSelected {
         max_batch_size: usize,
 
         /// Maximum prompt number of images to expect for this model. This affects automatic device mapping but is not a hard limit.
-        /// Only supported on specific vision models.
+        /// Only supported on specific multimodal models.
         #[arg(long)]
         max_num_images: Option<usize>,
 
         /// Maximum expected image size will have this edge length on both edges.
         /// This affects automatic device mapping but is not a hard limit.
-        /// Only supported on specific vision models.
+        /// Only supported on specific multimodal models.
         #[arg(long)]
         max_image_length: Option<usize>,
 
@@ -596,8 +592,8 @@ pub enum ModelSelected {
         tokenizer_json: Option<String>,
 
         /// The architecture of the model.
-        #[arg(short, long, value_parser = parse_vision_arch)]
-        arch: Option<VisionLoaderType>,
+        #[arg(short, long, value_parser = parse_multimodal_arch)]
+        arch: Option<MultimodalLoaderType>,
 
         /// Model data type. Defaults to `auto`.
         #[arg(short, long, default_value_t = ModelDType::Auto, value_parser = parse_model_dtype)]
@@ -656,6 +652,10 @@ pub enum ModelSelected {
         /// Name of the Matryoshka Transformer slice to use
         #[arg(long)]
         matformer_slice_name: Option<String>,
+
+        /// ISQ organization: `default` or `moqe` (Mixture of Quantized Experts: https://arxiv.org/abs/2310.02410).
+        #[arg(long)]
+        organization: Option<IsqOrganization>,
     },
 
     /// Select a diffusion model, without quantization or adapters

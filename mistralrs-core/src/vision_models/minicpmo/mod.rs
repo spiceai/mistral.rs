@@ -115,55 +115,23 @@ impl MiniCpmOModel {
             }
             let n_total_images = all_pixel_values_raw.len();
 
-            let tgt_sizes = Tensor::cat(tgt_sizes_all, 0)?;
-            let tgt_sizes_vec = tgt_sizes.to_vec2::<u32>()?;
-
-            let max_patches = (tgt_sizes.i((.., 0))? * tgt_sizes.i((.., 1))?)?
-                .max(0)?
-                .to_scalar::<u32>()? as usize;
-
-            // Original code does padding of the pixel values here
-            let lens = all_pixel_values
-                .iter()
-                .map(|pixel_values| pixel_values.dim(0))
-                .collect::<Result<Vec<_>>>()?;
-            let max_len = lens.into_iter().max().expect("No pixel values somehow?");
-            all_pixel_values = all_pixel_values
-                .into_iter()
-                .map(|pixel_values| {
-                    pixel_values.pad_with_zeros(0, 0, max_len - pixel_values.dim(0)?)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut all_pixel_values = Tensor::stack(&all_pixel_values, 0)?;
-
-            let (b, l, _) = all_pixel_values.dims3()?;
-            all_pixel_values = all_pixel_values
-                .permute((0, 2, 1))?
-                .reshape((b, 3, (), l))?;
-
-            let mut patch_attn_mask = Tensor::zeros((b, 1, max_patches), DType::U8, device)?;
-            for (i, tgt_sizes_vec_i) in tgt_sizes_vec.iter().enumerate().take(b) {
-                let n = (tgt_sizes_vec_i[0] * tgt_sizes_vec_i[1]) as usize;
-                patch_attn_mask = patch_attn_mask.slice_assign(
-                    &[i..i + 1, 0..1, 0..n],
-                    &Tensor::ones((1, 1, n), DType::U8, device)?,
-                )?;
-            }
-
-            let vision_batch_size = self.cfg.vision_batch_size;
-            all_pixel_values = all_pixel_values.to_dtype(self.llm.embed_dtype())?;
-
-            let mut vision_embedding = if b > vision_batch_size {
-                let mut hs = Vec::new();
-                for i in (0..b).step_by(vision_batch_size) {
-                    let start_idx = i;
-                    let end_idx = i + vision_batch_size;
-                    let tmp_hs = self.vpm.forward(
-                        &all_pixel_values.i(start_idx..end_idx)?,
-                        Some(&patch_attn_mask.i(start_idx..end_idx)?),
-                        Some(&tgt_sizes.i(start_idx..end_idx)?),
-                    )?;
-                    hs.push(tmp_hs);
+            // Per-image caching
+            let n_hashes = image_hashes.len();
+            let vision_embedding = if n_hashes > 0 && n_hashes == n_total_images {
+                let mut per_image_features: Vec<Option<Tensor>> = vec![None; n_total_images];
+                let mut miss_indices = Vec::new();
+                {
+                    let mut guard = self
+                        .encoder_cache
+                        .lock()
+                        .expect("encoder cache lock poisoned");
+                    for (i, &hash) in image_hashes.iter().enumerate() {
+                        if let Some(cached) = guard.get(hash) {
+                            per_image_features[i] = Some(cached[0].clone());
+                        } else {
+                            miss_indices.push(i);
+                        }
+                    }
                 }
 
                 if !miss_indices.is_empty() {

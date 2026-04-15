@@ -43,11 +43,11 @@ macro_rules! get_paths {
             api.build()?
         };
         let revision = $revision.unwrap_or("main".to_string());
-        let api = std::sync::Arc::new(api.repo(Repo::with_revision(
+        let api = api.repo(Repo::with_revision(
             $this.model_id.clone(),
             RepoType::Model,
             revision.clone(),
-        )));
+        ));
         let model_id = std::path::Path::new(&$this.model_id);
         let dir_list = $crate::api_dir_list!(api, model_id, false).collect::<Vec<_>>();
         let tokenizer_filename = if let Some(ref p) = $this.tokenizer_json {
@@ -93,7 +93,6 @@ macro_rules! get_paths {
             revision.clone(),
             $this.xlora_order.as_ref(),
         )?;
-        let dir_list = $crate::api_dir_list!(api, model_id, false).collect::<Vec<_>>();
 
         let gen_conf = if dir_list.contains(&"generation_config.json".to_string()) {
             info!("Loading `generation_config.json` at `{}`", $this.model_id);
@@ -131,7 +130,7 @@ macro_rules! get_paths {
         } else if dir_list.contains(&"chat_template.jinja".to_string()) {
             info!("Loading `chat_template.jinja` at `{}`", $this.model_id);
             Some($crate::api_get_file!(api, "chat_template.jinja", model_id))
-        } else {
+        } else if dir_list.contains(&"tokenizer_config.json".to_string()) {
             info!("Loading `tokenizer_config.json` at `{}`", $this.model_id);
             Some($crate::api_get_file!(
                 api,
@@ -190,21 +189,39 @@ macro_rules! get_embedding_paths {
             api.build()?
         };
         let revision = $revision.unwrap_or("main".to_string());
-        let api = std::sync::Arc::new(api.repo(Repo::with_revision(
+        let api = api.repo(Repo::with_revision(
             $this.model_id.clone(),
             RepoType::Model,
             revision.clone(),
-        )));
+        ));
         let model_id = std::path::Path::new(&$this.model_id);
+        let emb_dir_list = $crate::api_dir_list!(api, model_id, false).collect::<Vec<_>>();
         let tokenizer_filename = if let Some(ref p) = $this.tokenizer_json {
             info!("Using tokenizer.json at `{p}`");
             PathBuf::from_str(p)?
+        } else if emb_dir_list.contains(&"tokenizer.json".to_string()) {
+            info!("Loading `tokenizer.json` at `{}`", $this.model_id);
+            $crate::api_get_file!(api, "tokenizer.json", model_id)
+        } else if emb_dir_list.contains(&"tekken.json".to_string()) {
+            info!(
+                "Loading `tekken.json` (Mistral tokenizer) at `{}`",
+                $this.model_id
+            );
+            $crate::api_get_file!(api, "tekken.json", model_id)
         } else {
             info!("Loading `tokenizer.json` at `{}`", $this.model_id);
             $crate::api_get_file!(api, "tokenizer.json", model_id)
         };
-        info!("Loading `config.json` at `{}`", $this.model_id);
-        let config_filename = $crate::api_get_file!(api, "config.json", model_id);
+        let config_filename = if emb_dir_list.contains(&"params.json".to_string()) {
+            info!(
+                "Loading `params.json` (Mistral config) at `{}`",
+                $this.model_id
+            );
+            $crate::api_get_file!(api, "params.json", model_id)
+        } else {
+            info!("Loading `config.json` at `{}`", $this.model_id);
+            $crate::api_get_file!(api, "config.json", model_id)
+        };
         let filenames = get_model_paths(
             revision.clone(),
             &$token_source,
@@ -313,17 +330,68 @@ macro_rules! get_uqff_paths {
             .expect("Failed to read revision")
             .clone()
             .unwrap_or("main".to_string());
-        let api = std::sync::Arc::new(api.repo(Repo::with_revision(
+        let api = api.repo(Repo::with_revision(
             $this.model_id.to_string(),
             RepoType::Model,
             revision.clone(),
-        )));
+        ));
+
+        // Auto-discover UQFF shard siblings
+        let available_files =
+            $crate::pipeline::hf::list_repo_files(&api, Path::new(&$this.model_id), false)
+                .unwrap_or_default();
+
+        let input_files: Vec<String> = $from_uqff.iter().map(|f| f.display().to_string()).collect();
+        let input_count = input_files.len();
+
+        // Resolve numeric/ISQ-name shorthands (e.g., "8" -> "q8_0-0.uqff")
+        let resolved_files: Vec<String> = input_files
+            .iter()
+            .map(|file_str| {
+                if let Some(resolved) =
+                    $crate::pipeline::isq::resolve_uqff_shorthand(file_str, &available_files)
+                {
+                    tracing::info!("Resolved UQFF shorthand `{}` to `{}`", file_str, resolved,);
+                    resolved
+                } else if file_str.parse::<u32>().is_ok() {
+                    let available_uqff: Vec<_> = available_files
+                        .iter()
+                        .filter(|f| f.ends_with(".uqff"))
+                        .collect();
+                    tracing::warn!(
+                        "No UQFF file found for shorthand `{}`. Available UQFF files: {:?}",
+                        file_str,
+                        available_uqff,
+                    );
+                    file_str.clone()
+                } else {
+                    file_str.clone()
+                }
+            })
+            .collect();
+
+        let mut expanded_files: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for file_str in &resolved_files {
+            let expanded = $crate::pipeline::isq::expand_uqff_shards(file_str, &available_files);
+            for f in expanded {
+                if seen.insert(f.clone()) {
+                    expanded_files.push(f);
+                }
+            }
+        }
+
+        if expanded_files.len() > input_count {
+            tracing::info!(
+                "Auto-discovered {} UQFF shard files (from {} specified)",
+                expanded_files.len(),
+                input_count
+            );
+        }
 
         let mut files = Vec::new();
-        for file in $from_uqff {
-            let file = file.display().to_string();
-
-            files.push(api_get_file!(api, &file, Path::new(&$this.model_id)));
+        for file in &expanded_files {
+            files.push($crate::api_get_file!(api, file, Path::new(&$this.model_id)));
         }
         files
     }};
@@ -354,11 +422,11 @@ macro_rules! get_paths_gguf {
         };
         let revision = $revision.unwrap_or("main".to_string());
         let this_model_id = $this.model_id.clone().unwrap_or($this.quantized_model_id.clone());
-        let api = std::sync::Arc::new(api.repo(Repo::with_revision(
+        let api = api.repo(Repo::with_revision(
             this_model_id.clone(),
             RepoType::Model,
             revision.clone(),
-        )));
+        ));
         let model_id = std::path::Path::new(&this_model_id);
 
         let dir_list = $crate::api_dir_list!(api, model_id, false)
@@ -381,7 +449,7 @@ macro_rules! get_paths_gguf {
                     "chat_template.jinja",
                     model_id
                 ))
-            } else {
+            } else if dir_list.contains(&"tokenizer_config.json".to_string()) {
                 info!("Loading `tokenizer_config.json` at `{}` because no chat template file was specified.", this_model_id);
                 let res = $crate::api_get_file!(
                     api,
@@ -633,90 +701,6 @@ macro_rules! multimodal_normal_model_loader {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! multimodal_normal_model_loader_sharded {
-    (
-        $vb:expr,
-        $config:expr,
-        $loader:expr,
-        $mapper:expr,
-        $loading_isq:expr,
-        $real_device:expr,
-        $attention_mechanism:expr,
-        $multi_progress:expr,
-        $matformer_config:expr,
-    ) => {{
-        $loader.load(
-            &$config,
-            $vb,
-            $crate::pipeline::NormalLoadingMetadata {
-                mapper: $mapper,
-                loading_isq: $loading_isq,
-                real_device: $real_device,
-                multi_progress: $multi_progress,
-                matformer_slicing_config: $matformer_config,
-            },
-            $attention_mechanism,
-        )?
-    }};
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! embedding_normal_model_loader {
-    (
-        $paths:expr,
-        $dtype:expr,
-        $device:expr,
-        $layer_devices:expr,
-        $config:expr,
-        $loader:expr,
-        $silent:expr,
-        $mapper:expr,
-        $loading_isq:expr,
-        $loading_uqff:expr,
-        $real_device:expr,
-        $attention_mechanism:expr,
-        $multi_progress:expr,
-        $matformer_config:expr,
-    ) => {{
-        let regexes = if $loading_isq && $loading_uqff {
-            // Dummy weights for the layers which will be overwritten...
-            Some(std::sync::Arc::new($loader.isq_layer_regexes(&$config)?))
-        } else {
-            None
-        };
-        let get_device_for_tensor =
-            $loader.get_device_for_tensor(&$config, &*$mapper, $loading_isq)?;
-
-        let vb = from_mmaped_safetensors(
-            $paths.get_weight_filenames().to_vec(),
-            Vec::new(),
-            $dtype,
-            $device,
-            $layer_devices,
-            $silent,
-            regexes,
-            |_| true, // Will be overwritten...
-            get_device_for_tensor,
-        )?;
-
-        $loader.load(
-            &$config,
-            vb,
-            $crate::pipeline::NormalLoadingMetadata {
-                mapper: $mapper,
-                loading_isq: $loading_isq,
-                real_device: $real_device,
-                multi_progress: $multi_progress,
-                matformer_slicing_config: $matformer_config,
-            },
-            $attention_mechanism,
-        )?
-    }};
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! vision_normal_model_loader_sharded {
     (
         $vb:expr,
         $config:expr,

@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -13,7 +14,8 @@ use tokenizers::Tokenizer;
 use crate::{
     device_map::DeviceMapper,
     get_mut_arcmutex,
-    kv_cache::NormalCacheManager,
+    kv_cache::{CacheManager, HybridCacheManager, NormalCacheManager, RecurrentStateSnapshot},
+    layers_masker::PastKvLenCache,
     pipeline::sampling::{
         finish_or_add_toks_to_seq, sample_sequence, sample_target_sequence_speculative,
     },
@@ -22,7 +24,6 @@ use crate::{
     DeviceMapSetting, Loader, ModelKind, PagedAttentionConfig, Pipeline, TokenSource, TryIntoDType,
 };
 
-use crate::kv_cache::CacheManager;
 use crate::utils::progress::ProgressScopeGuard;
 
 use super::{
@@ -53,14 +54,6 @@ impl Loader for SpeculativeLoader {
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> anyhowResult<Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>> {
         let _progress_guard = ProgressScopeGuard::new(silent);
-        let paged_attn_config = if paged_attn_config.is_none() {
-            warn!(
-                "Speculative decoding does not currently support PagedAttention, running without"
-            );
-            None
-        } else {
-            paged_attn_config
-        };
 
         let target = self.target.load_model_from_hf(
             revision.clone(),
@@ -101,14 +94,6 @@ impl Loader for SpeculativeLoader {
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> anyhowResult<Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>> {
         let _progress_guard = ProgressScopeGuard::new(silent);
-        let paged_attn_config = if paged_attn_config.is_none() {
-            warn!(
-                "Speculative decoding does not currently support PagedAttention, running without"
-            );
-            None
-        } else {
-            paged_attn_config
-        };
 
         let target = self.target.load_model_from_path(
             paths,
@@ -389,11 +374,7 @@ impl CacheManagerMixin for SpeculativePipeline {
         }
     }
     fn cache(&self) -> &EitherCache {
-        unreachable!()
-    }
-    fn do_preallocated_cache(&self) -> bool {
-        // KV cache size is not the same (necessarily)
-        false
+        &self.target_cache
     }
 }
 
@@ -771,249 +752,32 @@ impl Pipeline for SpeculativePipeline {
                             false,
                             get_mut_arcmutex!(self.draft).get_metadata().sliding_window,
                             None,
-                            None, // TODO: get block tables/handle it
+                            paged_attn_metadata.clone(),
                             get_mut_arcmutex!(self.draft).device_mapper(),
                         )
                         .unwrap()
                         .inputs;
-                    let logits = get_mut_arcmutex!(self.draft).forward_inputs(inputs, false)?;
-                    #[allow(irrefutable_let_patterns)]
-                    let ForwardInputsResult::CausalGeneration { logits } = logits
-                    else {
-                        candle_core::bail!(
-                            "Speculative decoding requires `CausalGeneration` forward results"
-                        );
-                    };
-
-                    let sample = sample_sequence(
-                        logits.clone(),
-                        seq,
-                        seq.return_logprobs(),
-                        rng.clone(),
-                        false, // todo tune
-                        true,
-                        false,
-                    )
-                    .await?;
-                    seq.add_tmp_tok(sample.token);
-                    draft_samples.push(SpeculativeSample { sample });
+                    let _ = get_mut_arcmutex!(self.draft).forward_inputs(inputs, false)?;
+                    seq.reset_prefill_toks();
                 }
-                seq.remove_tmp_tok(self.gamma);
-
-                // ======================= Add all draft tokens but the last one. Add the last from the seq. ============================
-                let mut draft_prefill_tokens = if is_prompt {
-                    seq.get_toks().to_vec()
-                } else {
-                    vec![*seq.get_toks().last().unwrap()]
-                };
-                for (i, sample) in draft_samples.iter().enumerate() {
-                    if i == draft_samples.len() - 1 {
-                        continue;
-                    }
-                    draft_prefill_tokens.push(sample.sample.token);
-                }
-                seq.set_prefill_toks(draft_prefill_tokens);
-
-                // ======================= Run the model with all draft tokens. ============================
-
-                let initial_cache_len = match get_mut_arcmutex!(self.target).cache() {
-                    EitherCache::Full(full) => full.lock()[0]
-                        .as_ref()
-                        .map(|(k, _)| k.dims()[2])
-                        .unwrap_or(0),
-                    EitherCache::Normal(normal) => normal.lock().unwrap().0[0].current_seq_len(),
-                    EitherCache::Hybrid(_) => {
-                        unreachable!("Speculative decoding is not supported with hybrid caches")
-                    }
-                };
-
-                // ========= Run the model ============
-                let is_xlora = get_mut_arcmutex!(self.target).get_metadata().is_xlora;
-                let device = get_mut_arcmutex!(self.target).device();
-                let no_kv_cache = get_mut_arcmutex!(self.target).get_metadata().no_kv_cache;
-                let inputs = self
-                    .get_processor()
-                    .inputs_processor()
-                    .process_inputs(
-                        self.tokenizer(),
-                        &mut [seq],
-                        true, // use the "prefill" tokens
-                        is_xlora,
-                        &device,
-                        no_kv_cache,
-                        Some((self.gamma, initial_cache_len)), // Get the last gamma, see above
-                        false,
-                        None,
-                        None, // TODO: get block tables/handle it
-                        get_mut_arcmutex!(self.target).device_mapper(),
-                    )
-                    .unwrap()
-                    .inputs;
-
-                let logits = get_mut_arcmutex!(self.target).forward_inputs(inputs, false)?;
-                #[allow(irrefutable_let_patterns)]
-                let ForwardInputsResult::CausalGeneration { logits } = logits
-                else {
-                    candle_core::bail!(
-                        "Speculative decoding requires `CausalGeneration` forward results"
-                    );
-                };
-
-                // Reset the prefill tokens
-                seq.reset_prefill_toks();
-
-                // ======================= Rejection sampling. ============================
-                // Map from each target sample to corresponding in draft sample
-                // this will first rollback LLG state if any, and then advance for the accepted tokens only
-                let samples = sample_target_sequence_speculative(
-                    logits.clone(),
-                    seq,
-                    seq.return_logprobs(),
-                    rng.clone(),
-                    &draft_samples,
-                )
-                .await?;
-
-                let accepted_tokens = samples.into_iter().map(|s| s.sample).collect::<Vec<_>>();
-
-                // ======================= Narrow caches to account for rejections ============================
-                let n_not_accepted = self.gamma - accepted_tokens.len();
-
-                match get_mut_arcmutex!(self.draft).cache() {
-                    EitherCache::Full(full) => {
-                        for (k, v) in full.lock().iter_mut().flatten() {
-                            *k = k.i((.., .., ..k.dims()[2] - n_not_accepted, ..))?;
-                            *v = v.i((.., .., ..v.dims()[2] - n_not_accepted, ..))?;
-                        }
-                    }
-                    EitherCache::Normal(normal) => {
-                        for cache in &mut *normal.lock().unwrap().0 {
-                            cache
-                                .set_len(cache.current_seq_len() - n_not_accepted)
-                                .map_err(|_| candle_core::Error::msg("KV cache set_len failed."))?;
-                        }
-                    }
-                    EitherCache::Hybrid(_) => {
-                        unreachable!("Speculative decoding is not supported with hybrid caches")
-                    }
-                }
-                if get_mut_arcmutex!(self.draft).get_metadata().is_xlora {
-                    match get_mut_arcmutex!(self.draft).cache() {
-                        EitherCache::Full(full) => {
-                            for (k, v) in full.xlora_lock().iter_mut().flatten() {
-                                *k = k.i((.., .., ..k.dims()[2] - n_not_accepted, ..))?;
-                                *v = v.i((.., .., ..v.dims()[2] - n_not_accepted, ..))?;
-                            }
-                        }
-                        EitherCache::Normal(_) | EitherCache::Hybrid(_) => {
-                            unreachable!()
-                        }
-                    }
-                }
-                match get_mut_arcmutex!(self.target).cache() {
-                    EitherCache::Full(full) => {
-                        for (k, v) in full.lock().iter_mut().flatten() {
-                            *k = k.i((.., .., ..k.dims()[2] - n_not_accepted, ..))?;
-                            *v = v.i((.., .., ..v.dims()[2] - n_not_accepted, ..))?;
-                        }
-                    }
-                    EitherCache::Normal(normal) => {
-                        for cache in &mut *normal.lock().unwrap().0 {
-                            cache
-                                .set_len(cache.current_seq_len() - n_not_accepted)
-                                .map_err(|_| candle_core::Error::msg("KV cache set_len failed."))?;
-                        }
-                    }
-                    EitherCache::Hybrid(_) => {
-                        unreachable!("Speculative decoding is not supported with hybrid caches")
-                    }
-                }
-                if get_mut_arcmutex!(self.draft).get_metadata().is_xlora {
-                    match get_mut_arcmutex!(self.target).cache() {
-                        EitherCache::Full(full) => {
-                            for (k, v) in full.xlora_lock().iter_mut().flatten() {
-                                *k = k.i((.., .., ..k.dims()[2] - n_not_accepted, ..))?;
-                                *v = v.i((.., .., ..v.dims()[2] - n_not_accepted, ..))?;
-                            }
-                        }
-                        EitherCache::Normal(_) | EitherCache::Hybrid(_) => {
-                            unreachable!()
-                        }
-                    }
-                }
-
-                let eos_owned = get_mut_arcmutex!(self.target)
-                    .get_metadata()
-                    .eos_tok
-                    .clone();
-                let eos_tok = if disable_eos_stop {
-                    None
-                } else {
-                    Some(&eos_owned[..])
-                };
-                // Add the tokens to the seq and the trie
-                for accepted in accepted_tokens {
-                    // Do not use the prefix cacher
-                    finish_or_add_toks_to_seq(
-                        self,
-                        prefix_cacher,
-                        seq,
-                        accepted.clone(),
-                        eos_tok,
-                        false,
-                    )
-                    .await?;
-                }
-
-                // Trick to improve lower bounds. Sample last token in multinomial
-                /*
-                let sample = sample_sequence(
-                    logits.clone(),
-                    seq,
-                    seq.return_logprobs(),
-                    rng.clone(),
-                    false, // todo tune
-                    true, // do not add to tok trie yet
-                    true,
-                )
-                .await?;
-                finish_or_add_toks_to_seq(self, prefix_cacher, seq, sample, eos_tok, false);
-                */
-                let end = Instant::now();
-                let exec_duration = end.duration_since(start);
-
-                match post_op {
-                    CacheInstruction::Out => {
-                        self.clone_out_cache(input_seqs);
-                    }
-                    CacheInstruction::Nothing => (),
-                    CacheInstruction::Reset {
-                        reset_non_granular,
-                        load_preallocated_cache,
-                    } => self.set_none_cache(
-                        input_seqs,
-                        reset_non_granular,
-                        true,
-                        load_preallocated_cache,
-                    ),
-                    _ => unreachable!("Unreachable pre cache op."),
-                }
-
-                // Done! We have:
-                // - Run the draft model gamma times
-                // - Reset draft model cache fully
-                // - Sampled draft model's distributions
-                // - Run target model
-                // - Execute speculative decoding algorithm on the resulting distributions
-                // - Added the accepted tokens to buffer and trie
-                // - Maybe fixed up cache of base model based on accepted tokens.
-
-                Ok(exec_duration)
             }
-            CacheBackendMetadata::PagedAttention {
-                metadata: _,
-                blocks_to_copy: _,
-            } => unreachable!(),
+        } else if !using_paged_attn {
+            match get_mut_arcmutex!(self.draft).cache() {
+                EitherCache::Full(full) => {
+                    for (k, v) in full.lock().iter_mut().flatten() {
+                        *k = k.i((.., .., ..k.dims()[2] - n_not_accepted, ..))?;
+                        *v = v.i((.., .., ..v.dims()[2] - n_not_accepted, ..))?;
+                    }
+                }
+                EitherCache::Normal(normal) => {
+                    for cache in &mut *normal.lock().unwrap().0 {
+                        cache
+                            .set_len(cache.current_seq_len() - n_not_accepted)
+                            .map_err(|_| candle_core::Error::msg("KV cache set_len failed."))?;
+                    }
+                }
+                EitherCache::Hybrid(_) => unreachable!(),
+            }
         }
         if get_mut_arcmutex!(self.draft).get_metadata().is_xlora {
             match get_mut_arcmutex!(self.draft).cache() {

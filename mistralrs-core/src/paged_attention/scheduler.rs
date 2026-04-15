@@ -1,9 +1,5 @@
-//! The Scheduler uses a BlockEngine to schedule and automatically batch sequences. The
-//! primary method `schedule` returns the batched sequences as inputs, as well as the
-//! operations to be executed on the cache by the CacheEngine.
-
-type SrcBlockFrom = usize;
-type DstBlocksTo = Vec<usize>;
+//! The Scheduler uses a KVCacheManager to schedule and automatically batch sequences.
+//! The primary method `schedule` returns the batched sequences as inputs.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -36,18 +32,12 @@ type BucketKey = (usize, bool, usize);
 /// Allow sequences to wait for 64 scheduling passes before warning of deprivation.
 const WAITING_TIMEOUT: usize = 64;
 
-/// Bucket key: (sequence length, has_images && is_prompt, token_offset)
-/// We bucket sequences by these criteria to ensure all sequences in a batch have the same
-/// length, avoiding padding issues with flash attention varlen.
-type BucketKey = (usize, bool, usize);
-
-/// Allow sequences to wait for 64 scheduling passes before warning of deprivation.
-const WAITING_TIMEOUT: usize = 64;
-
 pub struct PagedAttentionSchedulerOutput {
     /// Either ALL prompt or ALL completion.
     pub scheduled: Vec<Arc<Mutex<Sequence>>>,
-    pub blocks_to_copy: HashMap<SrcBlockFrom, DstBlocksTo>,
+    /// Number of cached tokens per sequence (from prefix cache hits).
+    /// Only populated for prompt scheduling when prefix caching is enabled.
+    pub num_cached_tokens: Vec<usize>,
 }
 
 pub struct PagedAttentionSchedulerConfig {
@@ -58,47 +48,64 @@ pub struct PagedAttentionScheduler {
     waiting: VecDeque<Arc<Mutex<Sequence>>>,
     running: VecDeque<Arc<Mutex<Sequence>>>,
     config: PagedAttentionSchedulerConfig,
-    pub block_engine: Arc<tokio::sync::Mutex<BlockEngine>>,
+    pub kv_cache_manager: Arc<tokio::sync::Mutex<KVCacheManager>>,
     block_size: usize,
     prefix_caching_enabled: bool,
+    /// Block hashes per sequence for prefix caching.
+    /// Computed incrementally as sequences grow.
+    seq_block_hashes: HashMap<usize, Vec<BlockHash>>,
+    /// Per-sequence waitlist counter for starvation detection.
+    waiting_counts: HashMap<usize, usize>,
 }
 
 impl PagedAttentionScheduler {
     pub fn new(config: PagedAttentionSchedulerConfig, cache_config: CacheConfig) -> Self {
-        // Default to enabled, Engine::new will call set_prefix_caching_enabled
-        // based on the global no_prefix_cache flag
         Self {
             waiting: VecDeque::new(),
             running: VecDeque::new(),
-            block_engine: Arc::new(tokio::sync::Mutex::new(BlockEngine::new(
-                cache_config.block_size,
+            kv_cache_manager: Arc::new(tokio::sync::Mutex::new(KVCacheManager::new(
                 cache_config.num_gpu_blocks,
+                cache_config.block_size,
                 true, // Default enabled, will be configured by Engine
+                vec![0],
             ))),
             block_size: cache_config.block_size,
             config,
             prefix_caching_enabled: true,
+            seq_block_hashes: HashMap::new(),
+            waiting_counts: HashMap::new(),
         }
     }
 
-    /// Set whether prefix caching is enabled. This also updates the block engine.
+    /// Set whether prefix caching is enabled. This also updates the KV cache manager.
     pub fn set_prefix_caching_enabled_sync(&mut self, enabled: bool) {
         self.prefix_caching_enabled = enabled;
         if enabled {
             info!("Prefix caching enabled (block-level, PagedAttention). Expect higher multi-turn throughput for both text and multimodal.");
         }
-        // Update the block engine - we need to block on the async mutex
-        // This is called once at startup, so blocking is acceptable
-        let block_engine = self.block_engine.clone();
-        tokio::task::block_in_place(|| {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                block_engine
-                    .lock()
-                    .await
-                    .set_prefix_caching_enabled(enabled);
-            });
-        });
+    }
+
+    /// Compute or update block hashes for a sequence.
+    ///
+    /// `mm_features`: per-item multimodal feature positions. Each feature's content hash
+    /// is included only in blocks whose token range overlaps with that feature's placeholder
+    /// tokens, ensuring that adding a new image at the end of a conversation doesn't
+    /// invalidate hashes for earlier (unchanged) blocks.
+    fn ensure_block_hashes(
+        &mut self,
+        seq_id: usize,
+        tokens: &[u32],
+        mm_features: &[MultiModalFeature],
+    ) {
+        let hashes = self.seq_block_hashes.entry(seq_id).or_default();
+        if hashes.is_empty() {
+            // Compute all hashes from scratch
+            *hashes = compute_block_hashes(tokens, self.block_size, mm_features, &[]);
+        } else {
+            // Incrementally compute new block hashes
+            let new = compute_new_block_hashes(tokens, self.block_size, hashes, mm_features, &[]);
+            hashes.extend(new);
+        }
     }
 
     /// Bucket sequences by (length, has_images && is_prompt, token_offset).
@@ -121,8 +128,16 @@ impl PagedAttentionScheduler {
 
         for seq in sequences {
             let seq_guard = get_mut_arcmutex!(seq);
+            // Use effective length for prompts so sequences with different
+            // prefix cache hits land in separate buckets. The causal offset
+            // (seqlen_k - seqlen_q) is only correct when all Qs are the same.
+            let effective_len = if seq_guard.is_prompt() {
+                seq_guard.len().saturating_sub(seq_guard.prefix_cache_len())
+            } else {
+                seq_guard.len()
+            };
             let key: BucketKey = (
-                seq_guard.len(),
+                effective_len,
                 seq_guard.images().is_some() && seq_guard.is_prompt(),
                 seq_guard.token_offset(),
             );
@@ -132,7 +147,6 @@ impl PagedAttentionScheduler {
         }
 
         if buckets.len() == 1 {
-            // All sequences are in the same bucket, return them all
             return buckets.into_values().next().unwrap();
         }
 
@@ -147,122 +161,17 @@ impl PagedAttentionScheduler {
         // Collect IDs of sequences to preempt
         let mut ids_to_preempt = Vec::new();
 
-        // Preempt sequences from other buckets (free blocks, set state to Waiting, add to waiting)
+        // Preempt sequences from other buckets
         for (_, seqs) in buckets {
             for seq in seqs.into_iter().rev() {
-                ids_to_preempt.push(get_mut_arcmutex!(seq).get_id());
-                self._preempt_by_recompute(seq);
+                ids_to_preempt.push(*get_mut_arcmutex!(seq).id());
+                self._preempt(seq);
             }
         }
 
         // Remove preempted sequences from self.running
         self.running
-            .retain(|seq| !ids_to_preempt.contains(&get_mut_arcmutex!(seq).get_id()));
-
-        selected
-    }
-
-    pub fn schedule(&mut self, logger: &IntervalLogger) -> PagedAttentionSchedulerOutput {
-        let mut scheduled: VecDeque<Arc<Mutex<Sequence>>> = VecDeque::new();
-        let mut for_waiting_again: VecDeque<Arc<Mutex<Sequence>>> = VecDeque::new();
-        let mut did_ignore = false;
-        while !self.waiting.is_empty() {
-            let seq = self.waiting.front().unwrap().clone();
-
-            if self.running.len() >= self.config.max_num_seqs {
-                break;
-            }
-
-            let can_allocate =
-                get_mut_arcmutex!(self.block_engine).can_allocate(&mut *get_mut_arcmutex!(seq));
-            match can_allocate {
-                AllocStatus::Later { waitlisted_count } => {
-                    if waitlisted_count > WAITING_TIMEOUT {
-                        if let Some(seq_to_preempt) = self.running.pop_back() {
-                            self._preempt_by_recompute(seq_to_preempt);
-                            if !matches!(
-                                get_mut_arcmutex!(self.block_engine)
-                                    .can_allocate(&mut *get_mut_arcmutex!(seq)),
-                                AllocStatus::Ok
-                            ) {
-                                let id = *get_mut_arcmutex!(seq).id();
-                                let len = get_mut_arcmutex!(seq).get_toks().len();
-                                warn!(
-                                    "Sequence {id} with length of {len} tokens still exceeds KV cache size \
-                                     even after evicting another sequence.",
-                                );
-                                get_mut_arcmutex!(seq).set_state(SequenceState::FinishedIgnored);
-                                did_ignore = true;
-                            }
-                        } else {
-                            let id = *get_mut_arcmutex!(seq).id();
-                            let len = get_mut_arcmutex!(seq).get_toks().len();
-                            warn!(
-                                "Sequence {id} with length of {len} tokens is too long and exceeds KV cache size. \
-                                 To fix, increase the maximum sequence length for the KV cache, for example with \
-                                 `--max-seq-len`/ `max_seq_len` in automatic device mapping parameters.",
-                            );
-                            get_mut_arcmutex!(seq).set_state(SequenceState::FinishedIgnored);
-                            did_ignore = true;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-                AllocStatus::Impossible => {
-                    let id = *get_mut_arcmutex!(seq).id();
-                    let len = get_mut_arcmutex!(seq).get_toks().len();
-                    warn!(
-                        "Sequence {id} with length of {len} tokens is too long and exceeds KV cache size. To fix, increase the maximum sequence length for the KV cache, for example with `--max-seq-len`/ `max_seq_len` in automatic device mapping parameters.",
-                    );
-                    get_mut_arcmutex!(seq).set_state(SequenceState::FinishedIgnored);
-                    did_ignore = true;
-                }
-                _ => {}
-            }
-
-            let new_seq_has_images = get_mut_arcmutex!(seq).has_images();
-            if !scheduled.is_empty()
-                && get_mut_arcmutex!(scheduled[0]).has_images() != new_seq_has_images
-            {
-                let seq = self.waiting.pop_front().unwrap();
-                for_waiting_again.push_back(seq.clone());
-                continue;
-            }
-            if !did_ignore {
-                get_mut_arcmutex!(seq).set_state(SequenceState::RunningPrompt);
-                let mut seq_handle = get_mut_arcmutex!(seq);
-                self._allocate(&mut seq_handle);
-                // Check for prefix cache hit and report to logger
-                let seq_id = seq_handle.get_id();
-                if get_mut_arcmutex!(self.block_engine).last_allocate_had_cache_hit(seq_id) > 0 {
-                    logger.add_prefix_cache_hit();
-                }
-            }
-
-            let seq = self.waiting.pop_front().unwrap();
-            self.running.push_back(seq.clone());
-            if !did_ignore {
-                scheduled.push_back(seq);
-            }
-        }
-        self.waiting.extend(for_waiting_again);
-
-        if !scheduled.is_empty() || did_ignore {
-            // Bucket scheduled prompts by sequence length to ensure all sequences in a batch
-            // have the same length (required for correct flash attention varlen operation).
-            let scheduled = self.bucket_and_preempt_sequences(scheduled);
-
-            logger.set_num_running(self.running.len());
-            logger.set_num_waiting(self.waiting.len());
-
-            return PagedAttentionSchedulerOutput {
-                scheduled: scheduled.into_iter().collect(),
-                blocks_to_copy: HashMap::new(),
-            };
-        }
-
-        let mut blocks_to_copy = HashMap::new();
+            .retain(|seq| !ids_to_preempt.contains(get_mut_arcmutex!(seq).id()));
 
         selected
     }
@@ -428,15 +337,23 @@ impl PagedAttentionScheduler {
         while !self.running.is_empty() {
             let seq = self.running.pop_front().unwrap();
             let mut finished_with_break = false;
-            while !get_mut_arcmutex!(self.block_engine)
-                .can_append_token_to_seq(&*get_mut_arcmutex!(seq))
-            {
-                // If we cannot, now we need to preempt some seqs
+
+            let seq_guard = get_mut_arcmutex!(seq);
+            let seq_id = *seq_guard.id();
+            let num_tokens = seq_guard.len() + 1; // +1 for the new token to be generated
+            drop(seq_guard);
+
+            // Try to allocate for the new token
+            loop {
+                let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
+                if kv_mgr.allocate_slots(seq_id, num_tokens, &[]).is_some() {
+                    break;
+                }
+                drop(kv_mgr);
                 if !self.running.is_empty() {
                     let seq_to_preempt = self.running.pop_back().unwrap();
                     self._preempt(seq_to_preempt);
                 } else {
-                    // Nothing to preempt, preempt ourselves. Also, do not bother looking at anything else.
                     self._preempt(seq.clone());
                     finished_with_break = true;
                     break;
@@ -452,21 +369,11 @@ impl PagedAttentionScheduler {
                 } else {
                     self.running.push_back(seq);
                 }
-                let new_seq_has_images = get_mut_arcmutex!(seq).has_images();
-                // Only add it if has_images matches either current or there are none.
-                if running.is_empty()
-                    || get_mut_arcmutex!(running[0]).has_images() == new_seq_has_images
-                {
-                    running.push_back(seq);
-                } else {
-                    self.running.push_back(seq);
-                }
             }
         }
         self.running = running;
 
-        // Bucket running completions by sequence length to ensure all sequences in a batch
-        // have the same length (required for correct flash attention varlen operation).
+        // Bucket running completions by sequence length
         let running_for_bucket = std::mem::take(&mut self.running);
         let bucketed = self.bucket_and_preempt_sequences(running_for_bucket);
         self.running = bucketed;
@@ -482,116 +389,108 @@ impl PagedAttentionScheduler {
             TERMINATE_ALL_NEXT_STEP.store(false, Ordering::SeqCst);
         }
 
+        // Eagerly cache any newly-full blocks so other requests can hit the prefix cache
+        // sooner, rather than waiting until finish/preempt. cache_blocks is idempotent.
+        if self.prefix_caching_enabled {
+            // Collect sequence info first to avoid borrow conflict with self.ensure_block_hashes
+            let seq_infos: Vec<(usize, Vec<u32>, Vec<MultiModalFeature>)> = self
+                .running
+                .iter()
+                .map(|seq| {
+                    let seq_guard = get_mut_arcmutex!(seq);
+                    let seq_id = *seq_guard.id();
+                    let tokens = seq_guard.get_toks().to_vec();
+                    let mm_features = seq_guard.mm_features().to_vec();
+                    (seq_id, tokens, mm_features)
+                })
+                .collect();
+
+            for (seq_id, tokens, mm_features) in &seq_infos {
+                self.ensure_block_hashes(*seq_id, tokens, mm_features);
+                if let Some(block_hashes) = self.seq_block_hashes.get(seq_id).cloned() {
+                    let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
+                    kv_mgr.cache_blocks(*seq_id, &block_hashes, tokens.len());
+                }
+            }
+        }
+
         logger.set_num_running(self.running.len());
         logger.set_num_waiting(self.waiting.len());
 
         PagedAttentionSchedulerOutput {
             scheduled: self.running.clone().into_iter().collect(),
-            blocks_to_copy,
+            num_cached_tokens: Vec::new(), // No prefix cache for completion
         }
     }
 
     pub fn free_finished_sequence_groups(&mut self) {
-        let mut to_free: Vec<(usize, Vec<super::LogicalTokenBlock>)> = Vec::new();
-        self.running.retain(|seq| {
-            if get_mut_arcmutex!(seq).is_finished_paged_attn() {
-                let seq_guard = get_mut_arcmutex!(seq);
-                let id = seq_guard.get_id();
-                // Get logical blocks for caching (clone them since we're dropping the lock)
-                let logical_blocks = seq_guard.logical_token_blocks().to_vec();
-                drop(seq_guard);
-                to_free.push((id, logical_blocks));
-                false
-            } else {
-                true
+        // Collect finished sequence info before modifying self.running
+        let mut finished: Vec<(usize, Vec<u32>, Vec<MultiModalFeature>)> = Vec::new();
+        for seq in self.running.iter() {
+            let seq_guard = get_mut_arcmutex!(seq);
+            if seq_guard.is_finished_paged_attn() {
+                let id = *seq_guard.id();
+                let tokens = seq_guard.get_toks().to_vec();
+                let mm_features = seq_guard.mm_features().to_vec();
+                finished.push((id, tokens, mm_features));
             }
         }
 
-        for (id, logical_blocks) in to_free {
-            self._free_with_caching(id, Some(&logical_blocks));
+        // Remove finished sequences from running
+        self.running
+            .retain(|seq| !get_mut_arcmutex!(seq).is_finished_paged_attn());
+
+        // Cache and free blocks for finished sequences
+        if self.prefix_caching_enabled {
+            for (id, tokens, mm_features) in &finished {
+                self.ensure_block_hashes(*id, tokens, mm_features);
+                let block_hashes = self.seq_block_hashes.get(id).cloned().unwrap_or_default();
+                let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
+                kv_mgr.cache_blocks(*id, &block_hashes, tokens.len());
+                drop(kv_mgr);
+            }
+        }
+
+        let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
+        for (id, _, _) in finished {
+            kv_mgr.free(id);
+            self.seq_block_hashes.remove(&id);
+            self.waiting_counts.remove(&id);
         }
     }
 }
 
 impl PagedAttentionScheduler {
-    #[allow(dead_code)]
-    fn remove_seq(&mut self, seq_id: usize) -> Arc<Mutex<Sequence>> {
-        // Remove it if it is in waiting
-        if let Some(idx) = self
-            .waiting
-            .iter()
-            .position(|other| get_mut_arcmutex!(other).get_id() == seq_id)
-        {
-            return self.waiting.remove(idx).unwrap();
-        };
-        // Remove it if it is in running
-        if let Some(idx) = self
-            .running
-            .iter()
-            .position(|other| get_mut_arcmutex!(other).get_id() == seq_id)
-        {
-            return self.running.remove(idx).unwrap();
-        };
-        panic!("Attempted to remove sequence id {seq_id} but it is not running or waiting.");
-    }
-
-    fn _append_token_slot_to_seq(
-        &mut self,
-        seq: &Sequence,
-        blocks_to_copy: &mut HashMap<usize, Vec<usize>>,
-    ) {
-        let op = get_mut_arcmutex!(self.block_engine).append_token_slot_to_seq(seq);
-        if let Some((src_block, dst_block)) = op {
-            if let std::collections::hash_map::Entry::Vacant(e) = blocks_to_copy.entry(src_block) {
-                e.insert(vec![dst_block]);
-            } else {
-                blocks_to_copy.get_mut(&src_block).unwrap().push(dst_block);
-            }
-        }
-    }
-
-    fn _abort_seq(&mut self, seq_id: usize) {
-        let removed = self.remove_seq(seq_id);
-        get_mut_arcmutex!(removed).set_state(SequenceState::FinishedAborted);
-        self._free(seq_id);
-    }
-
-    /// Preempt sequences by dropping their cache and recomputing later.
     fn _preempt(&mut self, seq: Arc<Mutex<Sequence>>) {
-        self._preempt_by_recompute(seq)
-    }
-
-    fn _preempt_by_recompute(&mut self, seq: Arc<Mutex<Sequence>>) {
-        let seq_guard = get_mut_arcmutex!(seq);
+        let mut seq_guard = get_mut_arcmutex!(seq);
+        // Don't resurrect sequences that are already in a terminal state
+        if seq_guard.is_finished_paged_attn() {
+            return;
+        }
         seq_guard.set_state(SequenceState::Waiting);
-        let seq_id = seq_guard.get_id();
-        // Get logical blocks for proper cache ref release
-        let logical_blocks = seq_guard.logical_token_blocks().to_vec();
+        seq_guard.set_prefix_cache_len(0);
+        let seq_id = *seq_guard.id();
+        let tokens = seq_guard.get_toks().to_vec();
+        let mm_features = seq_guard.mm_features().to_vec();
         drop(seq_guard);
-        // Use free_with_caching to properly release prefix cache refs
-        // (but don't add blocks to cache since we're preempting)
-        self._free_for_preemption(seq_id, &logical_blocks);
+
+        // Ensure block hashes are up-to-date before freeing
+        self.ensure_block_hashes(seq_id, &tokens, &mm_features);
+        let block_hashes = self
+            .seq_block_hashes
+            .get(&seq_id)
+            .cloned()
+            .unwrap_or_default();
+
+        // Cache all full blocks and free, blocks stay in cache for LRU reuse
+        let mut kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
+        if self.prefix_caching_enabled {
+            kv_mgr.cache_blocks(seq_id, &block_hashes, tokens.len());
+        }
+        kv_mgr.free(seq_id);
+        drop(kv_mgr);
+
         self.waiting.push_front(seq);
-    }
-
-    fn _allocate(&mut self, seq: &mut Sequence) {
-        get_mut_arcmutex!(self.block_engine).allocate(seq)
-    }
-
-    fn _free(&mut self, seq_id: usize) {
-        get_mut_arcmutex!(self.block_engine).free_sequence(seq_id);
-    }
-
-    fn _free_for_preemption(&mut self, seq_id: usize, logical_blocks: &[super::LogicalTokenBlock]) {
-        get_mut_arcmutex!(self.block_engine).free_sequence_for_preemption(seq_id, logical_blocks);
-    }
-
-    fn _free_with_caching(
-        &mut self,
-        seq_id: usize,
-        logical_blocks: Option<&[super::LogicalTokenBlock]>,
-    ) {
-        get_mut_arcmutex!(self.block_engine).free_sequence_with_caching(seq_id, logical_blocks);
     }
 
     fn sort_running_by_priority_fcfs(&mut self) {
@@ -617,24 +516,21 @@ impl Scheduler for PagedAttentionScheduler {
     fn running_len(&self) -> usize {
         self.running.len()
     }
-    fn block_tables(&self) -> Option<BlockTables> {
-        Some(get_mut_arcmutex!(self.block_engine).block_tables.clone())
-    }
     fn block_size(&self) -> Option<usize> {
         Some(self.block_size)
     }
     fn free_finished_sequence_groups(&mut self) {
         self.free_finished_sequence_groups()
     }
-    fn get_finished_mamba_indices(&self) -> Vec<usize> {
+    fn get_finished_recurrent_indices(&self) -> Vec<usize> {
         self.running
             .iter()
             .filter(|seq| get_mut_arcmutex!(seq).is_finished_paged_attn())
-            .filter_map(|seq| get_mut_arcmutex!(seq).mamba_state_idx())
+            .filter_map(|seq| get_mut_arcmutex!(seq).recurrent_state_idx())
             .collect()
     }
-    fn block_engine(&self) -> Option<Arc<tokio::sync::Mutex<BlockEngine>>> {
-        Some(self.block_engine.clone())
+    fn kv_cache_manager(&self) -> Option<Arc<tokio::sync::Mutex<KVCacheManager>>> {
+        Some(self.kv_cache_manager.clone())
     }
     fn set_prefix_caching_enabled(&mut self, enabled: bool) {
         self.set_prefix_caching_enabled_sync(enabled);

@@ -91,19 +91,10 @@ impl TextSpeculativeBuilder {
             self.speculative_config,
         )?));
 
-        let mut runner = MistralRsBuilder::new(
-            pipeline,
-            scheduler_method,
-            self.target.throughput_logging,
-            self.target.search_embedding_model,
-        );
-        if let Some(cb) = self.target.search_callback.clone() {
-            runner = runner.with_search_callback(cb);
-        }
-        for (name, cb) in &self.target.tool_callbacks {
-            runner = runner.with_tool_callback(name.clone(), cb.clone());
-        }
+        // Speculative decoding still does not expose its own prefix-cache tuning surface.
+        add_model_config.engine_config.no_prefix_cache = false;
+        add_model_config.engine_config.prefix_cache_n = 16;
 
-        Ok(Model::new(runner.build().await))
+        Ok(build_model_from_pipeline(pipeline, scheduler_method, add_model_config).await)
     }
 }

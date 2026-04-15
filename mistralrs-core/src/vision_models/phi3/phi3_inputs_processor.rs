@@ -162,6 +162,7 @@ impl InputsProcessor for Phi3InputsProcessor {
                     no_kv_cache,
                     last_n_context_len,
                     return_raw_logits,
+                    sliding_window,
                     other_config,
                     paged_attn_metadata,
                     mapper,
@@ -192,7 +193,10 @@ impl InputsProcessor for Phi3InputsProcessor {
                         context_lens,
                         position_ids,
                         pixel_values: None,
-                        model_specific_args: Box::new(Phi3VisionSpecificArgs { image_sizes: None }),
+                        model_specific_args: Box::new(Phi3VisionSpecificArgs {
+                            image_sizes: None,
+                            image_hashes: vec![],
+                        }),
                         paged_attn_meta,
                         flash_meta,
                     });
@@ -278,6 +282,17 @@ impl InputsProcessor for Phi3InputsProcessor {
                     })
                     .collect::<Vec<_>>();
 
+                // Compute image placeholder ranges from interleave structure
+                let mut img_ranges = Vec::new();
+                {
+                    let mut offset = 0;
+                    for (chunk, pad) in prompt_chunks.iter().zip(image_ids_pad.iter()) {
+                        offset += chunk.len();
+                        img_ranges.push((offset, pad.len()));
+                        offset += pad.len();
+                    }
+                }
+
                 let mut input_ids: Vec<i64> = Vec::new();
                 for item in prompt_chunks
                     .iter()
@@ -294,6 +309,18 @@ impl InputsProcessor for Phi3InputsProcessor {
                     .collect::<Vec<_>>();
                 let new_prompt = tokenizer.decode(&new_ids, false).unwrap();
                 seq.set_initial_prompt(new_prompt);
+
+                // Build mm_features for position-aware prefix cache hashing
+                if seq.mm_features().is_empty() {
+                    if let Some(hashes) = seq.image_hashes().map(|h| h.to_vec()) {
+                        seq.set_mm_features(build_mm_features_from_ranges(
+                            &img_ranges,
+                            &hashes,
+                            "img",
+                        ));
+                    }
+                }
+
                 // NOTE(EricLBuehler): Casting to u32 is fine, we don't care about the other toks
                 seq.set_toks_and_reallocate(new_ids, paged_attn_metadata.as_mut());
                 seq.multimodal.has_changed_prompt = true;
@@ -342,6 +369,21 @@ impl InputsProcessor for Phi3InputsProcessor {
                     },
                 seq_indices,
             } = metadata;
+            let image_hashes: Vec<u64> = input_seqs
+                .iter()
+                .flat_map(|seq| {
+                    seq.image_hashes()
+                        .map(|h| {
+                            let cached = seq.count_prefix_cached_mm_items();
+                            if cached < h.len() {
+                                h[cached..].to_vec()
+                            } else {
+                                vec![]
+                            }
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
             let inputs: Box<dyn Any> = Box::new(ModelInputs {
                 input_ids: input,
                 seqlen_offsets: positions,

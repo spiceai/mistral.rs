@@ -53,6 +53,7 @@ impl VideoInput {
     }
 
     /// Compute per-frame timestamps in seconds.
+    #[allow(clippy::cast_precision_loss)]
     pub fn timestamps_secs(&self) -> Vec<f64> {
         self.sampled_indices
             .iter()
@@ -65,7 +66,9 @@ impl VideoInput {
         self.timestamps_secs()
             .iter()
             .map(|&secs| {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let minutes = (secs / 60.0) as u32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let seconds = (secs % 60.0) as u32;
                 format!("{minutes:02}:{seconds:02}")
             })
@@ -102,10 +105,16 @@ pub fn sample_frame_indices(total_frames: usize, num_frames: usize) -> Vec<usize
     if num_frames == 0 || total_frames == 0 {
         return Vec::new();
     }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn compute_index(i: usize, total_frames: usize, n: usize) -> usize {
+        ((i as f64) * (total_frames as f64) / (n as f64)) as usize
+    }
     let n = num_frames.min(total_frames);
-    (0..n)
-        .map(|i| ((i as f64) * (total_frames as f64) / (n as f64)) as usize)
-        .collect()
+    (0..n).map(|i| compute_index(i, total_frames, n)).collect()
 }
 
 #[cfg(test)]
