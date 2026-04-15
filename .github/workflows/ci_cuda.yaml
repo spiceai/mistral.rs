@@ -15,7 +15,7 @@ jobs:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.head_ref || github.run_id }}
       cancel-in-progress: true
 
-    runs-on: [self-hosted, Linux, ARM64, gpu, cuda]
+    runs-on: ubuntu-gpu-t4-4-core
 
     steps:
       - name: Checkout repository
