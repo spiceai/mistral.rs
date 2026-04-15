@@ -3,6 +3,11 @@
 // Licensed under the Apache License 2.0
 // Copyright © 2023 Apple Inc.
 
+// Portions of this file are adapted from the vLLM project
+// (https://github.com/vllm-project/vllm)
+// Licensed under the Apache License 2.0
+// Copyright contributors to the vLLM project
+
 #include "utils.metal"
 #include <metal_simdgroup>
 #include <metal_stdlib>
@@ -567,7 +572,7 @@ inline Vec fp8_convert(const thread Quant_vec &, float scale) {
   static_assert(sizeof(Vec) == 0, "Missing fp8_convert specialisation");
 }
 
-// ========================================== FP8 → float/half/bfloat
+// ========================================== FP8 -> float/half/bfloat
 inline float __dequant_single(uchar v, float scale) {
   return fp8_e4m3_to_float(v) * scale;
 }
@@ -754,6 +759,7 @@ inline float block_sum(threadgroup float *red_smem, float sum, uint simd_tid,
 constant bool use_partitioning [[function_constant(10)]];
 constant bool use_alibi [[function_constant(20)]];
 constant bool use_fp8_scales [[function_constant(30)]];
+constant bool use_sinks [[function_constant(40)]];
 
 template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
           int NUM_THREADS, int NUM_SIMD_LANES, int PARTITION_SIZE = 0>
@@ -787,6 +793,8 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
     const constant int &q_stride [[buffer(15)]],
     const constant int &kv_block_stride [[buffer(16)]],
     const constant int &kv_head_stride [[buffer(17)]],
+    const device float *sinks
+    [[buffer(18), function_constant(use_sinks)]], // [num_heads]
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -988,6 +996,11 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE,
   exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(&red_smem[NUM_WARPS], exp_sum,
                                                  simd_tid, simd_lid);
 
+  // For non-partitioned (V1) mode, include the sink in the exp sum.
+  if (!USE_PARTITIONING && use_sinks) {
+    exp_sum += exp(sinks[head_idx] - qk_max);
+  }
+
   // Compute softmax.
   const float inv_sum = 1.f / (exp_sum + 1e-6f);
   for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
@@ -1149,6 +1162,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
     const device T *tmp_out [[buffer(3)]],
     device uint32_t *context_lens [[buffer(4)]],
     const constant int &max_num_partitions [[buffer(5)]],
+    const device float *sinks
+    [[buffer(6), function_constant(use_sinks)]], // [num_heads]
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -1239,6 +1254,12 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   threadgroup_barrier(mem_flags::mem_threadgroup);
   global_exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(
       &red_smem[NUM_WARPS], global_exp_sum, simd_tid, simd_lid);
+
+  // Include the sink in the global exp sum.
+  if (use_sinks) {
+    global_exp_sum += exp(sinks[head_idx] - max_logit);
+  }
+
   const float inv_global_exp_sum = 1.0f / (global_exp_sum + 1e-6f);
 
   // Aggregate tmp_out to out.
@@ -1290,6 +1311,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       const constant int &q_stride [[buffer(15)]],                             \
       const constant int &kv_block_stride [[buffer(16)]],                      \
       const constant int &kv_head_stride [[buffer(17)]],                       \
+      const device float *sinks [[buffer(18), function_constant(use_sinks)]],  \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -1310,6 +1332,7 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       const device type *tmp_out [[buffer(3)]],                                \
       device uint32_t *context_lens [[buffer(4)]],                             \
       const constant int &max_num_partitions [[buffer(5)]],                    \
+      const device float *sinks [[buffer(6), function_constant(use_sinks)]],   \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -1340,6 +1363,9 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
                                     partition_size);                           \
   instantiate_paged_attention_inner(type, cache_type, 256, block_size,         \
                                     num_threads, num_simd_lanes,               \
+                                    partition_size);                           \
+  instantiate_paged_attention_inner(type, cache_type, 512, block_size,         \
+                                    num_threads, num_simd_lanes,               \
                                     partition_size);
 
 #define instantiate_paged_attention_v2_reduce_heads(                           \
@@ -1357,6 +1383,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
   instantiate_paged_attention_v2_reduce_inner(type, 192, num_threads,          \
                                               num_simd_lanes, partition_size); \
   instantiate_paged_attention_v2_reduce_inner(type, 256, num_threads,          \
+                                              num_simd_lanes, partition_size); \
+  instantiate_paged_attention_v2_reduce_inner(type, 512, num_threads,          \
                                               num_simd_lanes, partition_size);
 
 #define instantiate_paged_attention_block_size(type, cache_type, num_threads,  \

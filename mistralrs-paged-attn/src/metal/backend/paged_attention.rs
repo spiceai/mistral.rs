@@ -18,6 +18,7 @@ struct PagedAttention {
 
     k_scale: Option<Tensor>,
     v_scale: Option<Tensor>,
+    sinks: Option<Tensor>,
 }
 
 impl candle_core::CustomOp1 for PagedAttention {
@@ -179,6 +180,20 @@ impl candle_core::CustomOp1 for PagedAttention {
             };
 
             Some((k_scale.buffer().clone(), v_scale.buffer().clone()))
+        } else {
+            None
+        };
+
+        let sinks_storage_and_offset = if let Some(sinks) = self.sinks.as_ref() {
+            let (s, s_l) = sinks.storage_and_layout();
+            let s = match &*s {
+                Storage::Metal(s) => s,
+                _ => candle_core::bail!("sinks must be a metal tensor"),
+            };
+            Some((
+                s.buffer().clone(),
+                s_l.start_offset() * s.dtype().size_in_bytes(),
+            ))
         } else {
             None
         };
@@ -348,6 +363,9 @@ pub fn paged_attention(
         alibi_slopes: alibi_slopes.cloned(),
         k_scale: k_scale.cloned(),
         v_scale: v_scale.cloned(),
+        sinks: sinks
+            .map(|s| s.to_dtype(candle_core::DType::F32))
+            .transpose()?,
     };
     q.apply_op1(op)
 }
