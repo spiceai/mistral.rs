@@ -51,6 +51,21 @@ jobs:
           NVCC_CCBIN: g++-12
 
       - name: Test (cuda)
-        run: cargo test --features cuda
+        # T4 GPUs are SM 7.5 and do not support FP8 (needs SM >= 8.9) or
+        # the bf16 kernels we gate behind COMPUTE_CAP >= 80. Skip tests
+        # that exercise those code paths to keep CI green on T4 runners.
+        run: |
+          cargo test --features cuda -- \
+            --skip blockwise_fp8::ops::tests::test_fp8_blockwise_dequant_cuda \
+            --skip blockwise_fp8::ops::tests::test_fp8_blockwise_dequant_cuda_bf16 \
+            --skip blockwise_fp8::ops::tests::test_fp8_blockwise_quant_dequant_roundtrip \
+            --skip blockwise_fp8::ops::tests::test_blockwise_fp8_gemm \
+            --skip fp8::quantize::tests::test_cublaslt_matmul \
+            --skip fp8::quantize::tests::test_roundtrip_f8e4m3 \
+            --skip cublaslt::tests::test_fused_batch_matmul_f8e4m3_out_bf16 \
+            --skip cublaslt::tests::test_fused_batch_matmul_f8e4m3_nobias \
+            --skip vector_fp8::ops::tests::test_fp8_vector_cpu_cuda_equivalence \
+            --skip vector_fp8::ops::tests::test_fp8_vector_quant_dequant_roundtrip \
+            --skip utils::ops::tests::test_fused_glu_matches_candle_fallback_bf16_cuda
         env:
           NVCC_CCBIN: g++-12
