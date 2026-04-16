@@ -2,7 +2,7 @@ use candle_core::cuda::cudarc::cublaslt::result::set_matrix_layout_attribute;
 use candle_core::cuda::cudarc::cublaslt::{result, result::CublasError, sys};
 use candle_core::cuda::cudarc::driver::sys::{CUdevice_attribute, CUdeviceptr, CUstream};
 use candle_core::cuda::cudarc::driver::{
-    CudaDevice, CudaSlice, DevicePtr, DevicePtrMut, DeviceRepr, DriverError,
+    CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, DriverError,
 };
 use candle_core::cuda::CudaDType;
 use candle_core::DType;
@@ -18,13 +18,13 @@ use std::sync::Arc;
 /// 2. Execute matmul kernel with matmul. f32 is supported. f16 and bf16 are supported
 ///    if feature `half` is activated
 ///
-/// Note: This maintains a instance of [`Arc<CudaDevice>`], so will prevent the device
+/// Note: This maintains a instance of [`Arc<CudaStream>`], so will prevent the device
 /// from being dropped. Kernels will be launched on the device device default stream.
 #[derive(Debug)]
 pub struct CudaBlasLT {
     handle: sys::cublasLtHandle_t,
     workspace: Workspace,
-    device: Arc<CudaDevice>,
+    stream: Arc<CudaStream>,
 }
 
 unsafe impl Send for CudaBlasLT {}
@@ -33,14 +33,14 @@ unsafe impl Sync for CudaBlasLT {}
 
 impl CudaBlasLT {
     /// Creates a new cublasLt handle.
-    pub fn new(device: Arc<CudaDevice>) -> Result<Self, CublasError> {
+    pub fn new(stream: Arc<CudaStream>) -> Result<Self, CublasError> {
         let handle = result::create_handle()?;
-        let workspace = Workspace::new(device.clone()).unwrap();
+        let workspace = Workspace::new(stream.clone()).unwrap();
 
         Ok(Self {
             handle,
             workspace,
-            device,
+            stream,
         })
     }
 }
@@ -67,14 +67,15 @@ pub struct Workspace {
 
 impl Workspace {
     /// Creates a CublasLt workspace buffer on the provided device
-    pub fn new(device: Arc<CudaDevice>) -> Result<Self, DriverError> {
-        device.bind_to_thread()?;
+    pub fn new(stream: Arc<CudaStream>) -> Result<Self, DriverError> {
+        stream.context().bind_to_thread()?;
 
-        let major =
-            device.attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
+        let major = stream
+            .context()
+            .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
         let workspace_size = if major >= 9 { 33_554_432 } else { 4_194_304 };
 
-        let buffer = unsafe { device.alloc::<u8>(workspace_size)? };
+        let buffer = unsafe { stream.alloc::<u8>(workspace_size)? };
         Ok(Self {
             buffer,
             size: workspace_size,
@@ -306,7 +307,7 @@ pub trait MatmulShared {
     fn workspace(&self) -> &Workspace;
 
     /// Returns a reference to the underlying stream
-    fn stream(&self) -> &CUstream;
+    fn stream(&self) -> &Arc<CudaStream>;
 }
 
 /// Configuration for [Matmul]
@@ -327,11 +328,6 @@ pub struct MatmulConfig {
     pub stride_c: Option<i64>,
     pub stride_bias: Option<i64>,
     pub batch_size: Option<c_int>,
-}
-
-pub enum OutSlice<A: DevicePtrMut<F8E4M3>, B: DevicePtrMut<bf16>> {
-    F8(A),
-    BF16(B),
 }
 
 pub enum CublasLTInternalDType {
@@ -386,7 +382,6 @@ pub trait Matmul<T: CublasLTDType>: MatmulShared {
     unsafe fn matmul_fp8_like<
         I: DevicePtr<T>,
         C: DevicePtr<bf16>,
-        OA: DevicePtrMut<F8E4M3>,
         OB: DevicePtrMut<bf16>,
         S: DevicePtr<f32>,
         B: DevicePtr<bf16>,
@@ -399,8 +394,7 @@ pub trait Matmul<T: CublasLTDType>: MatmulShared {
         scale_b: &S,
         scale_d: &S,
         c: &C,
-        out: &mut OutSlice<OA, OB>,
-        // amax_d: &mut A,
+        out: &mut OB,
         bias: Option<&B>,
         act: Option<&Activation>,
     ) -> Result<(), CublasError> {
@@ -436,19 +430,22 @@ pub trait Matmul<T: CublasLTDType>: MatmulShared {
             c_layout.set_batch(batch_size, stride_c)?;
         }
 
-        let out_ty = match &out {
-            OutSlice::F8(_) => Self::matrix_type(),
-            OutSlice::BF16(_) => sys::cudaDataType_t::CUDA_R_16BF,
-        };
+        let out_ty = sys::cudaDataType_t::CUDA_R_16BF;
         let d_layout = MatrixLayout::new(out_ty, cfg.m, cfg.n, cfg.ldc)?;
         if let (Some(batch_size), Some(stride_c)) = (cfg.batch_size, cfg.stride_c) {
             d_layout.set_batch(batch_size, stride_c)?;
         }
 
-        // Set scale factors
-        matmul_desc.set_scale_ptr(scale_a.device_ptr(), Matrix::A)?;
-        matmul_desc.set_scale_ptr(scale_b.device_ptr(), Matrix::B)?;
-        matmul_desc.set_scale_ptr(scale_d.device_ptr(), Matrix::D)?;
+        // Set scale factors for FP8 inputs (dequantization scales)
+        // Note: D_SCALE is NOT set because output is BF16, not FP8.
+        // Setting D_SCALE with BF16 output causes CUBLAS_STATUS_INVALID_VALUE
+        // on some architectures (e.g., Blackwell SM 12.x).
+        let (scale_a, _scale_a_guard) = scale_a.device_ptr(self.stream());
+        let (scale_b, _scale_b_guard) = scale_b.device_ptr(self.stream());
+        let (_scale_d, _scale_d_guard) = scale_d.device_ptr(self.stream());
+        matmul_desc.set_scale_ptr(&scale_a, Matrix::A)?;
+        matmul_desc.set_scale_ptr(&scale_b, Matrix::B)?;
+        // D_SCALE is only valid when D matrix is FP8 (for requantization)
 
         // Pass amaxd ptr
         // unsafe {
@@ -462,7 +459,8 @@ pub trait Matmul<T: CublasLTDType>: MatmulShared {
         // }
 
         // Epilogue system can be leveraged to fuse add and activation operations
-        matmul_desc.set_epilogue(act, bias.map(|b| b.device_ptr()), cfg.stride_bias)?;
+        let (bias_ptr, _bias_ptr_guard) = bias.map(|b| b.device_ptr(self.stream())).unzip();
+        matmul_desc.set_epilogue(act, bias_ptr.as_ref(), cfg.stride_bias)?;
 
         // Create matmul heuristic search preferences
         let matmul_pref = MatmulPref::new()?;
@@ -481,29 +479,31 @@ pub trait Matmul<T: CublasLTDType>: MatmulShared {
             matmul_pref.handle,
         )?;
 
-        let out_ptr = match out {
-            OutSlice::BF16(s) => s.device_ptr_mut(),
-            OutSlice::F8(s) => s.device_ptr_mut(),
-        };
+        let (out_ptr, _out_guard) = out.device_ptr_mut(self.stream());
 
+        let (a, _a_guard) = a.device_ptr(self.stream());
+        let (b, _b_guard) = b.device_ptr(self.stream());
+        let (c, _c_guard) = c.device_ptr(self.stream());
+        let workspace = &self.workspace().buffer;
+        let (workspace, _workspace_guard) = workspace.device_ptr(self.stream());
         // Launch matmul kernel
         result::matmul(
             *self.handle(),
             matmul_desc.handle,
             (&cfg.alpha) as *const _ as *const _,
             (&cfg.beta) as *const _ as *const _,
-            *a.device_ptr() as *const _,
+            a as *const _,
             a_layout.handle,
-            *b.device_ptr() as *const _,
+            b as *const _,
             b_layout.handle,
-            *c.device_ptr() as *const _,
+            c as *const _,
             c_layout.handle,
-            *out_ptr as *mut _,
+            out_ptr as *mut _,
             d_layout.handle,
             (&heuristic.algo) as *const _,
-            *self.workspace().buffer.device_ptr() as *const CUdeviceptr as *mut _,
+            workspace as *mut _,
             self.workspace().size,
-            *self.stream() as *mut _,
+            self.stream().cu_stream() as *mut _,
         )
     }
 
@@ -558,7 +558,8 @@ pub trait Matmul<T: CublasLTDType>: MatmulShared {
         matmul_desc.set_transpose(cfg.transb, Matrix::B)?;
 
         // Epilogue system can be leveraged to fuse add and activation operations
-        matmul_desc.set_epilogue(act, bias.map(|b| b.device_ptr()), cfg.stride_bias)?;
+        let (bias_ptr, _bias_ptr_guard) = bias.map(|b| b.device_ptr(self.stream())).unzip();
+        matmul_desc.set_epilogue(act, bias_ptr.as_ref(), cfg.stride_bias)?;
 
         // Create matmul heuristic search preferences
         let matmul_pref = MatmulPref::new()?;
@@ -577,24 +578,29 @@ pub trait Matmul<T: CublasLTDType>: MatmulShared {
             matmul_pref.handle,
         )?;
 
+        let (a, _a_guard) = a.device_ptr(self.stream());
+        let (b, _b_guard) = b.device_ptr(self.stream());
+        let (c, _c_guard) = c.device_ptr_mut(self.stream());
+        let workspace = &self.workspace().buffer;
+        let (workspace, _workspace_guard) = workspace.device_ptr(self.stream());
         // Launch matmul kernel
         result::matmul(
             *self.handle(),
             matmul_desc.handle,
             (&cfg.alpha) as *const _ as *const _,
             (&cfg.beta) as *const _ as *const _,
-            *a.device_ptr() as *const _,
+            a as *const _,
             a_layout.handle,
-            *b.device_ptr() as *const _,
+            b as *const _,
             b_layout.handle,
-            *c.device_ptr_mut() as *const _,
+            c as *const _,
             c_layout.handle,
-            *c.device_ptr_mut() as *mut _,
+            c as *mut _,
             c_layout.handle,
             (&heuristic.algo) as *const _,
-            *self.workspace().buffer.device_ptr() as *const CUdeviceptr as *mut _,
+            workspace as *mut _,
             self.workspace().size,
-            *self.stream() as *mut _,
+            self.stream().cu_stream() as *mut _,
         )
     }
 }
@@ -608,8 +614,8 @@ impl MatmulShared for CudaBlasLT {
         &self.workspace
     }
 
-    fn stream(&self) -> &CUstream {
-        self.device.cu_stream()
+    fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
     }
 }
 

@@ -1,6 +1,6 @@
 #![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 
-use std::{any::Any, num::NonZeroUsize, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 use candle_core::{Device, Result, Tensor};
 use image::{imageops::FilterType, DynamicImage, GenericImage, GenericImageView, Rgba};
@@ -8,7 +8,6 @@ use itertools::Itertools;
 use mistralrs_vision::{ApplyTransforms, Normalize, ToTensor, Transforms};
 use regex_automata::meta::Regex;
 use tokenizers::Tokenizer;
-use tracing::warn;
 
 use crate::{
     device_map::DeviceMapper,
@@ -80,28 +79,21 @@ impl InputsProcessor for Phi3InputsProcessor {
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
         other_config: Option<Arc<dyn Any>>,
-        mut paged_attn_metadata: Option<PagedAttentionMeta<'_>>,
-        prompt_chunksize: Option<NonZeroUsize>,
+        mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
-    ) -> Box<dyn Iterator<Item = anyhow::Result<InputProcessorOutput>>> {
+    ) -> anyhow::Result<InputProcessorOutput> {
         if is_xlora {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
+            return Err(anyhow::Error::msg(
                 "Cannot make inputs for X-LoRA vision model.",
-            ))));
+            ));
         }
         if no_kv_cache {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
-                "Vision model must have kv cache.",
-            ))));
-        }
-        // TODO(EricLBuehler): support this? Would require some handling of image tokens.
-        if prompt_chunksize.is_some() {
-            warn!("`prompt_chunksize` is set. Idefics 2 does not support prompt batching.");
+            return Err(anyhow::Error::msg("Vision model must have kv cache."));
         }
         let Some(tokenizer) = tokenizer else {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
+            return Err(anyhow::Error::msg(
                 "Phi3InputProcessor requires a specified tokenizer.",
-            ))));
+            ));
         };
 
         let config = other_config
@@ -159,60 +151,55 @@ impl InputsProcessor for Phi3InputsProcessor {
                 n_images,
             )
         } else {
-            return Box::new(
-                text_models_inputs_processor::TextInputsProcessor
-                    .process_inputs(
-                        Some(tokenizer),
-                        input_seqs,
-                        is_prompt,
-                        is_xlora,
-                        device,
-                        no_kv_cache,
-                        last_n_context_len,
-                        return_raw_logits,
-                        other_config,
-                        paged_attn_metadata,
-                        None, // TODO
-                        mapper,
-                    )
-                    .map(|metadata| {
-                        let InputProcessorOutput {
-                            inputs,
-                            seq_indices,
-                        } = metadata?;
+            return text_models_inputs_processor::TextInputsProcessor
+                .process_inputs(
+                    Some(tokenizer),
+                    input_seqs,
+                    is_prompt,
+                    is_xlora,
+                    device,
+                    no_kv_cache,
+                    last_n_context_len,
+                    return_raw_logits,
+                    other_config,
+                    paged_attn_metadata,
+                    mapper,
+                )
+                .map(|metadata| {
+                    let InputProcessorOutput {
+                        inputs,
+                        seq_indices,
+                    } = metadata;
 
-                        let text_models_inputs_processor::ModelInputs {
-                            input_ids,
-                            input_ids_full: _,
-                            seqlen_offsets,
-                            seqlen_offsets_full: _,
-                            context_lens,
-                            position_ids,
-                            paged_attn_meta,
-                            flash_meta,
-                            flash_meta_full: _,
-                        } = *inputs
-                            .downcast::<text_models_inputs_processor::ModelInputs>()
-                            .expect("Downcast failed.");
+                    let text_models_inputs_processor::ModelInputs {
+                        input_ids,
+                        input_ids_full: _,
+                        seqlen_offsets,
+                        seqlen_offsets_full: _,
+                        context_lens,
+                        position_ids,
+                        paged_attn_meta,
+                        flash_meta,
+                        flash_meta_full: _,
+                    } = *inputs
+                        .downcast::<text_models_inputs_processor::ModelInputs>()
+                        .expect("Downcast failed.");
 
-                        let inputs: Box<dyn Any> = Box::new(ModelInputs {
-                            input_ids,
-                            seqlen_offsets,
-                            context_lens,
-                            position_ids,
-                            pixel_values: None,
-                            model_specific_args: Box::new(Phi3VisionSpecificArgs {
-                                image_sizes: None,
-                            }),
-                            paged_attn_meta,
-                            flash_meta,
-                        });
-                        Ok(InputProcessorOutput {
-                            inputs,
-                            seq_indices,
-                        })
-                    }),
-            );
+                    let inputs: Box<dyn Any> = Box::new(ModelInputs {
+                        input_ids,
+                        seqlen_offsets,
+                        context_lens,
+                        position_ids,
+                        pixel_values: None,
+                        model_specific_args: Box::new(Phi3VisionSpecificArgs { image_sizes: None }),
+                        paged_attn_meta,
+                        flash_meta,
+                    });
+                    InputProcessorOutput {
+                        inputs,
+                        seq_indices,
+                    }
+                });
         };
 
         let mut toks = Vec::new();
@@ -231,110 +218,115 @@ impl InputsProcessor for Phi3InputsProcessor {
                 .iter_mut()
                 .zip(num_img_tokens.unwrap().into_iter().zip(n_images)),
         ) {
-            let splits = self
-                .image_tag_splitter
-                .split(&detokenized)
-                .map(|span| &detokenized[span.range()])
-                .collect::<Vec<_>>();
-            let prompt_chunks = tokenizer
-                .encode_batch(splits, true)
-                .expect("Encode failed")
-                .into_iter()
-                .map(|enc| enc.get_ids().to_vec())
-                .collect::<Vec<_>>();
+            if !seq.multimodal.has_changed_prompt {
+                let splits = self
+                    .image_tag_splitter
+                    .split(&detokenized)
+                    .map(|span| &detokenized[span.range()])
+                    .collect::<Vec<_>>();
+                let prompt_chunks = tokenizer
+                    .encode_batch(splits, true)
+                    .expect("Encode failed")
+                    .into_iter()
+                    .map(|enc| enc.get_ids().to_vec())
+                    .collect::<Vec<_>>();
 
-            let image_tags = self.image_tag_splitter.find_iter(&detokenized);
-            let image_ids = image_tags
-                .into_iter()
-                .map(|s| {
-                    let s = &detokenized[s.range()];
-                    s.split('|')
-                        .nth(1)
-                        .unwrap()
-                        .split('_')
-                        .nth(1)
-                        .unwrap()
-                        .parse::<u32>()
-                        .expect("Failed to parse image id to u32")
-                })
-                .collect::<Vec<_>>();
-            let unique_image_ids = image_ids
-                .iter()
-                .copied()
-                .unique()
-                .sorted()
-                .collect::<Vec<_>>();
-            // `image_ids` must start from 1, and must be continuous int, e.g. [1, 2, 3], cannot be [1, 4, 5]
-            if unique_image_ids != (1u32..unique_image_ids.len() as u32 + 1).collect::<Vec<_>>() {
-                return Box::new(std::iter::once(Err(anyhow::Error::msg(
-                    "`image_ids` must start from 1, and must be continuous, e.g. [1, 2, 3], cannot be [1, 4, 5].",
-                ))));
-            }
-            // Total images must be the same as the number of image tags
-            if unique_image_ids.len() != n_images {
-                return Box::new(std::iter::once(Err(anyhow::Error::msg(
-                    "Total images must be the same as the number of image tags.",
-                ))));
-            }
-
-            // Use the TryInto + unwrap_or to handle case when id==0
-            let image_ids_pad = image_ids
-                .iter()
-                .map(|id| {
-                    [-(*id as i64)].repeat(
-                        num_img_tokens[TryInto::<usize>::try_into(*id as isize - 1)
-                            .unwrap_or(num_img_tokens.len() - 1)],
-                    )
-                })
-                .collect::<Vec<_>>();
-
-            let mut input_ids: Vec<i64> = Vec::new();
-            for item in prompt_chunks
-                .iter()
-                .map(|x| x.iter().map(|x| *x as i64).collect::<Vec<_>>())
-                .interleave(image_ids_pad)
-            {
-                input_ids.extend(item);
-            }
-
-            // NOTE(EricLBuehler): Casting to u32 is fine, we don't care about the other toks
-            seq.set_toks_and_reallocate(
-                input_ids
+                let image_tags = self.image_tag_splitter.find_iter(&detokenized);
+                let image_ids = image_tags
+                    .into_iter()
+                    .map(|s| {
+                        let s = &detokenized[s.range()];
+                        s.split('|')
+                            .nth(1)
+                            .unwrap()
+                            .split('_')
+                            .nth(1)
+                            .unwrap()
+                            .parse::<u32>()
+                            .expect("Failed to parse image id to u32")
+                    })
+                    .collect::<Vec<_>>();
+                let unique_image_ids = image_ids
                     .iter()
-                    .map(|x| if *x < 0 { 0u32 } else { *x as u32 })
-                    .collect::<Vec<_>>(),
-                paged_attn_metadata.as_mut(),
-            );
+                    .copied()
+                    .unique()
+                    .sorted()
+                    .collect::<Vec<_>>();
+                // `image_ids` must start from 1, and must be continuous int, e.g. [1, 2, 3], cannot be [1, 4, 5]
+                if unique_image_ids != (1u32..unique_image_ids.len() as u32 + 1).collect::<Vec<_>>()
+                {
+                    return Err(anyhow::Error::msg(
+                    "`image_ids` must start from 1, and must be continuous, e.g. [1, 2, 3], cannot be [1, 4, 5].",
+                ));
+                }
+                // Total images must be the same as the number of image tags
+                if unique_image_ids.len() != n_images {
+                    return Err(anyhow::Error::msg(
+                        "Total images must be the same as the number of image tags.",
+                    ));
+                }
 
-            toks.push(input_ids);
+                // Use the TryInto + unwrap_or to handle case when id==0
+                let image_ids_pad = image_ids
+                    .iter()
+                    .map(|id| {
+                        [-(*id as i64)].repeat(
+                            num_img_tokens[TryInto::<usize>::try_into(*id as isize - 1)
+                                .unwrap_or(num_img_tokens.len() - 1)],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut input_ids: Vec<i64> = Vec::new();
+                for item in prompt_chunks
+                    .iter()
+                    .map(|x| x.iter().map(|x| *x as i64).collect::<Vec<_>>())
+                    .interleave(image_ids_pad)
+                {
+                    input_ids.extend(item);
+                }
+
+                // SAFETY: transmuting the i64 to a u32 here, but keep the signed bit pattern
+                let new_ids = input_ids
+                    .iter()
+                    .map(|x| *x as i32 as u32)
+                    .collect::<Vec<_>>();
+                let new_prompt = tokenizer.decode(&new_ids, false).unwrap();
+                seq.set_initial_prompt(new_prompt);
+                // NOTE(EricLBuehler): Casting to u32 is fine, we don't care about the other toks
+                seq.set_toks_and_reallocate(new_ids, paged_attn_metadata.as_mut());
+                seq.multimodal.has_changed_prompt = true;
+
+                toks.push(input_ids);
+            } else {
+                toks.push(seq.get_toks().iter().map(|x| *x as i32 as i64).collect());
+            }
         }
 
-        let iter = if is_prompt {
+        let metadata = if is_prompt {
             get_prompt_input(
-                toks,
+                toks.iter().map(Vec::as_slice).collect(),
                 input_seqs,
                 device,
                 last_n_context_len,
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
                 mapper,
             )
         } else {
             get_completion_input(
-                toks,
+                toks.iter().map(Vec::as_slice).collect(),
                 input_seqs,
                 device,
                 no_kv_cache,
                 last_n_context_len,
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
                 mapper,
             )
         };
 
-        Box::new(iter.into_iter().map(move |metadata| {
+        metadata.map(|metadata| {
             let text_models_inputs_processor::InnerInputProcessorOutput {
                 inputs:
                     text_models_inputs_processor::InputMetadata {
@@ -346,7 +338,7 @@ impl InputsProcessor for Phi3InputsProcessor {
                         flash_meta,
                     },
                 seq_indices,
-            } = metadata?;
+            } = metadata;
             let inputs: Box<dyn Any> = Box::new(ModelInputs {
                 input_ids: input,
                 seqlen_offsets: positions,
@@ -359,11 +351,11 @@ impl InputsProcessor for Phi3InputsProcessor {
                 paged_attn_meta,
                 flash_meta,
             });
-            Ok(InputProcessorOutput {
+            InputProcessorOutput {
                 inputs,
                 seq_indices,
-            })
-        }))
+            }
+        })
     }
 }
 
@@ -390,7 +382,7 @@ impl Phi3InputsProcessor {
 
         // Paste the original image into the center of the new image
         new_image
-            .copy_from(image, left, top)
+            .copy_from(image, 0, 0)
             .expect("Failed to copy image");
 
         new_image
@@ -491,7 +483,7 @@ impl ImagePreProcessor for Phi3InputsProcessor {
                 max_size = Some((max_size.unwrap().0, image.dimensions().1 as usize));
             }
         }
-        let (max_h, max_w) = max_size.unwrap();
+        let (max_w, max_h) = max_size.unwrap();
         for image in images.iter_mut() {
             *image = image.resize_exact(max_w as u32, max_h as u32, FilterType::Nearest);
         }

@@ -1,181 +1,7 @@
 use std::ffi::c_void;
 
-#[cfg(feature = "cuda")]
-type FfiCudaStream = candle_core::cuda::cudarc::driver::sys::CUstream;
-#[cfg(not(feature = "cuda"))]
-type FfiCudaStream = *const std::ffi::c_void;
-
 #[allow(dead_code)]
 extern "C" {
-    pub(crate) fn count_nonzero_bf16(d_in: *const c_void, N: u32, stream: FfiCudaStream) -> u32;
-    pub(crate) fn count_nonzero_f16(d_in: *const c_void, N: u32, stream: FfiCudaStream) -> u32;
-    pub(crate) fn count_nonzero_f32(d_in: *const c_void, N: u32, stream: FfiCudaStream) -> u32;
-    pub(crate) fn count_nonzero_f64(d_in: *const c_void, N: u32, stream: FfiCudaStream) -> u32;
-    pub(crate) fn count_nonzero_u8(d_in: *const c_void, N: u32, stream: FfiCudaStream) -> u32;
-    pub(crate) fn count_nonzero_u32(d_in: *const c_void, N: u32, stream: FfiCudaStream) -> u32;
-    pub(crate) fn count_nonzero_i16(d_in: *const c_void, N: u32, stream: FfiCudaStream) -> u32;
-    pub(crate) fn count_nonzero_i64(d_in: *const c_void, N: u32, stream: FfiCudaStream) -> u32;
-    pub(crate) fn count_nonzero_i32(d_in: *const c_void, N: u32, stream: FfiCudaStream) -> u32;
-    pub(crate) fn nonzero_bf16(
-        d_in: *const c_void,
-        N: u32,
-        num_nonzero: u32,
-        dims: *const c_void,
-        num_dims: u32,
-        d_out: *mut c_void,
-        stream: FfiCudaStream,
-    );
-    pub(crate) fn nonzero_f16(
-        d_in: *const c_void,
-        N: u32,
-        num_nonzero: u32,
-        dims: *const c_void,
-        num_dims: u32,
-        d_out: *mut c_void,
-        stream: FfiCudaStream,
-    );
-    pub(crate) fn nonzero_f32(
-        d_in: *const c_void,
-        N: u32,
-        num_nonzero: u32,
-        dims: *const c_void,
-        num_dims: u32,
-        d_out: *mut c_void,
-        stream: FfiCudaStream,
-    );
-    pub(crate) fn nonzero_f64(
-        d_in: *const c_void,
-        N: u32,
-        num_nonzero: u32,
-        dims: *const c_void,
-        num_dims: u32,
-        d_out: *mut c_void,
-        stream: FfiCudaStream,
-    );
-    pub(crate) fn nonzero_u8(
-        d_in: *const c_void,
-        N: u32,
-        num_nonzero: u32,
-        dims: *const c_void,
-        num_dims: u32,
-        d_out: *mut c_void,
-        stream: FfiCudaStream,
-    );
-    pub(crate) fn nonzero_u32(
-        d_in: *const c_void,
-        N: u32,
-        num_nonzero: u32,
-        dims: *const c_void,
-        num_dims: u32,
-        d_out: *mut c_void,
-        stream: FfiCudaStream,
-    );
-    pub(crate) fn nonzero_i64(
-        d_in: *const c_void,
-        N: u32,
-        num_nonzero: u32,
-        dims: *const c_void,
-        num_dims: u32,
-        d_out: *mut c_void,
-        stream: FfiCudaStream,
-    );
-    pub(crate) fn nonzero_i16(
-        d_in: *const c_void,
-        N: u32,
-        num_nonzero: u32,
-        dims: *const c_void,
-        num_dims: u32,
-        d_out: *mut c_void,
-        stream: FfiCudaStream,
-    );
-    pub(crate) fn nonzero_i32(
-        d_in: *const c_void,
-        N: u32,
-        num_nonzero: u32,
-        dims: *const c_void,
-        num_dims: u32,
-        d_out: *mut c_void,
-        stream: FfiCudaStream,
-    );
-
-    pub(crate) fn bitwise_and_u8(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_and_u32(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_and_i64(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_and_i32(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_or_u8(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_or_u32(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_or_i64(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_or_i32(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_xor_u8(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_xor_u32(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_xor_i64(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    pub(crate) fn bitwise_xor_i32(
-        d_in1: *const c_void,
-        d_in2: *const c_void,
-        d_out: *mut c_void,
-        N: u32,
-    );
-    // Linked to in mistralrs-quant
-    pub(crate) fn leftshift_u8(d_in1: *const c_void, d_out: *mut c_void, N: u32, k: i32);
-    pub(crate) fn leftshift_u32(d_in1: *const c_void, d_out: *mut c_void, N: u32, k: i32);
-    pub(crate) fn leftshift_i64(d_in1: *const c_void, d_out: *mut c_void, N: u32, k: i32);
-    pub(crate) fn leftshift_i32(d_in1: *const c_void, d_out: *mut c_void, N: u32, k: i32);
-
     pub(crate) fn asort_asc_f32(
         x: *const c_void,
         dst: *mut c_void,
@@ -286,6 +112,167 @@ extern "C" {
         nrows: i32,
         ncols: i32,
         inplace: bool,
+        stream: i64,
+    );
+
+    // for unquntized models (decoding)
+    pub fn moe_gemm(
+        input: *const c_void,   // input [size_m, size_k]
+        weights: *const c_void, // weights [num_experts, size_n, size_k]
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        topk_weights: *const f32, // device ptr or nullptr
+        output: *mut c_void,      // output [size_m, size_n]
+        num_experts: i32,
+        topk: i32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        dtype: i32, // 0=float16, 1=bf16 (for input)
+        stream: i64,
+    );
+
+    // for unquntized models (prefill)
+    pub fn moe_gemm_wmma(
+        input: *const c_void,         // device pointer [size_m, size_k]
+        weights: *const c_void,       // device pointer [num_experts, size_n, size_k]
+        sorted_token_ids: *const i32, // device pointer [size_m]
+        expert_ids: *const i32,       // host array [size_m] (expert id per sorted token)
+        topk_weights: *const f32,
+        output: *mut c_void, // device pointer [size_m, size_n]
+        num_experts: i32,
+        topk: i32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        dtype: i32, // 0=float16, 1=bf16 (for input/output)
+        stream: i64,
+    );
+
+    // for unquntized models (decoding) with transposed weights [num_experts, size_k, size_n]
+    pub fn moe_gemm_transposed(
+        input: *const c_void,   // input [size_m, size_k]
+        weights: *const c_void, // weights [num_experts, size_k, size_n] - transposed layout
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        topk_weights: *const f32, // device ptr or nullptr
+        output: *mut c_void,      // output [size_m, size_n]
+        num_experts: i32,
+        topk: i32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        dtype: i32, // 0=float16, 1=bf16 (for input)
+        stream: i64,
+    );
+
+    // for unquntized models (prefill) with transposed weights [num_experts, size_k, size_n]
+    pub fn moe_gemm_wmma_transposed(
+        input: *const c_void,         // device pointer [size_m, size_k]
+        weights: *const c_void, // device pointer [num_experts, size_k, size_n] - transposed layout
+        sorted_token_ids: *const i32, // device pointer [size_m]
+        expert_ids: *const i32, // host array [size_m] (expert id per sorted token)
+        topk_weights: *const f32,
+        output: *mut c_void, // device pointer [size_m, size_n]
+        num_experts: i32,
+        topk: i32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        dtype: i32, // 0=float16, 1=bf16 (for input/output)
+        stream: i64,
+    );
+
+    // MoE GEMV for decode phase (optimized for small batch sizes M <= 8)
+    pub fn moe_gemv(
+        input: *const c_void,   // input [size_m or size_m / topk, size_k]
+        weights: *const c_void, // weights [num_experts, size_n, size_k]
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        topk_weights: *const f32, // device ptr or nullptr
+        output: *mut c_void,      // output [size_m, size_n]
+        num_experts: i32,
+        topk: i32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        dtype: i32, // 0=float16, 1=bf16 (for input)
+        stream: i64,
+    );
+
+    // MoE GEMV for decode phase with transposed weights [num_experts, size_k, size_n]
+    pub fn moe_gemv_transposed(
+        input: *const c_void,   // input [size_m or size_m / topk, size_k]
+        weights: *const c_void, // weights [num_experts, size_k, size_n] - transposed layout
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        topk_weights: *const f32, // device ptr or nullptr
+        output: *mut c_void,      // output [size_m, size_n]
+        num_experts: i32,
+        topk: i32,
+        size_m: i32,
+        size_n: i32,
+        size_k: i32,
+        dtype: i32, // 0=float16, 1=bf16 (for input)
+        stream: i64,
+    );
+
+    // Optimized parallel topk for small k (MoE routing)
+    // Single kernel call writes to both values and indices buffers
+    pub(crate) fn topk_f32(
+        input: *const c_void,
+        values_out: *mut c_void,  // [nrows, k]
+        indices_out: *mut c_void, // [nrows, k] as u32
+        nrows: i32,
+        ncols: i32,
+        k: i32,
+        stream: i64,
+    );
+    pub(crate) fn topk_bf16(
+        input: *const c_void,
+        values_out: *mut c_void,  // [nrows, k]
+        indices_out: *mut c_void, // [nrows, k] as u32
+        nrows: i32,
+        ncols: i32,
+        k: i32,
+        stream: i64,
+    );
+    pub(crate) fn topk_f16(
+        input: *const c_void,
+        values_out: *mut c_void,  // [nrows, k]
+        indices_out: *mut c_void, // [nrows, k] as u32
+        nrows: i32,
+        ncols: i32,
+        k: i32,
+        stream: i64,
+    );
+
+    // Fused topk + softmax - returns softmax weights directly (not raw logits)
+    pub(crate) fn topk_softmax_f32(
+        input: *const c_void,
+        weights_out: *mut c_void, // [nrows, k] - softmax weights
+        indices_out: *mut c_void, // [nrows, k] as u32
+        nrows: i32,
+        ncols: i32,
+        k: i32,
+        stream: i64,
+    );
+    pub(crate) fn topk_softmax_bf16(
+        input: *const c_void,
+        weights_out: *mut c_void,
+        indices_out: *mut c_void,
+        nrows: i32,
+        ncols: i32,
+        k: i32,
+        stream: i64,
+    );
+    pub(crate) fn topk_softmax_f16(
+        input: *const c_void,
+        weights_out: *mut c_void,
+        indices_out: *mut c_void,
+        nrows: i32,
+        ncols: i32,
+        k: i32,
         stream: i64,
     );
 }

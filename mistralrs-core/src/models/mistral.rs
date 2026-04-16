@@ -26,8 +26,34 @@ use crate::{
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
 
-serde_default_fn!(bool, use_flash_attn, false);
 serde_default_fn!(bool, tie_word_embeddings, false);
+serde_default_fn!(f64, default_rope_theta, 10000.0);
+
+/// RoPE type for Mistral models
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MistralRopeType {
+    #[default]
+    #[serde(rename = "default")]
+    Default,
+    #[serde(rename = "yarn")]
+    Yarn,
+}
+
+/// RoPE parameters for Mistral models, supporting YARN scaling
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MistralRopeParameters {
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub rope_type: MistralRopeType,
+    // YARN parameters (optional)
+    pub factor: Option<f32>,
+    pub beta_fast: Option<f32>,
+    pub beta_slow: Option<f32>,
+    pub mscale: Option<f32>,
+    pub mscale_all_dim: Option<f32>,
+    pub original_max_position_embeddings: Option<usize>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -40,10 +66,12 @@ pub struct Config {
     pub(crate) hidden_act: Activation,
     pub(crate) max_position_embeddings: usize,
     pub(crate) rms_norm_eps: f64,
+    // Support both flat rope_theta and nested rope_parameters
+    #[serde(default = "default_rope_theta")]
     pub(crate) rope_theta: f64,
+    #[serde(default)]
+    pub(crate) rope_parameters: Option<MistralRopeParameters>,
     pub(crate) sliding_window: Option<usize>,
-    #[serde(default = "use_flash_attn")]
-    pub(crate) use_flash_attn: bool,
     pub(crate) head_dim: Option<usize>,
     pub(crate) quantization_config: Option<QuantizedConfig>,
     #[serde(default = "tie_word_embeddings")]
@@ -54,6 +82,14 @@ impl Config {
     pub(crate) fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// Get rope_theta from either flat field or rope_parameters
+    pub(crate) fn get_rope_theta(&self) -> f64 {
+        self.rope_parameters
+            .as_ref()
+            .map(|p| p.rope_theta)
+            .unwrap_or(self.rope_theta)
     }
 }
 
@@ -137,7 +173,6 @@ impl Attention {
                     cfg.num_attention_heads,
                     comm,
                 ),
-                use_flash_attn: cfg.use_flash_attn,
                 softcap: None,
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: cfg.sliding_window,
@@ -400,7 +435,7 @@ impl Model {
             ropes.insert(
                 device.location(),
                 Arc::new(RotaryEmbedding::new(
-                    cfg.rope_theta as f32,
+                    cfg.get_rope_theta() as f32,
                     head_dim,
                     cfg.max_position_embeddings,
                     device,
@@ -410,13 +445,13 @@ impl Model {
             );
         }
 
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb_m.pp("layers");
-        for layer_idx in NiceProgressBar::<_, 'b'>(
+        let layers: Vec<DecoderLayer> = NiceProgressBar::<_, 'b'>(
             0..cfg.num_hidden_layers,
             "Loading repeating layers",
             &normal_loading_metadata.multi_progress,
-        ) {
+        )
+        .par_iter_if_isq(|layer_idx| {
             let device = mapper
                 .device_for(layer_idx, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
@@ -431,7 +466,7 @@ impl Model {
                 }
             };
             let comm = mapper.get_comm_for(layer_idx)?;
-            let layer = DecoderLayer::new(
+            DecoderLayer::new(
                 rotary_emb.clone(),
                 cfg,
                 vb_l.pp(layer_idx),
@@ -440,9 +475,8 @@ impl Model {
                 normal_loading_metadata.loading_isq,
                 paged_attn,
                 &comm,
-            )?;
-            layers.push(layer)
-        }
+            )
+        })?;
         let norm = RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -452,7 +486,7 @@ impl Model {
             ReplicatedLayer::new(
                 cfg.hidden_size,
                 cfg.vocab_size,
-                &None,
+                &cfg.quantization_config,
                 false,
                 mapper.set_nm_device(vb_lm_head, normal_loading_metadata.loading_isq),
             )?
@@ -488,6 +522,7 @@ impl Model {
                 sliding_window: cfg.sliding_window,
                 k_head_dim: cfg.head_dim(),
                 v_head_dim: cfg.head_dim(),
+                kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             mapper,
         })
@@ -561,11 +596,12 @@ impl Model {
             )?;
         }
         let xs = xs.to_device(&self.device)?;
-        let mut xs = xs.apply(&self.norm)?;
+        let xs = xs.apply(&self.norm)?;
+        let mut xs = extract_logits(&xs, context_lens)?;
         if let Some(t) = self.lm_head.quantized_act_type() {
             xs = xs.to_dtype(t)?;
         }
-        extract_logits(&MatMul.qmethod_matmul(&xs, &*self.lm_head)?, context_lens)
+        MatMul.qmethod_matmul(&xs, &*self.lm_head)
     }
 }
 

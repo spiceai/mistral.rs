@@ -1,12 +1,10 @@
 pub(crate) mod debug;
 pub(crate) mod gguf_metadata;
-pub(crate) mod log;
 pub(crate) mod memory_usage;
 pub(crate) mod model_config;
 pub(crate) mod normal;
 pub(crate) mod progress;
-#[allow(dead_code)]
-pub(crate) mod supports_attn_softmax;
+pub(crate) mod tiktoken;
 pub(crate) mod tokenizer;
 pub(crate) mod tokens;
 pub(crate) mod unvarbuilder;
@@ -20,6 +18,10 @@ macro_rules! get_mut_arcmutex {
             if let Ok(inner) = $thing.try_lock() {
                 break inner;
             }
+            // Yield to allow other threads to make progress and release the lock.
+            // This prevents deadlock when a spawned async task busy-loops while
+            // another task holds the lock across an await point.
+            std::thread::yield_now();
         }
     };
 }
@@ -32,10 +34,9 @@ macro_rules! handle_seq_error {
             Ok(v) => v,
             Err(e) => {
                 use $crate::response::Response;
-                $response
-                    .send(Response::InternalError(e.into()))
-                    .await
-                    .expect("Expected receiver.");
+                if let Err(_) = $response.send(Response::InternalError(e.into())).await {
+                    tracing::warn!("Receiver disconnected");
+                }
                 return;
             }
         }
@@ -50,10 +51,9 @@ macro_rules! handle_seq_error_ok {
             Ok(v) => v,
             Err(e) => {
                 use $crate::response::Response;
-                $response
-                    .send(Response::InternalError(e.into()))
-                    .await
-                    .expect("Expected receiver.");
+                if let Err(_) = $response.send(Response::InternalError(e.into())).await {
+                    tracing::warn!("Receiver disconnected");
+                }
                 return Ok(());
             }
         }
@@ -69,10 +69,13 @@ macro_rules! handle_seq_error_stateaware_ok {
             Err(e) => {
                 use $crate::response::Response;
                 use $crate::sequence::SequenceState;
-                $seq.responder()
+                if let Err(_) = $seq
+                    .responder()
                     .send(Response::InternalError(e.into()))
                     .await
-                    .expect("Expected receiver.");
+                {
+                    tracing::warn!("Receiver disconnected");
+                }
                 $seq.set_state(SequenceState::Error);
                 return Ok(());
             }
@@ -100,13 +103,13 @@ macro_rules! handle_pipeline_forward_error {
                 error!("{} - Model failed with error: {:?}", $stage, &e);
                 for seq in $seq_slice.iter_mut() {
                     // Step 1: Add all choices to groups
-                    let res = match &tokenizer
-                    {
-                        Some(tok) => match tok.decode(&seq.get_toks()[seq.prompt_tokens()..], false) {
+                    let start = seq.prompt_tokens().min(seq.get_toks().len());
+                    let res = match &tokenizer {
+                        Some(tok) => match tok.decode(&seq.get_toks()[start..], false) {
                             Ok(t) => t,
-                            Err(_) => "".to_string()
+                            Err(_) => "".to_string(),
                         },
-                        None => "".to_string()
+                        None => "".to_string(),
                     };
 
                     if seq.get_mut_group().is_chat {
@@ -117,6 +120,7 @@ macro_rules! handle_pipeline_forward_error {
                                 content: Some(res),
                                 role: "assistant".to_string(),
                                 tool_calls: None,
+                                reasoning_content: None,
                             },
                             logprobs: None,
                         };
@@ -146,14 +150,13 @@ macro_rules! handle_pipeline_forward_error {
                             usage: group.get_usage(),
                         };
 
-                        if let Err(e) = seq.responder()
+                        seq.responder()
                             .send(Response::ModelError(
                                 e.to_string(),
                                 partial_completion_response
                             ))
-                            .await {
-                                error!("{} - Failed to send partial chat response after error: {:?}", $stage, &e);
-                            };
+                            .await
+                            .unwrap();
                     } else {
                         let partial_completion_response = CompletionResponse {
                             id: seq.id().to_string(),
@@ -165,14 +168,13 @@ macro_rules! handle_pipeline_forward_error {
                             usage: group.get_usage(),
                         };
 
-                        if let Err(e) = seq.responder()
+                        seq.responder()
                             .send(Response::CompletionModelError(
                                 e.to_string(),
                                 partial_completion_response
                             ))
-                            .await {
-                                error!("{} - Failed to send partial completion response after error: {:?}", $stage, &e);
-                            };
+                            .await
+                            .unwrap();
                     }
                 }
                 for seq in $seq_slice.iter_mut() {
@@ -185,9 +187,8 @@ macro_rules! handle_pipeline_forward_error {
                 // - The sequence is gone
                 // - We should reset the state then, including draft.
                 p.set_none_cache($seq_slice, true, true, false);
-                if let Err(e) = get_mut_arcmutex!($prefix_cacher).evict_all_to_cpu() {
-                    error!("{} - Failed to evict prefix caches from CPU: {:?}", $stage, &e);
-                }
+                get_mut_arcmutex!($prefix_cacher).evict_all_caches().unwrap();
+
                 continue $label;
             }
         }
@@ -202,6 +203,8 @@ macro_rules! get_mut_group {
             if let Ok(inner) = $this.group.try_lock() {
                 break inner;
             }
+            // Yield to allow other threads to make progress and release the lock.
+            std::thread::yield_now();
         }
     };
 }

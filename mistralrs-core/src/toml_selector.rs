@@ -1,10 +1,12 @@
-use std::{fs::File, num::NonZeroUsize, path::PathBuf, str::FromStr};
+use std::{fs::File, path::PathBuf, str::FromStr};
 
 use mistralrs_quant::MULTI_LORA_DELIMITER;
 use serde::Deserialize;
 
 use crate::{
-    amoe::AnyMoeConfig, pipeline::IsqOrganization, AnyMoeLoader, AutoDeviceMapParams,
+    amoe::AnyMoeConfig,
+    pipeline::{EmbeddingLoaderType, IsqOrganization},
+    AnyMoeLoader, AutoDeviceMapParams, EmbeddingLoaderBuilder, EmbeddingSpecificConfig,
     GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader,
     ModelDType, NormalLoaderBuilder, NormalLoaderType, NormalSpecificConfig, SpeculativeConfig,
     SpeculativeLoader, Topology, VisionLoaderBuilder, VisionLoaderType, VisionSpecificConfig,
@@ -394,7 +396,7 @@ pub enum TomlModelSelected {
         model_id: String,
 
         /// The architecture of the model.
-        arch: VisionLoaderType,
+        arch: Option<VisionLoaderType>,
 
         /// Model data type. Defaults to `auto`.
         #[serde(default = "default_dtype")]
@@ -437,6 +439,40 @@ pub enum TomlModelSelected {
         max_image_length: usize,
 
         /// Cache path for Hugging Face models downloaded locally
+        hf_cache_path: Option<PathBuf>,
+    },
+
+    /// Select an embedding model, without quantization or adapters
+    Embedding {
+        /// Model ID to load from. This may be a HF hub repo or a local path.
+        model_id: String,
+
+        /// Path to local tokenizer.json file. If this is specified it is used over any remote file.
+        #[serde(default)]
+        tokenizer_json: Option<String>,
+
+        /// The architecture of the model.
+        #[serde(default)]
+        arch: Option<EmbeddingLoaderType>,
+
+        /// Model data type. Defaults to `auto`.
+        #[serde(default = "default_dtype")]
+        dtype: ModelDType,
+
+        /// Path to a topology YAML file.
+        #[serde(default)]
+        topology: Option<String>,
+
+        /// UQFF path to write to.
+        #[serde(default)]
+        write_uqff: Option<PathBuf>,
+
+        /// UQFF path to load from. If provided, this takes precedence over applying ISQ. Specify multiple files using a semicolon delimiter (;)
+        #[serde(default)]
+        from_uqff: Option<String>,
+
+        /// Cache path for Hugging Face models downloaded locally
+        #[serde(default)]
         hf_cache_path: Option<PathBuf>,
     },
 }
@@ -489,19 +525,15 @@ pub struct TomlSelector {
 
 #[derive(Clone)]
 struct TomlLoaderInnerParams {
-    use_flash_attn: bool,
     chat_template: Option<String>,
     no_kv_cache: bool,
     tokenizer_json: Option<String>,
-    prompt_chunksize: Option<NonZeroUsize>,
     jinja_explicit: Option<String>,
 }
 
 pub struct TomlLoaderArgs {
-    pub use_flash_attn: bool,
     pub chat_template: Option<String>,
     pub no_kv_cache: bool,
-    pub prompt_chunksize: Option<NonZeroUsize>,
     pub jinja_explicit: Option<String>,
 }
 
@@ -516,7 +548,8 @@ pub fn get_toml_selected_model_dtype(model: &TomlSelector) -> ModelDType {
         | TomlModelSelected::XLoraGGUF { dtype, .. }
         | TomlModelSelected::XLoraGGML { dtype, .. }
         | TomlModelSelected::LoraGGUF { dtype, .. }
-        | TomlModelSelected::LoraGGML { dtype, .. } => dtype,
+        | TomlModelSelected::LoraGGML { dtype, .. }
+        | TomlModelSelected::Embedding { dtype, .. } => dtype,
     }
 }
 
@@ -572,6 +605,7 @@ pub fn get_toml_selected_model_device_map_params(
             max_seq_len,
             max_batch_size,
         }),
+        TomlModelSelected::Embedding { .. } => Ok(AutoDeviceMapParams::default_text()),
         TomlModelSelected::VisionPlain {
             max_seq_len,
             max_batch_size,
@@ -591,7 +625,6 @@ fn loader_from_selected(
     args: TomlLoaderInnerParams,
     model: TomlModelSelected,
 ) -> anyhow::Result<Box<dyn Loader>> {
-    let use_flash_attn = args.use_flash_attn;
     let loader: Box<dyn Loader> = match model {
         TomlModelSelected::Plain {
             model_id,
@@ -608,8 +641,6 @@ fn loader_from_selected(
             hf_cache_path,
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
-                use_flash_attn,
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: organization.unwrap_or_default(),
                 write_uqff,
@@ -622,6 +653,8 @@ fn loader_from_selected(
                 imatrix,
                 calibration_file,
                 hf_cache_path,
+                matformer_config_path: None,
+                matformer_slice_name: None,
             },
             args.chat_template,
             args.tokenizer_json,
@@ -645,8 +678,6 @@ fn loader_from_selected(
             hf_cache_path,
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
-                use_flash_attn,
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
                 write_uqff,
@@ -659,6 +690,8 @@ fn loader_from_selected(
                 imatrix: None,
                 calibration_file: None,
                 hf_cache_path,
+                matformer_config_path: None,
+                matformer_slice_name: None,
             },
             args.chat_template,
             args.tokenizer_json,
@@ -689,8 +722,6 @@ fn loader_from_selected(
             hf_cache_path,
         } => NormalLoaderBuilder::new(
             NormalSpecificConfig {
-                use_flash_attn,
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 organization: Default::default(),
                 write_uqff,
@@ -703,6 +734,8 @@ fn loader_from_selected(
                 imatrix: None,
                 calibration_file: None,
                 hf_cache_path,
+                matformer_config_path: None,
+                matformer_slice_name: None,
             },
             args.chat_template,
             args.tokenizer_json,
@@ -734,7 +767,6 @@ fn loader_from_selected(
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.no_kv_cache,
@@ -761,7 +793,6 @@ fn loader_from_selected(
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.no_kv_cache,
@@ -794,7 +825,6 @@ fn loader_from_selected(
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>(),
             GGUFSpecificConfig {
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.no_kv_cache,
@@ -820,7 +850,6 @@ fn loader_from_selected(
         } => GGMLLoaderBuilder::new(
             GGMLSpecificConfig {
                 gqa,
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.chat_template,
@@ -847,7 +876,6 @@ fn loader_from_selected(
         } => GGMLLoaderBuilder::new(
             GGMLSpecificConfig {
                 gqa,
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.chat_template,
@@ -882,7 +910,6 @@ fn loader_from_selected(
         } => GGMLLoaderBuilder::new(
             GGMLSpecificConfig {
                 gqa,
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
             },
             args.chat_template,
@@ -918,8 +945,6 @@ fn loader_from_selected(
             hf_cache_path,
         } => VisionLoaderBuilder::new(
             VisionSpecificConfig {
-                use_flash_attn,
-                prompt_chunksize: args.prompt_chunksize,
                 topology: Topology::from_option_path(topology)?,
                 write_uqff,
                 from_uqff: from_uqff.map(|x| {
@@ -932,11 +957,38 @@ fn loader_from_selected(
                 calibration_file,
                 imatrix,
                 hf_cache_path,
+                matformer_config_path: None,
+                matformer_slice_name: None,
             },
             args.chat_template,
             args.tokenizer_json,
             Some(model_id),
             args.jinja_explicit,
+        )
+        .build(arch),
+        TomlModelSelected::Embedding {
+            model_id,
+            tokenizer_json,
+            arch,
+            dtype: _,
+            topology,
+            write_uqff,
+            from_uqff,
+            hf_cache_path,
+        } => EmbeddingLoaderBuilder::new(
+            EmbeddingSpecificConfig {
+                topology: Topology::from_option_path(topology)?,
+                write_uqff,
+                from_uqff: from_uqff.map(|x| {
+                    x.split(UQFF_MULTI_FILE_DELIMITER)
+                        .map(PathBuf::from_str)
+                        .map(|x| x.unwrap())
+                        .collect::<Vec<_>>()
+                }),
+                hf_cache_path,
+            },
+            tokenizer_json,
+            Some(model_id),
         )
         .build(arch),
     };
@@ -948,11 +1000,9 @@ impl TryInto<Box<dyn Loader>> for (TomlSelector, TomlLoaderArgs) {
     fn try_into(self) -> Result<Box<dyn Loader>, Self::Error> {
         let (selector, args) = self;
         let args = TomlLoaderInnerParams {
-            use_flash_attn: args.use_flash_attn,
             chat_template: args.chat_template,
             no_kv_cache: args.no_kv_cache,
             tokenizer_json: selector.tokenizer_json,
-            prompt_chunksize: args.prompt_chunksize,
             jinja_explicit: args.jinja_explicit,
         };
         let loader = loader_from_selected(args.clone(), selector.model)?;

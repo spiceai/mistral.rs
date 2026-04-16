@@ -3,6 +3,7 @@ use std::any::Any;
 use candle_core::Tensor;
 
 pub(crate) mod clip;
+pub(crate) mod conformer;
 pub(crate) mod idefics2;
 pub(crate) use idefics2::idefics2_input_processor;
 pub(crate) mod image_processor;
@@ -23,8 +24,11 @@ pub(crate) mod minicpmo;
 pub(crate) mod phi4;
 pub(crate) use phi4::inputs_processor;
 pub(crate) mod gemma3;
+pub(crate) mod gemma3n;
 pub(crate) mod llama4;
 pub(crate) mod mistral3;
+pub(crate) mod qwen3_vl;
+pub(crate) mod qwen3_vl_moe;
 pub(crate) mod siglip;
 
 use crate::pipeline::text_models_inputs_processor::{FlashParams, PagedAttentionInputMetadata};

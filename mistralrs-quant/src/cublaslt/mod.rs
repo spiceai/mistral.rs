@@ -2,10 +2,68 @@
 
 #![allow(unused_variables, unused_imports, dead_code)]
 
-use candle_core::{Device, Result, Tensor};
+use candle_core::{Device, DeviceLocation, Result, Tensor};
 use candle_nn::Activation as CandleActivation;
-use once_cell::sync::Lazy;
-use std::sync::{Mutex, Once};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex, Once};
+
+/// Controller for the CUBLASLT handle and inhibition flag.
+pub struct CublasLtController {
+    handle: Mutex<Option<&'static CublasLtWrapper>>,
+    inhibit: AtomicBool,
+    /// The device location where cuBLASLt was initialized. This is important
+    /// because cuBLASLt handles are device-specific and using them with tensors
+    /// on different devices will cause CUBLAS errors.
+    device_location: Mutex<Option<DeviceLocation>>,
+}
+
+impl CublasLtController {
+    /// Set whether to inhibit CUBLASLT usage.
+    pub fn set_inhibit(&self, value: bool) {
+        self.inhibit.store(value, Ordering::SeqCst);
+    }
+
+    /// Get the handle if not inhibited.
+    ///
+    /// Note: We check inhibit BEFORE reading handle_opt to avoid TOCTOU race.
+    /// If inhibit is checked after reading handle_opt, another thread could
+    /// call set_inhibit(true) between reading handle_opt and checking inhibit,
+    /// causing us to return a handle that should have been inhibited.
+    pub fn get(&self) -> Option<&'static CublasLtWrapper> {
+        // Check inhibit first to prevent TOCTOU race condition
+        if self.inhibit.load(Ordering::SeqCst) {
+            return None;
+        }
+        let handle_opt = self.handle.lock().unwrap();
+        *handle_opt
+    }
+
+    /// Get the handle only if the given device matches the device where cuBLASLt
+    /// was initialized. This is important for multi-GPU setups where using a
+    /// cuBLASLt handle with tensors on a different device causes CUBLAS errors.
+    pub fn get_for_device(&self, device: &Device) -> Option<&'static CublasLtWrapper> {
+        // Check inhibit first to prevent TOCTOU race condition
+        if self.inhibit.load(Ordering::SeqCst) {
+            return None;
+        }
+        // Check if the device matches the initialized device
+        let device_loc = self.device_location.lock().unwrap();
+        if let Some(init_loc) = *device_loc {
+            if device.location() != init_loc {
+                return None;
+            }
+        }
+        let handle_opt = self.handle.lock().unwrap();
+        *handle_opt
+    }
+}
+
+pub static CUBLASLT_CONTROLLER: LazyLock<CublasLtController> =
+    LazyLock::new(|| CublasLtController {
+        handle: Mutex::new(None),
+        inhibit: AtomicBool::new(false),
+        device_location: Mutex::new(None),
+    });
 
 #[cfg(feature = "cuda")]
 mod api;
@@ -18,42 +76,38 @@ mod tests;
 #[cfg(feature = "cuda")]
 pub use api::{fused_batch_matmul, fused_batch_matmul_f8, CublasLt};
 
-pub enum F8MatmulOutType {
-    F8,
-    BF16,
-}
-
-static INIT: Once = Once::new();
-static mut CUBLASLT: Option<CublasLtWrapper> = None;
-pub static CUBLASLT_HANDLE: Lazy<Mutex<Option<&'static CublasLtWrapper>>> =
-    Lazy::new(|| Mutex::new(None));
-
 pub fn maybe_init_cublas_lt_wrapper(device: Device) {
-    unsafe {
-        INIT.call_once(|| {
-            #[cfg(not(feature = "cuda"))]
-            {
-                CUBLASLT = None;
-            }
+    static INIT: Once = Once::new();
 
-            #[cfg(feature = "cuda")]
-            {
-                // Check if we can call the driver
-                // Then check if we can create a device
-                // Then check that the device is CUDA
-                use candle_core::cuda_backend::cudarc::driver;
-                CUBLASLT = match device {
-                    Device::Cuda(_) => Some(CublasLtWrapper {
+    INIT.call_once(|| {
+        #[cfg(feature = "cuda")]
+        {
+            match device {
+                Device::Cuda(_) => {
+                    let wrapper = Box::new(CublasLtWrapper {
                         cublaslt: CublasLt::new(&device).unwrap(),
-                    }),
-                    _ => None,
+                    });
+                    let wrapper_ptr = Box::leak(wrapper) as &'static CublasLtWrapper;
+
+                    // Set the controller handle and store the device location
+                    let mut handle_lock = CUBLASLT_CONTROLLER.handle.lock().unwrap();
+                    *handle_lock = Some(wrapper_ptr);
+                    let mut device_loc = CUBLASLT_CONTROLLER.device_location.lock().unwrap();
+                    *device_loc = Some(device.location());
+                }
+                _ => {
+                    let mut handle_lock = CUBLASLT_CONTROLLER.handle.lock().unwrap();
+                    *handle_lock = None;
                 }
             }
-            #[allow(static_mut_refs)]
-            let cublaslt: Option<&'static CublasLtWrapper> = CUBLASLT.as_ref();
-            *CUBLASLT_HANDLE.lock().unwrap() = cublaslt;
-        });
-    }
+        }
+
+        #[cfg(not(feature = "cuda"))]
+        {
+            let mut handle_lock = CUBLASLT_CONTROLLER.handle.lock().unwrap();
+            *handle_lock = None;
+        }
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +146,6 @@ impl CublasLtWrapper {
         beta: Option<f32>,
         bias: Option<&Tensor>,
         act: Option<CandleActivation>,
-        out_dtype: F8MatmulOutType,
     ) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         {
@@ -112,7 +165,6 @@ impl CublasLtWrapper {
                 beta,
                 bias,
                 inner_act,
-                out_dtype,
                 self.cublaslt.clone(),
             )?;
 

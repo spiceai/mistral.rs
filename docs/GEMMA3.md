@@ -9,10 +9,10 @@ The Python and HTTP APIs support sending images as:
 - Path to a local image
 - [Base64](https://en.wikipedia.org/wiki/Base64) encoded string
 
-The Rust API takes an image from the [image](https://docs.rs/image/latest/image/index.html) crate.
+The Rust SDK takes an image from the [image](https://docs.rs/image/latest/image/index.html) crate.
 
 ## HTTP server
-You can find this example [here](../examples/server/gemma3.py).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/server/gemma3.py).
 
 We support an OpenAI compatible HTTP API for vision models. This example demonstrates sending a chat completion request with an image.
 
@@ -43,11 +43,8 @@ The winding path visible on the mountain slopes appears to be part of the Mount 
 
 1) Start the server
 
-> [!NOTE]
-> You should replace `--features ...` with one of the features specified [here](../README.md#supported-accelerators), or remove it for pure CPU inference.
-
 ```
-cargo run --release --features ... -- --port 1234 vision-plain -m google/gemma-3-12b-it -a gemma3
+mistralrs serve vision -p 1234 -m google/gemma-3-12b-it
 ```
 
 2) Send a request
@@ -63,7 +60,7 @@ client = OpenAI(api_key="foobar", base_url="http://localhost:1234/v1/")
 
 
 completion = client.chat.completions.create(
-    model="gemma3",
+    model="default",
     messages=[
         {
             "role": "user",
@@ -91,24 +88,24 @@ print(resp)
 
 ```
 
-- You can find an example of encoding the [image via base64 here](../examples/server/phi3v_base64.py).
-- You can find an example of loading an [image locally here](../examples/server/phi3v_local_img.py).
+- You can find an example of encoding the [image via base64 here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/server/phi3v_base64.py).
+- You can find an example of loading an [image locally here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/server/phi3v_local_img.py).
 
 ---
 
 ## Rust
-You can find this example [here](../mistralrs/examples/gemma3/main.rs).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/gemma3/main.rs).
 
 This is a minimal example of running the Gemma 3 model with a dummy image.
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, VisionLoaderType, VisionMessages, VisionModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let model =
-        VisionModelBuilder::new("google/gemma-3-12b-it", VisionLoaderType::Gemma3)
+        VisionModelBuilder::new("google/gemma-3-12b-it")
             .with_isq(IsqType::Q4K)
             .with_logging()
             .build()
@@ -142,7 +139,7 @@ async fn main() -> Result<()> {
 ```
 
 ## Python
-You can find this example [here](../examples/python/gemma3.py).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/python/gemma3.py).
 
 This example demonstrates loading and sending a chat completion request with an image.
 
@@ -160,7 +157,7 @@ runner = Runner(
 
 res = runner.send_chat_completion_request(
     ChatCompletionRequest(
-        model="gemma3",
+        model="default",
         messages=[
             {
                 "role": "user",
@@ -189,5 +186,5 @@ print(res.usage)
 
 ```
 
-- You can find an example of encoding the [image via base64 here](../examples/python/phi3v_base64.py).
-- You can find an example of loading an [image locally here](../examples/python/phi3v_local_img.py).
+- You can find an example of encoding the [image via base64 here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/python/phi3v_base64.py).
+- You can find an example of loading an [image locally here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/python/phi3v_local_img.py).

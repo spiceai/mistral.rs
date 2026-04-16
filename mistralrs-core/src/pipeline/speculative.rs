@@ -1,6 +1,5 @@
 use std::{
     any::Any,
-    iter::zip,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -15,19 +14,23 @@ use tracing::warn;
 use crate::{
     device_map::DeviceMapper,
     get_mut_arcmutex,
+    kv_cache::NormalCacheManager,
     pipeline::sampling::{
         finish_or_add_toks_to_seq, sample_sequence, sample_target_sequence_speculative,
     },
     prefix_cacher::PrefixCacheManagerV2,
-    sequence::{Sequence, SequenceRecognizer},
+    sequence::Sequence,
     DeviceMapSetting, Loader, ModelKind, PagedAttentionConfig, Pipeline, TokenSource, TryIntoDType,
 };
 
+use crate::kv_cache::CacheManager;
+use crate::utils::progress::ProgressScopeGuard;
+
 use super::{
-    cache_manager::NormalCacheManager, chat_template::ChatTemplate, sampling::SpeculativeSample,
-    AnyMoePipelineMixin, CacheBackendMetadata, CacheInstruction, CacheManager, CacheManagerMixin,
-    EitherCache, ForwardInputsResult, GeneralMetadata, IsqPipelineMixin, MetadataMixin,
-    ModelCategory, ModelPaths, PreProcessingMixin,
+    chat_template::ChatTemplate, sampling::SpeculativeSample, AnyMoePipelineMixin,
+    CacheBackendMetadata, CacheInstruction, CacheManagerMixin, EitherCache, ForwardInputsResult,
+    GeneralMetadata, IsqPipelineMixin, MetadataMixin, ModelCategory, ModelPaths,
+    PreProcessingMixin,
 };
 
 /// A loader for a speculative pipeline using 2 [`Loader`]s.
@@ -50,6 +53,7 @@ impl Loader for SpeculativeLoader {
         in_situ_quant: Option<IsqType>,
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> anyhowResult<Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>> {
+        let _progress_guard = ProgressScopeGuard::new(silent);
         let paged_attn_config = if paged_attn_config.is_none() {
             warn!(
                 "Speculative decoding does not currently support PagedAttention, running without"
@@ -97,6 +101,7 @@ impl Loader for SpeculativeLoader {
         in_situ_quant: Option<IsqType>,
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> anyhowResult<Arc<tokio::sync::Mutex<dyn Pipeline + Send + Sync>>> {
+        let _progress_guard = ProgressScopeGuard::new(silent);
         let paged_attn_config = if paged_attn_config.is_none() {
             warn!(
                 "Speculative decoding does not currently support PagedAttention, running without"
@@ -335,7 +340,7 @@ impl Pipeline for SpeculativePipeline {
         prefix_cacher: &mut PrefixCacheManagerV2,
         disable_eos_stop: bool,
         rng: Arc<Mutex<Isaac64Rng>>,
-        backend_metadata: CacheBackendMetadata<'_>,
+        backend_metadata: CacheBackendMetadata,
     ) -> Result<Duration> {
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
@@ -380,11 +385,8 @@ impl Pipeline for SpeculativePipeline {
                             false,
                             None,
                             None, // TODO: get block tables/handle it
-                            None, // TODO: do we support???
                             get_mut_arcmutex!(self.draft).device_mapper(),
                         )
-                        .nth(0)
-                        .unwrap()
                         .unwrap()
                         .inputs;
                     let logits = get_mut_arcmutex!(self.draft).forward_inputs(inputs, false)?;
@@ -402,8 +404,8 @@ impl Pipeline for SpeculativePipeline {
                         seq.return_logprobs(),
                         rng.clone(),
                         false, // todo tune
-                        false, // do not add to tok trie yet
                         true,
+                        false,
                     )
                     .await?;
                     seq.add_tmp_tok(sample.token);
@@ -433,6 +435,9 @@ impl Pipeline for SpeculativePipeline {
                         .map(|(k, _)| k.dims()[2])
                         .unwrap_or(0),
                     EitherCache::Normal(normal) => normal.lock().unwrap().0[0].current_seq_len(),
+                    EitherCache::Hybrid(_) => {
+                        unreachable!("Speculative decoding is not supported with hybrid caches")
+                    }
                 };
 
                 // ========= Run the model ============
@@ -453,11 +458,8 @@ impl Pipeline for SpeculativePipeline {
                         false,
                         None,
                         None, // TODO: get block tables/handle it
-                        None, // TODO: do we support???
                         get_mut_arcmutex!(self.target).device_mapper(),
                     )
-                    .nth(0)
-                    .unwrap()
                     .unwrap()
                     .inputs;
 
@@ -475,26 +477,21 @@ impl Pipeline for SpeculativePipeline {
 
                 // ======================= Rejection sampling. ============================
                 // Map from each target sample to corresponding in draft sample
+                // this will first rollback LLG state if any, and then advance for the accepted tokens only
                 let samples = sample_target_sequence_speculative(
                     logits.clone(),
                     seq,
                     seq.return_logprobs(),
                     rng.clone(),
-                    self.gamma,
+                    &draft_samples,
                 )
                 .await?;
 
-                let mut accepted_tokens = Vec::new();
-                for (target_sample, draft_sample) in zip(samples, draft_samples) {
-                    let tok = target_sample.sample.token;
-                    accepted_tokens.push(target_sample.sample);
-                    if draft_sample.sample.token != tok {
-                        break;
-                    }
-                }
+                let accepted_tokens = samples.into_iter().map(|s| s.sample).collect::<Vec<_>>();
 
                 // ======================= Narrow caches to account for rejections ============================
                 let n_not_accepted = self.gamma - accepted_tokens.len();
+
                 match get_mut_arcmutex!(self.draft).cache() {
                     EitherCache::Full(full) => {
                         for (k, v) in full.lock().iter_mut().flatten() {
@@ -509,6 +506,9 @@ impl Pipeline for SpeculativePipeline {
                                 .map_err(|_| candle_core::Error::msg("KV cache set_len failed."))?;
                         }
                     }
+                    EitherCache::Hybrid(_) => {
+                        unreachable!("Speculative decoding is not supported with hybrid caches")
+                    }
                 }
                 if get_mut_arcmutex!(self.draft).get_metadata().is_xlora {
                     match get_mut_arcmutex!(self.draft).cache() {
@@ -518,7 +518,7 @@ impl Pipeline for SpeculativePipeline {
                                 *v = v.i((.., .., ..v.dims()[2] - n_not_accepted, ..))?;
                             }
                         }
-                        EitherCache::Normal(_) => {
+                        EitherCache::Normal(_) | EitherCache::Hybrid(_) => {
                             unreachable!()
                         }
                     }
@@ -537,6 +537,9 @@ impl Pipeline for SpeculativePipeline {
                                 .map_err(|_| candle_core::Error::msg("KV cache set_len failed."))?;
                         }
                     }
+                    EitherCache::Hybrid(_) => {
+                        unreachable!("Speculative decoding is not supported with hybrid caches")
+                    }
                 }
                 if get_mut_arcmutex!(self.draft).get_metadata().is_xlora {
                     match get_mut_arcmutex!(self.target).cache() {
@@ -546,7 +549,7 @@ impl Pipeline for SpeculativePipeline {
                                 *v = v.i((.., .., ..v.dims()[2] - n_not_accepted, ..))?;
                             }
                         }
-                        EitherCache::Normal(_) => {
+                        EitherCache::Normal(_) | EitherCache::Hybrid(_) => {
                             unreachable!()
                         }
                     }
@@ -573,13 +576,6 @@ impl Pipeline for SpeculativePipeline {
                         false,
                     )
                     .await?;
-                    match seq.recognizer {
-                        SequenceRecognizer::Llguidance(ref mut llg) => {
-                            llg.commit_token(Some(accepted.token))
-                                .map_err(candle_core::Error::msg)?;
-                        }
-                        SequenceRecognizer::None => {}
-                    }
                 }
 
                 // Trick to improve lower bounds. Sample last token in multinomial
@@ -630,8 +626,6 @@ impl Pipeline for SpeculativePipeline {
             CacheBackendMetadata::PagedAttention {
                 metadata: _,
                 blocks_to_copy: _,
-                blocks_to_swap_in: _,
-                blocks_to_swap_out: _,
             } => unreachable!(),
         }
     }

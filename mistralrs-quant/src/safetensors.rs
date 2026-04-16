@@ -1,4 +1,4 @@
-use candle_core::{DType, Device, Error, Result, Shape, Tensor, WithDType};
+use candle_core::{DType, Device, Error, IndexOp, Result, Shape, Storage, Tensor, WithDType};
 use candle_nn::var_builder::{Backend, SimpleBackend, VarBuilderArgs};
 use float8::F8E4M3;
 use regex::Regex;
@@ -11,7 +11,7 @@ use std::sync::Arc;
 fn convert_slice<T: WithDType>(data: &[u8], shape: &[usize], device: &Device) -> Result<Tensor> {
     let size_in_bytes = T::DTYPE.size_in_bytes();
     let elem_count = data.len() / size_in_bytes;
-    if (data.as_ptr() as usize) % size_in_bytes == 0 {
+    if (data.as_ptr() as usize).is_multiple_of(size_in_bytes) {
         // SAFETY This is safe because we just checked that this
         // was correctly aligned.
         let data: &[T] =
@@ -41,7 +41,7 @@ fn convert_slice_with_cast<T: Sized + Copy, U: WithDType, F: Fn(T) -> Result<U>>
 ) -> Result<Tensor> {
     let size_in_bytes = std::mem::size_of::<T>();
     let elem_count = data.len() / size_in_bytes;
-    if (data.as_ptr() as usize) % size_in_bytes == 0 {
+    if (data.as_ptr() as usize).is_multiple_of(size_in_bytes) {
         // SAFETY This is safe because we just checked that this
         // was correctly aligned.
         let data: &[T] =
@@ -93,21 +93,6 @@ fn convert(
     cast_dtype: Option<DType>,
 ) -> Result<Tensor> {
     match (view.dtype(), cast_dtype) {
-        (st::Dtype::U8, _) => convert_::<u8>(view, device),
-        (st::Dtype::U16, _) => {
-            let conv = |x| Ok(u32::from(x));
-            convert_with_cast_::<u16, u32, _>(view, device, conv)
-        }
-        (st::Dtype::U32, _) => convert_::<u32>(view, device),
-        (st::Dtype::I16, _) => convert_::<i16>(view, device),
-        (st::Dtype::I32, _) => convert_::<i32>(view, device),
-        (st::Dtype::I64, _) => convert_::<i64>(view, device),
-        (st::Dtype::BF16, None | Some(DType::BF16)) => convert_::<half::bf16>(view, device),
-        (st::Dtype::F16, None | Some(DType::F16)) => convert_::<half::f16>(view, device),
-        (st::Dtype::F32, _) => convert_::<f32>(view, device),
-        (st::Dtype::F64, _) => convert_::<f64>(view, device),
-        (st::Dtype::F8_E4M3, _) => convert_::<F8E4M3>(view, device),
-
         (st::Dtype::BF16, Some(DType::F16)) => {
             let conv = |x: half::bf16| Ok(half::f16::from_f32(x.to_f32()));
             convert_with_cast_::<half::bf16, half::f16, _>(view, device, conv)
@@ -124,8 +109,110 @@ fn convert(
             let conv = |x: half::f16| Ok(x.to_f32());
             convert_with_cast_::<half::f16, f32, _>(view, device, conv)
         }
+        (st::Dtype::F32, Some(DType::BF16)) => {
+            let conv = |x: f32| Ok(half::bf16::from_f32(x));
+            convert_with_cast_::<f32, half::bf16, _>(view, device, conv)
+        }
+        (st::Dtype::F32, Some(DType::F16)) => {
+            let conv = |x: f32| Ok(half::f16::from_f32(x));
+            convert_with_cast_::<f32, half::f16, _>(view, device, conv)
+        }
+
+        (st::Dtype::U8, _) => convert_::<u8>(view, device),
+        (st::Dtype::U16, _) => {
+            let conv = |x| Ok(u32::from(x));
+            convert_with_cast_::<u16, u32, _>(view, device, conv)
+        }
+        (st::Dtype::U32, _) => convert_::<u32>(view, device),
+        (st::Dtype::I16, _) => convert_::<i16>(view, device),
+        (st::Dtype::I32, _) => convert_::<i32>(view, device),
+        (st::Dtype::I64, _) => convert_::<i64>(view, device),
+        (st::Dtype::BF16, None | Some(DType::BF16)) => convert_::<half::bf16>(view, device),
+        (st::Dtype::F16, None | Some(DType::F16)) => convert_::<half::f16>(view, device),
+        (st::Dtype::F32, _) => convert_::<f32>(view, device),
+        (st::Dtype::F64, _) => convert_::<f64>(view, device),
+        (st::Dtype::F8_E4M3, _) => convert_::<F8E4M3>(view, device),
+        (st::Dtype::F6_E2M3, _)
+        | (st::Dtype::F6_E3M2, _)
+        | (st::Dtype::F4, _)
+        | (st::Dtype::F8_E8M0, _) => {
+            // For dummy types, we need to handle loading by creating a dummy tensor
+            // Since these types don't have actual data representation, we'll create
+            // a tensor that indicates it's a dummy type
+            convert_dummy(view, device)
+        }
         (dtype, _) => Err(Error::UnsupportedSafeTensorDtype(dtype)),
     }
+}
+
+fn convert_dummy(view: &st::TensorView<'_>, device: &Device) -> Result<Tensor> {
+    // For dummy types, we'll create the appropriate storage variant that preserves
+    // both the raw data and the correct dtype
+    let (dtype, _dtype_name) = match view.dtype() {
+        st::Dtype::F6_E2M3 => (DType::F6E2M3, "F6_E2M3 (MX6)"),
+        st::Dtype::F6_E3M2 => (DType::F6E3M2, "F6_E3M2 (MX6)"),
+        st::Dtype::F4 => (DType::F4, "F4 (MX4)"),
+        st::Dtype::F8_E8M0 => (DType::F8E8M0, "F8_E8M0"),
+        _ => unreachable!("convert_dummy called with non-dummy dtype"),
+    };
+
+    // Load the raw bytes
+    let data = view.data();
+    let shape = view.shape();
+
+    // Create storage with the appropriate dummy type variant
+    let storage = match device {
+        Device::Cpu => {
+            let cpu_storage = match dtype {
+                DType::F6E2M3 => candle_core::cpu_backend::CpuStorage::F6E2M3(data.to_vec()),
+                DType::F6E3M2 => candle_core::cpu_backend::CpuStorage::F6E3M2(data.to_vec()),
+                DType::F4 => candle_core::cpu_backend::CpuStorage::F4(data.to_vec()),
+                DType::F8E8M0 => candle_core::cpu_backend::CpuStorage::F8E8M0(data.to_vec()),
+                _ => unreachable!(),
+            };
+            Storage::Cpu(cpu_storage)
+        }
+        #[cfg(feature = "cuda")]
+        Device::Cuda(device) => {
+            let mut slice = unsafe { device.alloc::<u8>(data.len())? };
+            device.memcpy_htod(data, &mut slice)?;
+
+            let slice = match dtype {
+                DType::F6E2M3 => candle_core::cuda_backend::CudaStorageSlice::F6E2M3(slice),
+                DType::F6E3M2 => candle_core::cuda_backend::CudaStorageSlice::F6E3M2(slice),
+                DType::F4 => candle_core::cuda_backend::CudaStorageSlice::F4(slice),
+                DType::F8E8M0 => candle_core::cuda_backend::CudaStorageSlice::F8E8M0(slice),
+                _ => unreachable!(),
+            };
+            let storage = candle_core::cuda_backend::CudaStorage {
+                slice,
+                device: device.clone(),
+            };
+            Storage::Cuda(storage)
+        }
+        #[cfg(not(feature = "cuda"))]
+        Device::Cuda(_) => {
+            return Err(Error::Msg("CUDA support not compiled".to_string()));
+        }
+        #[cfg(feature = "metal")]
+        Device::Metal(device) => {
+            let buffer = device.new_buffer_with_data(data)?;
+
+            let storage = candle_core::metal_backend::MetalStorage::new(
+                buffer,
+                device.clone(),
+                data.len(),
+                dtype,
+            );
+            Storage::Metal(storage)
+        }
+        #[cfg(not(feature = "metal"))]
+        Device::Metal(_) => {
+            return Err(Error::Msg("Metal support not compiled".to_string()));
+        }
+    };
+
+    Ok(Tensor::from((storage, shape)))
 }
 
 #[derive(yoke::Yokeable)]
@@ -260,6 +347,7 @@ pub enum ShardedSafeTensors {
     Sharded {
         b: MmapedSafetensors,
         make_dummy_regexes: Option<Arc<Vec<Regex>>>,
+        predicate: Arc<dyn Fn(String) -> bool + Send + Sync + 'static>,
     },
     SimpleBackend(Box<dyn SimpleBackend + 'static>),
 }
@@ -270,6 +358,9 @@ impl ShardedSafeTensors {
     /// Initializes a `VarBuilder` that retrieves tensors stored in a collection of safetensors
     /// files and make them usable in a sharded way.
     ///
+    /// - If `regexes` is specified, this will be used in `make_dummy_predicate` based on `.any`
+    /// - Only include keys for which predicate evaluates to true.
+    ///
     /// # Safety
     ///
     /// The unsafe is inherited from [`memmap2::MmapOptions`].
@@ -278,11 +369,13 @@ impl ShardedSafeTensors {
         dtype: DType,
         dev: &Device,
         make_dummy_regexes: Option<Arc<Vec<Regex>>>,
+        predicate: Arc<dyn Fn(String) -> bool + Send + Sync + 'static>,
     ) -> Result<ShardedVarBuilder> {
         let tensors = MmapedSafetensors::multi(paths)?;
         let backend = ShardedSafeTensors::Sharded {
             b: tensors,
             make_dummy_regexes,
+            predicate,
         };
         Ok(VarBuilderArgs::new_with_args(backend, dtype, dev))
     }
@@ -310,6 +403,56 @@ pub enum Shard {
         offset: usize,
         len: usize,
     },
+}
+
+impl Shard {
+    pub fn apply_to(&self, tensor: &Tensor) -> Result<Tensor> {
+        match *self {
+            Shard::Simple {
+                dim,
+                rank,
+                world_size,
+            } => {
+                let size = tensor.dim(dim)?;
+                let shape = tensor.dims().to_vec();
+
+                if size % world_size != 0 {
+                    return Err(Error::ShapeMismatchSplit {
+                        shape: shape.into(),
+                        dim,
+                        n_parts: world_size,
+                    });
+                }
+                let block_size = size / world_size;
+                let start = rank * block_size;
+                let stop = (rank + 1) * block_size;
+
+                if dim == 0 {
+                    tensor.i(start..stop)
+                } else if dim == 1 {
+                    tensor.i((.., start..stop))
+                } else if dim == 2 {
+                    tensor.i((.., .., start..stop))
+                } else {
+                    candle_core::bail!("Got sharded on dimensions != 0 or 1 or 2")
+                }
+            }
+            Shard::Offset { dim, offset, len } => {
+                let start = offset;
+                let stop = start + len;
+
+                if dim == 0 {
+                    tensor.i(start..stop)
+                } else if dim == 1 {
+                    tensor.i((.., start..stop))
+                } else if dim == 2 {
+                    tensor.i((.., .., start..stop))
+                } else {
+                    candle_core::bail!("Got sharded on dimensions != 0 or 1 or 2")
+                }
+            }
+        }
+    }
 }
 
 impl Default for Shard {
@@ -351,6 +494,7 @@ impl Backend for ShardedSafeTensors {
                 Self::Sharded {
                     b,
                     make_dummy_regexes,
+                    predicate,
                 } => {
                     if let Some(make_dummy_regexes) = make_dummy_regexes {
                         if make_dummy_regexes.iter().any(|x| x.is_match(path)) {
@@ -359,6 +503,13 @@ impl Backend for ShardedSafeTensors {
                             });
                         }
                     }
+                    let should_include = predicate(path.to_string());
+                    if !should_include {
+                        return Err(Error::CannotFindTensor {
+                            path: path.to_string(),
+                        });
+                    }
+
                     return SimpleBackend::get(
                         b,
                         target_shape,
@@ -391,6 +542,7 @@ impl Backend for ShardedSafeTensors {
                     Self::Sharded {
                         b,
                         make_dummy_regexes,
+                        predicate,
                     } => {
                         use safetensors::slice::IndexOp;
 
@@ -400,6 +552,12 @@ impl Backend for ShardedSafeTensors {
                                     path: path.to_string(),
                                 });
                             }
+                        }
+                        let should_include = predicate(path.to_string());
+                        if !should_include {
+                            return Err(Error::CannotFindTensor {
+                                path: path.to_string(),
+                            });
                         }
 
                         let view = b.get(path)?;
@@ -450,32 +608,8 @@ impl Backend for ShardedSafeTensors {
                         Tensor::from_raw_buffer(&raw, view_dtype, &shape, dev)?.to_dtype(dtype)?
                     }
                     Self::SimpleBackend(b) => {
-                        use candle_core::IndexOp;
                         let tensor = b.get(target_shape, path, Default::default(), dtype, dev)?;
-
-                        let size = tensor.dim(dim)?;
-                        let shape = tensor.dims().to_vec();
-
-                        if size % world_size != 0 {
-                            return Err(Error::ShapeMismatchSplit {
-                                shape: shape.into(),
-                                dim,
-                                n_parts: world_size,
-                            });
-                        }
-                        let block_size = size / world_size;
-                        let start = rank * block_size;
-                        let stop = (rank + 1) * block_size;
-
-                        if dim == 0 {
-                            tensor.i(start..stop)?
-                        } else if dim == 1 {
-                            tensor.i((.., start..stop))?
-                        } else if dim == 2 {
-                            tensor.i((.., .., start..stop))?
-                        } else {
-                            candle_core::bail!("Got sharded on dimensions != 0 or 1 or 2")
-                        }
+                        h.apply_to(&tensor)?
                     }
                 }
             }
@@ -484,6 +618,7 @@ impl Backend for ShardedSafeTensors {
                     Self::Sharded {
                         b,
                         make_dummy_regexes,
+                        predicate,
                     } => {
                         use safetensors::slice::IndexOp;
 
@@ -493,6 +628,12 @@ impl Backend for ShardedSafeTensors {
                                     path: path.to_string(),
                                 });
                             }
+                        }
+                        let should_include = predicate(path.to_string());
+                        if !should_include {
+                            return Err(Error::CannotFindTensor {
+                                path: path.to_string(),
+                            });
                         }
 
                         let view = b.get(path)?;
@@ -534,21 +675,8 @@ impl Backend for ShardedSafeTensors {
                         Tensor::from_raw_buffer(&raw, view_dtype, &shape, dev)?.to_dtype(dtype)?
                     }
                     Self::SimpleBackend(b) => {
-                        use candle_core::IndexOp;
                         let tensor = b.get(target_shape, path, Default::default(), dtype, dev)?;
-
-                        let start = offset;
-                        let stop = start + len;
-
-                        if dim == 0 {
-                            tensor.i(start..stop)?
-                        } else if dim == 1 {
-                            tensor.i((.., start..stop))?
-                        } else if dim == 2 {
-                            tensor.i((.., .., start..stop))?
-                        } else {
-                            candle_core::bail!("Got sharded on dimensions != 0 or 1 or 2")
-                        }
+                        h.apply_to(&tensor)?
                     }
                 }
             }
@@ -562,6 +690,7 @@ impl Backend for ShardedSafeTensors {
             Self::Sharded {
                 b,
                 make_dummy_regexes,
+                predicate,
             } => {
                 if let Some(make_dummy_regexes) = make_dummy_regexes {
                     if make_dummy_regexes.iter().any(|x| x.is_match(name)) {
@@ -569,6 +698,12 @@ impl Backend for ShardedSafeTensors {
                             path: name.to_string(),
                         });
                     }
+                }
+                let should_include = predicate(name.to_string());
+                if !should_include {
+                    return Err(Error::CannotFindTensor {
+                        path: name.to_string(),
+                    });
                 }
                 <MmapedSafetensors as SimpleBackend>::get_unchecked(b, name, dtype, dev)
             }
@@ -581,11 +716,16 @@ impl Backend for ShardedSafeTensors {
             Self::Sharded {
                 b,
                 make_dummy_regexes,
+                predicate,
             } => {
                 if let Some(make_dummy_regexes) = make_dummy_regexes {
                     if make_dummy_regexes.iter().any(|x| x.is_match(name)) {
                         return false;
                     }
+                }
+                let should_include = predicate(name.to_string());
+                if !should_include {
+                    return false;
                 }
                 b.get(name).is_ok()
             }

@@ -2,33 +2,33 @@
 
 The DeepSeek V3 is a mixture of expert (MoE) model.
 
-```
-./mistralrs-server --isq Q4K -i plain -m deepseek-ai/DeepSeek-R1
+```bash
+mistralrs run --isq 4 -m deepseek-ai/DeepSeek-R1
 ```
 
 > [!NOTE]
 > The non-distill versions of the DeepSeek R1 models share the DeepSeek V3 architecture.
 
 > [!NOTE]
-> This models supports MoQE which can be activated in the ISQ organization parameter within the various APIs, as demonstrated below:
+> This model supports MoQE which can be activated in the ISQ organization parameter within the various APIs, as demonstrated below:
 
-```
-./mistralrs-server --isq Q4K -i plain -m deepseek-ai/DeepSeek-R1 --organization moqe
+```bash
+mistralrs run --isq 4 -m deepseek-ai/DeepSeek-R1 --isq-organization moqe
 ```
 
 ## Running the distill models
 
 The various [distillation](https://huggingface.co/collections/deepseek-ai/deepseek-r1-678e1e131c0169c0bc89728d) models can be run out of the box.
-```
-./mistralrs-server -i --isq Q4K plain -m deepseek-ai/DeepSeek-R1-Distill-Llama-8B
-./mistralrs-server -i --isq Q4K plain -m deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
-./mistralrs-server -i --isq Q4K plain -m deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+```bash
+mistralrs run --isq 4 -m deepseek-ai/DeepSeek-R1-Distill-Llama-8B
+mistralrs run --isq 4 -m deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+mistralrs run --isq 4 -m deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
 ```
 
 ## HTTP API
 
-```
-./mistralrs-server --isq Q4K --port 1234 plain -m deepseek-ai/DeepSeek-R1
+```bash
+mistralrs serve --isq 4 -p 1234 -m deepseek-ai/DeepSeek-R1
 ```
 
 ```py
@@ -44,7 +44,7 @@ while True:
     prompt = input(">>> ")
     messages.append({"role": "user", "content": prompt})
     completion = client.chat.completions.create(
-        model="deepseekv2",
+        model="default",
         messages=messages,
         max_tokens=256,
         frequency_penalty=1.0,
@@ -56,7 +56,7 @@ while True:
     messages.append({"role": "assistant", "content": resp})
 ```
 
-## Python API
+## Python SDK
 ```py
 from mistralrs import Runner, Which, ChatCompletionRequest, Architecture
 
@@ -69,7 +69,7 @@ runner = Runner(
 
 res = runner.send_chat_completion_request(
     ChatCompletionRequest(
-        model="mistral",
+        model="default",
         messages=[
             {"role": "user", "content": "Tell me a story about the Rust type system."}
         ],
@@ -83,8 +83,8 @@ print(res.choices[0].message.content)
 print(res.usage)
 ```
 
-## Rust API
-You can find this example [here](../mistralrs/examples/deepseekr1/main.rs).
+## Rust SDK
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/deepseekr1/main.rs).
 
 ```rust
 use anyhow::Result;

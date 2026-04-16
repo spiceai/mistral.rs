@@ -30,7 +30,6 @@ use crate::{
 };
 
 serde_default_fn!(bool, word_emb_default, false);
-serde_default_fn!(bool, use_flash_attn_default, false);
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Config {
@@ -41,8 +40,6 @@ pub struct Config {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
-    #[serde(default = "use_flash_attn_default")]
-    pub use_flash_attn: bool,
     pub rms_norm_eps: f64,
     pub rope_theta: f32,
     pub max_position_embeddings: usize,
@@ -240,7 +237,6 @@ impl CausalSelfAttention {
                     cfg.num_attention_heads,
                     comm,
                 ),
-                use_flash_attn: cfg.use_flash_attn,
                 softcap: None,
                 softmax_scale: 1.0 / ((cfg.hidden_size / cfg.num_attention_heads) as f32).sqrt(),
                 sliding_window: None,
@@ -385,7 +381,7 @@ impl Llama {
             ReplicatedLayer::new(
                 cfg.hidden_size,
                 cfg.vocab_size,
-                &None,
+                &cfg.quantization_config,
                 false,
                 mapper.set_nm_device(vb_lm_head, normal_loading_metadata.loading_isq),
             )?
@@ -421,8 +417,7 @@ impl Llama {
             "Loading repeating layers",
             &normal_loading_metadata.multi_progress,
         )
-        .into_iter()
-        .map(|i| {
+        .par_iter_if_isq(|i| {
             let device = mapper
                 .device_for(i, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
@@ -432,12 +427,11 @@ impl Llama {
                 .clone();
             let paged_attn = match &attention_mechanism {
                 AttentionImplementation::Eager => None,
-                AttentionImplementation::PagedAttention => Some(
-                    PagedAttention::new(head_dim, device, None)
-                        .expect("Failed to create PagedAttention"),
-                ),
+                AttentionImplementation::PagedAttention => {
+                    Some(PagedAttention::new(head_dim, device, None)?)
+                }
             };
-            let comm = mapper.get_comm_for(i).unwrap();
+            let comm = mapper.get_comm_for(i)?;
             Block::load(
                 vb_m.pp(format!("layers.{i}")),
                 cfg,
@@ -448,9 +442,7 @@ impl Llama {
                 paged_attn,
                 &comm,
             )
-            .expect("Failed to load block.")
-        })
-        .collect();
+        })?;
 
         Ok(Self {
             wte,
@@ -472,6 +464,7 @@ impl Llama {
                 sliding_window: None,
                 k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
                 v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+                kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             mapper,
         })
@@ -541,12 +534,12 @@ impl Llama {
             )?;
         }
         let x = x.to_device(&self.device)?;
-        let mut x = self.ln_f.forward(&x)?;
+        let x = self.ln_f.forward(&x)?;
+        let mut x = extract_logits(&x, context_lens)?;
         if let Some(t) = self.lm_head.quantized_act_type() {
             x = x.to_dtype(t)?;
         }
-        let xs = MatMul.qmethod_matmul(&x, &*self.lm_head)?;
-        extract_logits(&xs, context_lens)
+        MatMul.qmethod_matmul(&x, &*self.lm_head)
     }
 
     pub fn residual_tensors_m(&self, uvb_m: UnVarBuilder) -> Vec<(String, Tensor)> {

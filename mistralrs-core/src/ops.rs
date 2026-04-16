@@ -1,565 +1,360 @@
-use candle_core::{
-    backend::BackendStorage, shape::Dim, CpuStorage, CustomOp1, CustomOp2, DType, Error, Layout,
-    Result, Shape, Tensor, WithDType, D,
-};
-
-use std::{
-    fmt::Display,
-    ops::{BitAnd, BitOr, BitXor},
-};
+use candle_core::{shape::Dim, DType, Result, Tensor, D};
 
 #[cfg(feature = "cuda")]
 use crate::cuda::ffi;
+use crate::layers::Activation;
 #[cfg(feature = "cuda")]
-use candle_core::cuda::{cudarc::driver::DevicePtr, CudaStorage, WrapErr};
+use candle_core::Shape;
+
+// ============================================================================
+// Optimized parallel topk for CUDA
+// Uses a dedicated kernel that's much faster than full sort for small k
+// Single kernel call writes both values and indices - no post-processing needed
+// ============================================================================
+
 #[cfg(feature = "cuda")]
-use half::{bf16, f16};
-#[cfg(feature = "cuda")]
-use std::ffi::c_void;
-pub enum BitWiseOpEnum {
-    And,
-    Or,
-    Xor,
-}
+#[allow(clippy::cast_possible_truncation)]
+fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
+    use candle_core::backend::BackendStorage;
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core::cuda_backend::CudaStorageSlice;
+    use std::ffi::c_void;
 
-impl Display for BitWiseOpEnum {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BitWiseOpEnum::And => write!(f, "And"),
-            BitWiseOpEnum::Or => write!(f, "Or"),
-            BitWiseOpEnum::Xor => write!(f, "Xor"),
-        }
-    }
-}
+    let input = input.contiguous()?;
+    let dims = input.dims();
+    let ncols = *dims
+        .last()
+        .ok_or_else(|| candle_core::Error::Msg("empty dims".to_string()))?;
+    let nrows = (input.elem_count() / ncols) as i32;
+    let ncols_i32 = ncols as i32;
+    let k_i32 = k as i32;
 
-struct BitWise {
-    pub op: BitWiseOpEnum,
-}
+    // Output shapes
+    let mut out_dims = dims.to_vec();
+    *out_dims.last_mut().unwrap() = k;
+    let out_elem_count = nrows as usize * k;
 
-impl BitWise {
-    pub fn new(op: BitWiseOpEnum) -> Self {
-        Self { op }
-    }
+    let (storage, _layout) = input.storage_and_layout();
+    let storage = match &*storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("cuda_topk requires CUDA tensor"),
+    };
 
-    fn bitwise<T: WithDType + BitAnd<Output = T> + BitOr<Output = T> + BitXor<Output = T>>(
-        &self,
-        vs1: &[T],
-        vs2: &[T],
-    ) -> Vec<T> {
-        let n = vs1.len();
-        let mut result = Vec::with_capacity(n);
-        for i in 0..n {
-            let v1 = vs1[i];
-            let v2 = vs2[i];
-            let r = match self.op {
-                BitWiseOpEnum::And => v1 & v2,
-                BitWiseOpEnum::Or => v1 | v2,
-                BitWiseOpEnum::Xor => v1 ^ v2,
+    let dev = storage.device();
+    let stream = dev.cuda_stream().cu_stream() as i64;
+
+    let (src_ptr, _src_guard) = match &storage.slice {
+        CudaStorageSlice::BF16(inp) => inp.device_ptr(inp.stream()),
+        CudaStorageSlice::F16(inp) => inp.device_ptr(inp.stream()),
+        CudaStorageSlice::F32(inp) => inp.device_ptr(inp.stream()),
+        _ => candle_core::bail!("cuda_topk only supports BF16/F16/F32"),
+    };
+    let src_ptr = src_ptr as *const c_void;
+
+    // Allocate both output buffers
+    let indices_dst = unsafe { dev.alloc::<u32>(out_elem_count) }?;
+    let (indices_ptr, indices_guard) = indices_dst.device_ptr(indices_dst.stream());
+
+    let (values_tensor, indices_tensor) = match input.dtype() {
+        DType::BF16 => {
+            let values_dst = unsafe { dev.alloc::<half::bf16>(out_elem_count) }?;
+            let (values_ptr, values_guard) = values_dst.device_ptr(values_dst.stream());
+
+            unsafe {
+                ffi::topk_bf16(
+                    src_ptr,
+                    values_ptr as *mut c_void,
+                    indices_ptr as *mut c_void,
+                    nrows,
+                    ncols_i32,
+                    k_i32,
+                    stream,
+                );
+            }
+
+            drop(values_guard);
+            drop(indices_guard);
+
+            let values_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::BF16(values_dst),
+                device: dev.clone(),
             };
-            result.push(r);
+            let indices_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::U32(indices_dst),
+                device: dev.clone(),
+            };
+
+            let values_tensor = Tensor::from((
+                candle_core::Storage::Cuda(values_storage),
+                Shape::from_dims(&out_dims),
+            ));
+            let indices_tensor = Tensor::from((
+                candle_core::Storage::Cuda(indices_storage),
+                Shape::from_dims(&out_dims),
+            ));
+            (values_tensor, indices_tensor)
         }
-        result
-    }
+        DType::F16 => {
+            let values_dst = unsafe { dev.alloc::<half::f16>(out_elem_count) }?;
+            let (values_ptr, values_guard) = values_dst.device_ptr(values_dst.stream());
+
+            unsafe {
+                ffi::topk_f16(
+                    src_ptr,
+                    values_ptr as *mut c_void,
+                    indices_ptr as *mut c_void,
+                    nrows,
+                    ncols_i32,
+                    k_i32,
+                    stream,
+                );
+            }
+
+            drop(values_guard);
+            drop(indices_guard);
+
+            let values_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::F16(values_dst),
+                device: dev.clone(),
+            };
+            let indices_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::U32(indices_dst),
+                device: dev.clone(),
+            };
+
+            let values_tensor = Tensor::from((
+                candle_core::Storage::Cuda(values_storage),
+                Shape::from_dims(&out_dims),
+            ));
+            let indices_tensor = Tensor::from((
+                candle_core::Storage::Cuda(indices_storage),
+                Shape::from_dims(&out_dims),
+            ));
+            (values_tensor, indices_tensor)
+        }
+        DType::F32 => {
+            let values_dst = unsafe { dev.alloc::<f32>(out_elem_count) }?;
+            let (values_ptr, values_guard) = values_dst.device_ptr(values_dst.stream());
+
+            unsafe {
+                ffi::topk_f32(
+                    src_ptr,
+                    values_ptr as *mut c_void,
+                    indices_ptr as *mut c_void,
+                    nrows,
+                    ncols_i32,
+                    k_i32,
+                    stream,
+                );
+            }
+
+            drop(values_guard);
+            drop(indices_guard);
+
+            let values_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::F32(values_dst),
+                device: dev.clone(),
+            };
+            let indices_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::U32(indices_dst),
+                device: dev.clone(),
+            };
+
+            let values_tensor = Tensor::from((
+                candle_core::Storage::Cuda(values_storage),
+                Shape::from_dims(&out_dims),
+            ));
+            let indices_tensor = Tensor::from((
+                candle_core::Storage::Cuda(indices_storage),
+                Shape::from_dims(&out_dims),
+            ));
+            (values_tensor, indices_tensor)
+        }
+        dt => candle_core::bail!("cuda_topk unsupported dtype: {:?}", dt),
+    };
+
+    Ok(TopKOutput {
+        values: values_tensor,
+        indices: indices_tensor,
+    })
 }
 
-impl CustomOp2 for BitWise {
-    fn name(&self) -> &'static str {
-        "bitwise"
-    }
-
-    fn cpu_fwd(
-        &self,
-        s1: &CpuStorage,
-        l1: &Layout,
-        s2: &CpuStorage,
-        l2: &Layout,
-    ) -> Result<(CpuStorage, Shape)> {
-        if l1 != l2 {
-            return Err(Error::ShapeMismatchBinaryOp {
-                lhs: l1.shape().clone(),
-                rhs: l2.shape().clone(),
-                op: "bitwise",
-            });
-        }
-        if s1.dtype() != s2.dtype() {
-            return Err(Error::DTypeMismatchBinaryOp {
-                lhs: s1.dtype(),
-                rhs: s2.dtype(),
-                op: "bitwise",
-            });
-        }
-        match s1 {
-            CpuStorage::U8(vs1) => {
-                let vs2 = s2.as_slice::<u8>().unwrap();
-                let result = self.bitwise(vs1, vs2);
-                let result = CpuStorage::U8(result);
-                Ok((result, l1.shape().clone()))
-            }
-            CpuStorage::U32(vs1) => {
-                let vs2 = s2.as_slice::<u32>().unwrap();
-                let result = self.bitwise(vs1, vs2);
-                let result = CpuStorage::U32(result);
-                Ok((result, l1.shape().clone()))
-            }
-            CpuStorage::I64(vs1) => {
-                let vs2 = s2.as_slice::<i64>().unwrap();
-                let result = self.bitwise(vs1, vs2);
-                let result = CpuStorage::I64(result);
-                Ok((result, l1.shape().clone()))
-            }
-            CpuStorage::I16(vs1) => {
-                let vs2 = s2.as_slice::<i16>().unwrap();
-                let result = self.bitwise(vs1, vs2);
-                let result = CpuStorage::I16(result);
-                Ok((result, l1.shape().clone()))
-            }
-            CpuStorage::I32(vs1) => {
-                let vs2 = s2.as_slice::<i32>().unwrap();
-                let result = self.bitwise(vs1, vs2);
-                let result = CpuStorage::I32(result);
-                Ok((result, l1.shape().clone()))
-            }
-            CpuStorage::BF16(_) => Err(Error::UnsupportedDTypeForOp(DType::BF16, "bitwise")),
-            CpuStorage::F16(_) => Err(Error::UnsupportedDTypeForOp(DType::F16, "bitwise")),
-            CpuStorage::F32(_) => Err(Error::UnsupportedDTypeForOp(DType::F32, "bitwise")),
-            CpuStorage::F64(_) => Err(Error::UnsupportedDTypeForOp(DType::F64, "bitwise")),
-            CpuStorage::F8E4M3(_) => Err(Error::UnsupportedDTypeForOp(DType::F8E4M3, "bitwise")),
-        }
-    }
-    #[cfg(feature = "cuda")]
-    fn cuda_fwd(
-        &self,
-        s1: &CudaStorage,
-        l1: &Layout,
-        s2: &CudaStorage,
-        l2: &Layout,
-    ) -> Result<(CudaStorage, Shape)> {
-        if l1 != l2 {
-            return Err(Error::ShapeMismatchBinaryOp {
-                lhs: l1.shape().clone(),
-                rhs: l2.shape().clone(),
-                op: "bitwise",
-            });
-        }
-        if s1.dtype() != s2.dtype() {
-            return Err(Error::DTypeMismatchBinaryOp {
-                lhs: s1.dtype(),
-                rhs: s2.dtype(),
-                op: "bitwise",
-            });
-        }
-        let dev = s1.device().clone();
-        let (d_in1_ptr, d_in2_ptr, elem_count) = match s1.dtype() {
-            DType::U8 => {
-                let d_in1_ptr = *s1.as_cuda_slice::<u8>()?.device_ptr() as *const c_void;
-                let d_in2_ptr = *s2.as_cuda_slice::<u8>()?.device_ptr() as *const c_void;
-                let elem_count = l1.shape().elem_count();
-                (d_in1_ptr, d_in2_ptr, elem_count)
-            }
-            DType::U32 => {
-                let d_in1_ptr = *s1.as_cuda_slice::<u32>()?.device_ptr() as *const c_void;
-                let d_in2_ptr = *s2.as_cuda_slice::<u32>()?.device_ptr() as *const c_void;
-                let elem_count = l1.shape().elem_count();
-                (d_in1_ptr, d_in2_ptr, elem_count)
-            }
-            DType::I64 => {
-                let d_in1_ptr = *s1.as_cuda_slice::<i64>()?.device_ptr() as *const c_void;
-                let d_in2_ptr = *s2.as_cuda_slice::<i64>()?.device_ptr() as *const c_void;
-                let elem_count = l1.shape().elem_count();
-                (d_in1_ptr, d_in2_ptr, elem_count)
-            }
-            DType::I32 => {
-                let d_in1_ptr = *s1.as_cuda_slice::<i32>()?.device_ptr() as *const c_void;
-                let d_in2_ptr = *s2.as_cuda_slice::<i32>()?.device_ptr() as *const c_void;
-                let elem_count = l1.shape().elem_count();
-                (d_in1_ptr, d_in2_ptr, elem_count)
-            }
-            DType::I16 => {
-                let d_in1_ptr = *s1.as_cuda_slice::<i16>()?.device_ptr() as *const c_void;
-                let d_in2_ptr = *s2.as_cuda_slice::<i16>()?.device_ptr() as *const c_void;
-                let elem_count = l1.shape().elem_count();
-                (d_in1_ptr, d_in2_ptr, elem_count)
-            }
-            DType::BF16 => {
-                return Err(Error::UnsupportedDTypeForOp(DType::BF16, "bitwise"));
-            }
-            DType::F16 => {
-                return Err(Error::UnsupportedDTypeForOp(DType::F16, "bitwise"));
-            }
-            DType::F32 => {
-                return Err(Error::UnsupportedDTypeForOp(DType::F32, "bitwise"));
-            }
-            DType::F64 => {
-                return Err(Error::UnsupportedDTypeForOp(DType::F64, "bitwise"));
-            }
-            DType::F8E4M3 => {
-                return Err(Error::UnsupportedDTypeForOp(DType::F8E4M3, "bitwise"));
-            }
-        };
-        let dst = match s1.dtype() {
-            DType::U8 => {
-                let d_out = unsafe { dev.alloc::<u8>(elem_count) }.w()?;
-                let d_out_ptr = *d_out.device_ptr() as *mut c_void;
-                unsafe {
-                    match self.op {
-                        BitWiseOpEnum::And => ffi::bitwise_and_u8(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                        BitWiseOpEnum::Or => ffi::bitwise_or_u8(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                        BitWiseOpEnum::Xor => ffi::bitwise_xor_u8(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                    }
-                };
-                CudaStorage::wrap_cuda_slice(d_out, dev)
-            }
-            DType::U32 => {
-                let d_out = unsafe { dev.alloc::<u32>(elem_count) }.w()?;
-                let d_out_ptr = *d_out.device_ptr() as *mut c_void;
-                unsafe {
-                    match self.op {
-                        BitWiseOpEnum::And => ffi::bitwise_and_u32(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                        BitWiseOpEnum::Or => ffi::bitwise_or_u32(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                        BitWiseOpEnum::Xor => ffi::bitwise_xor_u32(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                    }
-                };
-                CudaStorage::wrap_cuda_slice(d_out, dev)
-            }
-            DType::I64 => {
-                let d_out = unsafe { dev.alloc::<i64>(elem_count) }.w()?;
-                let d_out_ptr = *d_out.device_ptr() as *mut c_void;
-                unsafe {
-                    match self.op {
-                        BitWiseOpEnum::And => ffi::bitwise_and_i64(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                        BitWiseOpEnum::Or => ffi::bitwise_or_i64(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                        BitWiseOpEnum::Xor => ffi::bitwise_xor_i64(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                    }
-                };
-                CudaStorage::wrap_cuda_slice(d_out, dev)
-            }
-            DType::I32 => {
-                let d_out = unsafe { dev.alloc::<i32>(elem_count) }.w()?;
-                let d_out_ptr = *d_out.device_ptr() as *mut c_void;
-                unsafe {
-                    match self.op {
-                        BitWiseOpEnum::And => ffi::bitwise_and_i32(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                        BitWiseOpEnum::Or => ffi::bitwise_or_i32(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                        BitWiseOpEnum::Xor => ffi::bitwise_xor_i32(
-                            d_in1_ptr,
-                            d_in2_ptr,
-                            d_out_ptr,
-                            u32::try_from(elem_count)?,
-                        ),
-                    }
-                };
-                CudaStorage::wrap_cuda_slice(d_out, dev)
-            }
-            _ => unreachable!(),
-        };
-        Ok((dst, l1.shape().clone()))
-    }
-}
-
-#[allow(dead_code)]
-pub trait BitWiseOp {
-    fn bitwise_and(&self, rhs: &Tensor) -> Result<Tensor>;
-    fn bitwise_or(&self, rhs: &Tensor) -> Result<Tensor>;
-    fn bitwise_xor(&self, rhs: &Tensor) -> Result<Tensor>;
-}
-
-impl BitWiseOp for Tensor {
-    #[cfg(feature = "metal")]
-    fn bitwise_and(&self, rhs: &Tensor) -> Result<Tensor> {
-        let original_device = rhs.device();
-        self.to_device(&candle_core::Device::Cpu)?
-            .apply_op2_no_bwd(
-                &rhs.to_device(&candle_core::Device::Cpu)?,
-                &BitWise::new(BitWiseOpEnum::And),
-            )?
-            .to_device(original_device)
-    }
-    #[cfg(not(feature = "metal"))]
-    fn bitwise_and(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.apply_op2_no_bwd(rhs, &BitWise::new(BitWiseOpEnum::And))
-    }
-
-    #[cfg(feature = "metal")]
-    fn bitwise_or(&self, rhs: &Tensor) -> Result<Tensor> {
-        let original_device = rhs.device();
-        self.to_device(&candle_core::Device::Cpu)?
-            .apply_op2_no_bwd(
-                &rhs.to_device(&candle_core::Device::Cpu)?,
-                &BitWise::new(BitWiseOpEnum::Or),
-            )?
-            .to_device(original_device)
-    }
-    #[cfg(not(feature = "metal"))]
-    fn bitwise_or(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.apply_op2_no_bwd(rhs, &BitWise::new(BitWiseOpEnum::Or))
-    }
-
-    #[cfg(feature = "metal")]
-    fn bitwise_xor(&self, rhs: &Tensor) -> Result<Tensor> {
-        let original_device = rhs.device();
-        self.to_device(&candle_core::Device::Cpu)?
-            .apply_op2_no_bwd(
-                &rhs.to_device(&candle_core::Device::Cpu)?,
-                &BitWise::new(BitWiseOpEnum::Xor),
-            )?
-            .to_device(original_device)
-    }
-    #[cfg(not(feature = "metal"))]
-    fn bitwise_xor(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.apply_op2_no_bwd(rhs, &BitWise::new(BitWiseOpEnum::Xor))
-    }
-}
-
-struct NonZero {}
-impl NonZero {
-    // Sequential version
-
-    fn nonzero<T: WithDType>(&self, vs: &[T], layout: &Layout) -> Vec<u32> {
-        let n = layout.dims().len();
-        let mut result = Vec::new();
-        let mut indices = vec![0u32; n];
-        for (i, v) in vs.iter().enumerate() {
-            if !v.is_zero() {
-                let mut idx = i;
-                for (dim_index, dim) in layout.dims().iter().enumerate().rev() {
-                    let d = idx % dim;
-                    indices[dim_index] = u32::try_from(d).unwrap();
-                    idx /= dim;
-                }
-                result.extend_from_slice(&indices);
-            }
-        }
-        result
-    }
-}
-
+/// Fused topk + softmax for MoE routing
+/// Returns softmax weights (not raw logits) and indices in a single kernel call
+/// This eliminates intermediate tensor allocations and the separate softmax kernel
 #[cfg(feature = "cuda")]
-fn count_nonzero_cuda(
-    dtype: candle_core::DType,
-    d_in: *const c_void,
-    n: u32,
-    stream: candle_core::cuda::cudarc::driver::sys::CUstream,
-) -> u32 {
-    unsafe {
-        match dtype {
-            candle_core::DType::U8 => ffi::count_nonzero_u8(d_in, n, stream),
-            candle_core::DType::U32 => ffi::count_nonzero_u32(d_in, n, stream),
-            candle_core::DType::I64 => ffi::count_nonzero_i64(d_in, n, stream),
-            candle_core::DType::I16 => ffi::count_nonzero_i16(d_in, n, stream),
-            candle_core::DType::I32 => ffi::count_nonzero_i32(d_in, n, stream),
-            candle_core::DType::BF16 => ffi::count_nonzero_bf16(d_in, n, stream),
-            candle_core::DType::F16 => ffi::count_nonzero_f16(d_in, n, stream),
-            candle_core::DType::F32 => ffi::count_nonzero_f32(d_in, n, stream),
-            candle_core::DType::F64 => ffi::count_nonzero_f64(d_in, n, stream),
-            candle_core::DType::F8E4M3 => todo!(),
-        }
-    }
-}
+#[allow(clippy::cast_possible_truncation)]
+pub fn cuda_topk_softmax(input: &Tensor, k: usize) -> Result<TopKOutput> {
+    use candle_core::backend::BackendStorage;
+    use candle_core::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_core::cuda_backend::CudaStorageSlice;
+    use std::ffi::c_void;
 
-#[allow(clippy::too_many_arguments)]
-#[cfg(feature = "cuda")]
-fn nonzero_cuda(
-    dtype: candle_core::DType,
-    d_in: *const c_void,
-    n: u32,
-    num_nonzero: u32,
-    dims: *const c_void,
-    num_dims: u32,
-    d_out: *mut c_void,
-    stream: candle_core::cuda::cudarc::driver::sys::CUstream,
-) {
-    unsafe {
-        match dtype {
-            candle_core::DType::U8 => {
-                ffi::nonzero_u8(d_in, n, num_nonzero, dims, num_dims, d_out, stream)
-            }
-            candle_core::DType::U32 => {
-                ffi::nonzero_u32(d_in, n, num_nonzero, dims, num_dims, d_out, stream)
-            }
-            candle_core::DType::I64 => {
-                ffi::nonzero_i64(d_in, n, num_nonzero, dims, num_dims, d_out, stream)
-            }
-            candle_core::DType::I32 => {
-                ffi::nonzero_i64(d_in, n, num_nonzero, dims, num_dims, d_out, stream)
-            }
-            candle_core::DType::I16 => {
-                ffi::nonzero_i16(d_in, n, num_nonzero, dims, num_dims, d_out, stream)
-            }
-            candle_core::DType::BF16 => {
-                ffi::nonzero_bf16(d_in, n, num_nonzero, dims, num_dims, d_out, stream)
-            }
-            candle_core::DType::F16 => {
-                ffi::nonzero_f16(d_in, n, num_nonzero, dims, num_dims, d_out, stream)
-            }
-            candle_core::DType::F32 => {
-                ffi::nonzero_f32(d_in, n, num_nonzero, dims, num_dims, d_out, stream)
-            }
-            candle_core::DType::F64 => {
-                ffi::nonzero_f64(d_in, n, num_nonzero, dims, num_dims, d_out, stream)
-            }
-            candle_core::DType::F8E4M3 => todo!(),
-        }
-    }
-}
-
-impl CustomOp1 for NonZero {
-    fn name(&self) -> &'static str {
-        "nonzero"
+    // Validate k to prevent shared memory issues in the CUDA kernel
+    const MAX_K: usize = 256;
+    if k == 0 || k > MAX_K {
+        candle_core::bail!("cuda_topk_softmax: k={} must be in range [1, {}]", k, MAX_K);
     }
 
-    fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
-        if !layout.is_contiguous() {
-            return Err(Error::RequiresContiguous { op: "nonzero" });
-        }
-        let result = match storage {
-            candle_core::CpuStorage::U8(vs) => self.nonzero(vs, layout),
-            candle_core::CpuStorage::U32(vs) => self.nonzero(vs, layout),
-            candle_core::CpuStorage::I16(vs) => self.nonzero(vs, layout),
-            candle_core::CpuStorage::I32(vs) => self.nonzero(vs, layout),
-            candle_core::CpuStorage::I64(vs) => self.nonzero(vs, layout),
-            candle_core::CpuStorage::BF16(vs) => self.nonzero(vs, layout),
-            candle_core::CpuStorage::F16(vs) => self.nonzero(vs, layout),
-            candle_core::CpuStorage::F32(vs) => self.nonzero(vs, layout),
-            candle_core::CpuStorage::F64(vs) => self.nonzero(vs, layout),
-            candle_core::CpuStorage::F8E4M3(_vs) => todo!(),
-        };
-        let index_len = layout.dims().len();
-        let result_len = result.len() / index_len;
-        let result = CpuStorage::U32(result);
-        let shape = Shape::from_dims(&[result_len, index_len]);
-        Ok((result, shape))
-    }
-    #[cfg(feature = "cuda")]
-    fn cuda_fwd(
-        &self,
-        storage: &candle_core::CudaStorage,
-        layout: &Layout,
-    ) -> Result<(candle_core::CudaStorage, Shape)> {
-        if !layout.is_contiguous() {
-            return Err(candle_core::Error::RequiresContiguous { op: "nonzero" });
-        }
-        let dev = storage.device().clone();
-        let d_in = match storage.dtype() {
-            candle_core::DType::U8 => *storage.as_cuda_slice::<u8>()?.device_ptr(),
-            candle_core::DType::U32 => *storage.as_cuda_slice::<u32>()?.device_ptr(),
-            candle_core::DType::I32 => *storage.as_cuda_slice::<i32>()?.device_ptr(),
-            candle_core::DType::I16 => *storage.as_cuda_slice::<i16>()?.device_ptr(),
-            candle_core::DType::I64 => *storage.as_cuda_slice::<i64>()?.device_ptr(),
-            candle_core::DType::BF16 => *storage.as_cuda_slice::<bf16>()?.device_ptr(),
-            candle_core::DType::F16 => *storage.as_cuda_slice::<f16>()?.device_ptr(),
-            candle_core::DType::F32 => *storage.as_cuda_slice::<f32>()?.device_ptr(),
-            candle_core::DType::F64 => *storage.as_cuda_slice::<f64>()?.device_ptr(),
-            candle_core::DType::F8E4M3 => todo!(),
-        } as *const c_void;
-        let n = layout.shape().elem_count();
+    let input = input.contiguous()?;
+    let dims = input.dims();
+    let ncols = *dims
+        .last()
+        .ok_or_else(|| candle_core::Error::Msg("empty dims".to_string()))?;
+    let nrows = (input.elem_count() / ncols) as i32;
+    let ncols_i32 = ncols as i32;
+    let k_i32 = k as i32;
 
-        let num_nonzero =
-            count_nonzero_cuda(storage.dtype(), d_in, u32::try_from(n)?, *dev.cu_stream());
-        let d_out = unsafe { dev.alloc::<u32>(num_nonzero as usize * layout.dims().len()) }
-            .map_err(|_| Error::Msg("Failed to allocate memory for nonzero result".to_string()))?;
-        let d_out_ptr = *d_out.device_ptr() as *mut c_void;
-        let dims = layout
-            .dims()
-            .iter()
-            .map(|&x| u32::try_from(x).unwrap())
-            .collect::<Vec<u32>>();
-        let d_dims = dev
-            .htod_copy(dims)
-            .map_err(|_| Error::Msg("Failed to copy dims to device".to_string()))?;
-        let d_dims_ptr = *d_dims.device_ptr() as *const c_void;
-        nonzero_cuda(
-            storage.dtype(),
-            d_in,
-            u32::try_from(n)?,
-            num_nonzero,
-            d_dims_ptr,
-            u32::try_from(layout.dims().len())?,
-            d_out_ptr,
-            *dev.cu_stream(),
-        );
-        let shape = Shape::from_dims(&[num_nonzero as usize, layout.dims().len()]);
-        let dst = candle_core::CudaStorage::wrap_cuda_slice(d_out, dev);
-        Ok((dst, shape))
-    }
-}
+    let mut out_dims = dims.to_vec();
+    *out_dims.last_mut().unwrap() = k;
+    let out_elem_count = nrows as usize * k;
 
-pub trait NonZeroOp {
-    fn nonzero(&self) -> Result<Tensor>;
-}
+    let (storage, _layout) = input.storage_and_layout();
+    let storage = match &*storage {
+        candle_core::Storage::Cuda(s) => s,
+        _ => candle_core::bail!("cuda_topk_softmax requires CUDA tensor"),
+    };
 
-impl NonZeroOp for Tensor {
-    #[cfg(feature = "metal")]
-    fn nonzero(&self) -> Result<Tensor> {
-        if !self.is_contiguous() {
-            return Err(candle_core::Error::RequiresContiguous { op: "nonzero" });
+    let dev = storage.device();
+    let stream = dev.cuda_stream().cu_stream() as i64;
+
+    let (src_ptr, _src_guard) = match &storage.slice {
+        CudaStorageSlice::BF16(inp) => inp.device_ptr(inp.stream()),
+        CudaStorageSlice::F16(inp) => inp.device_ptr(inp.stream()),
+        CudaStorageSlice::F32(inp) => inp.device_ptr(inp.stream()),
+        _ => candle_core::bail!("cuda_topk_softmax only supports BF16/F16/F32"),
+    };
+    let src_ptr = src_ptr as *const c_void;
+
+    let indices_dst = unsafe { dev.alloc::<u32>(out_elem_count) }?;
+    let (indices_ptr, indices_guard) = indices_dst.device_ptr(indices_dst.stream());
+
+    let (weights_tensor, indices_tensor) = match input.dtype() {
+        DType::BF16 => {
+            let weights_dst = unsafe { dev.alloc::<half::bf16>(out_elem_count) }?;
+            let (weights_ptr, weights_guard) = weights_dst.device_ptr(weights_dst.stream());
+
+            unsafe {
+                ffi::topk_softmax_bf16(
+                    src_ptr,
+                    weights_ptr as *mut c_void,
+                    indices_ptr as *mut c_void,
+                    nrows,
+                    ncols_i32,
+                    k_i32,
+                    stream,
+                );
+            }
+
+            drop(weights_guard);
+            drop(indices_guard);
+
+            let weights_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::BF16(weights_dst),
+                device: dev.clone(),
+            };
+            let indices_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::U32(indices_dst),
+                device: dev.clone(),
+            };
+
+            (
+                Tensor::from((
+                    candle_core::Storage::Cuda(weights_storage),
+                    Shape::from_dims(&out_dims),
+                )),
+                Tensor::from((
+                    candle_core::Storage::Cuda(indices_storage),
+                    Shape::from_dims(&out_dims),
+                )),
+            )
         }
-        let original_device = self.device();
-        self.to_device(&candle_core::Device::Cpu)?
-            .apply_op1_no_bwd(&NonZero {})?
-            .to_device(original_device)
-    }
-    #[cfg(not(feature = "metal"))]
-    fn nonzero(&self) -> Result<Tensor> {
-        if !self.is_contiguous() {
-            return Err(candle_core::Error::RequiresContiguous { op: "nonzero" });
+        DType::F16 => {
+            let weights_dst = unsafe { dev.alloc::<half::f16>(out_elem_count) }?;
+            let (weights_ptr, weights_guard) = weights_dst.device_ptr(weights_dst.stream());
+
+            unsafe {
+                ffi::topk_softmax_f16(
+                    src_ptr,
+                    weights_ptr as *mut c_void,
+                    indices_ptr as *mut c_void,
+                    nrows,
+                    ncols_i32,
+                    k_i32,
+                    stream,
+                );
+            }
+
+            drop(weights_guard);
+            drop(indices_guard);
+
+            let weights_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::F16(weights_dst),
+                device: dev.clone(),
+            };
+            let indices_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::U32(indices_dst),
+                device: dev.clone(),
+            };
+
+            (
+                Tensor::from((
+                    candle_core::Storage::Cuda(weights_storage),
+                    Shape::from_dims(&out_dims),
+                )),
+                Tensor::from((
+                    candle_core::Storage::Cuda(indices_storage),
+                    Shape::from_dims(&out_dims),
+                )),
+            )
         }
-        self.apply_op1_no_bwd(&NonZero {})
-    }
+        DType::F32 => {
+            let weights_dst = unsafe { dev.alloc::<f32>(out_elem_count) }?;
+            let (weights_ptr, weights_guard) = weights_dst.device_ptr(weights_dst.stream());
+
+            unsafe {
+                ffi::topk_softmax_f32(
+                    src_ptr,
+                    weights_ptr as *mut c_void,
+                    indices_ptr as *mut c_void,
+                    nrows,
+                    ncols_i32,
+                    k_i32,
+                    stream,
+                );
+            }
+
+            drop(weights_guard);
+            drop(indices_guard);
+
+            let weights_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::F32(weights_dst),
+                device: dev.clone(),
+            };
+            let indices_storage = candle_core::cuda_backend::CudaStorage {
+                slice: CudaStorageSlice::U32(indices_dst),
+                device: dev.clone(),
+            };
+
+            (
+                Tensor::from((
+                    candle_core::Storage::Cuda(weights_storage),
+                    Shape::from_dims(&out_dims),
+                )),
+                Tensor::from((
+                    candle_core::Storage::Cuda(indices_storage),
+                    Shape::from_dims(&out_dims),
+                )),
+            )
+        }
+        dt => candle_core::bail!("cuda_topk_softmax unsupported dtype: {:?}", dt),
+    };
+
+    // Note: "values" here are actually softmax weights, not raw logits
+    Ok(TopKOutput {
+        values: weights_tensor,
+        indices: indices_tensor,
+    })
 }
 
 #[allow(dead_code)]
@@ -593,28 +388,29 @@ impl candle_core::CustomOp1 for ArgSort {
         use candle_core::backend::BackendStorage;
         use candle_core::cuda_backend::cudarc::driver::DevicePtr;
         use candle_core::cuda_backend::CudaStorageSlice;
-        use candle_core::cuda_backend::WrapErr;
+
         let dev = storage.device();
         let elem_count = layout.shape().elem_count();
         let ncols = self.last_dim as i32;
         let nrows = elem_count as i32 / ncols;
-        let dst = unsafe { dev.alloc::<u32>(elem_count) }.w()?;
+        let dst = unsafe { dev.alloc::<u32>(elem_count) }?;
 
         use std::ffi::c_void;
 
-        let src = match &storage.slice {
-            CudaStorageSlice::U8(inp) => inp.device_ptr(),
-            CudaStorageSlice::U32(inp) => inp.device_ptr(),
-            CudaStorageSlice::I64(inp) => inp.device_ptr(),
-            CudaStorageSlice::BF16(inp) => inp.device_ptr(),
-            CudaStorageSlice::F16(inp) => inp.device_ptr(),
-            CudaStorageSlice::F32(inp) => inp.device_ptr(),
-            CudaStorageSlice::F64(inp) => inp.device_ptr(),
+        let (src, _src_guard) = match &storage.slice {
+            CudaStorageSlice::U8(inp) => inp.device_ptr(inp.stream()),
+            CudaStorageSlice::U32(inp) => inp.device_ptr(inp.stream()),
+            CudaStorageSlice::I64(inp) => inp.device_ptr(inp.stream()),
+            CudaStorageSlice::BF16(inp) => inp.device_ptr(inp.stream()),
+            CudaStorageSlice::F16(inp) => inp.device_ptr(inp.stream()),
+            CudaStorageSlice::F32(inp) => inp.device_ptr(inp.stream()),
+            CudaStorageSlice::F64(inp) => inp.device_ptr(inp.stream()),
             _ => candle_core::bail!("Unexpected dtype in asort"),
         };
-        let src_ptr = *src as *const c_void;
-        let dst_ptr = *dst.device_ptr() as *mut c_void;
-        let stream = *dev.cu_stream() as i64;
+        let src_ptr = src as *const c_void;
+        let (dst_ptr, dst_guard) = dst.device_ptr(dst.stream());
+        let dst_ptr = dst_ptr as *mut c_void;
+        let stream = dev.cuda_stream().cu_stream() as i64;
         unsafe {
             if self.asc {
                 match storage.dtype() {
@@ -668,6 +464,7 @@ impl candle_core::CustomOp1 for ArgSort {
                 }
             }
         }
+        drop(dst_guard);
         let dst_ret = candle_core::cuda_backend::CudaStorage {
             slice: CudaStorageSlice::U32(dst),
             device: dev.clone(),
@@ -750,11 +547,16 @@ pub trait TopKLastDimOp {
 
 impl TopKLastDimOp for Tensor {
     fn topk(&self, topk: usize) -> Result<TopKOutput> {
-        // Sorted descending
-        // #[cfg(feature = "cuda")]
-        // let (values, sorted_indices) = self.sort(false)?;
-        // #[cfg(not(feature = "cuda"))]
+        // Use optimized parallel topk kernel on CUDA
+        // Single kernel call, no post-processing overhead
+        #[cfg(feature = "cuda")]
+        if self.device().is_cuda() {
+            return cuda_topk(self, topk);
+        }
+
+        // Fallback: full sort (CPU or non-CUDA)
         let (values, sorted_indices) = self.sort_last_dim(false)?;
+
         let topk_indices = sorted_indices.narrow(D::Minus1, 0, topk)?.contiguous()?;
         let topk_values = values.narrow(D::Minus1, 0, topk)?.contiguous()?;
         Ok(TopKOutput {
@@ -868,8 +670,12 @@ fn bincount(values: &[u32], minlength: u32) -> Vec<u32> {
     }
 
     // Compute the maximum value in parallel.
-    // SAFETY: we know `values` is nonempty.
-    let max_val = *values.par_iter().max().unwrap();
+    // SAFETY: We just checked that values is nonempty above, so max() will return Some.
+    // Using expect() for clearer error message if this invariant is somehow violated.
+    let max_val = *values
+        .par_iter()
+        .max()
+        .expect("values should be non-empty after empty check");
 
     // The histogram length must cover all observed values as well as `minlength`.
     let result_len = (max_val + 1).max(minlength) as usize;
@@ -912,6 +718,60 @@ impl BincountOp for Tensor {
     }
 }
 
+// https://github.com/mokeyish/candle-ext/blob/ca4547c803469bd51c00ce5eda2f18dd249c8f10/src/triangular.rs#L21
+pub fn apply_triangular(xs: &Tensor, diagonal: isize, upper: bool) -> Result<Tensor> {
+    let device = xs.device();
+    let (l, s) = xs.dims2()?;
+    let mut xs_tri = vec![];
+    for i in 0..l as isize {
+        for j in 0..s as isize {
+            let cond = if upper {
+                i + diagonal > j
+            } else {
+                i + diagonal < j
+            };
+            xs_tri.push(if cond { 0u8 } else { 1u8 });
+        }
+    }
+    xs * Tensor::from_vec(xs_tri, (l, s), device)?.to_dtype(xs.dtype())?
+}
+
+/// Elementwise multiply and activation. The following activations are supported:
+/// - `gelu`
+/// - `silu`
+/// - `relu`
+///
+/// This is equivalent to:
+/// `act(a) * b`
+///
+/// With supported dtypes (F16, BF16, F32) and activations (SiLU, GELU, ReLU),
+/// this uses a fused kernel for better performance by eliminating intermediate
+/// memory allocation. Optimized implementations are available for:
+/// - CUDA: Custom CUDA kernel with vec4 optimization
+/// - Metal: Native Metal kernel
+/// - CPU: Rayon-parallelized implementation
+pub fn mul_and_act(a: &Tensor, b: &Tensor, act: Activation) -> Result<Tensor> {
+    // Check if we can use the fused kernel (works on CUDA, Metal, and CPU)
+    if matches!(a.dtype(), DType::F16 | DType::BF16 | DType::F32) && a.dtype() == b.dtype() {
+        // Map Activation to GluActivationType
+        let glu_act = match act {
+            Activation::Silu | Activation::Swish => Some(mistralrs_quant::GluActivationType::Silu),
+            Activation::Gelu | Activation::NewGelu | Activation::GeluPytorchTanh => {
+                Some(mistralrs_quant::GluActivationType::Gelu)
+            }
+            Activation::Relu => Some(mistralrs_quant::GluActivationType::Relu),
+            _ => None, // Unsupported activation, fall back to default
+        };
+
+        if let Some(activation_type) = glu_act {
+            return mistralrs_quant::fused_glu(a, b, activation_type);
+        }
+    }
+
+    // Fallback for unsupported dtypes or unsupported activations
+    a.apply(&act)? * b
+}
+
 mod tests {
     #[test]
     fn test_topk() {
@@ -940,196 +800,6 @@ mod tests {
         assert_eq!(
             indices.to_vec2::<u32>().unwrap(),
             vec![vec![2u32, 1u32], vec![2u32, 1u32]]
-        );
-    }
-
-    #[test]
-    fn test_nonzero_cpu() {
-        use crate::ops::NonZeroOp;
-        use candle_core::Tensor;
-        let device = candle_core::Device::Cpu;
-        let a = Tensor::from_vec(
-            vec![1f32, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0],
-            &[2, 4],
-            &device,
-        )
-        .unwrap();
-        let b = a.nonzero().unwrap().to_vec2::<u32>().unwrap();
-        assert_eq!(b, [[0, 0], [0, 2], [1, 0], [1, 2]]);
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn test_nonzero_cuda() {
-        use crate::ops::NonZeroOp;
-        use candle_core::Tensor;
-        let device = candle_core::Device::new_cuda(0).unwrap();
-        let a = Tensor::from_vec(
-            vec![1f32, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0],
-            &[2, 4],
-            &device,
-        )
-        .unwrap();
-        let b = a.nonzero().unwrap().to_vec2::<u32>().unwrap();
-        assert_eq!(b, [[0, 0], [0, 2], [1, 0], [1, 2]]);
-    }
-
-    #[test]
-    fn test_bitwise_and_cpu() {
-        use crate::ops::BitWiseOp;
-        use candle_core::Tensor;
-        let device = candle_core::Device::Cpu;
-        let a =
-            Tensor::from_vec(vec![1i64, 2, 3, -1, -1, -1, -1, 4, 5, 7], (5, 2), &device).unwrap();
-        let b =
-            Tensor::from_vec(vec![-1i64, 2, 3, -1, 1, -1, -1, 4, 5, 7], (5, 2), &device).unwrap();
-        let c = a.bitwise_and(&b).unwrap().to_vec2::<i64>().unwrap();
-        assert_eq!(c, [[1, 2], [3, -1], [1, -1], [-1, 4], [5, 7]]);
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn test_bitwise_and_cuda() {
-        use crate::ops::BitWiseOp;
-        use candle_core::Tensor;
-        let device = candle_core::Device::new_cuda(0).unwrap();
-        let a =
-            Tensor::from_vec(vec![1i64, 2, 3, -1, -1, -1, -1, 4, 5, 7], (5, 2), &device).unwrap();
-        let b =
-            Tensor::from_vec(vec![-1i64, 2, 3, -1, 1, -1, -1, 4, 0, 7], (5, 2), &device).unwrap();
-        let c = a.bitwise_and(&b).unwrap().to_vec2::<i64>().unwrap();
-        assert_eq!(c, [[1, 2], [3, -1], [1, -1], [-1, 4], [0, 7]]);
-    }
-
-    #[test]
-    fn test_bitwise_or_cpu() {
-        use crate::ops::BitWiseOp;
-        use candle_core::Tensor;
-        let device = candle_core::Device::Cpu;
-        let a =
-            Tensor::from_vec(vec![1i64, 2, 3, -1, -1, -1, -1, 4, 5, 7], (5, 2), &device).unwrap();
-        let b = Tensor::from_vec(vec![-1i64, 0, 0, 0, 0, 0, 0, 0, 0, 8], (5, 2), &device).unwrap();
-        let c = a.bitwise_or(&b).unwrap().to_vec2::<i64>().unwrap();
-        assert_eq!(c, [[-1, 2], [3, -1], [-1, -1], [-1, 4], [5, 15]]);
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn test_bitwise_or_cuda() {
-        use crate::ops::BitWiseOp;
-        use candle_core::Tensor;
-        let device = candle_core::Device::new_cuda(0).unwrap();
-        let a =
-            Tensor::from_vec(vec![1i64, 2, 3, -1, -1, -1, -1, 4, 5, 7], (5, 2), &device).unwrap();
-        let b = Tensor::from_vec(vec![-1i64, 0, 0, 0, 0, 0, 0, 0, 0, 8], (5, 2), &device).unwrap();
-        let c = a.bitwise_or(&b).unwrap().to_vec2::<i64>().unwrap();
-        assert_eq!(c, [[-1, 2], [3, -1], [-1, -1], [-1, 4], [5, 15]]);
-    }
-
-    #[test]
-    fn test_bitwise_xor_cpu() {
-        use crate::ops::BitWiseOp;
-        use candle_core::Tensor;
-        let device = candle_core::Device::Cpu;
-        let a =
-            Tensor::from_vec(vec![1i64, 2, 3, -1, -1, -1, -1, 4, 5, 7], (5, 2), &device).unwrap();
-        let b = Tensor::from_vec(vec![-1i64, 0, 0, 0, 0, 0, 0, 0, 0, 8], (5, 2), &device).unwrap();
-        let c = a.bitwise_xor(&b).unwrap().to_vec2::<i64>().unwrap();
-        assert_eq!(c, [[-2, 2], [3, -1], [-1, -1], [-1, 4], [5, 15]]);
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn test_bitwise_xor_cuda() {
-        use crate::ops::BitWiseOp;
-        use candle_core::Tensor;
-        let device = candle_core::Device::new_cuda(0).unwrap();
-        let a =
-            Tensor::from_vec(vec![1i64, 2, 3, -1, -1, -1, -1, 4, 5, 7], (5, 2), &device).unwrap();
-        let b = Tensor::from_vec(vec![-1i64, 0, 0, 0, 0, 0, 0, 0, 0, 8], (5, 2), &device).unwrap();
-        let c = a.bitwise_xor(&b).unwrap().to_vec2::<i64>().unwrap();
-        assert_eq!(c, [[-2, 2], [3, -1], [-1, -1], [-1, 4], [5, 15]]);
-    }
-
-    #[test]
-    fn test_nonzero_and() {
-        use crate::ops::{BitWiseOp, NonZeroOp};
-        use candle_core::{Device, Tensor};
-
-        let input1 = Tensor::from_vec(
-            vec![1i64, 2, 3, -1, -1, -1, -1, 4, 5, 7],
-            (10,),
-            &Device::Cpu,
-        )
-        .unwrap();
-        let input2 = Tensor::from_vec(
-            vec![-1i64, 2, 3, -1, 1, -1, -1, 4, 5, 7],
-            (10,),
-            &Device::Cpu,
-        )
-        .unwrap();
-        let input = Tensor::stack(&[input1, input2], 0).unwrap();
-
-        let lt = input.lt(0.0).unwrap();
-        let gt = input.gt(-10.0).unwrap();
-        let res = lt
-            .bitwise_and(&gt)
-            .unwrap()
-            .nonzero()
-            .unwrap()
-            .to_vec2::<u32>()
-            .unwrap();
-
-        assert_eq!(
-            res,
-            [
-                [0, 3],
-                [0, 4],
-                [0, 5],
-                [0, 6],
-                [1, 0],
-                [1, 3],
-                [1, 5],
-                [1, 6]
-            ]
-        );
-    }
-
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn nonzero_and_cuda() {
-        use crate::ops::{BitWiseOp, NonZeroOp};
-        use candle_core::{Device, Tensor};
-
-        let device = Device::new_cuda(0).unwrap();
-        let input1 =
-            Tensor::from_vec(vec![1i64, 2, 3, -1, -1, -1, -1, 4, 5, 7], (10,), &device).unwrap();
-        let input2 =
-            Tensor::from_vec(vec![-1i64, 2, 3, -1, 1, -1, -1, 4, 5, 7], (10,), &device).unwrap();
-        let input = Tensor::stack(&[input1, input2], 0).unwrap();
-
-        let lt = input.lt(0.0).unwrap();
-        let gt = input.gt(-10.0).unwrap();
-        let res = lt
-            .bitwise_and(&gt)
-            .unwrap()
-            .nonzero()
-            .unwrap()
-            .to_vec2::<u32>()
-            .unwrap();
-
-        assert_eq!(
-            res,
-            [
-                [0, 3],
-                [0, 4],
-                [0, 5],
-                [0, 6],
-                [1, 0],
-                [1, 3],
-                [1, 5],
-                [1, 6]
-            ]
         );
     }
 

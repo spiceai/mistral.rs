@@ -1,9 +1,12 @@
 use crate::{
-    get_mut_group,
+    get_mut_arcmutex, get_mut_group,
+    harmony::HarmonyContext,
+    paged_attention::BlockRef,
     pipeline::{text_models_inputs_processor::PagedAttentionMeta, LayerCaches},
     response::{ChatCompletionChunkResponse, Choice, ChunkChoice, Response, SYSTEM_FINGERPRINT},
     sampler::{Logprobs, Sampler},
-    ChatCompletionResponse, Usage,
+    think_tags::ThinkTagContext,
+    AudioInput, ChatCompletionResponse, Usage,
 };
 use crate::{
     paged_attention::{BlockEngineSequence, LogicalTokenBlock},
@@ -16,8 +19,9 @@ use crate::{
 use candle_core::Tensor;
 use std::{
     fmt::Display,
+    hash::{DefaultHasher, Hash, Hasher},
     sync::{Arc, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{
     mpsc::{error::SendError, Sender},
@@ -36,6 +40,8 @@ pub enum StopReason {
     },
     Canceled,
     GeneratedImage,
+    GeneratedSpeech,
+    ToolCalls,
 }
 
 impl Display for StopReason {
@@ -45,7 +51,9 @@ impl Display for StopReason {
             StopReason::Length(_) | StopReason::ModelLength(_) => write!(f, "length"),
             StopReason::StopTok(_) | StopReason::StopString { .. } => write!(f, "stop"),
             StopReason::Canceled => write!(f, "canceled"),
-            StopReason::GeneratedImage => write!(f, "generated-image"),
+            StopReason::GeneratedImage => write!(f, "generated_image"),
+            StopReason::GeneratedSpeech => write!(f, "generated_speech"),
+            StopReason::ToolCalls => write!(f, "tool_calls"),
         }
     }
 }
@@ -65,13 +73,14 @@ pub enum SequenceState {
 }
 
 pub enum SequenceRecognizer {
-    Llguidance(Box<llguidance::Constraint>),
+    Llguidance(Box<llguidance::Matcher>),
     None,
 }
 
 enum SequenceCustomMetadata {
     PagedAttention {
         logical_token_blocks: Vec<LogicalTokenBlock>,
+        physical_blocks_prefill: Option<Vec<BlockRef>>,
         block_size: usize,
     },
     None,
@@ -80,13 +89,44 @@ enum SequenceCustomMetadata {
 macro_rules! blocks_to_add_new_tok {
     ($logical_token_blocks:expr) => {{
         let last = $logical_token_blocks.last();
-        if !last.is_some_and(|last| last.is_full() || last.is_empty()) {
-            // If we have space
-            0
-        } else {
-            1
+        match last {
+            // If the last block is not full (including the common "empty sentinel"
+            // case after an exact block-size prompt), we can reuse it.
+            Some(last) if !last.is_full() => 0,
+            // Otherwise we need to allocate a new physical block.
+            _ => 1,
         }
     }};
+}
+
+pub(crate) fn util_append_token_to_blocks(
+    tok: usize,
+    logical_token_blocks: &mut Vec<LogicalTokenBlock>,
+    block_size: usize,
+) {
+    let last = logical_token_blocks.last_mut();
+    match last {
+        Some(last) => {
+            last.append_token_id(tok);
+        }
+        None => {
+            logical_token_blocks.push(LogicalTokenBlock::new(block_size));
+            // SAFETY: We just pushed a block, so last_mut() will return Some
+            logical_token_blocks
+                .last_mut()
+                .expect("just pushed a block, vector cannot be empty")
+                .append_token_id(tok);
+        }
+    }
+    // SAFETY: At this point, we either had a block or just created one above,
+    // so the vector is guaranteed to be non-empty.
+    if logical_token_blocks
+        .last()
+        .expect("logical_token_blocks should not be empty after appending")
+        .is_full()
+    {
+        logical_token_blocks.push(LogicalTokenBlock::new(block_size));
+    }
 }
 
 impl SequenceCustomMetadata {
@@ -94,24 +134,10 @@ impl SequenceCustomMetadata {
         match self {
             Self::PagedAttention {
                 logical_token_blocks,
+                physical_blocks_prefill: _,
                 block_size,
             } => {
-                let last = logical_token_blocks.last_mut();
-                match last {
-                    Some(last) => {
-                        last.append_token_id(tok);
-                    }
-                    None => {
-                        logical_token_blocks.push(LogicalTokenBlock::new(*block_size));
-                        logical_token_blocks
-                            .last_mut()
-                            .unwrap()
-                            .append_token_id(tok);
-                    }
-                }
-                if logical_token_blocks.last().as_ref().unwrap().is_full() {
-                    logical_token_blocks.push(LogicalTokenBlock::new(*block_size));
-                }
+                util_append_token_to_blocks(tok, logical_token_blocks, *block_size);
             }
             Self::None => (),
         }
@@ -121,6 +147,7 @@ impl SequenceCustomMetadata {
         match self {
             Self::PagedAttention {
                 logical_token_blocks,
+                physical_blocks_prefill: _,
                 block_size: _,
             } => {
                 let last = logical_token_blocks.last_mut().unwrap();
@@ -149,6 +176,214 @@ pub enum SeqStepType {
     OneShot,
 }
 
+pub struct SequenceImages {
+    images: Vec<image::DynamicImage>,
+    hashes: Vec<u64>,
+}
+
+#[derive(Clone)]
+pub struct SequenceAudios {
+    audios: Vec<AudioInput>,
+    hashes: Vec<u64>,
+}
+
+impl SequenceAudios {
+    fn new(input_audios: Vec<AudioInput>) -> Self {
+        let hashes = input_audios.iter().map(|a| {
+            let mut hasher = DefaultHasher::new();
+            for s in &a.samples {
+                s.to_bits().hash(&mut hasher);
+            }
+            a.sample_rate.hash(&mut hasher);
+            hasher.finish()
+        });
+        Self {
+            hashes: hashes.collect(),
+            audios: input_audios,
+        }
+    }
+
+    fn clone_audios(&self) -> Vec<AudioInput> {
+        self.audios.clone()
+    }
+
+    fn audios(&self) -> &[AudioInput] {
+        &self.audios
+    }
+
+    fn audios_mut(&mut self) -> &mut Vec<AudioInput> {
+        &mut self.audios
+    }
+
+    fn hashes(&self) -> &[u64] {
+        &self.hashes
+    }
+
+    fn keep_num_audios(&mut self, audios_to_keep: usize) {
+        if self.audios.len() > audios_to_keep {
+            let start = self.audios.len() - audios_to_keep;
+            self.audios = self.audios[start..].to_vec();
+            // Do not do this because we need all the hashes later in the prefix cacher.
+            // self.hashes = self.hashes[start..].to_vec();
+        }
+    }
+}
+
+impl SequenceImages {
+    fn new(input_images: Vec<image::DynamicImage>) -> Self {
+        let hashes = input_images.iter().map(|x| {
+            let mut hasher = DefaultHasher::new();
+            x.as_bytes().hash(&mut hasher);
+            hasher.finish()
+        });
+        Self {
+            hashes: hashes.collect(),
+            images: input_images,
+        }
+    }
+
+    fn clone_images(&self) -> Vec<image::DynamicImage> {
+        self.images.clone()
+    }
+
+    fn images(&self) -> &[image::DynamicImage] {
+        &self.images
+    }
+
+    fn images_mut(&mut self) -> &mut Vec<image::DynamicImage> {
+        &mut self.images
+    }
+
+    fn hashes(&self) -> &[u64] {
+        &self.hashes
+    }
+
+    fn keep_num_images(&mut self, images_to_keep: usize) {
+        if self.images.len() > images_to_keep {
+            let start = self.images.len() - images_to_keep;
+            self.images = self.images[start..].to_vec();
+            // Do not do this because we need all the hashes later in the prefix cacher.
+            // self.hashes = self.hashes[start..].to_vec();
+        }
+    }
+}
+
+// Holds all multimodal (vision/diffusion) data for a Sequence.
+pub struct MultimodalData {
+    pub input_images: Option<SequenceImages>,
+    pub input_audios: Option<SequenceAudios>,
+    pub cached_pixel_values: Option<Tensor>,
+    pub cached_img_thw: Option<Tensor>,
+    pub cached_vid_thw: Option<Tensor>,
+    pub has_changed_prompt: bool,
+    pub image_gen_response_format: Option<ImageGenerationResponseFormat>,
+    pub diffusion_params: Option<DiffusionGenerationParams>,
+}
+
+impl MultimodalData {
+    pub fn new(
+        input_images: Option<Vec<image::DynamicImage>>,
+        input_audios: Option<Vec<AudioInput>>,
+        image_gen_response_format: Option<ImageGenerationResponseFormat>,
+        diffusion_params: Option<DiffusionGenerationParams>,
+    ) -> Self {
+        MultimodalData {
+            input_images: input_images.map(SequenceImages::new),
+            input_audios: input_audios.map(SequenceAudios::new),
+            cached_pixel_values: None,
+            cached_img_thw: None,
+            cached_vid_thw: None,
+            has_changed_prompt: false,
+            image_gen_response_format,
+            diffusion_params,
+        }
+    }
+
+    pub fn take_images(&mut self) -> Option<Vec<image::DynamicImage>> {
+        if self.has_changed_prompt {
+            if let Some(input_images) = self.input_images.as_mut() {
+                let mut images = Vec::new();
+                std::mem::swap(&mut images, input_images.images_mut());
+                Some(images)
+            } else {
+                None
+            }
+        } else {
+            self.input_images.as_ref().map(|imgs| imgs.clone_images())
+        }
+    }
+
+    pub fn clone_images(&self) -> Option<Vec<image::DynamicImage>> {
+        self.input_images.as_ref().map(|imgs| imgs.clone_images())
+    }
+
+    pub fn images(&self) -> Option<&[image::DynamicImage]> {
+        self.input_images.as_ref().map(|imgs| imgs.images())
+    }
+
+    pub fn image_hashes(&self) -> Option<&[u64]> {
+        self.input_images.as_ref().map(|imgs| imgs.hashes())
+    }
+
+    pub fn has_images(&self) -> bool {
+        self.input_images
+            .as_ref()
+            .is_some_and(|imgs| !imgs.images().is_empty())
+    }
+
+    pub fn take_audios(&mut self) -> Option<Vec<AudioInput>> {
+        if self.has_changed_prompt {
+            if let Some(input_audios) = self.input_audios.as_mut() {
+                let mut audios = Vec::new();
+                std::mem::swap(&mut audios, input_audios.audios_mut());
+                Some(audios)
+            } else {
+                None
+            }
+        } else {
+            self.input_audios.as_ref().map(|imgs| imgs.clone_audios())
+        }
+    }
+
+    pub fn clone_audios(&self) -> Option<Vec<AudioInput>> {
+        self.input_audios.as_ref().map(|a| a.clone_audios())
+    }
+
+    pub fn audios(&self) -> Option<&[AudioInput]> {
+        self.input_audios.as_ref().map(|a| a.audios())
+    }
+
+    pub fn audio_hashes(&self) -> Option<&[u64]> {
+        self.input_audios.as_ref().map(|a| a.hashes())
+    }
+
+    pub fn has_audios(&self) -> bool {
+        self.input_audios
+            .as_ref()
+            .is_some_and(|a| !a.audios().is_empty())
+    }
+
+    pub fn keep_num_audios(&mut self, audios_to_keep: usize) {
+        if let Some(auds) = self.input_audios.as_mut() {
+            auds.keep_num_audios(audios_to_keep)
+        }
+    }
+
+    pub fn keep_num_images(&mut self, images_to_keep: usize) {
+        if let Some(imgs) = self.input_images.as_mut() {
+            imgs.keep_num_images(images_to_keep)
+        }
+    }
+
+    pub fn image_gen_response_format(&self) -> Option<ImageGenerationResponseFormat> {
+        self.image_gen_response_format
+    }
+
+    pub fn diffusion_params(&self) -> Option<DiffusionGenerationParams> {
+        self.diffusion_params.clone()
+    }
+}
+
 pub struct Sequence {
     // Metadata, const
     id: usize,
@@ -168,9 +403,8 @@ pub struct Sequence {
     token_offset: usize,
     eos_tokens: Vec<u32>,
 
-    // Image generation
-    image_gen_response_format: Option<ImageGenerationResponseFormat>,
-    diffusion_params: Option<DiffusionGenerationParams>,
+    // Multimodal data (images, diffusion settings, pixel caches)
+    pub multimodal: MultimodalData,
 
     // Completion requests
     suffix: Option<String>,
@@ -181,6 +415,9 @@ pub struct Sequence {
 
     // Prefix caching
     prefill_prompt_toks: Option<Vec<u32>>,
+    /// Number of tokens at the start of the prompt that are cached (KV already computed).
+    /// These tokens should be skipped during prefill.
+    prefix_cache_len: usize,
 
     // Cache
     normal_cache: Vec<Option<KvCache>>,
@@ -189,6 +426,8 @@ pub struct Sequence {
     cache: LayerCaches,
     draft_cache: LayerCaches,
     xlora_cache: Option<LayerCaches>,
+    /// For hybrid models: index into the Mamba state pool
+    mamba_state_idx: Option<usize>,
 
     // Preallocated KV cache (k,v)
     seq_preallocated_cache: Option<(Tensor, Tensor)>,
@@ -204,14 +443,13 @@ pub struct Sequence {
     stream_idx: usize,
     pub recognizer: SequenceRecognizer,
     scheduling_urgency: usize, // The number of passes since scheduling
-    input_images: Option<Vec<image::DynamicImage>>,
-    pub cached_pixel_values: Option<Tensor>,
-    pub cached_img_thw: Option<Tensor>,
-    pub cached_vid_thw: Option<Tensor>,
+    waitlisted_count: usize, // Used in PagedAttention to alert the user when a sequence repeatedly cannot be scheduled
 
     // GPU things
     pub prompt_tok_per_sec: f32,
     pub prompt_timestamp: Option<u128>,
+    pub total_prompt_time: Option<u128>,
+    pub step_start_instant: Option<Instant>,
     group: Arc<Mutex<SequenceGroup>>,
     state: RwLock<SequenceState>,
 
@@ -220,6 +458,12 @@ pub struct Sequence {
 
     // Tool calls
     pub tools: Option<Arc<ToolCallingMatcher>>,
+
+    // Harmony format parsing context (for GPT-OSS models)
+    harmony_context: Option<HarmonyContext>,
+
+    // Think tag parsing context (for models using <think>...</think> tags)
+    think_tag_context: Option<ThinkTagContext>,
 }
 
 impl BlockEngineSequence for Sequence {
@@ -227,6 +471,7 @@ impl BlockEngineSequence for Sequence {
         match &self.custom_metadata {
             SequenceCustomMetadata::PagedAttention {
                 logical_token_blocks,
+                physical_blocks_prefill: _,
                 block_size: _,
             } => {
                 blocks_to_add_new_tok!(logical_token_blocks)
@@ -239,12 +484,41 @@ impl BlockEngineSequence for Sequence {
         self.id
     }
 
-    fn get_logical_token_blocks(&self) -> usize {
+    fn logical_token_blocks(&self) -> &[LogicalTokenBlock] {
         match &self.custom_metadata {
             SequenceCustomMetadata::PagedAttention {
                 logical_token_blocks,
+                physical_blocks_prefill: _,
                 block_size: _,
-            } => logical_token_blocks.len(),
+            } => logical_token_blocks,
+            SequenceCustomMetadata::None => unreachable!(),
+        }
+    }
+
+    fn take_physical_blocks_prefill(&mut self) -> Option<Vec<BlockRef>> {
+        match &mut self.custom_metadata {
+            SequenceCustomMetadata::PagedAttention {
+                logical_token_blocks: _,
+                physical_blocks_prefill,
+                block_size: _,
+            } => physical_blocks_prefill.take(),
+            SequenceCustomMetadata::None => None,
+        }
+    }
+
+    fn increment_waitlist_count(&mut self) -> usize {
+        let prev = self.waitlisted_count;
+        self.waitlisted_count += 1;
+        prev
+    }
+
+    fn set_prefix_cache_len(&mut self, len: usize) {
+        self.prefix_cache_len = len;
+    }
+
+    fn block_size(&self) -> usize {
+        match &self.custom_metadata {
+            SequenceCustomMetadata::PagedAttention { block_size, .. } => *block_size,
             SequenceCustomMetadata::None => unreachable!(),
         }
     }
@@ -272,6 +546,7 @@ impl Sequence {
         suffix: Option<String>,
         prefix: Option<String>,
         input_images: Option<Vec<image::DynamicImage>>,
+        input_audios: Option<Vec<AudioInput>>,
         // Paged attention
         block_size: Option<usize>,
         //
@@ -289,6 +564,7 @@ impl Sequence {
         let mut custom_metadata = if let Some(block_size) = block_size {
             SequenceCustomMetadata::PagedAttention {
                 logical_token_blocks: Vec::new(),
+                physical_blocks_prefill: None,
                 block_size,
             }
         } else {
@@ -313,6 +589,7 @@ impl Sequence {
             } else {
                 None
             },
+            mamba_state_idx: None,
             seq_preallocated_cache,
             responder,
             sampler: sampler.into(),
@@ -328,6 +605,7 @@ impl Sequence {
             creation_time,
             recognizer,
             prefill_prompt_toks: None,
+            prefix_cache_len: 0,
             suffix,
             prefix,
             cumulative_logprob: 0.,
@@ -338,18 +616,24 @@ impl Sequence {
             last_is_done: None,
             is_tmp: false,
             scheduling_urgency: 0,
-            input_images,
+            // Multimodal data
+            multimodal: MultimodalData::new(
+                input_images,
+                input_audios,
+                image_gen_response_format,
+                diffusion_params,
+            ),
             custom_metadata,
             tools,
-            image_gen_response_format,
             sequence_stepping_type,
-            diffusion_params,
-            cached_pixel_values: None,
-            cached_img_thw: None,
-            cached_vid_thw: None,
             return_raw_logits,
             token_offset: 0,
             eos_tokens,
+            total_prompt_time: None,
+            step_start_instant: None,
+            waitlisted_count: 0,
+            harmony_context: None,
+            think_tag_context: None,
         }
     }
 
@@ -371,20 +655,7 @@ impl Sequence {
         (self.scheduling_urgency as f64) + (self.len() as f64).log2()
     }
 
-    pub fn prefill(
-        mut self,
-        cache: LayerCaches,
-        xlora_cache: Option<LayerCaches>,
-        toks: Vec<u32>,
-    ) -> Self {
-        self.cache = cache;
-        self.xlora_cache = xlora_cache;
-        self.prefill_prompt_toks = Some(toks);
-        self.set_state(SequenceState::RunningPrefillPrompt);
-        self
-    }
-
-    pub fn prefill_v2(
+    pub fn prefill_v2_normal(
         mut self,
         cache: Vec<Option<KvCache>>,
         toks: Vec<u32>,
@@ -394,6 +665,30 @@ impl Sequence {
         self.prefill_prompt_toks = Some(toks);
         self.set_state(SequenceState::RunningPrefillPrompt);
         self.token_offset = offset;
+        self
+    }
+
+    pub fn prefill_v2_paged(
+        mut self,
+        logical_blocks: Vec<LogicalTokenBlock>,
+        physical_blocks: Vec<BlockRef>,
+        toks: Vec<u32>,
+        offset: usize,
+    ) -> Self {
+        self.prefill_prompt_toks = Some(toks);
+        self.set_state(SequenceState::RunningPrefillPrompt);
+        self.token_offset = offset;
+
+        if let SequenceCustomMetadata::PagedAttention {
+            logical_token_blocks,
+            physical_blocks_prefill,
+            block_size: _,
+        } = &mut self.custom_metadata
+        {
+            *logical_token_blocks = logical_blocks;
+            *physical_blocks_prefill = Some(physical_blocks);
+        }
+
         self
     }
 
@@ -477,11 +772,22 @@ impl Sequence {
         self.token_offset
     }
 
+    /// Get the number of prefix tokens that are cached (KV already computed).
+    /// These tokens should be skipped during prefill.
+    pub fn prefix_cache_len(&self) -> usize {
+        self.prefix_cache_len
+    }
+
+    /// Set the number of prefix tokens that are cached.
+    pub fn set_prefix_cache_len(&mut self, len: usize) {
+        self.prefix_cache_len = len;
+    }
+
     /// This will also set prompt_len
     pub(crate) fn set_toks_and_reallocate(
         &mut self,
         toks: Vec<u32>,
-        paged_attn_metadata: Option<&mut PagedAttentionMeta<'_>>,
+        paged_attn_metadata: Option<&mut PagedAttentionMeta>,
     ) {
         self.tokens.clone_from(&toks);
         self.prompt_len = self.tokens.len();
@@ -489,6 +795,7 @@ impl Sequence {
         match &mut self.custom_metadata {
             SequenceCustomMetadata::PagedAttention {
                 logical_token_blocks,
+                physical_blocks_prefill: _,
                 block_size: _,
             } => {
                 logical_token_blocks.clear();
@@ -500,8 +807,8 @@ impl Sequence {
 
         if let Some(metadata) = paged_attn_metadata {
             // Free and then reallocate as appropriate
-            metadata.block_engine.free_sequence(*self.id());
-            metadata.block_engine.allocate(self);
+            get_mut_arcmutex!(metadata.block_engine).free_sequence(*self.id());
+            get_mut_arcmutex!(metadata.block_engine).allocate(self);
         }
     }
 
@@ -535,6 +842,14 @@ impl Sequence {
 
     pub fn scaling_cache(&mut self) -> &mut Option<Tensor> {
         &mut self.scaling_cache
+    }
+
+    pub fn mamba_state_idx(&self) -> Option<usize> {
+        self.mamba_state_idx
+    }
+
+    pub fn set_mamba_state_idx(&mut self, idx: Option<usize>) {
+        self.mamba_state_idx = idx;
     }
 
     pub fn is_xlora(&self) -> bool {
@@ -594,6 +909,19 @@ impl Sequence {
         self.custom_metadata
             .append_token_to_blocks(tok.token as usize);
 
+        // Process token through Harmony parser if in Harmony mode
+        if let Some(ref mut harmony_ctx) = self.harmony_context {
+            let _ = harmony_ctx.process_token(tok.token);
+        }
+
+        // Process token through think tag parser if in think tag mode
+        if let Some(ref mut think_ctx) = self.think_tag_context {
+            if !stopped_by_token {
+                // Use process_bytes to handle incomplete UTF-8 sequences (e.g., emojis split across tokens)
+                think_ctx.process_bytes(&completion_bytes);
+            }
+        }
+
         self.cumulative_logprob += tok.logprob;
         self.tokens.push(tok.token);
         self.logprobs.push(tok);
@@ -610,7 +938,8 @@ impl Sequence {
 
     pub fn set_state(&self, state: SequenceState) {
         if matches!(state, SequenceState::Error) {
-            get_mut_group!(self).n_choices -= 1;
+            let mut group = get_mut_group!(self);
+            group.n_choices = group.n_choices.saturating_sub(1);
         }
         *self.state.write().unwrap() = state;
     }
@@ -626,7 +955,7 @@ impl Sequence {
         max_model_len: usize,
     ) -> Option<StopReason> {
         let is_eos = match eos_tok {
-            Some(eos_tok) => eos_tok.iter().any(|t| *t == tok),
+            Some(eos_tok) => eos_tok.contains(&tok),
             None => false,
         };
         if is_eos {
@@ -639,11 +968,11 @@ impl Sequence {
         } else if self.stop_tokens.contains(&tok) {
             Some(StopReason::StopTok(tok))
         } else if self.max_len.is_some()
-            && self.tokens.len().saturating_sub(self.prompt_len) == self.max_len.unwrap()
+            && self.tokens.len().saturating_sub(self.prompt_len) + 1 >= self.max_len.unwrap()
         {
-            // add_token was already called
+            // add_token will be called after this check
             Some(StopReason::Length(self.max_len.unwrap()))
-        } else if self.tokens.len().saturating_sub(self.prompt_len) == max_model_len {
+        } else if self.tokens.len().saturating_sub(self.prompt_len) >= max_model_len {
             Some(StopReason::ModelLength(max_model_len))
         } else {
             if !self.stop_strings.is_empty() {
@@ -714,15 +1043,31 @@ impl Sequence {
         self.prompt_timestamp
     }
 
-    fn update_time_info(&self) {
+    /// Set the step start instant for accurate prompt timing measurement.
+    /// Call this right before step() is called.
+    pub fn set_step_start_instant(&mut self) {
+        self.step_start_instant = Some(Instant::now());
+    }
+
+    pub(crate) fn update_time_info(&self) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time travel has occurred!")
             .as_millis();
 
+        // Prefer the recorded prompt time so it doesn't grow during decode steps.
+        // Fall back to the in-flight Instant timing only while the prompt step is running.
+        let prompt_time_ms = if let Some(pt) = self.total_prompt_time {
+            pt
+        } else if let Some(start) = self.step_start_instant {
+            start.elapsed().as_millis()
+        } else {
+            0
+        };
+
         if let Some(ts) = self.prompt_timestamp {
             get_mut_group!(self).total_completion_time = now - ts;
-            get_mut_group!(self).total_prompt_time = ts - self.timestamp;
+            get_mut_group!(self).total_prompt_time = prompt_time_ms;
         }
 
         get_mut_group!(self).total_time = now - self.timestamp;
@@ -733,7 +1078,10 @@ impl Sequence {
 
     pub fn add_image_choice_to_group(&self, choice: ImageChoice) {
         get_mut_group!(self).image_choices.push(choice);
-        self.update_time_info();
+    }
+
+    pub fn add_speech_pcm_to_group(&self, pcm: Arc<Vec<f32>>, rate: usize, channels: usize) {
+        get_mut_group!(self).speech_pcms.push((pcm, rate, channels));
     }
 
     pub fn add_choice_to_group(&self, choice: Choice) {
@@ -745,6 +1093,11 @@ impl Sequence {
         get_mut_group!(self)
             .raw_choices
             .push((logit_chunks, self.tokens.clone()));
+        self.update_time_info();
+    }
+
+    pub fn add_embedding_choice_to_group(&self, embedding: Vec<f32>) {
+        get_mut_group!(self).embedding_choices.push(embedding);
         self.update_time_info();
     }
 
@@ -780,25 +1133,57 @@ impl Sequence {
     }
 
     pub fn take_images(&mut self) -> Option<Vec<image::DynamicImage>> {
-        self.input_images.take()
+        self.multimodal.take_images()
     }
 
-    pub fn clone_images(&mut self) -> Option<Vec<image::DynamicImage>> {
-        self.input_images.clone()
+    pub fn clone_images(&self) -> Option<Vec<image::DynamicImage>> {
+        self.multimodal.clone_images()
     }
 
     pub fn images(&self) -> Option<&[image::DynamicImage]> {
-        self.input_images.as_deref()
+        self.multimodal.images()
+    }
+
+    pub fn image_hashes(&self) -> Option<&[u64]> {
+        self.multimodal.image_hashes()
     }
 
     pub fn has_images(&self) -> bool {
-        self.input_images
-            .as_ref()
-            .is_some_and(|images| !images.is_empty())
+        self.multimodal.has_images()
+    }
+
+    pub fn take_audios(&mut self) -> Option<Vec<AudioInput>> {
+        self.multimodal.take_audios()
+    }
+
+    pub fn clone_audios(&self) -> Option<Vec<AudioInput>> {
+        self.multimodal.clone_audios()
+    }
+
+    pub fn audios(&self) -> Option<&[AudioInput]> {
+        self.multimodal.audios()
+    }
+
+    pub fn audio_hashes(&self) -> Option<&[u64]> {
+        self.multimodal.audio_hashes()
+    }
+
+    pub fn has_audios(&self) -> bool {
+        self.multimodal.has_audios()
+    }
+
+    /// Keep these last n audios
+    pub fn keep_num_audios(&mut self, audios_to_keep: usize) {
+        self.multimodal.keep_num_audios(audios_to_keep)
+    }
+
+    /// Keep these last n images
+    pub fn keep_num_images(&mut self, images_to_keep: usize) {
+        self.multimodal.keep_num_images(images_to_keep)
     }
 
     pub fn image_gen_response_format(&self) -> Option<ImageGenerationResponseFormat> {
-        self.image_gen_response_format
+        self.multimodal.image_gen_response_format()
     }
 
     pub fn sequence_stepping_type(&self) -> &SeqStepType {
@@ -806,11 +1191,160 @@ impl Sequence {
     }
 
     pub fn get_diffusion_diffusion_params(&self) -> Option<DiffusionGenerationParams> {
-        self.diffusion_params.clone()
+        self.multimodal.diffusion_params()
     }
 
     pub fn eos_tokens(&self) -> &[u32] {
         &self.eos_tokens
+    }
+
+    // === Harmony Format Support ===
+
+    /// Enable Harmony format parsing for this sequence.
+    /// Should be called when the model uses Harmony format (GPT-OSS models).
+    pub fn enable_harmony_mode(&mut self) -> Result<(), anyhow::Error> {
+        if self.harmony_context.is_none() {
+            self.harmony_context = Some(HarmonyContext::new()?);
+        }
+        Ok(())
+    }
+
+    /// Check if this sequence is in Harmony mode
+    pub fn is_harmony_mode(&self) -> bool {
+        self.harmony_context.is_some()
+    }
+
+    /// Process a token through the Harmony parser (if enabled).
+    /// Returns the Harmony delta if in Harmony mode.
+    pub fn process_harmony_token(&mut self, token_id: u32) -> Option<crate::harmony::HarmonyDelta> {
+        self.harmony_context
+            .as_mut()
+            .map(|ctx| ctx.process_token(token_id))
+    }
+
+    /// Get the latest Harmony reasoning delta (for streaming).
+    /// Returns None if not in Harmony mode or no new reasoning content.
+    pub fn get_harmony_reasoning_delta(&mut self) -> Option<String> {
+        self.harmony_context
+            .as_mut()
+            .and_then(|ctx| ctx.get_reasoning_delta())
+    }
+
+    /// Get the latest Harmony final content delta (for streaming).
+    /// Returns None if not in Harmony mode or no new final content.
+    pub fn get_harmony_final_delta(&mut self) -> Option<String> {
+        self.harmony_context
+            .as_mut()
+            .and_then(|ctx| ctx.get_final_delta())
+    }
+
+    /// Get accumulated Harmony reasoning content (for non-streaming).
+    /// Returns None if not in Harmony mode or no reasoning content.
+    pub fn get_harmony_reasoning_content(&self) -> Option<String> {
+        self.harmony_context
+            .as_ref()
+            .and_then(|ctx| ctx.reasoning_content())
+    }
+
+    /// Get accumulated Harmony final content.
+    /// Returns None if not in Harmony mode or no final content.
+    pub fn get_harmony_final_content(&self) -> Option<String> {
+        self.harmony_context
+            .as_ref()
+            .and_then(|ctx| ctx.final_content())
+    }
+
+    /// Signal end of stream to the Harmony parser
+    pub fn harmony_process_eos(&mut self) {
+        if let Some(ref mut ctx) = self.harmony_context {
+            ctx.process_eos();
+        }
+    }
+
+    /// Check if Harmony mode has detected any tool calls
+    pub fn has_harmony_tool_calls(&self) -> bool {
+        self.harmony_context
+            .as_ref()
+            .is_some_and(|ctx| ctx.has_tool_call())
+    }
+
+    /// Get all Harmony tool calls (finalizes any pending tool call)
+    pub fn get_harmony_tool_calls(&mut self) -> Vec<crate::harmony::HarmonyToolCall> {
+        self.harmony_context
+            .as_mut()
+            .map(|ctx| ctx.finalize_tool_calls())
+            .unwrap_or_default()
+    }
+
+    // === Think Tag Format Support ===
+
+    /// Enable think tag parsing for this sequence.
+    /// Should be called when the model uses `<think>...</think>` tags.
+    ///
+    /// If the prompt ends with `<think>`, the context will start inside a think block
+    /// since the chat template hardcoded the opening tag.
+    pub fn enable_think_tag_mode(&mut self) {
+        if self.think_tag_context.is_none() {
+            // Check if the prompt ends with <think> (template hardcoded the opening tag)
+            let starts_in_think_block = self.prompt.trim_end().ends_with("<think>");
+            self.think_tag_context = Some(if starts_in_think_block {
+                ThinkTagContext::new_in_think_block()
+            } else {
+                ThinkTagContext::new()
+            });
+        }
+    }
+
+    /// Check if this sequence is in think tag mode
+    pub fn is_think_tag_mode(&self) -> bool {
+        self.think_tag_context.is_some()
+    }
+
+    /// Process text through the think tag parser (if enabled).
+    pub fn process_think_tag_text(&mut self, text: &str) {
+        if let Some(ref mut ctx) = self.think_tag_context {
+            ctx.process_text(text);
+        }
+    }
+
+    /// Get the latest think tag reasoning delta (for streaming).
+    /// Returns None if not in think tag mode or no new reasoning content.
+    pub fn get_think_tag_reasoning_delta(&mut self) -> Option<String> {
+        self.think_tag_context
+            .as_mut()
+            .and_then(|ctx| ctx.get_reasoning_delta())
+    }
+
+    /// Get the latest think tag content delta (for streaming).
+    /// Returns None if not in think tag mode or no new content.
+    pub fn get_think_tag_content_delta(&mut self) -> Option<String> {
+        self.think_tag_context
+            .as_mut()
+            .and_then(|ctx| ctx.get_content_delta())
+    }
+
+    /// Get accumulated think tag reasoning content (for non-streaming).
+    /// Returns None if not in think tag mode or no reasoning content.
+    pub fn get_think_tag_reasoning_content(&self) -> Option<String> {
+        self.think_tag_context
+            .as_ref()
+            .and_then(|ctx| ctx.reasoning_content())
+    }
+
+    /// Get accumulated think tag content (for non-streaming).
+    /// Returns None if not in think tag mode or no content.
+    pub fn get_think_tag_content(&self) -> Option<String> {
+        self.think_tag_context
+            .as_ref()
+            .and_then(|ctx| ctx.content())
+    }
+
+    /// Finalize think tag parsing at end of stream.
+    /// Handles unclosed `<think>` blocks.
+    pub fn think_tag_finalize(&mut self) {
+        if let Some(ref mut ctx) = self.think_tag_context {
+            ctx.finalize();
+        }
     }
 }
 
@@ -824,7 +1358,9 @@ pub struct SequenceGroup {
     pub total_completion_time: u128,
     choices: Vec<Choice>,
     image_choices: Vec<ImageChoice>,
+    speech_pcms: Vec<(Arc<Vec<f32>>, usize, usize)>, // (pcm, rate, channels)
     raw_choices: Vec<(Vec<Tensor>, Vec<u32>)>,
+    embedding_choices: Vec<Vec<f32>>,
     completion_choices: Vec<(f32, CompletionChoice)>,
     pub chat_streaming_chunks: Vec<ChunkChoice>,
     pub completion_streaming_chunks: Vec<CompletionChunkChoice>,
@@ -842,7 +1378,9 @@ impl SequenceGroup {
         Self {
             choices: Vec::new(),
             image_choices: Vec::new(),
+            speech_pcms: Vec::new(),
             raw_choices: Vec::new(),
+            embedding_choices: Vec::new(),
             completion_choices: Vec::new(),
             n_choices,
             total_prompt_toks: 0,
@@ -889,15 +1427,26 @@ impl SequenceGroup {
     pub fn get_usage(&self) -> Usage {
         #[allow(clippy::cast_precision_loss)]
         Usage {
-            completion_tokens: self.total_toks - self.total_prompt_toks,
+            completion_tokens: self.total_toks.saturating_sub(self.total_prompt_toks),
             prompt_tokens: self.total_prompt_toks,
             total_tokens: self.total_toks,
-            avg_tok_per_sec: (self.total_toks as f32 / self.total_time as f32) * 1000.,
-            avg_prompt_tok_per_sec: (self.total_prompt_toks as f32 / self.total_prompt_time as f32)
-                * 1000.,
-            avg_compl_tok_per_sec: ((self.total_toks - self.total_prompt_toks) as f32
-                / self.total_completion_time as f32)
-                * 1000.,
+            avg_tok_per_sec: if self.total_time > 0 {
+                (self.total_toks as f32 / self.total_time as f32) * 1000.
+            } else {
+                0.0
+            },
+            avg_prompt_tok_per_sec: if self.total_prompt_time > 0 {
+                (self.total_prompt_toks as f32 / self.total_prompt_time as f32) * 1000.
+            } else {
+                0.0
+            },
+            avg_compl_tok_per_sec: if self.total_completion_time > 0 {
+                (self.total_toks.saturating_sub(self.total_prompt_toks) as f32
+                    / self.total_completion_time as f32)
+                    * 1000.
+            } else {
+                0.0
+            },
             total_time_sec: self.total_time as f32 / 1000.,
             total_completion_time_sec: self.total_completion_time as f32 / 1000.,
             total_prompt_time_sec: self.total_prompt_time as f32 / 1000.,
@@ -934,6 +1483,27 @@ impl SequenceGroup {
         Ok(())
     }
 
+    pub async fn maybe_send_embedding_done_response(
+        &self,
+        sender: Sender<Response>,
+    ) -> Result<(), SendError<Response>> {
+        if self.embedding_choices.len() == self.n_choices {
+            assert_eq!(self.embedding_choices.len(), 1);
+            let embeddings = self.embedding_choices[0].clone();
+            let prompt_tokens = self.total_prompt_toks;
+            let total_tokens = self.total_toks;
+            sender
+                .send(Response::Embeddings {
+                    embeddings,
+                    prompt_tokens,
+                    total_tokens,
+                })
+                .await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn maybe_send_image_gen_response(
         &self,
         response: ImageGenerationResponse,
@@ -942,6 +1512,24 @@ impl SequenceGroup {
         if self.image_choices.len() == self.n_choices {
             sender.send(Response::ImageGeneration(response)).await?;
         }
+
+        Ok(())
+    }
+
+    pub async fn maybe_send_speech_response(
+        &self,
+        sender: Sender<Response>,
+    ) -> Result<(), SendError<Response>> {
+        assert_eq!(self.speech_pcms.len(), 1);
+
+        let (pcm, rate, channels) = self.speech_pcms[0].clone();
+        sender
+            .send(Response::Speech {
+                pcm,
+                rate,
+                channels,
+            })
+            .await?;
 
         Ok(())
     }

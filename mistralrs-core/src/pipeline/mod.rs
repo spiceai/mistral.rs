@@ -1,7 +1,8 @@
 mod amoe;
-mod cache_manager;
+mod auto;
 pub mod chat_template;
 mod diffusion;
+mod embedding;
 mod ggml;
 mod gguf;
 pub(crate) mod hf;
@@ -16,6 +17,7 @@ mod processing;
 mod response;
 mod sampling;
 mod speculative;
+mod speech;
 mod vision;
 
 pub use super::diffusion_models::DiffusionGenerationParams;
@@ -23,26 +25,61 @@ use crate::amoe::{AnyMoeConfig, AnyMoeExpertType, AnyMoeTrainingInputs, AnyMoeTr
 use crate::device_map::DeviceMapper;
 use crate::paged_attention::{CacheConfig, CacheEngine, ModelConfigLike};
 use crate::prefix_cacher::PrefixCacheManagerV2;
+use crate::PagedAttentionConfig;
 pub use amoe::{AnyMoeLoader, AnyMoePipeline};
+pub use auto::{AutoLoader, AutoLoaderBuilder};
 use chat_template::ChatTemplate;
-pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder, DiffusionSpecificConfig};
+pub use diffusion::{DiffusionLoader, DiffusionLoaderBuilder};
+pub use embedding::{EmbeddingLoader, EmbeddingLoaderBuilder, EmbeddingSpecificConfig};
 pub use ggml::{GGMLLoader, GGMLLoaderBuilder, GGMLSpecificConfig};
 pub use gguf::{GGUFLoader, GGUFLoaderBuilder, GGUFSpecificConfig};
 use image::DynamicImage;
 pub use inputs_processor::InputProcessorOutput;
 pub(crate) use isq::IsqModelLoader;
 pub use isq::{parse_isq_value, IsqModel, IsqOrganization, UQFF_MULTI_FILE_DELIMITER};
+use llguidance::toktrie::TokEnv;
 pub use loaders::{
-    AdapterKind, AutoDeviceMapParams, AutoLoader, DeepSeekV2Loader, DeepSeekV3Loader,
-    DeviceMappedModelLoader, DiffusionLoaderType, DiffusionModel, DiffusionModelLoader, FluxLoader,
-    Gemma2Loader, Gemma3Loader, GemmaLoader, Idefics2Loader, Idefics3Loader, LLaVALoader,
-    LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader,
-    MistralLoader, MixtralLoader, ModelKind, ModelPaths, NormalLoaderType, NormalLoadingMetadata,
-    NormalModel, NormalModelLoader, Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader,
-    Phi4MMLoader, PrettyName, QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader,
-    Starcoder2Loader, TokenSource, VLlama4Loader, VLlamaLoader, VisionLoaderType, VisionModel,
-    VisionModelLoader,
+    AdapterKind, AutoDeviceMapParams, AutoEmbeddingLoader, AutoNormalLoader, AutoVisionLoader,
+    DeepSeekV2Loader, DeepSeekV3Loader, DeviceMappedModelLoader, DiffusionLoaderType,
+    DiffusionModel, DiffusionModelLoader, EmbeddingGemmaLoader, EmbeddingLoaderType,
+    EmbeddingModel, EmbeddingModelLoader, EmbeddingModelPaths, EmbeddingModule,
+    EmbeddingModulePaths, EmbeddingModuleType, FluxLoader, GLM4Loader, GLM4MoeLiteLoader,
+    GLM4MoeLoader, Gemma2Loader, Gemma3Loader, Gemma3nLoader, GemmaLoader, GptOssLoader,
+    GraniteMoeHybridLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader,
+    LlamaLoader, Loader, LocalModelPaths, MiniCpmOLoader, Mistral3Loader, MistralLoader,
+    MixtralLoader, ModelKind, ModelPaths, NormalLoaderType, NormalLoadingMetadata, NormalModel,
+    NormalModelLoader, Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader,
+    PrettyName, QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader,
+    Qwen3EmbeddingLoader, Qwen3Loader, Qwen3MoELoader, Qwen3VLLoader, Qwen3VLMoELoader,
+    SmolLm3Loader, Starcoder2Loader, TokenSource, VLlama4Loader, VLlamaLoader, VisionLoaderType,
+    VisionModel, VisionModelLoader,
 };
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn get_device_layers_for_loader(
+    loader: &dyn loaders::DeviceMappedModelLoader,
+    config: &str,
+    num_layers: usize,
+    layer_sizes_in_bytes: Vec<usize>,
+    non_mapped_size_in_bytes: usize,
+    total_model_size_in_bytes: usize,
+    devices: &[Device],
+    dtype: DType,
+    params: &loaders::AutoDeviceMapParams,
+    paged_attn_config: Option<&PagedAttentionConfig>,
+) -> Result<crate::device_map::DeviceMapMetadata> {
+    loaders::auto_device_map::get_device_layers(
+        loader,
+        config,
+        num_layers,
+        layer_sizes_in_bytes,
+        non_mapped_size_in_bytes,
+        total_model_size_in_bytes,
+        devices,
+        dtype,
+        params,
+        paged_attn_config,
+    )
+}
 use mistralrs_quant::IsqType;
 pub use normal::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
 pub(crate) use paths::{get_chat_template, get_model_paths, get_xlora_paths};
@@ -52,9 +89,10 @@ pub(crate) use processing::{
 };
 use rand_isaac::Isaac64Rng;
 pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline};
+pub use speech::{SpeechLoader, SpeechPipeline};
 use std::any::Any;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
@@ -65,19 +103,43 @@ use candle_core::{DType, Device, IndexOp, Tensor, Var};
 
 use crate::sequence::Sequence;
 
-pub use self::cache_manager::{
-    Cache, CacheManager, EitherCache, KvCache, LayerCaches, NormalCache, NormalCacheType,
-    RotatingCache, SingleCache,
-};
 pub use self::inputs_processor::{
     text_models_inputs_processor, InputsProcessor, InputsProcessorType,
 };
 use self::text_models_inputs_processor::PagedAttentionMeta;
+pub use crate::kv_cache::{
+    Cache, CacheManager, EitherCache, KvCache, LayerCaches, NormalCache, NormalCacheType,
+};
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum SupportedModality {
+    Text,
+    Audio,
+    Vision,
+    Embedding,
+}
+
+impl Debug for SupportedModality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text => write!(f, "📝 Text"),
+            Self::Audio => write!(f, "🔊 Audio"),
+            Self::Vision => write!(f, "🖼️ Vision"),
+            Self::Embedding => write!(f, "🔢 Embedding"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Modalities {
+    pub input: Vec<SupportedModality>,
+    pub output: Vec<SupportedModality>,
+}
 
 pub struct GeneralMetadata {
     pub max_seq_len: usize,
-    /// Only None if it doesnt make sense for the model
-    pub tok_env: Option<llguidance::toktrie::TokEnv>,
+    /// Only None if it doesn't make sense for the model
+    pub llg_factory: Option<Arc<llguidance::ParserFactory>>,
     pub no_kv_cache: bool,
     pub no_prefix_cache: bool,
     pub num_hidden_layers: usize,
@@ -90,8 +152,14 @@ pub struct GeneralMetadata {
     // PagedAttention stuff
     pub cache_config: Option<CacheConfig>,
     pub cache_engine: Option<CacheEngine>,
-    pub prompt_chunksize: Option<NonZeroUsize>,
     pub model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>>,
+    pub modalities: Modalities,
+}
+
+impl GeneralMetadata {
+    pub fn tok_env(&self) -> Option<TokEnv> {
+        self.llg_factory.as_ref().map(|f| f.tok_env().clone())
+    }
 }
 
 pub enum CacheInstruction {
@@ -211,10 +279,25 @@ pub trait AnyMoePipelineMixin {
 pub enum ModelCategory {
     Text,
     Vision {
-        has_conv2d: bool,
-        prefixer: Arc<dyn VisionPromptPrefixer>,
+        prefixer: Arc<dyn MultimodalPromptPrefixer>,
     },
     Diffusion,
+    Audio,
+    Speech,
+    Embedding,
+}
+
+impl std::fmt::Debug for ModelCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModelCategory::Text => write!(f, "ModelCategory::Text"),
+            ModelCategory::Vision { .. } => write!(f, "ModelCategory::Vision {{ prefixer: .. }}"),
+            ModelCategory::Diffusion => write!(f, "ModelCategory::Diffusion"),
+            ModelCategory::Audio => write!(f, "ModelCategory::Audio"),
+            ModelCategory::Speech => write!(f, "ModelCategory::Speech"),
+            ModelCategory::Embedding => write!(f, "ModelCategory::Embedding"),
+        }
+    }
 }
 
 impl PartialEq for ModelCategory {
@@ -222,38 +305,65 @@ impl PartialEq for ModelCategory {
         match (self, other) {
             (Self::Text, Self::Text) => true,
             (Self::Vision { .. }, Self::Vision { .. }) => true,
+            (Self::Audio, Self::Audio) => true,
+            (Self::Speech, Self::Speech) => true,
             (Self::Diffusion, Self::Diffusion) => true,
-            (Self::Text, _) => false,
-            (Self::Vision { .. }, _) => false,
-            (Self::Diffusion, _) => false,
+            (Self::Embedding, Self::Embedding) => true,
+            (
+                Self::Text
+                | Self::Vision { .. }
+                | Self::Diffusion
+                | Self::Audio
+                | Self::Speech
+                | Self::Embedding,
+                _,
+            ) => false,
         }
     }
 }
 
-/// Prepend a vision tag appropriate for the model to the prompt. Image indexing is assumed that start at
-pub trait VisionPromptPrefixer: Send + Sync {
+/// Prepend a vision tag appropriate for the model to the prompt. Image indexing is assumed that start at 0.
+pub trait MultimodalPromptPrefixer: Send + Sync {
     /// Prefix for inclusion in messages (may do nothing if the chat template handles it).
-    fn prefix_image(&self, image_index: usize, prompt: &str) -> String;
+    fn prefix_image(&self, _image_indices: Vec<usize>, prompt: &str) -> String {
+        prompt.to_string()
+    }
+    /// Prefix for inclusion in messages (may do nothing if the chat template handles it).
+    fn prefix_audio(&self, _audio_indexes: Vec<usize>, prompt: &str) -> String {
+        prompt.to_string()
+    }
 }
 
-pub enum CacheBackendMetadata<'a> {
+pub enum CacheBackendMetadata {
     DefaultInstructions {
         pre_op: CacheInstruction,
         post_op: CacheInstruction,
     },
     PagedAttention {
-        metadata: PagedAttentionMeta<'a>,
-        blocks_to_swap_in: HashMap<usize, usize>,
-        blocks_to_swap_out: HashMap<usize, usize>,
+        metadata: PagedAttentionMeta,
         blocks_to_copy: HashMap<usize, Vec<usize>>,
     },
 }
 
 #[derive(Clone, Debug)]
 pub enum ForwardInputsResult {
-    RawLogits { logits: Tensor },
-    CausalGeneration { logits: Tensor },
-    Image { images: Vec<DynamicImage> },
+    RawLogits {
+        logits: Tensor,
+    },
+    Embeddings {
+        embeddings: Tensor,
+    },
+    CausalGeneration {
+        logits: Tensor,
+    },
+    Image {
+        images: Vec<DynamicImage>,
+    },
+    Speech {
+        pcms: Vec<Arc<Vec<f32>>>,
+        rates: Vec<usize>,
+        channels: Vec<usize>,
+    },
 }
 
 impl ForwardInputsResult {
@@ -262,11 +372,23 @@ impl ForwardInputsResult {
             Self::CausalGeneration { logits } => Ok(Self::CausalGeneration {
                 logits: logits.i(bs_idx)?,
             }),
+            Self::Embeddings { embeddings } => Ok(Self::Embeddings {
+                embeddings: embeddings.i(bs_idx)?,
+            }),
             Self::RawLogits { logits } => Ok(Self::RawLogits {
                 logits: logits.i(bs_idx)?,
             }),
             Self::Image { images } => Ok(Self::Image {
                 images: vec![images[bs_idx].clone()],
+            }),
+            Self::Speech {
+                pcms,
+                rates,
+                channels,
+            } => Ok(Self::Speech {
+                pcms: vec![pcms[bs_idx].clone()],
+                rates: vec![rates[bs_idx]],
+                channels: vec![channels[bs_idx]],
             }),
         }
     }
@@ -279,9 +401,18 @@ impl ForwardInputsResult {
             Self::RawLogits { logits } => Ok(Self::RawLogits {
                 logits: logits.to_device(device)?,
             }),
+            Self::Embeddings { embeddings } => Ok(Self::Embeddings {
+                embeddings: embeddings.to_device(device)?,
+            }),
             Self::Image { .. } => Ok(self.clone()),
+            Self::Speech { .. } => Ok(self.clone()),
         }
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileListCache {
+    files: Vec<String>,
 }
 
 #[async_trait::async_trait]
@@ -310,37 +441,29 @@ pub trait Pipeline:
         prefix_cacher: &mut PrefixCacheManagerV2,
         disable_eos_stop: bool,
         rng: Arc<std::sync::Mutex<Isaac64Rng>>,
-        backend_metadata: CacheBackendMetadata<'_>,
+        backend_metadata: CacheBackendMetadata,
     ) -> Result<Duration, candle_core::Error> {
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
-                let inputs_iter = self.get_processor().inputs_processor().process_inputs(
-                    self.tokenizer(),
-                    input_seqs,
-                    is_prompt,
-                    self.get_metadata().is_xlora,
-                    &self.device(),
-                    self.get_metadata().no_kv_cache,
-                    None,
-                    return_raw_logits,
-                    self.get_input_processor_config(),
-                    None,
-                    self.get_metadata().prompt_chunksize,
-                    self.device_mapper(),
-                );
+                let inputs_iter =
+                    std::iter::once(self.get_processor().inputs_processor().process_inputs(
+                        self.tokenizer(),
+                        input_seqs,
+                        is_prompt,
+                        self.get_metadata().is_xlora,
+                        &self.device(),
+                        self.get_metadata().no_kv_cache,
+                        None,
+                        return_raw_logits,
+                        self.get_input_processor_config(),
+                        None,
+                        self.device_mapper(),
+                    ));
 
                 let mut logits = vec![None; input_seqs.len()];
-                let prompt_chunksize = self
-                    .get_metadata()
-                    .prompt_chunksize
-                    .map(NonZeroUsize::get)
-                    .unwrap_or(1);
-                let len_inputs = input_seqs
-                    .iter()
-                    .map(|seq| seq.get_toks().len().div_ceil(prompt_chunksize))
-                    .max()
-                    .unwrap();
+                let len_inputs = 1;
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
+                let mut embedding_logits = vec![None; input_seqs.len()];
 
                 let mut exec_duration = Duration::ZERO;
                 for (i, inputs) in inputs_iter.into_iter().enumerate() {
@@ -374,6 +497,9 @@ pub trait Pipeline:
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
                             raw_out_logits[seq_idx][i] =
                                 Some(logits.i(logit_idx)?.to_device(&Device::Cpu)?);
+                        } else if let ForwardInputsResult::Embeddings { embeddings } = &raw_logits {
+                            embedding_logits[seq_idx] =
+                                Some(embeddings.i(logit_idx)?.to_device(&Device::Cpu)?);
                         } else {
                             logits[seq_idx] = Some(raw_logits.index_bs(logit_idx)?);
                         }
@@ -410,18 +536,45 @@ pub trait Pipeline:
 
                     return Ok(exec_duration);
                 }
+                if embedding_logits[0].is_some() {
+                    let start = Instant::now();
+                    response::send_embedding_responses(
+                        input_seqs,
+                        embedding_logits
+                            .into_iter()
+                            .map(|raw| {
+                                raw.unwrap()
+                                    .to_dtype(DType::F32)
+                                    .unwrap()
+                                    .to_vec1::<f32>()
+                                    .unwrap()
+                            })
+                            .collect(),
+                    )
+                    .await?;
+                    let end = Instant::now();
+                    exec_duration += end.duration_since(start);
 
+                    return Ok(exec_duration);
+                }
+
+                let start = Instant::now();
+                let logits_on_cpu = logits.len() > 1;
                 let logits = logits
                     .into_iter()
                     .map(|l| {
-                        l.expect("Did not get any inputs. This is shocking.")
-                            .to_device(&Device::Cpu)
+                        let l = l.expect("Did not get any inputs. This is shocking.");
+                        if logits_on_cpu {
+                            l.to_device(&Device::Cpu)
+                        } else {
+                            Ok(l)
+                        }
                     })
                     .collect::<candle_core::Result<Vec<_>>>()?;
 
-                let start = Instant::now();
                 match &logits[0] {
-                    ForwardInputsResult::RawLogits { .. } => unreachable!(),
+                    ForwardInputsResult::RawLogits { .. }
+                    | ForwardInputsResult::Embeddings { .. } => unreachable!(),
                     ForwardInputsResult::CausalGeneration { .. } => {
                         self.sample_causal_gen(
                             input_seqs,
@@ -453,9 +606,7 @@ pub trait Pipeline:
                                     #[allow(irrefutable_let_patterns)]
                                     let ForwardInputsResult::Image { images } = r
                                     else {
-                                        unreachable!(
-                                            "All results must have same type, `CausalGeneration`"
-                                        )
+                                        unreachable!("All results must have same type, `Image`")
                                     };
                                     images
                                         .into_iter()
@@ -466,6 +617,50 @@ pub trait Pipeline:
                         )
                         .await?;
                     }
+                    ForwardInputsResult::Speech { .. } => {
+                        let rates = logits
+                            .iter()
+                            .map(|r| {
+                                #[allow(irrefutable_let_patterns)]
+                                let ForwardInputsResult::Speech { rates, .. } = r
+                                else {
+                                    unreachable!("All results must have same type, `Speech`")
+                                };
+                                assert_eq!(rates.len(), 1, "Each sequence must have 1 PCM output.");
+                                *rates.first().unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        let channels = logits
+                            .iter()
+                            .map(|r| {
+                                #[allow(irrefutable_let_patterns)]
+                                let ForwardInputsResult::Speech { channels, .. } = r
+                                else {
+                                    unreachable!("All results must have same type, `Speech`")
+                                };
+                                assert_eq!(
+                                    channels.len(),
+                                    1,
+                                    "Each sequence must have 1 PCM output."
+                                );
+                                *channels.first().unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        let pcms = logits
+                            .into_iter()
+                            .map(|r| {
+                                #[allow(irrefutable_let_patterns)]
+                                let ForwardInputsResult::Speech { pcms, .. } = r
+                                else {
+                                    unreachable!("All results must have same type, `Speech`")
+                                };
+                                assert_eq!(pcms.len(), 1, "Each sequence must have 1 PCM output.");
+                                pcms.into_iter().nth(0).unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        response::send_speech_responses(input_seqs, &pcms, &rates, &channels)
+                            .await?;
+                    }
                 }
                 let end = Instant::now();
                 exec_duration += end.duration_since(start);
@@ -475,47 +670,33 @@ pub trait Pipeline:
             CacheBackendMetadata::PagedAttention {
                 metadata,
                 blocks_to_copy,
-                blocks_to_swap_in,
-                blocks_to_swap_out,
             } => {
                 // Cloning might be bad?
                 self.get_metadata()
                     .cache_engine
                     .as_ref()
                     .expect("PagedAttention must have cache engines.")
-                    .execute_scheduler_ops(
-                        blocks_to_swap_in.clone(),
-                        blocks_to_swap_out.clone(),
-                        blocks_to_copy.clone(),
-                    )?;
+                    .execute_scheduler_ops(&blocks_to_copy)?;
 
-                let inputs_iter = self.get_processor().inputs_processor().process_inputs(
-                    self.tokenizer(),
-                    input_seqs,
-                    is_prompt,
-                    self.get_metadata().is_xlora,
-                    &self.device(),
-                    self.get_metadata().no_kv_cache,
-                    None,
-                    return_raw_logits,
-                    self.get_input_processor_config(),
-                    Some(metadata),
-                    self.get_metadata().prompt_chunksize,
-                    self.device_mapper(),
-                );
+                let inputs_iter =
+                    std::iter::once(self.get_processor().inputs_processor().process_inputs(
+                        self.tokenizer(),
+                        input_seqs,
+                        is_prompt,
+                        self.get_metadata().is_xlora,
+                        &self.device(),
+                        self.get_metadata().no_kv_cache,
+                        None,
+                        return_raw_logits,
+                        self.get_input_processor_config(),
+                        Some(metadata),
+                        self.device_mapper(),
+                    ));
 
                 let mut logits = vec![None; input_seqs.len()];
-                let prompt_chunksize = self
-                    .get_metadata()
-                    .prompt_chunksize
-                    .map(NonZeroUsize::get)
-                    .unwrap_or(1);
-                let len_inputs = input_seqs
-                    .iter()
-                    .map(|seq| seq.get_toks().len().div_ceil(prompt_chunksize))
-                    .max()
-                    .unwrap();
+                let len_inputs = 1;
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
+                let mut embedding_logits = vec![None; input_seqs.len()];
 
                 let mut exec_duration = Duration::ZERO;
                 for (i, inputs) in inputs_iter.into_iter().enumerate() {
@@ -533,6 +714,9 @@ pub trait Pipeline:
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
                             raw_out_logits[seq_idx][i] =
                                 Some(logits.i(logit_idx)?.to_device(&Device::Cpu)?);
+                        } else if let ForwardInputsResult::Embeddings { embeddings } = &raw_logits {
+                            embedding_logits[seq_idx] =
+                                Some(embeddings.i(logit_idx)?.to_device(&Device::Cpu)?);
                         } else {
                             logits[seq_idx] = Some(raw_logits.index_bs(logit_idx)?);
                         }
@@ -554,18 +738,45 @@ pub trait Pipeline:
 
                     return Ok(exec_duration);
                 }
+                if embedding_logits[0].is_some() {
+                    let start = Instant::now();
+                    response::send_embedding_responses(
+                        input_seqs,
+                        embedding_logits
+                            .into_iter()
+                            .map(|raw| {
+                                raw.unwrap()
+                                    .to_dtype(DType::F32)
+                                    .unwrap()
+                                    .to_vec1::<f32>()
+                                    .unwrap()
+                            })
+                            .collect(),
+                    )
+                    .await?;
+                    let end = Instant::now();
+                    exec_duration += end.duration_since(start);
 
+                    return Ok(exec_duration);
+                }
+
+                let start = Instant::now();
+                let logits_on_cpu = logits.len() > 1;
                 let logits = logits
                     .into_iter()
                     .map(|l| {
-                        l.expect("Did not get any inputs. This is shocking.")
-                            .to_device(&Device::Cpu)
+                        let l = l.expect("Did not get any inputs. This is shocking.");
+                        if logits_on_cpu {
+                            l.to_device(&Device::Cpu)
+                        } else {
+                            Ok(l)
+                        }
                     })
                     .collect::<candle_core::Result<Vec<_>>>()?;
 
-                let start = Instant::now();
                 match &logits[0] {
-                    ForwardInputsResult::RawLogits { .. } => unreachable!(),
+                    ForwardInputsResult::RawLogits { .. }
+                    | ForwardInputsResult::Embeddings { .. } => unreachable!(),
                     ForwardInputsResult::CausalGeneration { .. } => {
                         self.sample_causal_gen(
                             input_seqs,
@@ -595,9 +806,7 @@ pub trait Pipeline:
                                     #[allow(irrefutable_let_patterns)]
                                     let ForwardInputsResult::Image { images } = r
                                     else {
-                                        unreachable!(
-                                            "All results must have same type, `CausalGeneration`"
-                                        )
+                                        unreachable!("All results must have same type, `Image`")
                                     };
                                     images
                                         .into_iter()
@@ -607,6 +816,50 @@ pub trait Pipeline:
                                 .collect::<Vec<_>>(),
                         )
                         .await?;
+                    }
+                    ForwardInputsResult::Speech { .. } => {
+                        let rates = logits
+                            .iter()
+                            .map(|r| {
+                                #[allow(irrefutable_let_patterns)]
+                                let ForwardInputsResult::Speech { rates, .. } = r
+                                else {
+                                    unreachable!("All results must have same type, `Speech`")
+                                };
+                                assert_eq!(rates.len(), 1, "Each sequence must have 1 PCM output.");
+                                *rates.first().unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        let channels = logits
+                            .iter()
+                            .map(|r| {
+                                #[allow(irrefutable_let_patterns)]
+                                let ForwardInputsResult::Speech { channels, .. } = r
+                                else {
+                                    unreachable!("All results must have same type, `Speech`")
+                                };
+                                assert_eq!(
+                                    channels.len(),
+                                    1,
+                                    "Each sequence must have 1 PCM output."
+                                );
+                                *channels.first().unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        let pcms = logits
+                            .into_iter()
+                            .map(|r| {
+                                #[allow(irrefutable_let_patterns)]
+                                let ForwardInputsResult::Speech { pcms, .. } = r
+                                else {
+                                    unreachable!("All results must have same type, `Speech`")
+                                };
+                                assert_eq!(pcms.len(), 1, "Each sequence must have 1 PCM output.");
+                                pcms.into_iter().nth(0).unwrap()
+                            })
+                            .collect::<Vec<_>>();
+                        response::send_speech_responses(input_seqs, &pcms, &rates, &channels)
+                            .await?;
                     }
                 }
                 let end = Instant::now();
@@ -686,6 +939,8 @@ mod tests {
                     inputs.clone()
                 },
                 true,
+                None,
+                None, // reasoning_effort
                 &ChatTemplateValue(Either::Left(template.to_string())),
                 Some(bos.to_string()),
                 Some(eos.to_string()),

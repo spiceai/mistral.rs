@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
-use mistralrs_quant::{linear_b, QuantMethod, ShardedVarBuilder};
+use mistralrs_quant::{linear_b, Convolution, QuantMethod, ShardedVarBuilder};
 
 use crate::{
     layers::{self, GetFloatInfo, RmsNorm},
     pipeline::NormalLoadingMetadata,
+    utils::unvarbuilder::UnVarBuilder,
 };
 
 fn default_act() -> candle_nn::Activation {
@@ -32,6 +33,16 @@ fn default_num_attention_heads() -> usize {
     16
 }
 
+fn default_rope_theta() -> f64 {
+    10000.0
+}
+
+/// RoPE parameters for Mistral3 vision model
+#[derive(serde::Deserialize, Debug, Clone)]
+pub struct Mistral3VisionRopeParameters {
+    pub rope_theta: f64,
+}
+
 #[derive(serde::Deserialize, Debug, Clone)]
 pub struct Mistral3VisionConfig {
     #[serde(default = "default_hidden_size")]
@@ -40,7 +51,11 @@ pub struct Mistral3VisionConfig {
     pub num_channels: usize,
     pub image_size: usize,
     pub patch_size: usize,
+    // Support both flat rope_theta and nested rope_parameters
+    #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
+    #[serde(default)]
+    pub rope_parameters: Option<Mistral3VisionRopeParameters>,
     #[serde(default = "default_intermediate_size")]
     pub intermediate_size: usize,
     #[serde(default = "default_num_hidden_layers")]
@@ -56,6 +71,14 @@ impl Mistral3VisionConfig {
     fn head_dim(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// Get rope_theta from either flat field or rope_parameters
+    pub fn get_rope_theta(&self) -> f64 {
+        self.rope_parameters
+            .as_ref()
+            .map(|p| p.rope_theta)
+            .unwrap_or(self.rope_theta)
     }
 }
 
@@ -263,7 +286,7 @@ impl RotaryEmbedding {
         let dtype = vb.dtype();
         let dev = vb.device();
         let dim = cfg.head_dim();
-        let rope_theta = cfg.rope_theta as f32;
+        let rope_theta = cfg.get_rope_theta() as f32;
         let max_patches_per_side = cfg.image_size / cfg.patch_size;
         let freqs: Vec<_> = (0..dim)
             .step_by(2)
@@ -408,7 +431,7 @@ impl Mistral3VisionModel {
         };
         for (start, end) in block_start_idx.into_iter().zip(block_end_idx) {
             causal_mask = causal_mask.slice_assign(
-                &[&(start..end), &(start..end)],
+                &[start..end, start..end],
                 &Tensor::zeros(
                     (end - start, end - start),
                     causal_mask.dtype(),
@@ -423,7 +446,7 @@ impl Mistral3VisionModel {
     }
 
     pub fn forward(&self, xs: &Tensor, image_sizes: Vec<(u32, u32)>) -> Result<Tensor> {
-        let patch_embeds = xs.apply(&self.patch_conv)?;
+        let patch_embeds = Convolution.forward_2d(&self.patch_conv, xs)?;
         let patch_embeds_list = image_sizes
             .iter()
             .enumerate()
@@ -480,5 +503,26 @@ impl Mistral3VisionModel {
             tensors.push((&mut layer.feed_forward.down_proj, None));
         }
         tensors
+    }
+
+    pub fn residual_tensors(&self) -> Vec<(String, Tensor)> {
+        let uvb = UnVarBuilder::new();
+
+        uvb.pp("patch_conv").add(&self.patch_conv);
+        uvb.pp("ln_pre").add(&self.ln_pre);
+
+        {
+            let uvb_pos = uvb.pp("patch_positional_embedding");
+            uvb_pos.add_tensor("cos", self.patch_positional_embedding.cos.clone());
+            uvb_pos.add_tensor("sin", self.patch_positional_embedding.sin.clone());
+        }
+
+        for (layer_idx, layer) in self.transformer.layers.iter().enumerate() {
+            let uvb_l = uvb.pp("transformer").pp("layers").pp(layer_idx);
+            uvb_l.pp("attention_norm").add(&layer.attention_norm);
+            uvb_l.pp("ffn_norm").add(&layer.ffn_norm);
+        }
+
+        uvb.to_safetensors()
     }
 }

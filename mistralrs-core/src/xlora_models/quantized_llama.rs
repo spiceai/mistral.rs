@@ -7,12 +7,11 @@ use crate::attention::SdpaParams;
 use crate::gguf::Content;
 use crate::lora::{get_lora_cfg, LinearLayerLike, LoraConfig, Merge, Ordering, QLoraLinear};
 use crate::pipeline::text_models_inputs_processor::FlashParams;
-use crate::utils::progress::NiceProgressBar;
+use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 use candle_core::quantized::ggml_file;
 use candle_core::quantized::QMatMul;
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Module};
-use indicatif::MultiProgress;
 use mistralrs_quant::{MatMul, ShardedVarBuilder};
 use tqdm::Iter;
 use tracing::info;
@@ -27,7 +26,7 @@ use crate::models::quantized_llama::PropsGGUF;
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 
-const MAX_SEQ_LEN: u32 = 4096;
+const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
 const SUPPORTED_LAYERS: [&str; 8] = [
     "self_attn.q_proj",
     "self_attn.k_proj",
@@ -77,7 +76,7 @@ impl Mlp {
 
 #[derive(Debug)]
 enum MlpOrMoe {
-    Mlp(Mlp),
+    Mlp(Box<Mlp>),
     MoE {
         n_expert_used: usize,
         feed_forward_gate_inp: QMatMul,
@@ -231,7 +230,7 @@ impl LayerWeights {
 
         let (q, k) = self.rotary.forward(&q, &k, start_offsets)?;
 
-        let (k, v) = Cache::update_kv_cache(kv_cache, k, v, false)?;
+        let (k, v) = Cache::update_kv_cache(kv_cache, k, v)?;
 
         let y = Sdpa.run_attention(
             &q,
@@ -281,7 +280,7 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
         let rotary = RotaryEmbedding::new_partial(
             10000.,
             ct.hparams.n_rot as usize,
-            MAX_SEQ_LEN as usize,
+            DEFAULT_MAX_SEQ_LEN as usize,
             &ct.device,
             false,
             dtype,
@@ -305,7 +304,7 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
                 let cfg_w1 = get_lora_cfg(&feed_forward_w1);
                 let cfg_w2 = get_lora_cfg(&feed_forward_w2);
                 let cfg_w3 = get_lora_cfg(&feed_forward_w3);
-                MlpOrMoe::Mlp(Mlp {
+                MlpOrMoe::Mlp(Box::new(Mlp {
                     feed_forward_w1: QLoraLinear::new(
                         QMatMul::from_qtensor(feed_forward_w1)?,
                         &cfg_w1,
@@ -336,7 +335,7 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
                         &mut count,
                         preload_adapters,
                     )?,
-                })
+                }))
             };
             let attention_norm = ct.remove(&format!("{prefix}.attention_norm.weight"))?;
             let ffn_norm = ct.remove(&format!("{prefix}.ffn_norm.weight"))?;
@@ -395,7 +394,6 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
                 rotary: rotary.clone().into(),
                 sdpa_params: SdpaParams {
                     n_kv_groups: ct.hparams.n_head as usize / n_kv_head,
-                    use_flash_attn: false,
                     softcap: None,
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: None,
@@ -457,7 +455,7 @@ impl ModelConfig::FromAdapterGGML for ModelWeights {
                 XLoraClassifier::new(xlora_config, count, lora_config.len(), vb.clone(), true)
                     .unwrap()
             }),
-            max_seq_len: MAX_SEQ_LEN as usize, // Cannot determine from ggml.
+            max_seq_len: DEFAULT_MAX_SEQ_LEN as usize, // Cannot determine from ggml.
             mapper: None,
             dtype,
         })
@@ -536,7 +534,7 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
         for layer_idx in NiceProgressBar::<_, 'b'>(
             0..block_count,
             "Loading repeating layers",
-            &MultiProgress::new(),
+            &new_multi_progress(),
         ) {
             let prefix = format!("blk.{layer_idx}");
             let device = mapper.device_for(layer_idx, false).unwrap_or(device);
@@ -556,7 +554,7 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
                 let cfg_w1 = get_lora_cfg(&feed_forward_w1);
                 let cfg_w2 = get_lora_cfg(&feed_forward_w2);
                 let cfg_w3 = get_lora_cfg(&feed_forward_w3);
-                MlpOrMoe::Mlp(Mlp {
+                MlpOrMoe::Mlp(Box::new(Mlp {
                     feed_forward_w1: QLoraLinear::new(
                         QMatMul::from_qtensor(feed_forward_w1)?,
                         &cfg_w1,
@@ -587,7 +585,7 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
                         &mut count,
                         preload_adapters,
                     )?,
-                })
+                }))
             } else {
                 let feed_forward_gate_inp =
                     ct.tensor(&format!("{prefix}.ffn_gate_inp.weight"), device)?;
@@ -697,7 +695,6 @@ impl ModelConfig::FromAdapterGGUF for ModelWeights {
                 rotary: rotary.clone(),
                 sdpa_params: SdpaParams {
                     n_kv_groups: head_count / head_count_kv,
-                    use_flash_attn: false,
                     softcap: None,
                     softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                     sliding_window: None,
@@ -862,67 +859,49 @@ impl ModelWeights {
             )?;
 
             if no_kv_cache {
-                extract_logits(
-                    &self.output.lora_forward(
-                        &self
-                            .inner_forward(
-                                input_ids_full,
-                                seqlen_offsets_full,
-                                Some(scalings),
-                                true,
-                                no_kv_cache,
-                                None,
-                                flash_params_full,
-                            )?
-                            .contiguous()?,
+                let hidden = self
+                    .inner_forward(
+                        input_ids_full,
+                        seqlen_offsets_full,
+                        Some(scalings),
+                        true,
+                        no_kv_cache,
                         None,
-                        1.0,
-                        None,
-                    )?,
-                    context_lens,
-                )
+                        flash_params_full,
+                    )?
+                    .contiguous()?;
+                let hidden = extract_logits(&hidden, context_lens)?;
+                self.output.lora_forward(&hidden, None, 1.0, None)
             } else {
                 // is_full_pass=true is ok because no_kv_cache=false
-                extract_logits(
-                    &self.output.lora_forward(
-                        &self
-                            .inner_forward(
-                                input_ids,
-                                seqlen_offsets,
-                                Some(scalings),
-                                true,
-                                no_kv_cache,
-                                None,
-                                flash_params,
-                            )?
-                            .contiguous()?,
+                let hidden = self
+                    .inner_forward(
+                        input_ids,
+                        seqlen_offsets,
+                        Some(scalings),
+                        true,
+                        no_kv_cache,
                         None,
-                        1.0,
-                        None,
-                    )?,
-                    context_lens,
-                )
+                        flash_params,
+                    )?
+                    .contiguous()?;
+                let hidden = extract_logits(&hidden, context_lens)?;
+                self.output.lora_forward(&hidden, None, 1.0, None)
             }
         } else {
-            extract_logits(
-                &self.output.lora_forward(
-                    &self
-                        .inner_forward(
-                            input_ids,
-                            seqlen_offsets,
-                            None,
-                            false,
-                            no_kv_cache,
-                            None,
-                            flash_params,
-                        )?
-                        .contiguous()?,
+            let hidden = self
+                .inner_forward(
+                    input_ids,
+                    seqlen_offsets,
                     None,
-                    1.0,
+                    false,
+                    no_kv_cache,
                     None,
-                )?,
-                context_lens,
-            )
+                    flash_params,
+                )?
+                .contiguous()?;
+            let hidden = extract_logits(&hidden, context_lens)?;
+            self.output.lora_forward(&hidden, None, 1.0, None)
         }
     }
 }

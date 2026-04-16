@@ -1,6 +1,8 @@
-use candle_core::{Device, Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
+use mistralrs_paged_attn::{kv_scale_update, paged_attention, reshape_and_cache};
 
-use mistralrs_paged_attn::{paged_attention, reshape_and_cache};
+const KV_SCALE_UPDATE_ITERATION: i32 = 128;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::{
     attention::SdpaParams,
@@ -10,6 +12,9 @@ use crate::{
 
 pub struct PagedAttention {
     alibi_slopes: Option<Tensor>,
+    k_scale: Option<Tensor>,
+    v_scale: Option<Tensor>,
+    kv_updated_times: AtomicI32,
 }
 
 impl PagedAttention {
@@ -20,7 +25,12 @@ impl PagedAttention {
         } else {
             None
         };
-        Ok(Self { alibi_slopes })
+        Ok(Self {
+            alibi_slopes,
+            k_scale: Some(Tensor::new(1f32, device)?),
+            v_scale: Some(Tensor::new(1f32, device)?),
+            kv_updated_times: AtomicI32::new(0),
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -45,6 +55,18 @@ impl PagedAttention {
         sdpa_params: &SdpaParams,
         flash_params: Option<&FlashParams>,
     ) -> Result<Tensor> {
+        if let (Some(k_scale), Some(v_scale), Some(key_cache)) =
+            (&self.k_scale, &self.v_scale, &key_cache)
+        {
+            if self.kv_updated_times.load(Ordering::Relaxed) < KV_SCALE_UPDATE_ITERATION
+                && key_cache.dtype() == DType::F8E4M3
+            {
+                // scale update only used for fp8 kvcache
+                kv_scale_update(key, value, k_scale, v_scale)?;
+                self.kv_updated_times.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         let slot_mapping = input_metadata
             .slot_mappings
             .get(&query.device().location())
@@ -120,6 +142,8 @@ impl PagedAttention {
             reshape_and_cache(
                 &key,
                 &value,
+                self.k_scale.as_ref(),
+                self.v_scale.as_ref(),
                 key_cache.as_mut().unwrap(),
                 value_cache.as_mut().unwrap(),
                 slot_mapping,
@@ -146,8 +170,10 @@ impl PagedAttention {
         //
         //  alibi_slopes: shape = [num_heads]
         #[allow(clippy::cast_possible_truncation)]
-        paged_attention(
+        let res = paged_attention(
             &query,
+            self.k_scale.as_ref(),
+            self.v_scale.as_ref(),
             key_cache.as_ref().unwrap(),
             value_cache.as_ref().unwrap(),
             block_tables,
@@ -156,6 +182,8 @@ impl PagedAttention {
             input_metadata.max_context_len.unwrap(),
             sdpa_params.softmax_scale,
             sdpa_params.softcap.unwrap_or(1.0f32),
-        )
+        )?;
+
+        Ok(res)
     }
 }

@@ -10,7 +10,6 @@ use crate::amoe::AnyMoeBaseModelMixin;
 use crate::amoe::MlpLayer;
 use crate::device_map::DeviceMapper;
 use crate::layers;
-use crate::ops::NonZeroOp;
 use crate::paged_attention::{AttentionImplementation, ModelConfigMetadata};
 use crate::pipeline::text_models_inputs_processor::FlashParams;
 use crate::pipeline::text_models_inputs_processor::PagedAttentionInputMetadata;
@@ -24,6 +23,7 @@ use crate::AnyMoeConfig;
 use crate::AnyMoeExpertType;
 use candle_core::{bail, DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{Activation, Linear};
+use mistralrs_quant::NonZeroOp;
 use mistralrs_quant::ShardedVarBuilder;
 
 pub(crate) struct LLaVAVisionSpecificArgs; // only a dumb struct to satisfy the trait
@@ -205,9 +205,9 @@ impl Model {
         for (i, image_index) in image_indexes.iter().enumerate() {
             result = result.slice_assign(
                 &[
-                    &(0usize..1usize),
-                    &(*image_index as usize..*image_index as usize + num_image_tokens),
-                    &(..),
+                    0usize..1usize,
+                    *image_index as usize..*image_index as usize + num_image_tokens,
+                    0..result.dim(2)?,
                 ],
                 &image_features_vec[i],
             )?;
@@ -331,10 +331,6 @@ impl VisionModel for Model {
 
     fn max_seq_len(&self) -> usize {
         self.config.text_config.max_length
-    }
-
-    fn has_conv2d(&self) -> bool {
-        true
     }
 
     fn config(&self) -> &ModelConfigMetadata {

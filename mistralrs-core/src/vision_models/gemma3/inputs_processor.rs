@@ -1,6 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use std::{any::Any, num::NonZeroUsize, sync::Arc};
+use std::{any::Any, sync::Arc};
 
 use candle_core::{Device, Result, Tensor};
 use image::{DynamicImage, GenericImageView};
@@ -8,7 +8,6 @@ use itertools::Itertools;
 use mistralrs_vision::{ApplyTransforms, Normalize, Rescale, ToTensorNoNorm, Transforms};
 use regex::Regex;
 use tokenizers::Tokenizer;
-use tracing::warn;
 
 use crate::{
     device_map::DeviceMapper,
@@ -88,28 +87,21 @@ impl InputsProcessor for Gemma3ImageProcessor {
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
         other_config: Option<Arc<dyn Any>>,
-        mut paged_attn_metadata: Option<PagedAttentionMeta<'_>>,
-        prompt_chunksize: Option<NonZeroUsize>,
+        mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
-    ) -> Box<dyn Iterator<Item = anyhow::Result<InputProcessorOutput>>> {
+    ) -> anyhow::Result<InputProcessorOutput> {
         if is_xlora {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
+            return Err(anyhow::Error::msg(
                 "Cannot make inputs for X-LoRA vision model.",
-            ))));
+            ));
         }
         if no_kv_cache {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
-                "Vision model must have kv cache.",
-            ))));
-        }
-        // TODO(EricLBuehler): support this? Would require some handling of image tokens.
-        if prompt_chunksize.is_some() {
-            warn!("`prompt_chunksize` is set. Gemma3 does not support prompt batching.");
+            return Err(anyhow::Error::msg("Vision model must have kv cache."));
         }
         let Some(tokenizer) = tokenizer else {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
+            return Err(anyhow::Error::msg(
                 "Idefics3ImageProcessor requires a specified tokenizer.",
-            ))));
+            ));
         };
 
         let config = other_config.expect("Need a PreProcessorConfig config.");
@@ -119,9 +111,9 @@ impl InputsProcessor for Gemma3ImageProcessor {
 
         let pixel_values = if has_images {
             if !self.supports_images {
-                return Box::new(std::iter::once(Err(anyhow::Error::msg(
+                return Err(anyhow::Error::msg(
                     "This image processor does not support images.",
-                ))));
+                ));
             }
 
             let mut pixel_values_accum = Vec::new();
@@ -181,13 +173,16 @@ impl InputsProcessor for Gemma3ImageProcessor {
 
                 prompt = prompt.replace(BOI_TOKEN, &self.full_image_sequence);
 
-                seq.set_initial_prompt(prompt.clone());
-                let toks = tokenizer
-                    .encode_fast(prompt, false)
-                    .expect("Detokenization failed!");
+                if !seq.multimodal.has_changed_prompt {
+                    seq.set_initial_prompt(prompt.clone());
+                    let toks = tokenizer
+                        .encode_fast(prompt, false)
+                        .expect("Detokenization failed!");
 
-                let ids = toks.get_ids().to_vec();
-                seq.set_toks_and_reallocate(ids, paged_attn_metadata.as_mut());
+                    let ids = toks.get_ids().to_vec();
+                    seq.set_toks_and_reallocate(ids, paged_attn_metadata.as_mut());
+                    seq.multimodal.has_changed_prompt = true;
+                }
             }
 
             Some(Tensor::cat(&pixel_values_accum, 0).unwrap())
@@ -210,24 +205,21 @@ impl InputsProcessor for Gemma3ImageProcessor {
             get_prompt_input(
                 input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().to_vec())
+                    .map(|seq| seq.get_toks())
                     .collect::<Vec<_>>(),
                 input_seqs,
                 device,
                 last_n_context_len,
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
                 mapper,
             )
-            .nth(0)
-            .unwrap()
             .unwrap()
         } else {
             get_completion_input(
                 input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().to_vec())
+                    .map(|seq| seq.get_toks())
                     .collect::<Vec<_>>(),
                 input_seqs,
                 device,
@@ -235,11 +227,8 @@ impl InputsProcessor for Gemma3ImageProcessor {
                 last_n_context_len,
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
                 mapper,
             )
-            .nth(0)
-            .unwrap()
             .unwrap()
         };
 
@@ -253,10 +242,10 @@ impl InputsProcessor for Gemma3ImageProcessor {
             paged_attn_meta,
             flash_meta,
         });
-        Box::new(std::iter::once(Ok(InputProcessorOutput {
+        Ok(InputProcessorOutput {
             inputs,
             seq_indices,
-        })))
+        })
     }
 }
 

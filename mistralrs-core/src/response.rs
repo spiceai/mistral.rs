@@ -1,6 +1,7 @@
 use std::{
     error::Error,
     fmt::{Debug, Display},
+    sync::Arc,
 };
 
 use candle_core::Tensor;
@@ -32,6 +33,10 @@ pub struct ResponseMessage {
     pub content: Option<String>,
     pub role: String,
     pub tool_calls: Option<Vec<ToolCallResponse>>,
+    /// Reasoning/analysis content from Harmony format (separate from final content).
+    /// This contains chain-of-thought reasoning that is not intended for end users.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 generate_repr!(ResponseMessage);
@@ -44,6 +49,10 @@ pub struct Delta {
     pub content: Option<String>,
     pub role: String,
     pub tool_calls: Option<Vec<ToolCallResponse>>,
+    /// Reasoning/analysis content delta from Harmony format.
+    /// This contains incremental chain-of-thought reasoning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 generate_repr!(Delta);
@@ -241,10 +250,21 @@ pub enum Response {
     CompletionChunk(CompletionChunkResponse),
     // Image generation
     ImageGeneration(ImageGenerationResponse),
+    // Speech generation
+    Speech {
+        pcm: Arc<Vec<f32>>,
+        rate: usize,
+        channels: usize,
+    },
     // Raw
     Raw {
         logits_chunks: Vec<Tensor>,
         tokens: Vec<u32>,
+    },
+    Embeddings {
+        embeddings: Vec<f32>,
+        prompt_tokens: usize,
+        total_tokens: usize,
     },
 }
 
@@ -258,10 +278,22 @@ pub enum ResponseOk {
     CompletionChunk(CompletionChunkResponse),
     // Image generation
     ImageGeneration(ImageGenerationResponse),
+    // Speech generation
+    Speech {
+        pcm: Arc<Vec<f32>>,
+        rate: usize,
+        channels: usize,
+    },
     // Raw
     Raw {
         logits_chunks: Vec<Tensor>,
         tokens: Vec<u32>,
+    },
+    // Embeddings
+    Embeddings {
+        embeddings: Vec<f32>,
+        prompt_tokens: usize,
+        total_tokens: usize,
     },
 }
 
@@ -325,12 +357,30 @@ impl Response {
                 Err(Box::new(ResponseErr::CompletionModelError(e, x)))
             }
             Self::ImageGeneration(x) => Ok(ResponseOk::ImageGeneration(x)),
+            Self::Speech {
+                pcm,
+                rate,
+                channels,
+            } => Ok(ResponseOk::Speech {
+                pcm,
+                rate,
+                channels,
+            }),
             Self::Raw {
                 logits_chunks,
                 tokens,
             } => Ok(ResponseOk::Raw {
                 logits_chunks,
                 tokens,
+            }),
+            Self::Embeddings {
+                embeddings,
+                prompt_tokens,
+                total_tokens,
+            } => Ok(ResponseOk::Embeddings {
+                embeddings,
+                prompt_tokens,
+                total_tokens,
             }),
         }
     }

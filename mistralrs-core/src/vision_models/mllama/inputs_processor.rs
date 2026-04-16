@@ -3,7 +3,6 @@
 use std::{
     any::Any,
     collections::HashMap,
-    num::NonZeroUsize,
     sync::{Arc, RwLock},
 };
 
@@ -15,7 +14,6 @@ use mistralrs_vision::{
     Transforms,
 };
 use tokenizers::Tokenizer;
-use tracing::warn;
 
 use crate::{
     device_map::DeviceMapper,
@@ -148,10 +146,10 @@ fn convert_sparse_cross_attention_mask_to_dense(
             }
             cross_attention_mask = cross_attention_mask.slice_assign(
                 &[
-                    &sample_idx,
-                    &(start as usize..end as usize),
-                    &mask_idx,
-                    &(..mask_num_tiles),
+                    sample_idx..sample_idx + 1,
+                    start as usize..end as usize,
+                    mask_idx..mask_idx + 1,
+                    0..mask_num_tiles,
                 ],
                 &Tensor::ones(
                     (1, end as usize - start as usize, 1, mask_num_tiles),
@@ -180,28 +178,21 @@ impl InputsProcessor for MLlamaImageProcessor {
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
         other_config: Option<Arc<dyn Any>>,
-        mut paged_attn_metadata: Option<PagedAttentionMeta<'_>>,
-        prompt_chunksize: Option<NonZeroUsize>,
+        mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
-    ) -> Box<dyn Iterator<Item = anyhow::Result<InputProcessorOutput>>> {
+    ) -> anyhow::Result<InputProcessorOutput> {
         if is_xlora {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
+            return Err(anyhow::Error::msg(
                 "Cannot make inputs for X-LoRA vision model.",
-            ))));
+            ));
         }
         if no_kv_cache {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
-                "Vision model must have kv cache.",
-            ))));
-        }
-        // TODO(EricLBuehler): support this? Would require some handling of image tokens.
-        if prompt_chunksize.is_some() {
-            warn!("`prompt_chunksize` is set. MLlama does not support prompt batching.");
+            return Err(anyhow::Error::msg("Vision model must have kv cache."));
         }
         let Some(tokenizer) = tokenizer else {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
+            return Err(anyhow::Error::msg(
                 "MLlamaInputProcessor requires a specified tokenizer.",
-            ))));
+            ));
         };
 
         let text_models_inputs_processor::InnerInputProcessorOutput {
@@ -219,24 +210,21 @@ impl InputsProcessor for MLlamaImageProcessor {
             get_prompt_input(
                 input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().to_vec())
+                    .map(|seq| seq.get_toks())
                     .collect::<Vec<_>>(),
                 input_seqs,
                 device,
                 last_n_context_len,
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
                 mapper,
             )
-            .nth(0)
-            .unwrap()
             .unwrap()
         } else {
             get_completion_input(
                 input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().to_vec())
+                    .map(|seq| seq.get_toks())
                     .collect::<Vec<_>>(),
                 input_seqs,
                 device,
@@ -244,11 +232,8 @@ impl InputsProcessor for MLlamaImageProcessor {
                 last_n_context_len,
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
                 mapper,
             )
-            .nth(0)
-            .unwrap()
             .unwrap()
         };
         let config = other_config.expect("Need a PreProcessorConfig config.");
@@ -282,9 +267,9 @@ impl InputsProcessor for MLlamaImageProcessor {
                 .collect::<Vec<_>>();
 
             if n_images_in_text != n_images_in_images {
-                return Box::new(std::iter::once(Err(anyhow::Error::msg(format!(
+                return Err(anyhow::Error::msg(format!(
                     "The number of images in each batch {n_images_in_text:?} should be the same as the number of images {n_images_in_images:?}. The model cannot support a different number of images per patch. Perhaps you forgot a `<|image|>` tag?"
-                )))));
+                )));
             }
 
             let max_num_images = *n_images_in_images
@@ -323,6 +308,8 @@ impl InputsProcessor for MLlamaImageProcessor {
                 aspect_ratio_ids_accum.push(aspect_ratio_ids.unwrap().unsqueeze(0).unwrap());
                 aspect_ratio_mask_accum.push(aspect_ratio_mask.unwrap().unsqueeze(0).unwrap());
                 num_tiles_accum.push(num_tiles.unwrap());
+
+                seq.multimodal.has_changed_prompt = true;
             }
 
             // Create cross attn mask
@@ -364,7 +351,7 @@ impl InputsProcessor for MLlamaImageProcessor {
 
             let cross_attn_mask = match cross_attn_mask {
                 Ok(v) => v,
-                Err(e) => return Box::new(std::iter::once(Err(anyhow::Error::msg(e.to_string())))),
+                Err(e) => return Err(anyhow::Error::msg(e.to_string())),
             };
 
             (
@@ -392,24 +379,21 @@ impl InputsProcessor for MLlamaImageProcessor {
             get_prompt_input(
                 input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().to_vec())
+                    .map(|seq| seq.get_toks())
                     .collect::<Vec<_>>(),
                 input_seqs,
                 device,
                 last_n_context_len,
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
                 mapper,
             )
-            .nth(0)
-            .unwrap()
             .unwrap()
         } else {
             get_completion_input(
                 input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().to_vec())
+                    .map(|seq| seq.get_toks())
                     .collect::<Vec<_>>(),
                 input_seqs,
                 device,
@@ -417,11 +401,8 @@ impl InputsProcessor for MLlamaImageProcessor {
                 last_n_context_len,
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
                 mapper,
             )
-            .nth(0)
-            .unwrap()
             .unwrap()
         };
 
@@ -439,10 +420,10 @@ impl InputsProcessor for MLlamaImageProcessor {
             paged_attn_meta,
             flash_meta,
         });
-        Box::new(std::iter::once(Ok(InputProcessorOutput {
+        Ok(InputProcessorOutput {
             inputs,
             seq_indices,
-        })))
+        })
     }
 }
 
@@ -710,8 +691,10 @@ impl MLlamaImageProcessor {
         let mut num_sample_tiles = Vec::new();
         for (i, image) in images.into_iter().enumerate() {
             let num_tiles = image.dim(0)?;
-            stacked_images = stacked_images
-                .slice_assign(&[&i, &(..num_tiles), &.., &.., &..], &image.unsqueeze(0)?)?;
+            stacked_images = stacked_images.slice_assign(
+                &[i..i + 1, 0..num_tiles, 0..ch, 0..tile_h, 0..tile_w],
+                &image.unsqueeze(0)?,
+            )?;
             num_sample_tiles.push(num_tiles)
         }
         Ok((stacked_images, num_sample_tiles))
@@ -755,13 +738,13 @@ impl MLlamaImageProcessor {
         // because in the original implementation, aspect ratios are apdded with (1,1)
 
         aspect_ratio_mask = aspect_ratio_mask.slice_assign(
-            &[&.., &0],
+            &[0..max_num_images, 0..1],
             &Tensor::ones((max_num_images, 1), DType::I64, device)?,
         )?;
 
         for (i, (num_tiles_h, num_tiles_w)) in aspect_ratios.iter().enumerate() {
             aspect_ratio_mask = aspect_ratio_mask.slice_assign(
-                &[&i, &(..*num_tiles_h * *num_tiles_w)],
+                &[i..i + 1, 0..*num_tiles_h * *num_tiles_w],
                 &Tensor::ones((1, *num_tiles_h * *num_tiles_w), DType::I64, device)?,
             )?;
         }

@@ -1,265 +1,55 @@
+#include "utils.metal"
 #include <metal_stdlib>
+
 using namespace metal;
 
-#if defined(__HAVE_BFLOAT__)
+template <typename KV_T, typename CACHE_T>
+inline CACHE_T to_cache(KV_T v) = delete;
 
-typedef bfloat bfloat16_t;
-
-#else
-
-/////////////////////////////////////////////////////////////////////////////
-// Helpers
-/////////////////////////////////////////////////////////////////////////////
-
-constexpr METAL_FUNC uint16_t float_to_bfloat_bits(float x) {
-  // Check for nan
-  if ((as_type<uint32_t>(x) & ~_fp_encoding_traits<float>::sign_mask) >
-      _fp_encoding_traits<float>::inf_mask) {
-    return uint16_t(as_type<uint32_t>(0x7FC0));
-  }
-  // Take bits
-  uint32_t float_bits = as_type<uint32_t>(x);
-
-  // Round to nearest even
-  float_bits += ((float_bits >> 16) & 1) + as_type<uint32_t>(0x7FFF);
-
-  // Take upper 16 bits
-  return float_bits >> 16;
+template <> inline uchar to_cache<float, uchar>(float v) {
+  return float_to_fp8_e4m3(v);
 }
 
-constexpr METAL_FUNC float bfloat_bits_to_float(uint16_t x) {
-  // Upper 16 bits are the data and lower 16 bits are 0s
-  return as_type<float>((uint32_t)x << 16);
+template <> inline uchar to_cache<bfloat16_t, uchar>(bfloat16_t v) {
+  return float_to_fp8_e4m3((float)v);
 }
 
-struct _MLX_BFloat16;
-
-template <typename T>
-static constexpr constant bool can_convert_to_bfloat =
-    !is_same_v<T, _MLX_BFloat16> && is_convertible_v<T, float>;
-
-template <typename T>
-static constexpr constant bool can_convert_from_bfloat =
-    !is_same_v<T, _MLX_BFloat16> && is_convertible_v<float, T>;
-
-/////////////////////////////////////////////////////////////////////////////
-// Bfloat struct
-/////////////////////////////////////////////////////////////////////////////
-
-struct _MLX_BFloat16 {
-  /////////////////////////////////////////////////////////////////////////////
-  // Constructors
-  uint16_t bits_;
-  _MLX_BFloat16() thread = default;
-  _MLX_BFloat16() threadgroup = default;
-  _MLX_BFloat16() device = default;
-  _MLX_BFloat16() constant = default;
-
-  struct bits_to_bfloat_struct {};
-  static constexpr METAL_FUNC bits_to_bfloat_struct bits_to_bfloat() {
-    return bits_to_bfloat_struct();
-  }
-  constexpr METAL_FUNC _MLX_BFloat16(uint16_t bits, bits_to_bfloat_struct)
-      : bits_(bits) {}
-
-  /////////////////////////////////////////////////////////////////////////////
-  // Conversions to bfloat
-
-  template <typename T,
-            typename = typename enable_if<can_convert_to_bfloat<T>>::type>
-  constexpr METAL_FUNC _MLX_BFloat16(T x) thread
-      : bits_(float_to_bfloat_bits(static_cast<float>(x))) {}
-
-  template <typename T,
-            typename = typename enable_if<can_convert_to_bfloat<T>>::type>
-  constexpr METAL_FUNC _MLX_BFloat16(T x) threadgroup
-      : bits_(float_to_bfloat_bits(static_cast<float>(x))) {}
-
-  template <typename T,
-            typename = typename enable_if<can_convert_to_bfloat<T>>::type>
-  constexpr METAL_FUNC _MLX_BFloat16(T x) device
-      : bits_(float_to_bfloat_bits(static_cast<float>(x))) {}
-
-  template <typename T,
-            typename = typename enable_if<can_convert_to_bfloat<T>>::type>
-  constexpr METAL_FUNC _MLX_BFloat16(T x) constant
-      : bits_(float_to_bfloat_bits(static_cast<float>(x))) {}
-
-  /////////////////////////////////////////////////////////////////////////////
-  // Conversions from bfloat
-
-  template <typename T,
-            typename = typename enable_if<can_convert_from_bfloat<T>>::type>
-  constexpr METAL_FUNC operator T() const thread {
-    return static_cast<T>(bfloat_bits_to_float(bits_));
-  }
-
-  template <typename T,
-            typename = typename enable_if<can_convert_from_bfloat<T>>::type>
-  constexpr METAL_FUNC operator T() const threadgroup {
-    return static_cast<T>(bfloat_bits_to_float(bits_));
-  }
-
-  template <typename T,
-            typename = typename enable_if<can_convert_from_bfloat<T>>::type>
-  constexpr METAL_FUNC operator T() const device {
-    return static_cast<T>(bfloat_bits_to_float(bits_));
-  }
-
-  template <typename T,
-            typename = typename enable_if<can_convert_from_bfloat<T>>::type>
-  constexpr METAL_FUNC operator T() constant {
-    return static_cast<T>(bfloat_bits_to_float(bits_));
-  }
-};
-
-/////////////////////////////////////////////////////////////////////////////
-// Bfloat operators
-/////////////////////////////////////////////////////////////////////////////
-
-/////////////////////////////////////////////////////////////////////////////
-// Unary ops
-constexpr METAL_FUNC _MLX_BFloat16 operator-(_MLX_BFloat16 x) {
-  return -static_cast<float>(x);
+template <> inline uchar to_cache<half, uchar>(half v) {
+  return float_to_fp8_e4m3((float)v);
 }
 
-/////////////////////////////////////////////////////////////////////////////
-// Binary operators
-#define bfloat_binop_base(__op__, __operator__, otype, atype, btype, ctype)    \
-  constexpr METAL_FUNC otype __operator__(atype lhs, btype rhs) {              \
-    return static_cast<ctype>(lhs) __op__ static_cast<ctype>(rhs);             \
-  }
+template <> inline float to_cache<float, float>(float v) { return v; }
 
-#define bfloat_binop_helper(__op__, __operator__, otype, itype, ctype)         \
-  constexpr METAL_FUNC otype __operator__(_MLX_BFloat16 lhs, itype rhs) {      \
-    return static_cast<ctype>(lhs) __op__ static_cast<ctype>(rhs);             \
-  }                                                                            \
-  constexpr METAL_FUNC otype __operator__(itype lhs, _MLX_BFloat16 rhs) {      \
-    return static_cast<ctype>(lhs) __op__ static_cast<ctype>(rhs);             \
-  }
+template <> inline bfloat16_t to_cache<bfloat16_t, bfloat16_t>(bfloat16_t v) {
+  return v;
+}
 
-/////////////////////////////////////////////////////////////////////////////
-// Arithmetic Operators
-#define bfloat_binop(_op_, _operator_)                                         \
-  bfloat_binop_base(_op_, _operator_, _MLX_BFloat16, _MLX_BFloat16,            \
-                    _MLX_BFloat16, float);                                     \
-  bfloat_binop_helper(_op_, _operator_, float, float, float);                  \
-  bfloat_binop_helper(_op_, _operator_, float, half, float);                   \
-  bfloat_binop_helper(_op_, _operator_, _MLX_BFloat16, int32_t, float);        \
-  bfloat_binop_helper(_op_, _operator_, _MLX_BFloat16, uint32_t, float);       \
-  bfloat_binop_helper(_op_, _operator_, _MLX_BFloat16, int64_t, float);        \
-  bfloat_binop_helper(_op_, _operator_, _MLX_BFloat16, uint64_t, float);
+template <> inline half to_cache<half, half>(half v) { return v; }
 
-bfloat_binop(+, operator+);
-bfloat_binop(-, operator-);
-bfloat_binop(*, operator*);
-bfloat_binop(/, operator/);
+constant bool use_fp8_scales [[function_constant(10)]];
 
-/////////////////////////////////////////////////////////////////////////////
-// Comparison ops
-#define bfloat_compop(__op__, __operator__)                                    \
-  bfloat_binop_base(__op__, __operator__, bool, _MLX_BFloat16, _MLX_BFloat16,  \
-                    float);                                                    \
-  bfloat_binop_helper(__op__, __operator__, bool, float, float);               \
-  bfloat_binop_helper(__op__, __operator__, bool, half, float);                \
-  bfloat_binop_helper(__op__, __operator__, bool, int32_t, float);             \
-  bfloat_binop_helper(__op__, __operator__, bool, uint32_t, float);            \
-  bfloat_binop_helper(__op__, __operator__, bool, int64_t, float);             \
-  bfloat_binop_helper(__op__, __operator__, bool, uint64_t, float);
-
-bfloat_compop(>, operator>);
-bfloat_compop(<, operator<);
-bfloat_compop(>=, operator>=);
-bfloat_compop(<=, operator<=);
-bfloat_compop(==, operator==);
-bfloat_compop(!=, operator!=);
-
-#undef bfloat_compop
-#undef bfloat_binop_base
-#undef bfloat_binop_helper
-#undef bfloat_binop
-
-/////////////////////////////////////////////////////////////////////////////
-// Inplace Operators
-#define bfloat_inplace_op_helper(__op__, __operator__, itype, addr_space)      \
-  constexpr METAL_FUNC addr_space _MLX_BFloat16 &__operator__(                 \
-      addr_space _MLX_BFloat16 &lhs, itype rhs) {                              \
-    lhs = static_cast<float>(lhs) __op__ static_cast<float>(rhs);              \
-    return lhs;                                                                \
-  }                                                                            \
-  constexpr METAL_FUNC addr_space itype &__operator__(addr_space itype &lhs,   \
-                                                      _MLX_BFloat16 rhs) {     \
-    lhs = static_cast<float>(lhs) __op__ static_cast<float>(rhs);              \
-    return lhs;                                                                \
-  }
-
-#define bfloat_inplace_op_addr_space_helper(__op__, __operator__, itype)       \
-  bfloat_inplace_op_helper(__op__, __operator__, itype, device);               \
-  bfloat_inplace_op_helper(__op__, __operator__, itype, thread);               \
-  bfloat_inplace_op_helper(__op__, __operator__, itype, threadgroup);
-
-#define bfloat_inplace_op(itype)                                               \
-  bfloat_inplace_op_addr_space_helper(+, operator+=, itype);                   \
-  bfloat_inplace_op_addr_space_helper(-, operator-=, itype);                   \
-  bfloat_inplace_op_addr_space_helper(*, operator*=, itype);                   \
-  bfloat_inplace_op_addr_space_helper(/, operator/=, itype);
-
-bfloat_inplace_op(float);
-bfloat_inplace_op(half);
-bfloat_inplace_op(int16_t);
-bfloat_inplace_op(int32_t);
-bfloat_inplace_op(int64_t);
-bfloat_inplace_op(uint16_t);
-bfloat_inplace_op(uint32_t);
-bfloat_inplace_op(uint64_t);
-
-#undef bfloat_inplace_op_helper
-#undef bfloat_inplace_op_addr_space_helper
-#undef bfloat_inplace_op
-
-#define bfloat_inplace_op_helper(__op__, __operator__, addr_space)             \
-  constexpr METAL_FUNC addr_space _MLX_BFloat16 &__operator__(                 \
-      addr_space _MLX_BFloat16 &lhs, _MLX_BFloat16 rhs) {                      \
-    lhs = static_cast<float>(lhs) __op__ static_cast<float>(rhs);              \
-    return lhs;                                                                \
-  }
-
-#define bfloat_inplace_op_addr_space_helper(__op__, __operator__)              \
-  bfloat_inplace_op_helper(__op__, __operator__, device);                      \
-  bfloat_inplace_op_helper(__op__, __operator__, thread);                      \
-  bfloat_inplace_op_helper(__op__, __operator__, threadgroup);
-
-bfloat_inplace_op_addr_space_helper(+, operator+=);
-bfloat_inplace_op_addr_space_helper(-, operator-=);
-bfloat_inplace_op_addr_space_helper(*, operator*=);
-bfloat_inplace_op_addr_space_helper(/, operator/=);
-
-#undef bfloat_inplace_op_helper
-#undef bfloat_inplace_op_addr_space_helper
-
-/////////////////////////////////////////////////////////////////////////////
-// Bfloat typedef
-/////////////////////////////////////////////////////////////////////////////
-
-typedef struct _MLX_BFloat16 bfloat16_t;
-
-#endif
-
-template <typename T>
+template <typename KV_T, typename CACHE_T>
 [[kernel]] void reshape_and_cache(
-    const device T *__restrict__ key
+    const device KV_T *__restrict__ key
     [[buffer(0)]], // [num_tokens, num_heads, head_size]
-    const device T *__restrict__ value
+    const device KV_T *__restrict__ value
     [[buffer(1)]], // [num_tokens, num_heads, head_size]
-    device T *__restrict__ key_cache
+    device CACHE_T *__restrict__ key_cache
     [[buffer(2)]], // [num_blocks, num_heads, head_size/x, block_size, x]
-    device T *__restrict__ value_cache
+    device CACHE_T *__restrict__ value_cache
     [[buffer(3)]], // [num_blocks, num_heads, head_size, block_size]
     const device int64_t *__restrict__ slot_mapping
     [[buffer(4)]], // [num_tokens]
-    device const int &key_stride, device const int &value_stride,
-    device const int &num_heads, device const int &head_size,
-    device const int &block_size, device const int &x,
+    const device float *__restrict__ k_scale
+    [[buffer(5), function_constant(use_fp8_scales)]], // [1]
+    const device float *__restrict__ v_scale
+    [[buffer(6), function_constant(use_fp8_scales)]], // [1]
+    device const int &key_stride [[buffer(7)]],
+    device const int &value_stride [[buffer(8)]],
+    device const int &num_heads [[buffer(9)]],
+    device const int &head_size [[buffer(10)]],
+    device const int &block_size [[buffer(11)]],
+    device const int &x [[buffer(12)]],
     uint gid [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint threads_per_threadgroup [[threads_per_threadgroup]]) {
@@ -291,25 +81,47 @@ template <typename T>
         block_idx * num_heads * head_size * block_size +
         head_idx * head_size * block_size + head_offset * block_size +
         block_offset;
-    key_cache[tgt_key_idx] = key[src_key_idx];
-    value_cache[tgt_value_idx] = value[src_value_idx];
+
+    if (use_fp8_scales) {
+      key_cache[tgt_key_idx] =
+          to_cache<KV_T, CACHE_T>(KV_T((float)key[src_key_idx] / *k_scale));
+      value_cache[tgt_value_idx] =
+          to_cache<KV_T, CACHE_T>(KV_T((float)value[src_value_idx] / *v_scale));
+    } else {
+      key_cache[tgt_key_idx] = to_cache<KV_T, CACHE_T>(key[src_key_idx]);
+      value_cache[tgt_value_idx] =
+          to_cache<KV_T, CACHE_T>(value[src_value_idx]);
+    }
   }
 }
 
-#define instantiate_reshape_and_cache(type)                                    \
-  template [[host_name("reshape_and_cache_" #type)]] [[kernel]] void           \
-  reshape_and_cache<type>(                                                     \
-      const device type *__restrict__ key [[buffer(0)]],                       \
-      const device type *__restrict__ value [[buffer(1)]],                     \
-      device type *__restrict__ key_cache [[buffer(2)]],                       \
-      device type *__restrict__ value_cache [[buffer(3)]],                     \
+#define instantiate_reshape_and_cache(kv_type, cache_type)                     \
+  template [[host_name("reshape_and_cache_kv_" #kv_type                        \
+                       "_cache_" #cache_type)]] [[kernel]] void                \
+  reshape_and_cache<kv_type, cache_type>(                                      \
+      const device kv_type *__restrict__ key [[buffer(0)]],                    \
+      const device kv_type *__restrict__ value [[buffer(1)]],                  \
+      device cache_type *__restrict__ key_cache [[buffer(2)]],                 \
+      device cache_type *__restrict__ value_cache [[buffer(3)]],               \
       const device int64_t *__restrict__ slot_mapping [[buffer(4)]],           \
-      device const int &key_stride, device const int &value_stride,            \
-      device const int &num_heads, device const int &head_size,                \
-      device const int &block_size, device const int &x,                       \
+      const device float *__restrict__ k_scale                                 \
+      [[buffer(5), function_constant(use_fp8_scales)]],                        \
+      const device float *__restrict__ v_scale                                 \
+      [[buffer(6), function_constant(use_fp8_scales)]],                        \
+      device const int &key_stride [[buffer(7)]],                              \
+      device const int &value_stride [[buffer(8)]],                            \
+      device const int &num_heads [[buffer(9)]],                               \
+      device const int &head_size [[buffer(10)]],                              \
+      device const int &block_size [[buffer(11)]],                             \
+      device const int &x [[buffer(12)]],                                      \
       uint gid [[threadgroup_position_in_grid]],                               \
       uint tid [[thread_position_in_threadgroup]],                             \
       uint threads_per_threadgroup [[threads_per_threadgroup]]);
 
-instantiate_reshape_and_cache(float) instantiate_reshape_and_cache(bfloat16_t)
-    instantiate_reshape_and_cache(half)
+instantiate_reshape_and_cache(float, float);
+instantiate_reshape_and_cache(bfloat16_t, bfloat16_t);
+instantiate_reshape_and_cache(half, half);
+
+instantiate_reshape_and_cache(float, uchar);
+instantiate_reshape_and_cache(bfloat16_t, uchar);
+instantiate_reshape_and_cache(half, uchar);

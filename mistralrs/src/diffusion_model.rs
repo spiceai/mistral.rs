@@ -1,6 +1,7 @@
 use mistralrs_core::*;
 
-use crate::{best_device, Model};
+use crate::model_builder_trait::{build_diffusion_pipeline, build_model_from_pipeline};
+use crate::Model;
 
 /// Configure a text model with the various parameters for loading, running, and other inference behaviors.
 pub struct DiffusionModelBuilder {
@@ -13,7 +14,6 @@ pub struct DiffusionModelBuilder {
     pub(crate) loader_type: DiffusionLoaderType,
     pub(crate) dtype: ModelDType,
     pub(crate) force_cpu: bool,
-    pub(crate) use_flash_attn: bool,
 
     // Other things
     pub(crate) max_num_seqs: usize,
@@ -27,7 +27,6 @@ impl DiffusionModelBuilder {
     pub fn new(model_id: impl ToString, loader_type: DiffusionLoaderType) -> Self {
         Self {
             model_id: model_id.to_string(),
-            use_flash_attn: cfg!(feature = "flash-attn"),
             loader_type,
             dtype: ModelDType::Auto,
             force_cpu: false,
@@ -75,35 +74,7 @@ impl DiffusionModelBuilder {
     }
 
     pub async fn build(self) -> anyhow::Result<Model> {
-        let config = DiffusionSpecificConfig {
-            use_flash_attn: self.use_flash_attn,
-        };
-
-        if self.with_logging {
-            initialize_logging();
-        }
-
-        let loader =
-            DiffusionLoaderBuilder::new(config, Some(self.model_id)).build(self.loader_type);
-
-        // Load, into a Pipeline
-        let pipeline = loader.load_model_from_hf(
-            self.hf_revision,
-            self.token_source,
-            &self.dtype,
-            &best_device(self.force_cpu)?,
-            !self.with_logging,
-            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
-            None,
-            None,
-        )?;
-
-        let scheduler_method = SchedulerConfig::DefaultScheduler {
-            method: DefaultSchedulerMethod::Fixed(self.max_num_seqs.try_into()?),
-        };
-
-        let runner = MistralRsBuilder::new(pipeline, scheduler_method, false, None);
-
-        Ok(Model::new(runner.build()))
+        let (pipeline, scheduler_config, add_model_config) = build_diffusion_pipeline(self).await?;
+        Ok(build_model_from_pipeline(pipeline, scheduler_config, add_model_config).await)
     }
 }

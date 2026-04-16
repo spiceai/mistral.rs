@@ -4,14 +4,13 @@ use candle_core::{
     backend::BackendStorage, CpuStorage, Device, IndexOp, Layout, MetalDevice, MetalStorage,
     Result, Storage, Tensor, WithDType,
 };
-use metal::NSUInteger;
 
 use crate::metal::kernels;
 
 pub fn copy_blocks(
     key_caches: Vec<&mut Tensor>,
     value_caches: Vec<&mut Tensor>,
-    block_mapping: HashMap<usize, Vec<usize>>,
+    block_mapping: &HashMap<usize, Vec<usize>>,
 ) -> Result<()> {
     let cache_dev = key_caches.first().unwrap().device();
     let Device::Metal(dev) = cache_dev else {
@@ -35,15 +34,15 @@ pub fn copy_blocks(
     let mut block_mapping_vec: Vec<i64> = Vec::new();
     for (src_block_number, dst_blocks) in block_mapping {
         for dst_block_number in dst_blocks {
-            block_mapping_vec.push(src_block_number.try_into().unwrap());
-            block_mapping_vec.push(dst_block_number.try_into().unwrap());
+            block_mapping_vec.push((*src_block_number).try_into().unwrap());
+            block_mapping_vec.push((*dst_block_number).try_into().unwrap());
         }
     }
     let block_mapping = dev.new_buffer_with_data(&block_mapping_vec)?;
 
     let num_pairs: u64 = (block_mapping_vec.len() / 2).try_into().unwrap();
 
-    let numel_per_block: u64 = key_caches
+    let numel_per_block_key: u64 = key_caches
         .first()
         .unwrap()
         .i(0)?
@@ -53,6 +52,25 @@ pub fn copy_blocks(
         .product::<usize>()
         .try_into()
         .unwrap();
+    let numel_per_block_value: u64 = value_caches
+        .first()
+        .unwrap()
+        .i(0)?
+        .shape()
+        .dims()
+        .iter()
+        .product::<usize>()
+        .try_into()
+        .unwrap();
+    assert_eq!(
+        numel_per_block_key, numel_per_block_value,
+        "key and value blocks must be the same size"
+    );
+    if numel_per_block_key != numel_per_block_key {
+        candle_core::bail!(
+            "numel_per_block_key ({numel_per_block_key}) and numel_per_block_value ({numel_per_block_value}) must be the same",
+        );
+    }
 
     for (key_cache, value_cache) in zip(&key_caches, &value_caches) {
         key_cache.to_device(cache_dev)?;
@@ -68,13 +86,13 @@ pub fn copy_blocks(
             unreachable!()
         };
 
-        let command_buffer = dev.command_buffer()?;
-        command_buffer.set_label("copy-blocks");
+        let encoder = dev.command_encoder()?;
+        encoder.set_label("copy-blocks");
 
         kernels::call_copy_blocks(
             dev.device(),
-            &command_buffer,
-            kernels::Kernels::default(),
+            &encoder,
+            &kernels::Kernels::new(),
             key_cache.dtype(),
             key_storage.buffer(),
             key_offset * key_storage.dtype().size_in_bytes(),
@@ -83,7 +101,8 @@ pub fn copy_blocks(
             &block_mapping,
             0,
             num_pairs,
-            numel_per_block,
+            numel_per_block_key,
+            numel_per_block_value,
         )
         .map_err(candle_core::Error::wrap)?;
     }
@@ -127,17 +146,14 @@ pub unsafe fn swap_blocks(
                 let dst_offset = dst_block_number * block_size_in_bytes
                     + dst_layout.start_offset() * dst_storage.dtype().size_in_bytes();
 
-                let command_buffer = src_dev.command_buffer()?;
-                command_buffer.set_label("swap-blocks-gpu-gpu");
-                let blit = command_buffer.new_blit_command_encoder();
+                let blit = src_dev.blit_command_encoder()?;
                 blit.set_label("swap-blocks-gpu-gpu");
-                let length = (src_layout.shape().elem_count() * src_storage.dtype().size_in_bytes())
-                    as NSUInteger;
+                let length = src_layout.shape().elem_count() * src_storage.dtype().size_in_bytes();
                 blit.copy_from_buffer(
                     src_storage.buffer(),
-                    src_offset as u64,
+                    src_offset,
                     dst_storage.buffer(),
-                    dst_offset as u64,
+                    dst_offset,
                     length,
                 );
                 blit.end_encoding();
@@ -174,17 +190,14 @@ pub unsafe fn swap_blocks(
                         &src_slice[src_offset..src_offset + block_size_in_bytes],
                     )?;
 
-                    let command_buffer = dev.command_buffer()?;
-                    command_buffer.set_label("swap-blocks-cpu-gpu");
-                    let blit = command_buffer.new_blit_command_encoder();
+                    let blit = dev.blit_command_encoder()?;
                     blit.set_label("swap-blocks-cpu-gpu");
-                    let length = (src_layout.shape().elem_count() * SRCT::DTYPE.size_in_bytes())
-                        as NSUInteger;
+                    let length = src_layout.shape().elem_count() * SRCT::DTYPE.size_in_bytes();
                     blit.copy_from_buffer(
                         &src_buffer,
-                        src_offset as u64,
+                        src_offset,
                         dst_storage.buffer(),
-                        dst_offset as u64,
+                        dst_offset,
                         length,
                     );
                     blit.end_encoding();

@@ -1,28 +1,23 @@
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use candle_core::{Device, Result};
-use either::Either;
+use indexmap::IndexMap;
 use itertools::Itertools;
 use tracing::info;
 
-use crate::{
-    pipeline::{KvCache, RotatingCache, SingleCache},
-    sequence::Sequence,
-};
+use crate::{paged_attention::BlockEngine, pipeline::KvCache, sequence::Sequence};
 
 #[derive(PartialEq, Eq, Debug, Hash)]
 struct Tokens(Vec<u32>);
 
 impl Tokens {
-    /// Maximum index to where the two sets of tokens match
-    fn find_max_index(&self, x: &Self) -> Option<usize> {
+    /// Returns the length of the common prefix shared with `other`.
+    fn shared_prefix_len(&self, other: &Self) -> usize {
         self.0
             .iter()
-            .zip(x.0.iter())
-            .enumerate()
-            .take_while(|(_, (a, b))| a == b)
-            .map(|(index, _)| index)
-            .last()
+            .zip(other.0.iter())
+            .take_while(|(a, b)| a == b)
+            .count()
     }
 }
 
@@ -35,108 +30,72 @@ impl From<Vec<u32>> for Tokens {
 #[derive(Clone)]
 struct CacheElement {
     cache: Vec<Option<KvCache>>,
-    devices: Vec<Option<Device>>,
+    audio_hashes: Option<Vec<u64>>,
+    image_hashes: Option<Vec<u64>>,
 }
 
 pub struct PrefixCacheManagerV2 {
-    caches: HashMap<Tokens, CacheElement>,
+    caches: IndexMap<Tokens, CacheElement>,
     n_on_device: usize,
     no_prefix_cache: bool,
+    block_engine: Option<Arc<tokio::sync::Mutex<BlockEngine>>>,
 }
 
 #[derive(Clone)]
-pub struct MatchingCache {
-    pub normal: Vec<Option<KvCache>>,
-    pub toks: Vec<u32>,
-    pub offset: usize,
+pub enum MatchingCache {
+    Normal {
+        normal: Vec<Option<KvCache>>,
+        images_to_keep: usize,
+        audios_to_keep: usize,
+        toks: Vec<u32>,
+        offset: usize,
+    },
 }
 
 impl PrefixCacheManagerV2 {
-    pub fn new(n_on_device: usize, no_prefix_cache: bool) -> Self {
-        if !no_prefix_cache {
-            info!("PrefixCacherV2 is enabled! Expect higher multi-turn prompt throughput.");
+    pub fn new(
+        n_on_device: usize,
+        no_prefix_cache: bool,
+        block_engine: Option<Arc<tokio::sync::Mutex<BlockEngine>>>,
+    ) -> Self {
+        if !no_prefix_cache && block_engine.is_none() {
+            info!("Prefix caching enabled (sequence-level, non-paged attention). Expect higher multi-turn throughput for both text and multimodal.");
         }
         PrefixCacheManagerV2 {
-            caches: HashMap::new(),
+            caches: IndexMap::new(),
             n_on_device,
             no_prefix_cache,
+            block_engine,
         }
     }
 
     /// This always keeps the cache on the device.
     pub fn add_sequence(&mut self, seq: &mut Sequence) {
-        if self.no_prefix_cache || seq.has_images() {
+        // Do not cache if prefix caching disabled
+        if self.no_prefix_cache {
             return;
         }
-        let cache = seq.normal_cache().to_vec();
-        let devices = cache
-            .iter()
-            .map(|x| x.as_ref().map(|x| x.k().unwrap().unwrap().device().clone()))
-            .collect::<Vec<_>>();
-        self.caches.insert(
-            seq.get_toks().to_vec().into(),
-            CacheElement { cache, devices },
-        );
-    }
 
-    fn cache_to(
-        cache: &mut [Option<KvCache>],
-        devices: Either<&Device, &Vec<Option<Device>>>,
-    ) -> Result<()> {
-        for (i, layer) in cache
-            .iter_mut()
-            .enumerate()
-            .flat_map(|(i, x)| x.as_mut().map(|x| (i, x)))
-        {
-            let device = devices.left_or_else(|layers| layers[i].as_ref().unwrap());
+        // For paged attention, prefix caching is handled by the low-level
+        // PrefixCacher in BlockEngine. PrefixCacheManagerV2 only handles
+        // non-paged attention caching.
+        if self.block_engine.is_none() {
+            let cache = seq.normal_cache().to_vec();
 
-            match layer {
-                KvCache::Normal { k, v } => {
-                    *layer = KvCache::Normal {
-                        k: SingleCache {
-                            all_data: k.all_data.as_ref().map(|x| x.to_device(device).unwrap()),
-                            dim: k.dim,
-                            current_seq_len: k.current_seq_len,
-                            max_seq_len: k.max_seq_len,
-                            capacity_seq_len: k.capacity_seq_len,
-                        },
-                        v: SingleCache {
-                            all_data: v.all_data.as_ref().map(|x| x.to_device(device).unwrap()),
-                            dim: v.dim,
-                            current_seq_len: v.current_seq_len,
-                            max_seq_len: v.max_seq_len,
-                            capacity_seq_len: v.capacity_seq_len,
-                        },
-                    }
-                }
-                KvCache::Rotating { k, v } => {
-                    *layer = KvCache::Rotating {
-                        k: RotatingCache {
-                            all_data: k.all_data.as_ref().map(|x| x.to_device(device).unwrap()),
-                            dim: k.dim,
-                            current_seq_len: k.current_seq_len,
-                            max_seq_len: k.max_seq_len,
-                            offset: k.offset,
-                            capacity_seq_len: k.capacity_seq_len,
-                        },
-                        v: RotatingCache {
-                            all_data: v.all_data.as_ref().map(|x| x.to_device(device).unwrap()),
-                            dim: v.dim,
-                            current_seq_len: v.current_seq_len,
-                            max_seq_len: v.max_seq_len,
-                            offset: v.offset,
-                            capacity_seq_len: v.capacity_seq_len,
-                        },
-                    }
-                }
-            }
+            self.caches.insert(
+                seq.get_toks().to_vec().into(),
+                CacheElement {
+                    cache,
+                    image_hashes: seq.image_hashes().map(|x| x.to_vec()),
+                    audio_hashes: seq.audio_hashes().map(|x| x.to_vec()),
+                },
+            );
         }
-        Ok(())
     }
 
-    /// Evict the caches to CPU. This will evict the first k seqs such that the number of sequences on device after the copy is
+    /// Evict the caches. This will evict the first k seqs such that the number of sequences on device after the copy is
     /// the maximum allowed. Returns the number of evicted sequences.
-    pub fn evict_to_cpu(&mut self) -> Result<usize> {
+    pub fn evict_caches(&mut self) -> Result<usize> {
         if self.no_prefix_cache {
             return Ok(0);
         }
@@ -163,7 +122,7 @@ impl PrefixCacheManagerV2 {
         let mut n_evicted = 0;
         // Intentionally evict the first ones first, as they are the oldest
         for cache in self.caches.values_mut() {
-            if n_on_device - n_evicted == self.n_on_device {
+            if n_on_device - n_evicted <= self.n_on_device {
                 break;
             }
             let first_non_none = cache.cache.iter().find_or_first(|x| x.is_some());
@@ -181,78 +140,119 @@ impl PrefixCacheManagerV2 {
             };
 
             if !matches!(cache_device, Device::Cpu) {
-                Self::cache_to(&mut cache.cache, Either::Left(&Device::Cpu))?;
+                cache.cache.clear();
                 n_evicted += 1;
             }
         }
-        Ok(self.caches.len().saturating_sub(self.n_on_device))
+
+        self.caches.retain(|_tokens, cache| !cache.cache.is_empty());
+
+        Ok(n_evicted)
     }
 
-    /// Evict all the caches to CPU.
-    pub fn evict_all_to_cpu(&mut self) -> Result<usize> {
-        if self.no_prefix_cache {
-            return Ok(0);
-        }
-        // Intentionally evict the first ones first, as they are the oldest
-        for cache in self.caches.values_mut() {
-            let first_non_none = cache.cache.iter().find_or_first(|x| x.is_some());
-            let Some(Some(first_non_none)) = first_non_none else {
-                continue;
-            };
-
-            let cache_device = match first_non_none {
-                KvCache::Normal { k, .. } => {
-                    k.all_data().as_ref().expect("No KV cache data").device()
-                }
-                KvCache::Rotating { k, .. } => {
-                    k.all_data().as_ref().expect("No KV cache data").device()
-                }
-            };
-
-            if !matches!(cache_device, Device::Cpu) {
-                Self::cache_to(&mut cache.cache, Either::Left(&Device::Cpu))?;
-            }
-        }
-        Ok(self.caches.len())
+    /// Evict all the caches.
+    pub fn evict_all_caches(&mut self) -> Result<usize> {
+        let len = self.caches.len();
+        self.caches.clear();
+        Ok(len)
     }
 
-    /// Search for a matching cache given some toks
+    /// Search for a matching cache given some tokens. Image-containing sequences are now cached too.
     pub fn search_for_matching_cache(
         &mut self,
         toks: &[u32],
-        contains_images: bool,
+        image_hashes: Option<&[u64]>,
+        audio_hashes: Option<&[u64]>,
     ) -> Result<Option<MatchingCache>> {
-        if self.no_prefix_cache || toks.is_empty() || contains_images {
+        // Do not search if prefix caching disabled or no tokens
+        if self.no_prefix_cache || toks.is_empty() {
+            return Ok(None);
+        }
+
+        if self.block_engine.is_some() {
+            // For paged attention, prefix caching is handled by the low-level
+            // PrefixCacher in BlockEngine. PrefixCacheManagerV2 only handles
+            // non-paged attention caching.
             return Ok(None);
         }
 
         let toks = Tokens(toks.to_vec());
 
-        let mut longest_match = (0, None);
-        for (k, v) in self.caches.iter() {
-            let match_len = toks.find_max_index(k);
-            if let Some(match_len) = match_len {
-                if match_len > longest_match.0 {
-                    longest_match = (match_len, Some(v));
-                }
+        let mut best_match: Option<(usize, &CacheElement, usize, usize)> = None;
+        for (k, v) in &self.caches {
+            let match_len = toks.shared_prefix_len(k);
+            if match_len == 0 {
+                continue;
+            }
+
+            let images_match_until = match image_hashes {
+                Some(input_hashes) => match &v.image_hashes {
+                    Some(cached_hashes) => input_hashes
+                        .iter()
+                        .zip(cached_hashes)
+                        .take_while(|(a, b)| a == b)
+                        .count(),
+                    None => 0,
+                },
+                None => 0,
+            };
+
+            let audios_match_until = match audio_hashes {
+                Some(input_hashes) => match &v.audio_hashes {
+                    Some(cached_hashes) => input_hashes
+                        .iter()
+                        .zip(cached_hashes)
+                        .take_while(|(a, b)| a == b)
+                        .count(),
+                    None => 0,
+                },
+                None => 0,
+            };
+
+            if best_match
+                .as_ref()
+                .is_none_or(|(len, _, _, _)| match_len > *len)
+            {
+                best_match = Some((match_len, v, images_match_until, audios_match_until));
             }
         }
-        if let (match_len, Some(longest_match)) = longest_match {
-            let mut cache = longest_match.clone();
-            Self::cache_to(&mut cache.cache, Either::Right(&cache.devices))?;
+
+        if let Some((match_len, cache_element, images_match_until, audios_match_until)) = best_match
+        {
+            let new_toks = toks.0[match_len..].to_vec();
+            if new_toks.is_empty() {
+                return Ok(None);
+            }
+
+            let mut cache = cache_element.clone();
+            // Count how many input images are not already cached
+            let images_to_keep = if let Some(input_hashes) = image_hashes {
+                input_hashes.len().saturating_sub(images_match_until)
+            } else {
+                0
+            };
+            let audios_to_keep = if let Some(input_hashes) = audio_hashes {
+                input_hashes.len().saturating_sub(audios_match_until)
+            } else {
+                0
+            };
             for layer in cache.cache.iter_mut().flatten() {
-                match layer.set_len(match_len) {
-                    Ok(_) => (),
-                    Err(_) => return Ok(None),
+                if layer.try_set_len(match_len).is_err() {
+                    return Ok(None);
                 }
             }
-            Ok(Some(MatchingCache {
+            for layer in cache.cache.iter_mut().flatten() {
+                layer.set_len(match_len)?;
+            }
+            return Ok(Some(MatchingCache::Normal {
                 normal: cache.cache,
-                toks: toks.0[match_len..].to_vec(),
+                images_to_keep,
+                audios_to_keep,
+                toks: new_toks,
                 offset: match_len,
-            }))
-        } else {
-            Ok(None)
+            }));
         }
+
+        Ok(None)
     }
 }

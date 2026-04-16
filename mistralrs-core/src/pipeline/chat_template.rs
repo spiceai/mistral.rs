@@ -5,6 +5,7 @@ use either::Either;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use minijinja::{context, value::Kwargs, Environment, Error, ErrorKind, Template, Value};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 use tracing::{info, warn};
@@ -76,6 +77,51 @@ impl ChatTemplate {
         self.chat_template.is_some()
     }
 
+    /// Check if this chat template uses OpenAI Harmony format.
+    pub fn is_harmony_format(&self) -> bool {
+        if let Some(ref template_value) = self.chat_template {
+            let template_str = match &template_value.0 {
+                Either::Left(s) => s.as_str(),
+                Either::Right(vec) => {
+                    // For multi-template format, check if any template contains Harmony markers
+                    return vec
+                        .iter()
+                        .any(|t| t.values().any(|v| crate::harmony::is_harmony_template(v)));
+                }
+            };
+            crate::harmony::is_harmony_template(template_str)
+        } else {
+            false
+        }
+    }
+
+    /// Check if this chat template uses `<think>...</think>` tags for reasoning.
+    ///
+    /// This is mutually exclusive with Harmony format - if the template uses
+    /// Harmony format, this returns false even if think tags are present.
+    pub fn uses_think_tags(&self) -> bool {
+        // Don't enable if Harmony format is detected (mutual exclusivity)
+        if self.is_harmony_format() {
+            return false;
+        }
+
+        if let Some(ref template_value) = self.chat_template {
+            let template_str = match &template_value.0 {
+                Either::Left(s) => s.as_str(),
+                Either::Right(vec) => {
+                    // For multi-template format, check if any template contains think tags
+                    return vec.iter().any(|t| {
+                        t.values()
+                            .any(|v| crate::think_tags::is_think_tag_template(v))
+                    });
+                }
+            };
+            crate::think_tags::is_think_tag_template(template_str)
+        } else {
+            false
+        }
+    }
+
     pub fn eos_tok(&self) -> Option<String> {
         match self.eos_token.as_ref()?.0 {
             Either::Left(ref lit) => Some(lit.clone()),
@@ -113,29 +159,33 @@ pub fn calculate_eos_tokens(
     }
 
     if let Some(gen_conf) = gen_conf {
-        let ids = match gen_conf.eos_token_id {
-            Either::Left(id) => vec![id],
-            Either::Right(ids) => ids,
-        };
-        for id in ids {
-            let s = tokenizer
-                .decode(&[id], false)
-                .unwrap_or_else(|_| panic!("Unable to decode id {id})"));
-            if !eos_tok_ids.contains(&s) {
-                eos_tok_ids.push(s);
+        if let Some(eos_field) = gen_conf.eos_token_id {
+            let ids = match eos_field {
+                Either::Left(id) => vec![id],
+                Either::Right(ids) => ids,
+            };
+            for id in ids {
+                let s = tokenizer
+                    .decode(&[id], false)
+                    .unwrap_or_else(|_| panic!("Unable to decode id {id})"));
+                if !eos_tok_ids.contains(&s) {
+                    eos_tok_ids.push(s);
+                }
             }
         }
 
-        let ids = match gen_conf.bos_token_id {
-            Either::Left(id) => vec![id],
-            Either::Right(ids) => ids,
-        };
-        for id in ids {
-            let s = tokenizer
-                .decode(&[id], false)
-                .unwrap_or_else(|_| panic!("Unable to decode id {id})"));
-            if !bos_tok_ids.contains(&s) {
-                bos_tok_ids.push(s);
+        if let Some(bos_field) = gen_conf.bos_token_id {
+            let ids = match bos_field {
+                Either::Left(id) => vec![id],
+                Either::Right(ids) => ids,
+            };
+            for id in ids {
+                let s = tokenizer
+                    .decode(&[id], false)
+                    .unwrap_or_else(|_| panic!("Unable to decode id {id})"));
+                if !bos_tok_ids.contains(&s) {
+                    bos_tok_ids.push(s);
+                }
             }
         }
     }
@@ -145,12 +195,12 @@ pub fn calculate_eos_tokens(
 
     let bos_render = bos_tok_ids
         .iter()
-        .map(|val| format!("{:?}", val))
+        .map(|val| format!("{val:?}"))
         .collect::<Vec<String>>()
         .join(", ");
     let eos_render = eos_tok_ids
         .iter()
-        .map(|val| format!("{:?}", val))
+        .map(|val| format!("{val:?}"))
         .collect::<Vec<String>>()
         .join(", ");
 
@@ -175,10 +225,12 @@ pub fn calculate_eos_tokens(
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct GenerationConfig {
-    #[serde(with = "either::serde_untagged")]
-    bos_token_id: Either<u32, Vec<u32>>,
-    #[serde(with = "either::serde_untagged")]
-    eos_token_id: Either<u32, Vec<u32>>,
+    #[serde(default)]
+    #[serde(with = "either::serde_untagged_optional")]
+    bos_token_id: Option<Either<u32, Vec<u32>>>,
+    #[serde(default)]
+    #[serde(with = "either::serde_untagged_optional")]
+    eos_token_id: Option<Either<u32, Vec<u32>>>,
 }
 
 fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
@@ -221,9 +273,14 @@ fn strftime_now(fmt: String) -> Result<String, minijinja::Error> {
     Ok(date_string)
 }
 
+use crate::request::ReasoningEffort;
+
+#[allow(clippy::too_many_arguments)]
 pub fn apply_chat_template_to(
     messages: Vec<IndexMap<String, MessageContent>>,
     add_generation_prompt: bool,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<ReasoningEffort>,
     template: &ChatTemplateValue,
     bos_tok: Option<String>,
     eos_tok: Option<String>,
@@ -290,17 +347,63 @@ pub fn apply_chat_template_to(
             template
         }
     };
+    let mut template = template.replace("[::-1]", "|reverse");
+    // Convert Python‑style descending ranges `range(..., -1, -1)` to a forward
+    // range followed by Jinja’s `|reverse` filter so it works even when
+    // negative‑step ranges aren’t supported.
+    let re = Regex::new(r"range\((?P<expr>[^,]+),\s*-1,\s*-1\)").unwrap();
+    template = re
+        .replace_all(&template, |caps: &regex::Captures| {
+            format!("range({})|reverse", &caps["expr"])
+        })
+        .into_owned();
+
+    if template.contains("{{ meta }}") {
+        // Fix for GLM4 models
+        template = template.replace("{%- set meta = message.get(\"metadata\", \"\") %}", "");
+        template = template.replace("{{ meta }}", "");
+    }
+    if template.contains("{% generation %}") && template.contains("{% endgeneration %}") {
+        // Strip for smollm3 models
+        template = template.replace("{% generation %}", "");
+        template = template.replace("{% endgeneration %}", "");
+    }
 
     env.add_template("chat_template", &template)?;
 
     env.add_function("raise_exception", raise_exception);
     env.add_filter("tojson", tojson);
     env.add_function("strftime_now", strftime_now);
-
     let tmpl = env.get_template("chat_template").unwrap();
 
     let date = chrono::Utc::now();
     let date_string = date.format("%d, %B, %Y").to_string();
+
+    // Convert reasoning effort to string for template
+    let reasoning_effort_str = reasoning_effort.map(|r| r.as_str()).unwrap_or("medium");
+
+    // Detect builtin tools from the tools list
+    // Known builtin tools for GPT-OSS/Harmony format: "browser", "python"
+    // Known builtin tools for Llama 3.x: "wolfram_alpha", "web_search", "brave_search", "python", "code_interpreter"
+    let builtin_tool_names = [
+        "browser",
+        "python",
+        "code_interpreter",
+        "web_search",
+        "brave_search",
+        "wolfram_alpha",
+    ];
+    let builtin_tools: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| {
+            let name = t.function.name.as_str();
+            if builtin_tool_names.contains(&name) {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
 
     if tools.is_empty() {
         Ok(tmpl.render(context! {
@@ -310,6 +413,8 @@ pub fn apply_chat_template_to(
             eos_token => eos_tok,
             unk_token => unk_tok,
             date_string => date_string,
+            enable_thinking => enable_thinking.unwrap_or(true),
+            reasoning_effort => reasoning_effort_str,
         })?)
     } else {
         if !tools_are_supported(&tmpl) {
@@ -321,8 +426,12 @@ pub fn apply_chat_template_to(
             bos_token => bos_tok,
             eos_token => eos_tok,
             unk_token => unk_tok,
+            xml_tools => tools.clone(), // SmolLM3
             tools => tools,
+            builtin_tools => builtin_tools,
             date_string => date_string,
+            enable_thinking => enable_thinking.unwrap_or(true),
+            reasoning_effort => reasoning_effort_str,
         })?)
     }
 }

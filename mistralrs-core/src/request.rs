@@ -1,14 +1,13 @@
 use either::Either;
 use indexmap::IndexMap;
+use mistralrs_audio::AudioInput;
 use mistralrs_quant::IsqType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    response::Response,
-    sampler::SamplingParams,
-    tools::{Tool, ToolChoice},
-    CustomLogitsProcessor, DiffusionGenerationParams,
+    response::Response, sampler::SamplingParams, tools::ToolChoice, CustomLogitsProcessor,
+    DiffusionGenerationParams, Tool,
 };
 use std::{fmt::Debug, sync::Arc};
 use tokio::sync::mpsc::Sender;
@@ -27,6 +26,7 @@ pub enum Constraint {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 /// Image generation response format
 pub enum ImageGenerationResponseFormat {
     Url,
@@ -35,10 +35,42 @@ pub enum ImageGenerationResponseFormat {
 
 pub type MessageContent = Either<String, Vec<IndexMap<String, Value>>>;
 
+/// Reasoning effort level for models that support it (e.g., GPT-OSS with Harmony format).
+/// Controls the depth of reasoning/analysis in the model's response.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// Minimal reasoning, faster responses
+    Low,
+    /// Balanced reasoning depth
+    #[default]
+    Medium,
+    /// Deep reasoning, more thorough analysis
+    High,
+}
+
+impl ReasoningEffort {
+    /// Convert to string representation for chat template
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 /// Message or messages for a [`Request`].
 pub enum RequestMessage {
-    Chat(Vec<IndexMap<String, MessageContent>>),
+    Chat {
+        messages: Vec<IndexMap<String, MessageContent>>,
+        enable_thinking: Option<bool>,
+        /// Reasoning effort level for Harmony-format models
+        reasoning_effort: Option<ReasoningEffort>,
+    },
     Completion {
         text: String,
         echo_prompt: bool,
@@ -46,14 +78,28 @@ pub enum RequestMessage {
     },
     CompletionTokens(Vec<u32>),
     VisionChat {
-        #[serde(skip)] // TODO!!!!
+        #[serde(skip)] // TODO
         images: Vec<image::DynamicImage>,
+        #[serde(skip)] // TODO
+        audios: Vec<AudioInput>,
         messages: Vec<IndexMap<String, MessageContent>>,
+        enable_thinking: Option<bool>,
+        /// Reasoning effort level for Harmony-format models
+        reasoning_effort: Option<ReasoningEffort>,
     },
     ImageGeneration {
         prompt: String,
         format: ImageGenerationResponseFormat,
         generation_params: DiffusionGenerationParams,
+    },
+    SpeechGeneration {
+        prompt: String,
+    },
+    Embedding {
+        prompt: String,
+    },
+    EmbeddingTokens {
+        prompt: Vec<u32>,
     },
 }
 
@@ -63,6 +109,7 @@ fn default_responder<T>() -> Sender<T> {
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub enum SearchContextSize {
     #[serde(rename = "low")]
@@ -75,6 +122,7 @@ pub enum SearchContextSize {
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ApproximateUserLocation {
     pub city: String,
@@ -84,6 +132,7 @@ pub struct ApproximateUserLocation {
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum WebSearchUserLocation {
@@ -94,10 +143,15 @@ pub enum WebSearchUserLocation {
 }
 
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq))]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct WebSearchOptions {
     pub search_context_size: Option<SearchContextSize>,
     pub user_location: Option<WebSearchUserLocation>,
+    /// Override the description for the search tool.
+    pub search_description: Option<String>,
+    /// Override the description for the extraction tool.
+    pub extract_description: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -118,6 +172,7 @@ pub struct WebSearchOptions {
 ///     3) Apply temperature and softmax
 ///     4) Sample the next token (topk, topp, minp, etc)
 /// - `return_raw_logits`: Return raw logits.
+/// - `truncate_sequence`: Whether to truncate the prompt if it exceeds the model's maximum context length.
 pub struct NormalRequest {
     pub messages: RequestMessage,
     pub sampling_params: SamplingParams,
@@ -135,6 +190,9 @@ pub struct NormalRequest {
     pub logits_processors: Option<Vec<Arc<dyn CustomLogitsProcessor>>>,
     pub return_raw_logits: bool,
     pub web_search_options: Option<WebSearchOptions>,
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub truncate_sequence: bool,
 }
 
 impl NormalRequest {
@@ -160,6 +218,8 @@ impl NormalRequest {
             logits_processors: None,
             return_raw_logits: false,
             web_search_options: None,
+            model_id: None,
+            truncate_sequence: false,
         }
     }
 }
@@ -172,6 +232,8 @@ pub struct TokenizationRequest {
     pub tools: Option<Vec<Tool>>,
     pub add_generation_prompt: bool,
     pub add_special_tokens: bool,
+    pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default = "default_responder")]
     #[serde(skip)]
     pub response: Sender<anyhow::Result<Vec<u32>>>,
@@ -191,7 +253,7 @@ pub struct DetokenizationRequest {
 /// A request to the Engine, encapsulating the various parameters as well as
 /// the `mpsc` response `Sender` used to return the [`Response`].
 pub enum Request {
-    Normal(NormalRequest),
+    Normal(Box<NormalRequest>),
     ReIsq(IsqType),
     Tokenize(TokenizationRequest),
     Detokenize(DetokenizationRequest),
@@ -204,13 +266,14 @@ pub enum Request {
 impl Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Request::Normal(NormalRequest {
-                messages,
-                sampling_params,
-                is_streaming,
-                id,
-                ..
-            }) => {
+            Request::Normal(boxed_req) => {
+                let NormalRequest {
+                    messages,
+                    sampling_params,
+                    is_streaming,
+                    id,
+                    ..
+                } = &**boxed_req;
                 write!(
                     f,
                     "Request {id} {{ messages: `{messages:?}`, sampling_params: {sampling_params:?}, is_streaming: {is_streaming}}}",

@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::{io::Cursor, sync::Arc};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use candle_core::Tensor;
@@ -70,6 +70,38 @@ pub async fn send_image_responses(
     Ok(())
 }
 
+pub async fn send_speech_responses(
+    input_seqs: &mut [&mut Sequence],
+    pcms: &[Arc<Vec<f32>>],
+    rates: &[usize],
+    channels: &[usize],
+) -> candle_core::Result<()> {
+    if input_seqs.len() != pcms.len() {
+        candle_core::bail!(
+            "Input seqs len ({}) does not match pcms generated len ({})",
+            input_seqs.len(),
+            pcms.len()
+        );
+    }
+
+    for (seq, (pcm, (rate, channel))) in input_seqs
+        .iter_mut()
+        .zip(pcms.iter().zip(rates.iter().zip(channels)))
+    {
+        seq.add_speech_pcm_to_group(pcm.clone(), *rate, *channel);
+
+        let group = seq.get_mut_group();
+        group
+            .maybe_send_speech_response(seq.responder())
+            .await
+            .map_err(candle_core::Error::msg)?;
+
+        seq.set_state(SequenceState::Done(StopReason::GeneratedSpeech));
+    }
+
+    Ok(())
+}
+
 pub async fn send_raw_responses(
     input_seqs: &mut [&mut Sequence],
     logits_chunks: Vec<Vec<Tensor>>,
@@ -92,6 +124,29 @@ pub async fn send_raw_responses(
         .map_err(candle_core::Error::msg)?;
 
     seq.set_state(SequenceState::Done(StopReason::Length(0)));
+
+    Ok(())
+}
+
+pub async fn send_embedding_responses(
+    input_seqs: &mut [&mut Sequence],
+    embedings: Vec<Vec<f32>>,
+) -> candle_core::Result<()> {
+    if embedings.len() != input_seqs.len() {
+        candle_core::bail!("Number of embeddings must match number of sequences..");
+    }
+
+    for (seq, embeddings) in input_seqs.iter_mut().zip(embedings) {
+        seq.add_embedding_choice_to_group(embeddings);
+
+        let group = seq.get_mut_group();
+        group
+            .maybe_send_embedding_done_response(seq.responder())
+            .await
+            .map_err(candle_core::Error::msg)?;
+
+        seq.set_state(SequenceState::Done(StopReason::Length(0)));
+    }
 
     Ok(())
 }

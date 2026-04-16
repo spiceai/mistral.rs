@@ -12,13 +12,15 @@ The Python and HTTP APIs support sending images as:
 - Path to a local image
 - [Base64](https://en.wikipedia.org/wiki/Base64) encoded string
 
-The Rust API takes an image from the [image](https://docs.rs/image/latest/image/index.html) crate.
+The Rust SDK takes an image from the [image](https://docs.rs/image/latest/image/index.html) crate.
 
 ## ToC
-- [Interactive mode](#interactive-mode)
-- [HTTP server](#http-server)
-- [Rust API](#rust)
-- [Python API](#python)
+- [MiniCPM-O 2.6 Model: `openbmb/MiniCPM-o-2_6`](#minicpm-o-26-model-openbmbminicpm-o-2_6)
+  - [ToC](#toc)
+  - [Interactive mode](#interactive-mode)
+  - [HTTP server](#http-server)
+  - [Rust](#rust)
+  - [Python](#python)
 
 ## Interactive mode
 
@@ -26,11 +28,8 @@ Mistral.rs supports interactive mode for vision models! It is an easy way to int
 
 1) Start up interactive mode with the MiniCPM-O 2.6 Model model
 
-> [!NOTE]
-> You should replace `--features ...` with one of the features specified [here](../README.md#supported-accelerators), or remove it for pure CPU inference.
-
 ```
-cargo run --features ... --release -- -i --isq Q4K vision-plain -m openbmb/MiniCPM-o-2_6 -a minicpmo
+mistralrs run vision --isq 4 -m openbmb/MiniCPM-o-2_6
 ```
 
 2) Say hello!
@@ -50,7 +49,7 @@ The image shows a close-up view of a rose flower with dew drops on its petals. T
 
 
 ## HTTP server
-You can find this example [here](../examples/server/minicpmo_2_6.py).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/server/minicpmo_2_6.py).
 
 We support an OpenAI compatible HTTP API for vision models. This example demonstrates sending a chat completion request with an image.
 
@@ -88,11 +87,8 @@ Overall, the image showcases the diverse geological and ecological features of M
 
 1) Start the server
 
-> [!NOTE]
-> You should replace `--features ...` with one of the features specified [here](../README.md#supported-accelerators), or remove it for pure CPU inference.
-
 ```
-cargo run --release --features ... -- --port 1234 --isq Q4K vision-plain -m openbmb/MiniCPM-o-2_6 -a minicpmo
+mistralrs serve vision -p 1234 --isq 4 -m openbmb/MiniCPM-o-2_6
 ```
 
 2) Send a request
@@ -103,7 +99,7 @@ from openai import OpenAI
 client = OpenAI(api_key="foobar", base_url="http://localhost:1234/v1/")
 
 completion = client.chat.completions.create(
-    model="minicpmo_2_6",
+    model="default",
     messages=[
         {
             "role": "user",
@@ -116,7 +112,7 @@ completion = client.chat.completions.create(
                 },
                 {
                     "type": "text",
-                    "text": "(<image>./</image>) What is shown in this image? Write a detailed response analyzing the scene.",
+                    "text": "What is shown in this image? Write a detailed response analyzing the scene.",
                 },
             ],
         },
@@ -131,24 +127,24 @@ print(resp)
 
 ```
 
-- You can find an example of encoding the [image via base64 here](../examples/server/phi3v_base64.py).
-- You can find an example of loading an [image locally here](../examples/server/phi3v_local_img.py).
+- You can find an example of encoding the [image via base64 here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/server/phi3v_base64.py).
+- You can find an example of loading an [image locally here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/server/phi3v_local_img.py).
 
 ---
 
 ## Rust
-You can find this example [here](../mistralrs/examples/minicpmo_2_6/main.rs).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/minicpmo_2_6/main.rs).
 
 ```rust
 use anyhow::Result;
-use mistralrs::{IsqType, TextMessageRole, VisionLoaderType, VisionMessages, VisionModelBuilder};
+use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 const MODEL_ID: &str = "openbmb/MiniCPM-o-2_6";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let model =
-        VisionModelBuilder::new(MODEL_ID, VisionLoaderType::VLlama)
+        VisionModelBuilder::new(MODEL_ID)
             .with_isq(IsqType::Q4K)
             .with_logging()
             .build()
@@ -183,7 +179,7 @@ async fn main() -> Result<()> {
 ---
 
 ## Python
-You can find this example [here](../examples/python/minicpmo_2_6.py).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/python/minicpmo_2_6.py).
 
 This example demonstrates loading and sending a chat completion request with an image.
 
@@ -203,7 +199,7 @@ runner = Runner(
 
 res = runner.send_chat_completion_request(
     ChatCompletionRequest(
-        model="minicpmo_2_6",
+        model="default",
         messages=[
             {
                 "role": "user",
@@ -216,7 +212,7 @@ res = runner.send_chat_completion_request(
                     },
                     {
                         "type": "text",
-                        "text": "(<image>./</image>) What is shown in this image? Write a detailed response analyzing the scene.",
+                        "text": "What is shown in this image? Write a detailed response analyzing the scene.",
                     },
                 ],
             }
@@ -231,5 +227,5 @@ print(res.choices[0].message.content)
 print(res.usage)
 ```
 
-- You can find an example of encoding the [image via base64 here](../examples/python/phi3v_base64.py).
-- You can find an example of loading an [image locally here](../examples/python/phi3v_local_img.py).
+- You can find an example of encoding the [image via base64 here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/python/phi3v_base64.py).
+- You can find an example of loading an [image locally here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/python/phi3v_local_img.py).

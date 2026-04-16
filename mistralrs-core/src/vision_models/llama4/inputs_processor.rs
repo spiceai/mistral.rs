@@ -3,7 +3,6 @@
 use std::{
     any::Any,
     collections::{HashMap, HashSet},
-    num::NonZeroUsize,
     sync::Arc,
 };
 
@@ -16,7 +15,6 @@ use mistralrs_vision::{
 };
 use ordered_float::NotNan;
 use tokenizers::Tokenizer;
-use tracing::warn;
 
 use crate::{
     device_map::DeviceMapper,
@@ -137,28 +135,21 @@ impl InputsProcessor for Llama4ImageProcessor {
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
         other_config: Option<Arc<dyn Any>>,
-        mut paged_attn_metadata: Option<PagedAttentionMeta<'_>>,
-        prompt_chunksize: Option<NonZeroUsize>,
+        mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
-    ) -> Box<dyn Iterator<Item = anyhow::Result<InputProcessorOutput>>> {
+    ) -> anyhow::Result<InputProcessorOutput> {
         if is_xlora {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
+            return Err(anyhow::Error::msg(
                 "Cannot make inputs for X-LoRA vision model.",
-            ))));
+            ));
         }
         if no_kv_cache {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
-                "Vision model must have kv cache.",
-            ))));
-        }
-        // TODO(EricLBuehler): support this? Would require some handling of image tokens.
-        if prompt_chunksize.is_some() {
-            warn!("`prompt_chunksize` is set. Llama4 does not support prompt batching.");
+            return Err(anyhow::Error::msg("Vision model must have kv cache."));
         }
         let Some(tokenizer) = tokenizer else {
-            return Box::new(std::iter::once(Err(anyhow::Error::msg(
+            return Err(anyhow::Error::msg(
                 "Llama4InputProcessor requires a specified tokenizer.",
-            ))));
+            ));
         };
 
         let config = other_config.expect("Need a PreProcessorConfig config.");
@@ -190,9 +181,9 @@ impl InputsProcessor for Llama4ImageProcessor {
                 .collect::<Vec<_>>();
 
             if n_images_in_text != n_images_in_images {
-                return Box::new(std::iter::once(Err(anyhow::Error::msg(format!(
+                return Err(anyhow::Error::msg(format!(
                     "The number of images in each batch {n_images_in_text:?} should be the same as the number of images {n_images_in_images:?}. The model cannot support a different number of images per patch. Perhaps you forgot a `<|image|>` tag?"
-                )))));
+                )));
             }
 
             let max_num_images = *n_images_in_images
@@ -268,13 +259,16 @@ impl InputsProcessor for Llama4ImageProcessor {
                 }
                 let prompt = new_prompt.join("");
 
-                seq.set_initial_prompt(prompt.clone());
-                let toks = tokenizer
-                    .encode_fast(prompt, false)
-                    .expect("Detokenization failed!");
+                if !seq.multimodal.has_changed_prompt {
+                    seq.set_initial_prompt(prompt.clone());
+                    let toks = tokenizer
+                        .encode_fast(prompt, false)
+                        .expect("Detokenization failed!");
 
-                let ids = toks.get_ids().to_vec();
-                seq.set_toks_and_reallocate(ids, paged_attn_metadata.as_mut());
+                    let ids = toks.get_ids().to_vec();
+                    seq.set_toks_and_reallocate(ids, paged_attn_metadata.as_mut());
+                    seq.multimodal.has_changed_prompt = true;
+                }
             }
 
             Some(pixel_values)
@@ -297,24 +291,21 @@ impl InputsProcessor for Llama4ImageProcessor {
             get_prompt_input(
                 input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().to_vec())
+                    .map(|seq| seq.get_toks())
                     .collect::<Vec<_>>(),
                 input_seqs,
                 device,
                 last_n_context_len,
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
                 mapper,
             )
-            .nth(0)
-            .unwrap()
             .unwrap()
         } else {
             get_completion_input(
                 input_seqs
                     .iter()
-                    .map(|seq| seq.get_toks().to_vec())
+                    .map(|seq| seq.get_toks())
                     .collect::<Vec<_>>(),
                 input_seqs,
                 device,
@@ -322,11 +313,8 @@ impl InputsProcessor for Llama4ImageProcessor {
                 last_n_context_len,
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
-                None, // TODO: evaluate if it is possible to batch this
                 mapper,
             )
-            .nth(0)
-            .unwrap()
             .unwrap()
         };
 
@@ -340,10 +328,10 @@ impl InputsProcessor for Llama4ImageProcessor {
             paged_attn_meta,
             flash_meta,
         });
-        Box::new(std::iter::once(Ok(InputProcessorOutput {
+        Ok(InputProcessorOutput {
             inputs,
             seq_indices,
-        })))
+        })
     }
 }
 
@@ -353,7 +341,7 @@ impl Llama4ImageProcessor {
 
         let sqrt = (dividend as f64).sqrt() as u32;
         for i in 1..=sqrt {
-            if dividend % i == 0 {
+            if dividend.is_multiple_of(i) {
                 factors_set.insert(i);
                 factors_set.insert(dividend / i);
             }

@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::fs;
 use tracing::warn;
 
+use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::gguf::Content;
+use crate::matformer::MatformerSliceConfig;
 use crate::paged_attention::ModelConfigLike;
 use crate::pipeline::AutoDeviceMapParams;
 use crate::pipeline::DeviceMappedModelLoader;
@@ -235,10 +237,9 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         &self,
         _config: &str,
         params: &AutoDeviceMapParams,
-        prompt_chunksize: usize,
     ) -> Result<usize> {
         let AutoDeviceMapParams::Text {
-            max_seq_len: _,
+            max_seq_len,
             max_batch_size,
         } = params
         else {
@@ -246,7 +247,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         };
         let num_heads = self.model.get_metadata()[&format!("{}.attention.head_count", self.arch)]
             .to_u32()? as usize;
-        Ok(max_batch_size * num_heads * prompt_chunksize * prompt_chunksize)
+        Ok(max_batch_size * num_heads * max_seq_len.min(&ATTENTION_CHUNK_SIZE))
     }
     fn non_mapped_max_act_size_elems(
         &self,
@@ -261,6 +262,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         _config: &str,
         _dtype: DType,
         _weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
     ) -> Result<usize> {
         let size_in_bytes = match self.arch {
             GGUFArchitecture::Llama => {
@@ -312,7 +314,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 };
                 token_embd + output_norm + output
             }
-            GGUFArchitecture::Qwen2 => {
+            GGUFArchitecture::Qwen2 | GGUFArchitecture::Qwen3 | GGUFArchitecture::Qwen3MoE => {
                 let token_embd = tensor_info_size_in_bytes!(
                     self.model.tensor_info("token_embd.weight")?,
                     DType::F32
@@ -357,6 +359,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
         config: &str,
         _dtype: DType,
         _weight_pack_factor: usize,
+        _matformer_config: Option<&MatformerSliceConfig>,
     ) -> Result<Vec<usize>> {
         let size_in_bytes = match self.arch {
             GGUFArchitecture::Llama => {
@@ -476,7 +479,7 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
 
                 attn_norm + ffn_norm + attn_qkv + attn_output + ffn_up + ffn_down
             }
-            GGUFArchitecture::Qwen2 => {
+            GGUFArchitecture::Qwen2 | GGUFArchitecture::Qwen3 | GGUFArchitecture::Qwen3MoE => {
                 let attn_norm = tensor_info_size_in_bytes!(
                     self.model.tensor_info("blk.0.attn_norm.weight")?,
                     DType::F32
@@ -486,28 +489,53 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     DType::F32
                 );
 
-                let attn_q = tensor_info_size_in_bytes!(self
-                    .model
-                    .tensor_info("blk.0.attn_q.weight")?)
-                    + tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_q.bias")?);
-                let attn_k = tensor_info_size_in_bytes!(self
-                    .model
-                    .tensor_info("blk.0.attn_k.weight")?)
-                    + tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_k.bias")?);
-                let attn_v = tensor_info_size_in_bytes!(self
-                    .model
-                    .tensor_info("blk.0.attn_v.weight")?)
-                    + tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_v.bias")?);
+                let mut attn_q =
+                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_q.weight")?);
+                if let GGUFArchitecture::Qwen2 = self.arch {
+                    attn_q +=
+                        tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_q.bias")?);
+                }
+                let mut attn_k =
+                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_k.weight")?);
+                if let GGUFArchitecture::Qwen2 = self.arch {
+                    attn_k +=
+                        tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_k.bias")?);
+                }
+
+                let mut attn_v =
+                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_v.weight")?);
+                if let GGUFArchitecture::Qwen2 = self.arch {
+                    attn_v +=
+                        tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.attn_v.bias")?);
+                }
+
                 let attn_output = tensor_info_size_in_bytes!(self
                     .model
                     .tensor_info("blk.0.attn_output.weight")?);
 
-                let ffn_gate =
-                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_gate.weight")?);
-                let ffn_up =
-                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_up.weight")?);
-                let ffn_down =
-                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_down.weight")?);
+                let ffn_gate = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                    tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.ffn_gate_exps.weight")?)
+                } else {
+                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_gate.weight")?)
+                };
+
+                let ffn_up = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                    tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.ffn_up_exps.weight")?)
+                } else {
+                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_up.weight")?)
+                };
+
+                let ffn_down = if let GGUFArchitecture::Qwen3MoE = self.arch {
+                    tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info("blk.0.ffn_down_exps.weight")?)
+                } else {
+                    tensor_info_size_in_bytes!(self.model.tensor_info("blk.0.ffn_down.weight")?)
+                };
 
                 attn_norm
                     + ffn_norm

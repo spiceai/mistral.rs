@@ -31,7 +31,6 @@ impl GgufXLoraModelBuilder {
 
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = GGUFSpecificConfig {
-            prompt_chunksize: self.gguf_model.prompt_chunksize,
             topology: self.gguf_model.topology,
         };
 
@@ -95,15 +94,22 @@ impl GgufXLoraModelBuilder {
             pipeline,
             scheduler_method,
             self.gguf_model.throughput_logging,
-            self.gguf_model.search_bert_model,
-        )
-        .with_no_kv_cache(self.gguf_model.no_kv_cache)
-        .with_no_prefix_cache(self.gguf_model.prefix_cache_n.is_none());
+            self.gguf_model.search_embedding_model,
+        );
+        if let Some(cb) = self.gguf_model.search_callback.clone() {
+            runner = runner.with_search_callback(cb);
+        }
+        for (name, cb) in &self.gguf_model.tool_callbacks {
+            runner = runner.with_tool_callback(name.clone(), cb.clone());
+        }
+        runner = runner
+            .with_no_kv_cache(self.gguf_model.no_kv_cache)
+            .with_no_prefix_cache(self.gguf_model.prefix_cache_n.is_none());
 
         if let Some(n) = self.gguf_model.prefix_cache_n {
             runner = runner.with_prefix_cache_n(n)
         }
 
-        Ok(Model::new(runner.build()))
+        Ok(Model::new(runner.build().await))
     }
 }

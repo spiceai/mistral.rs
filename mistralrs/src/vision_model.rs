@@ -1,11 +1,15 @@
+use candle_core::Device;
 use mistralrs_core::*;
+use mistralrs_core::{SearchCallback, Tool, ToolCallback};
+use std::collections::HashMap;
 use std::{
-    num::NonZeroUsize,
     ops::{Deref, DerefMut},
     path::PathBuf,
+    sync::Arc,
 };
 
-use crate::{best_device, Model};
+use crate::model_builder_trait::{build_model_from_pipeline, build_vision_pipeline};
+use crate::Model;
 
 #[derive(Clone)]
 /// Configure a vision model with the various parameters for loading, running, and other inference behaviors.
@@ -24,13 +28,18 @@ pub struct VisionModelBuilder {
     pub(crate) device_mapping: Option<DeviceMapSetting>,
     pub(crate) max_edge: Option<u32>,
     pub(crate) hf_cache_path: Option<PathBuf>,
-    pub(crate) search_bert_model: Option<BertEmbeddingModel>,
+    pub(crate) search_embedding_model: Option<SearchEmbeddingModel>,
+    pub(crate) search_callback: Option<Arc<SearchCallback>>,
+    pub(crate) tool_callbacks: HashMap<String, Arc<ToolCallback>>,
+    pub(crate) tool_callbacks_with_tools: HashMap<String, ToolCallbackWithTool>,
+    pub(crate) device: Option<Device>,
+    pub(crate) matformer_config_path: Option<PathBuf>,
+    pub(crate) matformer_slice_name: Option<String>,
 
     // Model running
-    pub(crate) use_flash_attn: bool,
-    pub(crate) prompt_chunksize: Option<NonZeroUsize>,
     pub(crate) topology: Option<Topology>,
-    pub(crate) loader_type: VisionLoaderType,
+    pub(crate) topology_path: Option<String>,
+    pub(crate) loader_type: Option<VisionLoaderType>,
     pub(crate) dtype: ModelDType,
     pub(crate) force_cpu: bool,
     pub(crate) isq: Option<IsqType>,
@@ -40,6 +49,7 @@ pub struct VisionModelBuilder {
     pub(crate) paged_attn_cfg: Option<PagedAttentionConfig>,
     pub(crate) max_num_seqs: usize,
     pub(crate) with_logging: bool,
+    pub(crate) prefix_cache_n: Option<usize>,
 }
 
 impl VisionModelBuilder {
@@ -48,18 +58,17 @@ impl VisionModelBuilder {
     /// - Maximum number of sequences running is 32
     /// - Automatic device mapping with model defaults according to `AutoDeviceMapParams`
     /// - By default, web searching compatible with the OpenAI `web_search_options` setting is disabled.
-    pub fn new(model_id: impl ToString, loader_type: VisionLoaderType) -> Self {
+    pub fn new(model_id: impl ToString) -> Self {
         Self {
             model_id: model_id.to_string(),
-            use_flash_attn: cfg!(feature = "flash-attn"),
             topology: None,
+            topology_path: None,
             write_uqff: None,
             from_uqff: None,
-            prompt_chunksize: None,
             chat_template: None,
             tokenizer_json: None,
             max_edge: None,
-            loader_type,
+            loader_type: None,
             dtype: ModelDType::Auto,
             force_cpu: false,
             token_source: TokenSource::CacheToken,
@@ -74,13 +83,49 @@ impl VisionModelBuilder {
             throughput_logging: false,
             paged_attn_cfg: None,
             hf_cache_path: None,
-            search_bert_model: None,
+            search_embedding_model: None,
+            search_callback: None,
+            tool_callbacks: HashMap::new(),
+            tool_callbacks_with_tools: HashMap::new(),
+            device: None,
+            matformer_config_path: None,
+            matformer_slice_name: None,
+            prefix_cache_n: None,
         }
     }
 
-    /// Enable searching compatible with the OpenAI `web_search_options` setting. This uses the BERT model specified or the default.
-    pub fn with_search(mut self, search_bert_model: BertEmbeddingModel) -> Self {
-        self.search_bert_model = Some(search_bert_model);
+    /// Enable searching compatible with the OpenAI `web_search_options` setting. This loads the selected search embedding reranker (EmbeddingGemma by default).
+    pub fn with_search(mut self, search_embedding_model: SearchEmbeddingModel) -> Self {
+        self.search_embedding_model = Some(search_embedding_model);
+        self
+    }
+
+    /// Override the search function used when `web_search_options` is enabled.
+    pub fn with_search_callback(mut self, callback: Arc<SearchCallback>) -> Self {
+        self.search_callback = Some(callback);
+        self
+    }
+
+    pub fn with_tool_callback(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+    ) -> Self {
+        self.tool_callbacks.insert(name.into(), callback);
+        self
+    }
+
+    /// Register a callback with an associated Tool definition that will be automatically
+    /// added to requests when tool callbacks are active.
+    pub fn with_tool_callback_and_tool(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+        tool: Tool,
+    ) -> Self {
+        let name = name.into();
+        self.tool_callbacks_with_tools
+            .insert(name, ToolCallbackWithTool { callback, tool });
         self
     }
 
@@ -96,16 +141,22 @@ impl VisionModelBuilder {
         self
     }
 
-    /// Set the prompt batchsize to use for inference.
-    pub fn with_prompt_chunksize(mut self, prompt_chunksize: NonZeroUsize) -> Self {
-        self.prompt_chunksize = Some(prompt_chunksize);
-        self
-    }
-
     /// Set the model topology for use during loading. If there is an overlap, the topology type is used over the ISQ type.
     pub fn with_topology(mut self, topology: Topology) -> Self {
         self.topology = Some(topology);
         self
+    }
+
+    /// Set the model topology from a path. This preserves the path for unload/reload support.
+    /// If there is an overlap, the topology type is used over the ISQ type.
+    pub fn with_topology_from_path<P: AsRef<std::path::Path>>(
+        mut self,
+        path: P,
+    ) -> anyhow::Result<Self> {
+        let path_str = path.as_ref().to_string_lossy().to_string();
+        self.topology = Some(Topology::from_path(&path)?);
+        self.topology_path = Some(path_str);
+        Ok(self)
     }
 
     /// Literal Jinja chat template OR Path (ending in `.json`) to one.
@@ -117,6 +168,13 @@ impl VisionModelBuilder {
     /// Path to a discrete `tokenizer.json` file.
     pub fn with_tokenizer_json(mut self, tokenizer_json: impl ToString) -> Self {
         self.tokenizer_json = Some(tokenizer_json.to_string());
+        self
+    }
+
+    /// Manually set the model loader type. Otherwise, it will attempt to automatically
+    /// determine the loader type.
+    pub fn with_loader_type(mut self, loader_type: VisionLoaderType) -> Self {
+        self.loader_type = Some(loader_type);
         self
     }
 
@@ -157,7 +215,7 @@ impl VisionModelBuilder {
     }
 
     /// Enable PagedAttention. Configure PagedAttention with a [`PagedAttentionConfig`] object, which
-    /// can be created with sensible values with a [`PagedAttentionMetaBuilder`].
+    /// can be created with sensible values with a [`PagedAttentionMetaBuilder`](crate::PagedAttentionMetaBuilder).
     ///
     /// If PagedAttention is not supported (query with [`paged_attn_supported`]), this will do nothing.
     pub fn with_paged_attn(
@@ -178,6 +236,12 @@ impl VisionModelBuilder {
         self
     }
 
+    /// Set the number of sequences to hold in the prefix cache. Set to `None` to disable the prefix cacher.
+    pub fn with_prefix_cache_n(mut self, n_seqs: Option<usize>) -> Self {
+        self.prefix_cache_n = n_seqs;
+        self
+    }
+
     /// Enable logging.
     pub fn with_logging(mut self) -> Self {
         self.with_logging = true;
@@ -190,7 +254,16 @@ impl VisionModelBuilder {
         self
     }
 
-    /// Path to read a UQFF file from.
+    #[deprecated(
+        note = "Use `UqffTextModelBuilder` to load a UQFF model instead of the generic `from_uqff`"
+    )]
+    /// Path to read a `.uqff` file from. Other necessary configuration files must be present at this location.
+    ///
+    /// For example, these include:
+    /// - `residual.safetensors`
+    /// - `tokenizer.json`
+    /// - `config.json`
+    /// - More depending on the model
     pub fn from_uqff(mut self, path: Vec<PathBuf>) -> Self {
         self.from_uqff = Some(path);
         self
@@ -203,14 +276,16 @@ impl VisionModelBuilder {
         self
     }
 
-    /// Path to write a UQFF file to.
+    /// Path to write a `.uqff` file to and serialize the other necessary files.
     ///
     /// The parent (part of the path excluding the filename) will determine where any other files
-    /// generated are written to. These can be used to load UQFF models standalone, and may include:
+    /// serialized are written to.
+    ///
+    /// For example, these include:
     /// - `residual.safetensors`
     /// - `tokenizer.json`
     /// - `config.json`
-    /// - And others
+    /// - More depending on the model
     pub fn write_uqff(mut self, path: PathBuf) -> Self {
         self.write_uqff = Some(path);
         self
@@ -222,76 +297,27 @@ impl VisionModelBuilder {
         self
     }
 
+    /// Set the main device to load this model onto. Automatic device mapping will be performed starting with this device.
+    pub fn with_device(mut self, device: Device) -> Self {
+        self.device = Some(device);
+        self
+    }
+
+    /// Path to a Matryoshka Transformer configuration CSV file.
+    pub fn with_matformer_config_path(mut self, path: PathBuf) -> Self {
+        self.matformer_config_path = Some(path);
+        self
+    }
+
+    /// Name of the slice to use from the Matryoshka Transformer configuration.
+    pub fn with_matformer_slice_name(mut self, name: String) -> Self {
+        self.matformer_slice_name = Some(name);
+        self
+    }
+
     pub async fn build(self) -> anyhow::Result<Model> {
-        let config = VisionSpecificConfig {
-            use_flash_attn: self.use_flash_attn,
-            prompt_chunksize: self.prompt_chunksize,
-            topology: self.topology,
-            write_uqff: self.write_uqff,
-            from_uqff: self.from_uqff,
-            max_edge: self.max_edge,
-            calibration_file: self.calibration_file,
-            imatrix: self.imatrix,
-            hf_cache_path: self.hf_cache_path,
-        };
-
-        if self.with_logging {
-            initialize_logging();
-        }
-
-        let loader = VisionLoaderBuilder::new(
-            config,
-            self.chat_template,
-            self.tokenizer_json,
-            Some(self.model_id),
-            self.jinja_explicit,
-        )
-        .build(self.loader_type);
-
-        // Load, into a Pipeline
-        let pipeline = loader.load_model_from_hf(
-            self.hf_revision,
-            self.token_source,
-            &self.dtype,
-            &best_device(self.force_cpu)?,
-            !self.with_logging,
-            self.device_mapping
-                .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_vision())),
-            self.isq,
-            self.paged_attn_cfg,
-        )?;
-
-        let scheduler_method = match self.paged_attn_cfg {
-            Some(_) => {
-                let config = pipeline
-                    .lock()
-                    .await
-                    .get_metadata()
-                    .cache_config
-                    .as_ref()
-                    .unwrap()
-                    .clone();
-
-                SchedulerConfig::PagedAttentionMeta {
-                    max_num_seqs: self.max_num_seqs,
-                    config,
-                }
-            }
-            None => SchedulerConfig::DefaultScheduler {
-                method: DefaultSchedulerMethod::Fixed(self.max_num_seqs.try_into()?),
-            },
-        };
-
-        let runner = MistralRsBuilder::new(
-            pipeline,
-            scheduler_method,
-            self.throughput_logging,
-            self.search_bert_model,
-        )
-        .with_no_kv_cache(false)
-        .with_no_prefix_cache(false);
-
-        Ok(Model::new(runner.build()))
+        let (pipeline, scheduler_config, add_model_config) = build_vision_pipeline(self).await?;
+        Ok(build_model_from_pipeline(pipeline, scheduler_config, add_model_config).await)
     }
 }
 
@@ -305,13 +331,9 @@ impl UqffVisionModelBuilder {
     /// - Token source is from the cache (.cache/huggingface/token)
     /// - Maximum number of sequences running is 32
     /// - Automatic device mapping with model defaults according to `AutoDeviceMapParams`
-    pub fn new(
-        model_id: impl ToString,
-        loader_type: VisionLoaderType,
-        uqff_file: Vec<PathBuf>,
-    ) -> Self {
-        let mut inner = VisionModelBuilder::new(model_id, loader_type);
-        inner = inner.from_uqff(uqff_file);
+    pub fn new(model_id: impl ToString, uqff_file: Vec<PathBuf>) -> Self {
+        let mut inner = VisionModelBuilder::new(model_id);
+        inner.from_uqff = Some(uqff_file);
         Self(inner)
     }
 

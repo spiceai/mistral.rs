@@ -1,6 +1,6 @@
-use crate::utils::{get_pixel_data, n_channels};
-use candle_core::{DType, Device, Result, Tensor, D};
-use image::{DynamicImage, GenericImageView};
+use crate::utils::image_to_pixels;
+use candle_core::{Device, Result, Tensor, D};
+use image::DynamicImage;
 
 use crate::ImageTransform;
 
@@ -8,24 +8,11 @@ use crate::ImageTransform;
 /// The tensor's shape is (channels, height, width).
 pub struct ToTensor;
 
-impl ToTensor {
-    fn to_tensor(device: &Device, channels: usize, data: Vec<Vec<Vec<u8>>>) -> Result<Tensor> {
-        ToTensorNoNorm::to_tensor(device, channels, data)? / 255.0f64
-    }
-}
-
 impl ImageTransform for ToTensor {
     type Input = DynamicImage;
     type Output = Tensor;
     fn map(&self, x: &Self::Input, device: &Device) -> Result<Self::Output> {
-        let num_channels = n_channels(x);
-        let data = get_pixel_data(
-            num_channels,
-            x.to_rgba8(),
-            x.dimensions().1 as usize,
-            x.dimensions().0 as usize,
-        );
-        Self::to_tensor(device, num_channels, data)
+        image_to_pixels(x, device)? / 255.
     }
 }
 
@@ -33,43 +20,18 @@ impl ImageTransform for ToTensor {
 /// The tensor's shape is (channels, height, width).
 pub struct ToTensorNoNorm;
 
-impl ToTensorNoNorm {
-    fn to_tensor(device: &Device, channels: usize, data: Vec<Vec<Vec<u8>>>) -> Result<Tensor> {
-        let mut accum = Vec::new();
-        for row in data {
-            let mut row_accum = Vec::new();
-            for item in row {
-                row_accum.push(
-                    Tensor::from_slice(&item[..channels], (1, channels), &Device::Cpu)?
-                        .to_dtype(DType::F32)?,
-                )
-            }
-            let row = Tensor::cat(&row_accum, 0)?;
-            accum.push(row.t()?.unsqueeze(1)?);
-        }
-        Tensor::cat(&accum, 1)?.to_device(device)
-    }
-}
-
 impl ImageTransform for ToTensorNoNorm {
     type Input = DynamicImage;
     type Output = Tensor;
     fn map(&self, x: &Self::Input, device: &Device) -> Result<Self::Output> {
-        let num_channels = n_channels(x);
-        let data = get_pixel_data(
-            num_channels,
-            x.to_rgba8(),
-            x.dimensions().1 as usize,
-            x.dimensions().0 as usize,
-        );
-        Self::to_tensor(device, num_channels, data)
+        image_to_pixels(x, device)
     }
 }
 
 /// Normalize the image data based on the mean and standard deviation.
 /// The value is computed as follows:
 /// `
-/// x[channel]=(x[channel - mean[channel]) / std[channel]
+/// x[channel] = (x[channel] - mean[channel]) / std[channel]
 /// `
 ///
 /// Expects an input tensor of shape (channels, height, width).
@@ -92,11 +54,23 @@ impl ImageTransform for Normalize {
                 self.std.len()
             );
         }
-        let mut accum = Vec::new();
-        for (i, channel) in x.chunk(num_channels, D::Minus(3))?.iter().enumerate() {
-            accum.push(((channel - self.mean[i])? / self.std[i])?);
-        }
-        Tensor::cat(&accum, D::Minus(3))
+        let dtype = x.dtype();
+        let device = x.device();
+        let mean = Tensor::from_slice(
+            &self.mean.iter().map(|x| *x as f32).collect::<Vec<_>>(),
+            (num_channels,),
+            device,
+        )?
+        .to_dtype(dtype)?;
+        let std = Tensor::from_slice(
+            &self.std.iter().map(|x| *x as f32).collect::<Vec<_>>(),
+            (num_channels,),
+            device,
+        )?
+        .to_dtype(dtype)?;
+        let mean = mean.reshape((num_channels, 1, 1))?;
+        let std = std.reshape((num_channels, 1, 1))?;
+        x.broadcast_sub(&mean)?.broadcast_div(&std)
     }
 }
 
@@ -168,9 +142,9 @@ mod tests {
     #[test]
     fn test_normalize() {
         use crate::{ImageTransform, Normalize};
-        use candle_core::{DType, Device, Tensor};
+        use candle_core::{Device, Tensor};
 
-        let image = Tensor::zeros((3, 5, 4), DType::U8, &Device::Cpu).unwrap();
+        let image = Tensor::randn(1f32, 0f32, (3, 5, 4), &Device::Cpu).unwrap();
         let res = Normalize {
             mean: vec![0.5, 0.5, 0.5],
             std: vec![0.5, 0.5, 0.5],

@@ -5,25 +5,30 @@ use super::{
     IsqPipelineMixin, Loader, MetadataMixin, ModelCategory, ModelKind, ModelPaths,
     PreProcessingMixin, Processor, TokenSource,
 };
-use crate::device_map::DeviceMapper;
+use crate::device_map::{self, DeviceMapper};
 use crate::diffusion_models::processor::{DiffusionProcessor, ModelInputs};
+use crate::distributed::{self, WorkerTransferData};
 use crate::paged_attention::AttentionImplementation;
-use crate::pipeline::ChatTemplate;
+use crate::pipeline::{ChatTemplate, Modalities, SupportedModality};
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::varbuilder_utils::DeviceForLoadTensor;
-use crate::utils::{tokens::get_token, varbuilder_utils::from_mmaped_safetensors};
+use crate::utils::{
+    progress::{new_multi_progress, ProgressScopeGuard},
+    tokens::get_token,
+    varbuilder_utils::from_mmaped_safetensors,
+};
 use crate::{DeviceMapSetting, PagedAttentionConfig, Pipeline, TryIntoDType};
 use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use image::{DynamicImage, RgbImage};
-use indicatif::MultiProgress;
+use mistralrs_quant::log::once_log_info;
 use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
 use std::any::Any;
-use std::io;
 use std::sync::Arc;
+use std::{env, io};
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -39,7 +44,6 @@ pub struct DiffusionPipeline {
 pub struct DiffusionLoader {
     inner: Box<dyn DiffusionModelLoader>,
     model_id: String,
-    config: DiffusionSpecificConfig,
     kind: ModelKind,
 }
 
@@ -47,20 +51,12 @@ pub struct DiffusionLoader {
 /// A builder for a loader for a vision (non-quantized) model.
 pub struct DiffusionLoaderBuilder {
     model_id: Option<String>,
-    config: DiffusionSpecificConfig,
     kind: ModelKind,
 }
 
-#[derive(Clone, Default)]
-/// Config specific to loading a vision model.
-pub struct DiffusionSpecificConfig {
-    pub use_flash_attn: bool,
-}
-
 impl DiffusionLoaderBuilder {
-    pub fn new(config: DiffusionSpecificConfig, model_id: Option<String>) -> Self {
+    pub fn new(model_id: Option<String>) -> Self {
         Self {
-            config,
             model_id,
             kind: ModelKind::Normal,
         }
@@ -74,7 +70,6 @@ impl DiffusionLoaderBuilder {
         Box::new(DiffusionLoader {
             inner: loader,
             model_id: self.model_id.unwrap(),
-            config: self.config,
             kind: self.kind,
         })
     }
@@ -93,22 +88,21 @@ impl Loader for DiffusionLoader {
         in_situ_quant: Option<IsqType>,
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
+        let _progress_guard = ProgressScopeGuard::new(silent);
         let paths: anyhow::Result<Box<dyn ModelPaths>> = {
             let api = ApiBuilder::new()
                 .with_progress(!silent)
                 .with_token(get_token(&token_source)?)
                 .build()?;
             let revision = revision.unwrap_or("main".to_string());
-            let api = Arc::new(api.repo(Repo::with_revision(
+            let api = std::sync::Arc::new(api.repo(Repo::with_revision(
                 self.model_id.clone(),
                 RepoType::Model,
                 revision.clone(),
             )));
             let model_id = std::path::Path::new(&self.model_id);
-            let filenames = self.inner.get_model_paths(Arc::clone(&api), model_id)?;
-            let config_filenames = self
-                .inner
-                .get_config_filenames(Arc::clone(&api), model_id)?;
+            let filenames = self.inner.get_model_paths(&api, model_id)?;
+            let config_filenames = self.inner.get_config_filenames(&api, model_id)?;
             Ok(Box::new(DiffusionModelPaths(DiffusionModelPathsInner {
                 config_filenames,
                 filenames,
@@ -136,6 +130,7 @@ impl Loader for DiffusionLoader {
         in_situ_quant: Option<IsqType>,
         mut paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
+        let _progress_guard = ProgressScopeGuard::new(silent);
         let paths = &paths
             .as_ref()
             .as_any()
@@ -157,13 +152,33 @@ impl Loader for DiffusionLoader {
             paged_attn_config = None;
         }
 
+        if crate::using_flash_attn() {
+            once_log_info("FlashAttention is enabled.");
+        }
+
         let configs = paths
             .config_filenames
             .iter()
             .map(std::fs::read_to_string)
             .collect::<io::Result<Vec<_>>>()?;
 
-        let mapper = DeviceMapSetting::dummy().into_mapper(usize::MAX, device, None)?;
+        #[cfg(feature = "cuda")]
+        if let Device::Cuda(dev) = &device {
+            unsafe { dev.disable_event_tracking() };
+        }
+        let use_nccl = mistralrs_quant::distributed::use_nccl();
+        let available_devices = if let Ok(payload) = env::var(distributed::IS_DAEMON_FLAG) {
+            let payload: WorkerTransferData = serde_json::from_str(&payload)?;
+            let WorkerTransferData::Init { id: _, worker_rank } = payload;
+            vec![candle_core::Device::new_cuda(worker_rank + 1)?]
+        } else if use_nccl {
+            vec![candle_core::Device::new_cuda(0)?]
+        } else {
+            device_map::get_all_similar_devices(device)?
+        };
+
+        let mapper =
+            DeviceMapSetting::dummy().into_mapper(usize::MAX, device, None, &available_devices)?;
         let dtype = mapper.get_min_dtype(dtype)?;
 
         let attention_mechanism = if paged_attn_config.is_some() {
@@ -196,13 +211,13 @@ impl Loader for DiffusionLoader {
 
                 self.inner.load(
                     configs,
-                    self.config.use_flash_attn,
                     vbs,
                     crate::pipeline::NormalLoadingMetadata {
                         mapper,
                         loading_isq: false,
                         real_device: device.clone(),
-                        multi_progress: Arc::new(MultiProgress::new()),
+                        multi_progress: Arc::new(new_multi_progress()),
+                        matformer_slicing_config: None,
                     },
                     attention_mechanism,
                     silent,
@@ -217,7 +232,7 @@ impl Loader for DiffusionLoader {
             model_id: self.model_id.clone(),
             metadata: Arc::new(GeneralMetadata {
                 max_seq_len,
-                tok_env: None,
+                llg_factory: None,
                 is_xlora: false,
                 no_prefix_cache: false,
                 num_hidden_layers: 1, // FIXME(EricLBuehler): we know this is only for caching, so its OK.
@@ -228,8 +243,11 @@ impl Loader for DiffusionLoader {
                 sliding_window: None,
                 cache_config: None,
                 cache_engine: None,
-                prompt_chunksize: None,
                 model_metadata: None,
+                modalities: Modalities {
+                    input: vec![SupportedModality::Text],
+                    output: vec![SupportedModality::Vision],
+                },
             }),
             dummy_cache: EitherCache::Full(Cache::new(0, false)),
         })))

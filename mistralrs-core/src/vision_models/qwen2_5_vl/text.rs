@@ -153,7 +153,6 @@ impl Attention {
                     cfg.num_attention_heads,
                     comm,
                 ),
-                use_flash_attn: false,
                 softcap: None,
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
@@ -338,7 +337,12 @@ impl Qwen2_5VLTextModel {
             candle_core::bail!("Expected eager attention implementation");
         }
         let mapper = normal_loading_metadata.mapper;
-        let vb_m = vb.pp("model");
+        // Support both HuggingFace naming (model.*) and MLX naming (language_model.model.*)
+        let vb_m = if vb.contains_tensor("language_model.model.embed_tokens.weight") {
+            vb.pp("language_model").pp("model")
+        } else {
+            vb.pp("model")
+        };
 
         let embed_tokens = layers::embedding(
             cfg.vocab_size,
@@ -346,7 +350,6 @@ impl Qwen2_5VLTextModel {
             mapper.set_nm_device(vb_m.pp("embed_tokens"), false),
             &cfg.quantization_config,
         )?;
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let head_dim = cfg.hidden_size / cfg.num_attention_heads;
 
         let mut ropes = HashMap::new();
@@ -364,13 +367,13 @@ impl Qwen2_5VLTextModel {
                 )?),
             );
         }
-
         let vb_l = vb_m.pp("layers");
-        for layer_idx in NiceProgressBar::<_, 'b'>(
+        let layers = NiceProgressBar::<_, 'b'>(
             0..cfg.num_hidden_layers,
             "Loading repeating layers",
             &normal_loading_metadata.multi_progress,
-        ) {
+        )
+        .par_iter_if_isq(|layer_idx| {
             let device = mapper
                 .device_for(layer_idx, false)
                 .unwrap_or(&normal_loading_metadata.real_device);
@@ -379,7 +382,7 @@ impl Qwen2_5VLTextModel {
                 .expect("No RoPE for device location!")
                 .clone();
             let comm = mapper.get_comm_for(layer_idx)?;
-            let layer = DecoderLayer::new(
+            DecoderLayer::new(
                 rotary_emb.clone(),
                 cfg,
                 vb_l.pp(layer_idx),
@@ -387,9 +390,8 @@ impl Qwen2_5VLTextModel {
                 layer_idx,
                 normal_loading_metadata.loading_isq,
                 &comm,
-            )?;
-            layers.push(layer)
-        }
+            )
+        })?;
         let norm = F32RmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
@@ -399,7 +401,7 @@ impl Qwen2_5VLTextModel {
             ReplicatedLayer::new(
                 cfg.hidden_size,
                 cfg.vocab_size,
-                &None,
+                &cfg.quantization_config,
                 false,
                 mapper.set_nm_device(vb.pp("lm_head"), normal_loading_metadata.loading_isq),
             )?
@@ -432,6 +434,7 @@ impl Qwen2_5VLTextModel {
                 sliding_window: cfg.sliding_window,
                 k_head_dim: cfg.hidden_size / cfg.num_attention_heads,
                 v_head_dim: cfg.hidden_size / cfg.num_attention_heads,
+                kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
             },
             device: normal_loading_metadata.real_device.clone(),
             dtype: vb.dtype(),
@@ -471,11 +474,12 @@ impl Qwen2_5VLTextModel {
             )?
         }
         let xs = xs.to_device(&self.device)?;
-        let mut xs = xs.apply(&self.norm)?;
+        let xs = xs.apply(&self.norm)?;
+        let mut xs = extract_logits(&xs, context_lens)?;
         if let Some(t) = self.lm_head.quantized_act_type() {
             xs = xs.to_dtype(t)?;
         }
-        extract_logits(&self.lm_head.forward(&xs)?, context_lens)
+        self.lm_head.forward(&xs)
     }
 }
 

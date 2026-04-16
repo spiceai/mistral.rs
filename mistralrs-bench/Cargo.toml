@@ -3,6 +3,7 @@ name = "mistralrs-bench"
 publish = false
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -18,10 +19,10 @@ candle-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
-mistralrs-core = { version = "0.5.0", path = "../mistralrs-core" }
+mistralrs-core.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-cli-table = "0.4.7"
+cli-table.workspace = true
 
 [features]
 cuda = ["mistralrs-core/cuda"]
@@ -31,3 +32,4 @@ flash-attn = ["cuda", "mistralrs-core/flash-attn"]
 accelerate = ["mistralrs-core/accelerate"]
 mkl = ["mistralrs-core/mkl"]
 nccl = ["mistralrs-core/nccl"]
+ring = ["mistralrs-core/ring"]

@@ -4,3 +4,8 @@
 *.a
 .DS_Store
 .idea
+mistral.rs/
+mistralrs-web-chat/cache
+
+# mdbook output
+docs/book/

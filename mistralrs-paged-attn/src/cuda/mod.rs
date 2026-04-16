@@ -1,10 +1,9 @@
-pub const COPY_BLOCKS_KERNEL: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/copy_blocks_kernel.ptx"));
-pub const PAGEDATTENTION: &str = include_str!(concat!(env!("OUT_DIR"), "/pagedattention.ptx"));
-pub const RESHAPE_AND_CACHE_KERNEL: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/reshape_and_cache_kernel.ptx"));
+pub const USE_FP8: bool = cfg!(has_fp8);
 
 mod backend;
 mod ffi;
 
-pub use backend::{copy_blocks, paged_attention, reshape_and_cache, swap_blocks};
+pub use backend::{
+    concat_and_cache_mla, copy_blocks, flashinfer_mla_decode, gather_mla_cache, kv_scale_update,
+    paged_attention, reshape_and_cache, swap_blocks,
+};

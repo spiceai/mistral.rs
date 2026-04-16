@@ -21,8 +21,10 @@ pub fn initialize_logging() {
             } else {
                 LevelFilter::INFO.into()
             })
-            .from_env_lossy();
-        tracing_subscriber::fmt().with_env_filter(filter).init();
+            .from_env_lossy()
+            // disable info (and below) logs from symphonia
+            .add_directive("symphonia=warn".parse().unwrap());
+        let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
     });
 }
 
