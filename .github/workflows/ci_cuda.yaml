@@ -27,9 +27,9 @@ jobs:
           sudo apt-get install -y curl build-essential libssl-dev protobuf-compiler pkg-config
 
       - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@8022558310ea543e35132143092835585f60e628 # v0.2.21
+        uses: Jimver/cuda-toolkit@b6fc3a9f3f15256d9d94ffe1254f9c5a2565cde6 # v0.2.30
         with:
-          cuda: '12.6.3'
+          cuda: '12.8.1'
           method: 'network'
           sub-packages: '["nvcc", "cudart-dev"]'
 
