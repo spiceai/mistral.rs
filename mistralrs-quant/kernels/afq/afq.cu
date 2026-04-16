@@ -142,7 +142,7 @@ __device__ void compute_scale_bias_warp(const T *w, int group_start, int cols,
   for (int i = lane; i < group_size; i += AFQ_WARP_SIZE) {
     int col = group_start + i;
     if (col < cols) {
-      float val;
+      float val = 0.0f;
       if constexpr (std::is_same_v<T, float>) {
         val = w[col];
       } else if constexpr (std::is_same_v<T, __half>) {
@@ -229,7 +229,7 @@ afq_quantize_kernel(const T *__restrict__ w, uint32_t *__restrict__ w_q,
     if (col >= cols)
       continue;
 
-    float val;
+    float val = 0.0f;
     if constexpr (std::is_same_v<T, float>) {
       val = row_w[col];
     } else if constexpr (std::is_same_v<T, __half>) {
