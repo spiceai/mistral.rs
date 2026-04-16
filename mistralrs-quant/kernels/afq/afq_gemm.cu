@@ -467,6 +467,7 @@ DEFINE_QMV_LAUNCHER(8, 64, __half, f16)
 DEFINE_QMV_LAUNCHER(8, 128, __half, f16)
 
 // BFloat16 QMV
+#if defined(COMPUTE_CAP) && COMPUTE_CAP >= 80
 DEFINE_QMV_LAUNCHER(2, 32, __nv_bfloat16, bf16)
 DEFINE_QMV_LAUNCHER(2, 64, __nv_bfloat16, bf16)
 DEFINE_QMV_LAUNCHER(2, 128, __nv_bfloat16, bf16)
@@ -482,6 +483,22 @@ DEFINE_QMV_6BIT_LAUNCHER(128, __nv_bfloat16, bf16)
 DEFINE_QMV_LAUNCHER(8, 32, __nv_bfloat16, bf16)
 DEFINE_QMV_LAUNCHER(8, 64, __nv_bfloat16, bf16)
 DEFINE_QMV_LAUNCHER(8, 128, __nv_bfloat16, bf16)
+#else
+#define BF16_QMV_STUB(bits, gs) \
+  extern "C" void afq_qmv_##bits##bit_gs##gs##_bf16( \
+      const void *, const void *, const void *, const void *, void *, int, int, int) {}
+#define BF16_QMV_3BIT_STUB(gs) \
+  extern "C" void afq_qmv_3bit_gs##gs##_bf16( \
+      const void *, const void *, const void *, const void *, void *, int, int, int) {}
+#define BF16_QMV_6BIT_STUB(gs) \
+  extern "C" void afq_qmv_6bit_gs##gs##_bf16( \
+      const void *, const void *, const void *, const void *, void *, int, int, int) {}
+BF16_QMV_STUB(2, 32) BF16_QMV_STUB(2, 64) BF16_QMV_STUB(2, 128)
+BF16_QMV_3BIT_STUB(32) BF16_QMV_3BIT_STUB(64) BF16_QMV_3BIT_STUB(128)
+BF16_QMV_STUB(4, 32) BF16_QMV_STUB(4, 64) BF16_QMV_STUB(4, 128)
+BF16_QMV_6BIT_STUB(32) BF16_QMV_6BIT_STUB(64) BF16_QMV_6BIT_STUB(128)
+BF16_QMV_STUB(8, 32) BF16_QMV_STUB(8, 64) BF16_QMV_STUB(8, 128)
+#endif
 
 // ============================================================================
 // Extern "C" Launch Functions - QMM (for larger batch sizes)
@@ -525,6 +542,7 @@ DEFINE_QMM_LAUNCHER(2, 64, __half, f16)
 DEFINE_QMM_LAUNCHER(2, 128, __half, f16)
 
 // BFloat16 QMM
+#if defined(COMPUTE_CAP) && COMPUTE_CAP >= 80
 DEFINE_QMM_LAUNCHER(4, 32, __nv_bfloat16, bf16)
 DEFINE_QMM_LAUNCHER(4, 64, __nv_bfloat16, bf16)
 DEFINE_QMM_LAUNCHER(4, 128, __nv_bfloat16, bf16)
@@ -534,3 +552,11 @@ DEFINE_QMM_LAUNCHER(8, 128, __nv_bfloat16, bf16)
 DEFINE_QMM_LAUNCHER(2, 32, __nv_bfloat16, bf16)
 DEFINE_QMM_LAUNCHER(2, 64, __nv_bfloat16, bf16)
 DEFINE_QMM_LAUNCHER(2, 128, __nv_bfloat16, bf16)
+#else
+#define BF16_QMM_STUB(bits, gs) \
+  extern "C" void afq_qmm_##bits##bit_gs##gs##_bf16( \
+      const void *, const void *, const void *, const void *, void *, int, int, int) {}
+BF16_QMM_STUB(2, 32) BF16_QMM_STUB(2, 64) BF16_QMM_STUB(2, 128)
+BF16_QMM_STUB(4, 32) BF16_QMM_STUB(4, 64) BF16_QMM_STUB(4, 128)
+BF16_QMM_STUB(8, 32) BF16_QMM_STUB(8, 64) BF16_QMM_STUB(8, 128)
+#endif
