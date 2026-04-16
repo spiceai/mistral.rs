@@ -20,7 +20,7 @@ The Rust SDK takes an image from the [image](https://docs.rs/image/latest/image/
 ## HTTP server
 You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/server/llava_next.py).
 
-We support an OpenAI compatible HTTP API for vision models. This example demonstrates sending a chat completion request with an image.
+We support an OpenAI compatible HTTP API for multimodal models. This example demonstrates sending a chat completion request with an image.
 
 > Note: The image_url may be either a path, URL, or a base64 encoded string.
 
@@ -101,7 +101,7 @@ use mistralrs::{IsqType, TextMessageRole, VisionMessages, VisionModelBuilder};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let model = VisionModelBuilder::new(
+    let model = MultimodalModelBuilder::new(
         "llava-hf/llava-v1.6-mistral-7b-hf",
     )
     .with_isq(IsqType::Q4K)
@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
     };
     let image = image::load_from_memory(&bytes)?;
 
-    let messages = VisionMessages::new().add_llava_image_message(
+    let messages = MultimodalMessages::new().add_llava_image_message(
         TextMessageRole::User,
         "What is depicted here? Please describe the scene in detail.",
         image,
@@ -143,12 +143,12 @@ This example demonstrates loading and sending a chat completion request with an 
 > Note: the image_url may be either a path, URL, or a base64 encoded string.
 
 ```py
-from mistralrs import Runner, Which, ChatCompletionRequest, VisionArchitecture
+from mistralrs import Runner, Which, ChatCompletionRequest, MultimodalArchitecture
 
 runner = Runner(
-    which=Which.VisionPlain(
+    which=Which.MultimodalPlain(
         model_id="llava-hf/llava-v1.6-mistral-7b-hf",
-        arch=VisionArchitecture.LLaVANext,
+        arch=MultimodalArchitecture.LLaVANext,
     ),
 )
 

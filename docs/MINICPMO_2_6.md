@@ -24,7 +24,7 @@ The Rust SDK takes an image from the [image](https://docs.rs/image/latest/image/
 
 ## Interactive mode
 
-Mistral.rs supports interactive mode for vision models! It is an easy way to interact with the model.
+Mistral.rs supports interactive mode for multimodal models! It is an easy way to interact with the model.
 
 1) Start up interactive mode with the MiniCPM-O 2.6 Model model
 
@@ -51,7 +51,7 @@ The image shows a close-up view of a rose flower with dew drops on its petals. T
 ## HTTP server
 You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/examples/server/minicpmo_2_6.py).
 
-We support an OpenAI compatible HTTP API for vision models. This example demonstrates sending a chat completion request with an image.
+We support an OpenAI compatible HTTP API for multimodal models. This example demonstrates sending a chat completion request with an image.
 
 > Note: The image_url may be either a path, URL, or a base64 encoded string.
 
@@ -158,10 +158,10 @@ async fn main() -> Result<()> {
     };
     let image = image::load_from_memory(&bytes)?;
 
-    let messages = VisionMessages::new().add_image_message(
+    let messages = MultimodalMessages::new().add_image_message(
         TextMessageRole::User,
         "What is depicted here? Please describe the scene in detail.",
-        image,
+        vec![image],
     );
 
     let response = model.send_chat_request(messages).await?;
@@ -186,14 +186,14 @@ This example demonstrates loading and sending a chat completion request with an 
 > Note: the image_url may be either a path, URL, or a base64 encoded string.
 
 ```py
-from mistralrs import Runner, Which, ChatCompletionRequest, VisionArchitecture
+from mistralrs import Runner, Which, ChatCompletionRequest, MultimodalArchitecture
 
 MODEL_ID = "openbmb/MiniCPM-o-2_6"
 
 runner = Runner(
-    which=Which.VisionPlain(
+    which=Which.MultimodalPlain(
         model_id=MODEL_ID,
-        arch=VisionArchitecture.MiniCpmO,
+        arch=MultimodalArchitecture.MiniCpmO,
     ),
 )
 

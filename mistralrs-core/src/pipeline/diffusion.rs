@@ -7,7 +7,7 @@ use super::{
 };
 use crate::device_map::{self, DeviceMapper};
 use crate::diffusion_models::processor::{DiffusionProcessor, ModelInputs};
-use crate::distributed::{self, WorkerTransferData};
+use crate::distributed::{self, use_ring, WorkerTransferData};
 use crate::paged_attention::AttentionImplementation;
 use crate::pipeline::{ChatTemplate, Modalities, SupportedModality};
 use crate::prefix_cacher::PrefixCacheManagerV2;
@@ -40,7 +40,7 @@ pub struct DiffusionPipeline {
     dummy_cache: EitherCache,
 }
 
-/// A loader for a vision (non-quantized) model.
+/// A loader for a diffusion (non-quantized) model.
 pub struct DiffusionLoader {
     inner: Box<dyn DiffusionModelLoader>,
     model_id: String,
@@ -48,7 +48,7 @@ pub struct DiffusionLoader {
 }
 
 #[derive(Default)]
-/// A builder for a loader for a vision (non-quantized) model.
+/// A builder for a loader for a diffusion (non-quantized) model.
 pub struct DiffusionLoaderBuilder {
     model_id: Option<String>,
     kind: ModelKind,
@@ -95,11 +95,11 @@ impl Loader for DiffusionLoader {
                 .with_token(get_token(&token_source)?)
                 .build()?;
             let revision = revision.unwrap_or("main".to_string());
-            let api = std::sync::Arc::new(api.repo(Repo::with_revision(
+            let api = api.repo(Repo::with_revision(
                 self.model_id.clone(),
                 RepoType::Model,
                 revision.clone(),
-            )));
+            ));
             let model_id = std::path::Path::new(&self.model_id);
             let filenames = self.inner.get_model_paths(&api, model_id)?;
             let config_filenames = self.inner.get_config_filenames(&api, model_id)?;
@@ -171,7 +171,7 @@ impl Loader for DiffusionLoader {
             let payload: WorkerTransferData = serde_json::from_str(&payload)?;
             let WorkerTransferData::Init { id: _, worker_rank } = payload;
             vec![candle_core::Device::new_cuda(worker_rank + 1)?]
-        } else if use_nccl {
+        } else if use_nccl || use_ring() {
             vec![candle_core::Device::new_cuda(0)?]
         } else {
             device_map::get_all_similar_devices(device)?

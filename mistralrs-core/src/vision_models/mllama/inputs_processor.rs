@@ -23,7 +23,7 @@ use crate::{
         },
         InputProcessorOutput, InputsProcessor, InputsProcessorType, MessagesAction, Processor,
     },
-    sequence::Sequence,
+    sequence::{build_mm_features_from_ranges, find_image_placeholder_ranges, Sequence},
     vision_models::{
         image_processor::{ImagePreProcessor, PreprocessedImages},
         preprocessor_config::{PreProcessorConfig, ToFilter},
@@ -177,6 +177,7 @@ impl InputsProcessor for MLlamaImageProcessor {
         no_kv_cache: bool,
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
+        sliding_window: Option<usize>,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
@@ -218,6 +219,7 @@ impl InputsProcessor for MLlamaImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
             .unwrap()
         } else {
@@ -233,6 +235,7 @@ impl InputsProcessor for MLlamaImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
             .unwrap()
         };
@@ -308,6 +311,16 @@ impl InputsProcessor for MLlamaImageProcessor {
                 aspect_ratio_ids_accum.push(aspect_ratio_ids.unwrap().unsqueeze(0).unwrap());
                 aspect_ratio_mask_accum.push(aspect_ratio_mask.unwrap().unsqueeze(0).unwrap());
                 num_tiles_accum.push(num_tiles.unwrap());
+
+                // Build mm_features for position-aware prefix cache hashing
+                if seq.mm_features().is_empty() {
+                    if let Some(hashes) = seq.image_hashes().map(|h| h.to_vec()) {
+                        let img_tok_id =
+                            tokenizer.encode_fast(IMAGE_TOKEN, false).unwrap().get_ids()[0];
+                        let ranges = find_image_placeholder_ranges(seq.get_toks(), img_tok_id);
+                        seq.set_mm_features(build_mm_features_from_ranges(&ranges, &hashes, "img"));
+                    }
+                }
 
                 seq.multimodal.has_changed_prompt = true;
             }
@@ -387,6 +400,7 @@ impl InputsProcessor for MLlamaImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
             .unwrap()
         } else {
@@ -402,8 +416,29 @@ impl InputsProcessor for MLlamaImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
             .unwrap()
+        };
+
+        let image_hashes: Vec<u64> = if is_prompt {
+            input_seqs
+                .iter()
+                .flat_map(|seq| {
+                    seq.image_hashes()
+                        .map(|h| {
+                            let cached = seq.count_prefix_cached_mm_items();
+                            if cached < h.len() {
+                                h[cached..].to_vec()
+                            } else {
+                                vec![]
+                            }
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        } else {
+            vec![]
         };
 
         let inputs: Box<dyn Any> = Box::new(ModelInputs {
@@ -416,6 +451,7 @@ impl InputsProcessor for MLlamaImageProcessor {
                 aspect_ratio_ids,
                 aspect_ratio_mask,
                 cross_attn_mask,
+                image_hashes,
             }),
             paged_attn_meta,
             flash_meta,

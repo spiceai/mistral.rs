@@ -11,7 +11,7 @@ use mistralrs_quant::{
 use crate::{
     attention::SdpaParams,
     layers::{conv2d_no_bias, embedding, layer_norm, GetFloatInfo, Sdpa},
-    pipeline::IsqModel,
+    pipeline::{text_models_inputs_processor::FlashParams, IsqModel},
     utils::unvarbuilder::UnVarBuilder,
 };
 
@@ -184,6 +184,7 @@ impl MLlamaVisionAttention {
                 softcap: None,
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
+                sinks: None,
             },
             num_heads: cfg.num_attention_heads,
             head_dim,
@@ -220,13 +221,15 @@ impl MLlamaVisionAttention {
             .reshape((bs, k_sq, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
+        let flash_params = FlashParams::empty(false);
+
         let mut attn_output = Sdpa
             .run_attention(
                 &q.contiguous()?,
                 &k.contiguous()?,
                 &v.contiguous()?,
                 attention_mask,
-                None,
+                Some(&flash_params),
                 &self.sdpa_params,
             )?
             .transpose(1, 2)?

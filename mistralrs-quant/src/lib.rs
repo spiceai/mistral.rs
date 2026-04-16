@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     fmt::Debug,
     num::NonZeroUsize,
-    sync::{atomic::AtomicUsize, Arc, Mutex, MutexGuard},
+    sync::{atomic::AtomicUsize, Arc, Condvar, Mutex, MutexGuard},
 };
 
 use blockwise_fp8::blockwise_fp8_linear_b;
@@ -21,6 +21,7 @@ mod blockwise_fp8;
 pub mod cublaslt;
 pub mod distributed;
 mod dummy;
+pub mod f8q8;
 mod fp8;
 pub mod gemv;
 mod gguf;
@@ -29,6 +30,7 @@ mod hqq;
 mod imatrix;
 mod lora;
 mod mxfp4;
+mod pending_layer;
 mod pertensor_fp8;
 pub mod rotary;
 pub mod safetensors;
@@ -56,6 +58,7 @@ pub use distributed::{
     BarrierLike, Comm, Id, RingConfig, SumAllReduce,
 };
 pub use dummy::DummyLayer;
+pub use f8q8::F8Q8Linear;
 pub use fp8::FP8Linear;
 #[cfg(feature = "cuda")]
 pub use gemv::gemv;
@@ -69,14 +72,16 @@ pub use lora::{
     LoraAdapter, LoraConfig, StaticLoraConfig, MULTI_LORA_DELIMITER,
 };
 pub use mxfp4::MXFP4Layer;
+pub use pending_layer::PendingIsqLayer;
 pub use pertensor_fp8::PerTensorFP8Linear;
 pub use unquantized::UnquantLinear;
+pub use utils::flash_attn_sinks_metal;
+pub use utils::flash_attn_sinks_varlen_metal;
 #[cfg(feature = "cuda")]
 pub use utils::gptoss_swiglu_fused;
 #[cfg(feature = "cuda")]
 pub use utils::gptoss_swiglu_interleaved;
 pub use utils::isq::apply_immediate_isq;
-#[cfg(feature = "cuda")]
 pub use utils::softmax_with_sinks;
 pub use utils::{fused_glu, GluActivationType};
 pub use utils::{log, BitWiseOp, CumSumOp, LeftshiftOp, NonZeroOp, SortOp, UQFF_QUANT_TYPE_OFFSET};
@@ -85,12 +90,68 @@ pub use vector_fp8::{fp8_vector_dequantize, fp8_vector_quantize};
 use candle_nn::{Conv1d, Conv2d, Linear, Module};
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// Limits outstanding async ISQ jobs to prevent unbounded memory growth.
+///
+/// Without backpressure, MoE models (e.g. Gemma4 with 128 experts × 30 layers)
+/// queue BF16 tensor data in the rayon pool faster than the pool can quantize,
+/// causing OOM on memory-constrained systems like macOS Metal with unified memory.
+pub struct IsqBackpressure {
+    count: Mutex<usize>,
+    cvar: Condvar,
+    max: usize,
+}
+
+impl IsqBackpressure {
+    pub fn new(max: usize) -> Self {
+        Self {
+            count: Mutex::new(0),
+            cvar: Condvar::new(),
+            max,
+        }
+    }
+
+    /// Block until a slot is available, then increment the outstanding count.
+    pub fn acquire(&self) {
+        let mut count = self.count.lock().expect("ISQ backpressure lock poisoned");
+        while *count >= self.max {
+            count = self
+                .cvar
+                .wait(count)
+                .expect("ISQ backpressure lock poisoned");
+        }
+        *count += 1;
+    }
+
+    /// Decrement the outstanding count and wake a blocked loader thread.
+    pub fn release(&self) {
+        let mut count = self.count.lock().expect("ISQ backpressure lock poisoned");
+        *count = count.saturating_sub(1);
+        self.cvar.notify_one();
+    }
+}
+
+impl Debug for IsqBackpressure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self.count.lock().map(|c| *c).unwrap_or(0);
+        f.debug_struct("IsqBackpressure")
+            .field("outstanding", &count)
+            .field("max", &self.max)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ImmediateIsqParams {
     pub guard: QuantizeOntoGuard,
     pub ty: Option<IsqType>,
     pub predicates: Vec<Regex>,
     pub overrides: Vec<ImmediateIsqOverride>,
+    /// Thread pool for parallel immediate ISQ on discrete GPUs.
+    /// When `Some`, `apply_immediate_isq` will spawn quantization tasks
+    /// on this pool and return `PendingIsqLayer` wrappers.
+    pub pool: Option<Arc<rayon::ThreadPool>>,
+    /// Backpressure to limit outstanding async ISQ jobs.
+    pub backpressure: Arc<IsqBackpressure>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,22 +172,53 @@ thread_local! {
 }
 
 pub fn set_immediate_isq(isq: Option<IsqType>, predicates: Vec<Regex>) {
-    set_immediate_isq_with_overrides(isq, predicates, Vec::new());
+    let (pool, _) = create_isq_thread_pool(isq);
+    set_immediate_isq_with_pool(isq, predicates, Vec::new(), pool);
 }
 
-pub fn set_immediate_isq_with_overrides(
+pub fn set_immediate_isq_with_pool(
     isq: Option<IsqType>,
     predicates: Vec<Regex>,
     overrides: Vec<ImmediateIsqOverride>,
+    pool: rayon::ThreadPool,
 ) {
+    // Allow pool threads + 1 outstanding jobs: enough for pipeline overlap
+    // (load next tensor while pool quantizes current) without unbounded growth.
+    let max_outstanding = pool.current_num_threads() + 1;
     ENGINE_IMMEDIATE_ISQ.with(|cell| {
         *cell.borrow_mut() = Some(ImmediateIsqParams {
             guard: QuantizeOntoGuard::new(),
             ty: isq,
             predicates,
             overrides,
+            backpressure: Arc::new(IsqBackpressure::new(max_outstanding)),
+            pool: Some(Arc::new(pool)),
         });
     });
+}
+
+/// Create a rayon thread pool for parallel immediate ISQ.
+/// Returns `(pool, num_threads)` so callers can log the thread count.
+///
+/// Thread count is based on the quantization type:
+/// - GGML types (Q2K-Q8K) and F8E4M3: `rayon::current_num_threads()` (CPU quantization)
+/// - HQQ/AFQ: 1 thread (GPU quantization, serialized by `QuantizeOntoGuard`)
+pub fn create_isq_thread_pool(ty: Option<IsqType>) -> (rayon::ThreadPool, usize) {
+    let num_threads = if std::env::var("MISTRALRS_ISQ_SINGLETHREAD").is_ok() {
+        1
+    } else if let Some(ty) = ty {
+        ty.get_max_isq_cpu_threads()
+            .map(usize::from)
+            .unwrap_or_else(rayon::current_num_threads)
+    } else {
+        rayon::current_num_threads()
+    };
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .expect("Failed to create ISQ thread pool");
+    (pool, num_threads)
 }
 
 pub fn get_immediate_isq() -> Option<ImmediateIsqParams> {
@@ -478,6 +570,7 @@ impl Convolution {
     }
 }
 
+/// In-situ quantization type specifying the format to apply to model weights.
 #[derive(Clone, Copy, Debug, PartialEq, Hash, Eq, Serialize, Deserialize)]
 pub enum IsqType {
     Q4_0,
@@ -503,6 +596,113 @@ pub enum IsqType {
     AFQ4,
     AFQ3,
     AFQ2,
+    F8Q8,
+    MXFP4,
+}
+
+/// Target bit width for automatic ISQ quantization.
+///
+/// On Metal, these select AFQ variants; on CUDA/CPU, they select Q*K variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IsqBits {
+    /// 2-bit quantization (AFQ2 on Metal, Q2K otherwise).
+    Two,
+    /// 3-bit quantization (AFQ3 on Metal, Q3K otherwise).
+    Three,
+    /// 4-bit quantization (AFQ4 on Metal, Q4K otherwise).
+    Four,
+    /// 5-bit quantization (Q5K on all platforms).
+    Five,
+    /// 6-bit quantization (AFQ6 on Metal, Q6K otherwise).
+    Six,
+    /// 8-bit quantization (AFQ8 on Metal, Q8_0 otherwise).
+    Eight,
+}
+
+impl IsqBits {
+    /// Resolve to the platform-appropriate `IsqType` for the given device.
+    pub fn resolve(self, device: &Device) -> IsqType {
+        match (self, device.is_metal()) {
+            (Self::Two, true) => IsqType::AFQ2,
+            (Self::Two, false) => IsqType::Q2K,
+            (Self::Three, true) => IsqType::AFQ3,
+            (Self::Three, false) => IsqType::Q3K,
+            (Self::Four, true) => IsqType::AFQ4,
+            (Self::Four, false) => IsqType::Q4K,
+            (Self::Five, _) => IsqType::Q5K,
+            (Self::Six, true) => IsqType::AFQ6,
+            (Self::Six, false) => IsqType::Q6K,
+            (Self::Eight, true) => IsqType::AFQ8,
+            (Self::Eight, false) => IsqType::Q8_0,
+        }
+    }
+
+    /// Return all platform variants, with the current platform's preferred variant first.
+    /// On Metal, AFQ variants come first; on other platforms, GGUF/Q variants come first.
+    pub fn expand(self) -> Vec<IsqType> {
+        #[cfg(feature = "metal")]
+        match self {
+            Self::Two => vec![IsqType::AFQ2, IsqType::Q2K],
+            Self::Three => vec![IsqType::AFQ3, IsqType::Q3K],
+            Self::Four => vec![IsqType::AFQ4, IsqType::Q4K],
+            Self::Five => vec![IsqType::Q5K],
+            Self::Six => vec![IsqType::AFQ6, IsqType::Q6K],
+            Self::Eight => vec![IsqType::AFQ8, IsqType::Q8_0],
+        }
+        #[cfg(not(feature = "metal"))]
+        match self {
+            Self::Two => vec![IsqType::Q2K, IsqType::AFQ2],
+            Self::Three => vec![IsqType::Q3K, IsqType::AFQ3],
+            Self::Four => vec![IsqType::Q4K, IsqType::AFQ4],
+            Self::Five => vec![IsqType::Q5K],
+            Self::Six => vec![IsqType::Q6K, IsqType::AFQ6],
+            Self::Eight => vec![IsqType::Q8_0, IsqType::AFQ8],
+        }
+    }
+}
+
+impl TryFrom<&str> for IsqBits {
+    type Error = ();
+    fn try_from(s: &str) -> std::result::Result<Self, ()> {
+        match s {
+            "2" => Ok(Self::Two),
+            "3" => Ok(Self::Three),
+            "4" => Ok(Self::Four),
+            "5" => Ok(Self::Five),
+            "6" => Ok(Self::Six),
+            "8" => Ok(Self::Eight),
+            _ => Err(()),
+        }
+    }
+}
+
+impl std::fmt::Display for IsqType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Q4_0 => write!(f, "q4_0"),
+            Self::Q4_1 => write!(f, "q4_1"),
+            Self::Q5_0 => write!(f, "q5_0"),
+            Self::Q5_1 => write!(f, "q5_1"),
+            Self::Q8_0 => write!(f, "q8_0"),
+            Self::Q8_1 => write!(f, "q8_1"),
+            Self::Q2K => write!(f, "q2k"),
+            Self::Q3K => write!(f, "q3k"),
+            Self::Q4K => write!(f, "q4k"),
+            Self::Q5K => write!(f, "q5k"),
+            Self::Q6K => write!(f, "q6k"),
+            Self::Q8K => write!(f, "q8k"),
+            Self::HQQ8 => write!(f, "hqq8"),
+            Self::HQQ4 => write!(f, "hqq4"),
+            Self::F8E4M3 => write!(f, "fp8"),
+            Self::AFQ8 => write!(f, "afq8"),
+            Self::AFQ6 => write!(f, "afq6"),
+            Self::AFQ4 => write!(f, "afq4"),
+            Self::AFQ3 => write!(f, "afq3"),
+            Self::AFQ2 => write!(f, "afq2"),
+            Self::F8Q8 => write!(f, "f8q8"),
+            Self::MXFP4 => write!(f, "mxfp4"),
+        }
+    }
 }
 
 impl IsqType {
@@ -534,10 +734,15 @@ impl IsqType {
                 .div_ceil(GgmlDType::Q6K.type_size()),
             Self::Q8K => (dtype.size_in_bytes() * GgmlDType::Q8K.block_size())
                 .div_ceil(GgmlDType::Q8K.type_size()),
+            // F8Q8: 33 bytes per 32 values -> similar to Q8_0
+            Self::F8Q8 => (dtype.size_in_bytes() * 32).div_ceil(33),
             // Estimates
             Self::HQQ4 => 4,
             Self::HQQ8 => 2,
             Self::F8E4M3 => 2,
+            // MXFP4: 4 bits per value + 1 byte scale per 32 values
+            // For BF16 (2 bytes): (2*32)/(16+1) ≈ 3.76 → 3
+            Self::MXFP4 => 3,
         }
     }
 
@@ -550,11 +755,12 @@ impl IsqType {
             | IsqType::AFQ3
             | IsqType::AFQ4
             | IsqType::AFQ6
-            | IsqType::AFQ8 => {
+            | IsqType::AFQ8
+            | IsqType::MXFP4 => {
                 // Use 1 because our HQQ quantizes on the GPU
                 Some(1.try_into().unwrap())
             }
-            IsqType::F8E4M3 => None,
+            IsqType::F8E4M3 | IsqType::F8Q8 => None,
             IsqType::Q2K
             | IsqType::Q3K
             | IsqType::Q4K
@@ -643,6 +849,8 @@ pub enum QuantizedSerdeType {
     Hqq = 2,
     Fp8 = 3,
     Afq = 4,
+    F8Q8 = 5,
+    Mxfp4 = 6,
 }
 
 impl TryFrom<usize> for QuantizedSerdeType {
@@ -654,6 +862,8 @@ impl TryFrom<usize> for QuantizedSerdeType {
             2 => Ok(Self::Hqq),
             3 => Ok(Self::Fp8),
             4 => Ok(Self::Afq),
+            5 => Ok(Self::F8Q8),
+            6 => Ok(Self::Mxfp4),
             other => candle_core::bail!("QuantizedSerdeType {other} is invalid."),
         }
     }

@@ -6,7 +6,6 @@ const CUDA_NVCC_FLAGS: Option<&'static str> = option_env!("CUDA_NVCC_FLAGS");
 #[cfg(all(feature = "cuda", target_family = "unix"))]
 fn main() -> Result<()> {
     use std::path::PathBuf;
-    use std::process::Command;
 
     // Declare expected cfg values for check-cfg lint
     println!("cargo::rustc-check-cfg=cfg(has_fp8)");
@@ -17,8 +16,10 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/reshape_and_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/concat_and_cache_mla_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/gather_mla_cache_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/gather_kv_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer_mla_decode.cu");
     println!("cargo:rerun-if-changed=src/cuda/update_kvscales.cu");
+    println!("cargo:rerun-if-changed=src/cuda/flash_attn_sinks.cu");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/cp_async.cuh");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/exception.h");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/fastdiv.cuh");
@@ -34,40 +35,9 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/state.cuh");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/variant_helper.cuh");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer/attention/variants.cuh");
-    // Detect CUDA compute capability for FP8 support
-    let compute_cap = {
-        if let Ok(var) = std::env::var("CUDA_COMPUTE_CAP") {
-            var.parse::<usize>().unwrap() * 10
-        } else {
-            let mut cmd = Command::new("nvidia-smi");
-            match cmd
-                .args(["--query-gpu=compute_cap", "--format=csv"])
-                .output()
-            {
-                Ok(out) => {
-                    let output =
-                        String::from_utf8(out.stdout).expect("Output of nvidia-smi was not utf8.");
-                    (output
-                        .split('\n')
-                        .nth(1)
-                        .unwrap()
-                        .trim()
-                        .parse::<f32>()
-                        .unwrap()
-                        * 100.) as usize
-                }
-                Err(_) => {
-                    // If nvidia-smi fails, assume no FP8 support
-                    println!(
-                        "cargo:warning=Could not detect CUDA compute capability, disabling FP8"
-                    );
-                    0
-                }
-            }
-        }
-    };
 
-    let mut builder = bindgen_cuda::Builder::default()
+    let mut builder = cudaforge::KernelBuilder::new()
+        .source_glob("src/cuda/*.cu")
         .arg("-std=c++17")
         .arg("-O3")
         .arg("-U__CUDA_NO_HALF_OPERATORS__")
@@ -81,8 +51,9 @@ fn main() -> Result<()> {
         .arg("--compiler-options")
         .arg("-fPIC");
 
+    let compute_cap = builder.get_compute_cap().unwrap_or(80);
     // Enable FP8 if compute capability >= 8.0 (Ampere and newer)
-    let using_fp8 = if compute_cap >= 800 {
+    let using_fp8 = if compute_cap >= 80 {
         builder = builder.arg("-DENABLE_FP8");
         true
     } else {
@@ -105,7 +76,9 @@ fn main() -> Result<()> {
     } else {
         build_dir.join("libmistralrspagedattention.a")
     };
-    builder.build_lib(out_file);
+    builder
+        .build_lib(out_file)
+        .expect("Build paged attention lib failed!");
 
     println!("cargo:rustc-link-search={}", build_dir.display());
     println!("cargo:rustc-link-lib=mistralrspagedattention");
@@ -126,11 +99,12 @@ fn main() -> Result<(), String> {
     // Declare expected cfg values for check-cfg lint
     println!("cargo::rustc-check-cfg=cfg(has_fp8)");
 
-    const METAL_SOURCES: [&str; 4] = [
+    const METAL_SOURCES: [&str; 5] = [
         "copy_blocks",
         "pagedattention",
         "reshape_and_cache",
         "kv_scale_update",
+        "gather_kv_cache",
     ];
     for src in METAL_SOURCES {
         println!("cargo::rerun-if-changed=src/metal/kernels/{src}.metal");
@@ -154,12 +128,14 @@ fn main() -> Result<(), String> {
         let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|_| "OUT_DIR not set")?);
         std::fs::write(out_dir.join("mistralrs_paged_attention.metallib"), []).unwrap();
         std::fs::write(out_dir.join("mistralrs_paged_attention_ios.metallib"), []).unwrap();
+        std::fs::write(out_dir.join("mistralrs_paged_attention_tvos.metallib"), []).unwrap();
         return Ok(());
     }
 
     enum Platform {
         MacOS,
         Ios,
+        TvOS,
     }
 
     impl Platform {
@@ -167,15 +143,23 @@ fn main() -> Result<(), String> {
             match self {
                 Platform::MacOS => "macosx",
                 Platform::Ios => "iphoneos",
+                Platform::TvOS => "appletvos",
             }
         }
 
         fn metal_std(&self) -> &str {
-            // Use Metal 3.1 unified standard for both platforms
-            // This fixes Xcode 26+ where the default Metal standard may be too low
+            // Use Metal 3.1 unified standard for all platforms.
+            // This enables native bfloat16 support (__HAVE_BFLOAT__) which is
+            // required for PagedAttention kernels with bf16 models (e.g. Qwen3).
+            // Without Metal 3.1, the emulated _MLX_BFloat16 struct is used instead,
+            // which can fail on some Metal compiler/runtime combinations.
             // https://github.com/EricLBuehler/mistral.rs/issues/1844
+            //
+            // Note: Metal 3.1 MSL compiles on all Apple Silicon. The native bfloat
+            // type is used on M3+ GPUs; older GPUs use the emulated fallback path
+            // in utils.metal, which is still correctly compiled with MSL 3.1.
             match self {
-                Platform::MacOS | Platform::Ios => "metal3.1",
+                Platform::MacOS | Platform::Ios | Platform::TvOS => "metal3.1",
             }
         }
     }
@@ -233,6 +217,7 @@ fn main() -> Result<(), String> {
         let lib_name = match platform {
             Platform::MacOS => "mistralrs_paged_attention.metallib",
             Platform::Ios => "mistralrs_paged_attention_ios.metallib",
+            Platform::TvOS => "mistralrs_paged_attention_tvos.metallib",
         };
         let metallib = out_dir.join(lib_name);
         let mut compile_metallib_cmd = Command::new("xcrun");
@@ -270,6 +255,7 @@ fn main() -> Result<(), String> {
 
     compile(Platform::MacOS)?;
     compile(Platform::Ios)?;
+    compile(Platform::TvOS)?;
 
     Ok(())
 }

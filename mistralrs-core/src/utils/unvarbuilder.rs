@@ -8,7 +8,7 @@ use candle_nn::{Conv2d, Embedding, LayerNorm, Linear};
 use itertools::Itertools;
 use mistralrs_quant::QuantMethod;
 
-use crate::layers::{F32RmsNorm, QLinear, RmsNorm, ScaledEmbedding};
+use crate::layers::{F32RmsNorm, GemmaRmsNorm, QLinear, RmsNorm, ScaledEmbedding};
 
 pub trait ToTensors {
     /// Tensor names to tensors
@@ -30,6 +30,12 @@ impl ToTensors for ScaledEmbedding {
 impl ToTensors for RmsNorm {
     fn to_tensors(&self) -> HashMap<String, Tensor> {
         HashMap::from_iter([("weight".to_string(), self.weight().clone())])
+    }
+}
+
+impl ToTensors for GemmaRmsNorm {
+    fn to_tensors(&self) -> HashMap<String, Tensor> {
+        HashMap::from_iter([("weight".to_string(), self.original_weight().clone())])
     }
 }
 
@@ -150,7 +156,16 @@ impl UnVarBuilder {
         data.extend(
             item.to_tensors()
                 .into_iter()
-                .map(|(n, t)| (format!("{path}.{n}"), t))
+                .map(|(n, t)| {
+                    (
+                        if path.is_empty() {
+                            n
+                        } else {
+                            format!("{path}.{n}")
+                        },
+                        t,
+                    )
+                })
                 .collect::<Vec<(_, _)>>(),
         );
     }

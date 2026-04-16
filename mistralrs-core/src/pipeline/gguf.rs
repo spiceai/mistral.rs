@@ -82,6 +82,7 @@ pub struct GGUFPipeline {
     model_id: String,
     non_granular_state: Option<NonGranularState>,
     metadata: Arc<GeneralMetadata>,
+    generation_defaults: Option<crate::ModelGenerationDefaults>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
 }
 
@@ -283,6 +284,7 @@ impl Loader for GGUFLoader {
             self.quantized_filenames.clone(),
             silent
         );
+
         self.load_model_from_path(
             &paths?,
             dtype,
@@ -319,15 +321,19 @@ impl Loader for GGUFLoader {
             readers.push(std::fs::File::open(filename)?);
         }
         let mut readers = readers.iter_mut().collect::<Vec<_>>();
-
         let model = Content::from_readers(&mut readers)?;
+
         if !silent {
             model.print_metadata()?;
         }
+
         let arch = model.arch();
 
         // If auto, convert to Map
         let num_layers = model.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
+
+        let mut max_kv_tokens: Option<usize> = None;
+
         if let DeviceMapSetting::Auto(params) = mapper.clone() {
             let devices = device_map::get_all_similar_devices(device)?;
             // Initial dtype
@@ -356,6 +362,7 @@ impl Loader for GGUFLoader {
                 &params,
                 paged_attn_config.as_ref(),
             )?;
+            max_kv_tokens = Some(params.max_seq_len() * params.max_batch_size());
             mapper = DeviceMapSetting::Map(new);
         }
 
@@ -465,7 +472,9 @@ impl Loader for GGUFLoader {
         // Config into model:
         let model = match self.kind {
             ModelKind::GgufQuantized { .. } => match arch {
-                GGUFArchitecture::Llama => Model::Llama(QLlama::try_from(model_config)?),
+                GGUFArchitecture::Llama | GGUFArchitecture::Mistral3 => {
+                    Model::Llama(QLlama::try_from(model_config)?)
+                }
                 GGUFArchitecture::Phi2 => Model::Phi2(QPhi::try_from(model_config)?),
                 GGUFArchitecture::Phi3 => Model::Phi3(QPhi3::try_from(model_config)?),
                 GGUFArchitecture::Starcoder2 => {
@@ -477,7 +486,9 @@ impl Loader for GGUFLoader {
                 a => bail!("Unsupported architecture `{a:?}` for GGUF"),
             },
             ModelKind::GgufAdapter { adapter, .. } => match arch {
-                GGUFArchitecture::Llama => Model::XLoraLlama(XLoraQLlama::try_from(model_config)?),
+                GGUFArchitecture::Llama | GGUFArchitecture::Mistral3 => {
+                    Model::XLoraLlama(XLoraQLlama::try_from(model_config)?)
+                }
                 GGUFArchitecture::Phi3 => Model::XLoraPhi3(XLoraQPhi3::try_from(model_config)?),
                 a => bail!(
                     "Unsupported architecture `{a:?}` for GGUF {kind}",
@@ -498,6 +509,8 @@ impl Loader for GGUFLoader {
                 device,
                 &layer_devices,
                 silent,
+                None,
+                max_kv_tokens,
             )?;
             let cache_engine = CacheEngine::new(
                 model_config,
@@ -566,7 +579,10 @@ impl Loader for GGUFLoader {
             }
         }
 
-        let eos = calculate_eos_tokens(&chat_template, gen_conf, &tokenizer);
+        let generation_defaults = gen_conf
+            .as_ref()
+            .and_then(GenerationConfig::generation_defaults);
+        let eos = calculate_eos_tokens(&chat_template, gen_conf.as_ref(), &tokenizer);
         Ok(Arc::new(Mutex::new(GGUFPipeline {
             model,
             tokenizer: tokenizer.into(),
@@ -601,6 +617,7 @@ impl Loader for GGUFLoader {
                     output: vec![SupportedModality::Text],
                 },
             }),
+            generation_defaults,
             mapper: pipeline_mapper,
         })))
     }
@@ -713,6 +730,9 @@ impl MetadataMixin for GGUFPipeline {
     }
     fn get_metadata(&self) -> Arc<GeneralMetadata> {
         self.metadata.clone()
+    }
+    fn generation_defaults(&self) -> Option<crate::ModelGenerationDefaults> {
+        self.generation_defaults.clone()
     }
     fn device_mapper(&self) -> Option<&dyn DeviceMapper> {
         Some(&*self.mapper)

@@ -143,6 +143,7 @@ impl InputsProcessor for Idefics2ImageProcessor {
         no_kv_cache: bool,
         last_n_context_len: Option<(usize, usize)>,
         return_raw_logits: bool,
+        sliding_window: Option<usize>,
         other_config: Option<Arc<dyn Any>>,
         mut paged_attn_metadata: Option<PagedAttentionMeta>,
         mapper: Option<&dyn DeviceMapper>,
@@ -179,6 +180,7 @@ impl InputsProcessor for Idefics2ImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
             .unwrap()
         } else {
@@ -194,6 +196,7 @@ impl InputsProcessor for Idefics2ImageProcessor {
                 return_raw_logits,
                 paged_attn_metadata.as_mut(),
                 mapper,
+                sliding_window,
             )
             .unwrap()
         };
@@ -244,13 +247,36 @@ impl InputsProcessor for Idefics2ImageProcessor {
             (None, None)
         };
 
+        let image_hashes: Vec<u64> = if is_prompt {
+            input_seqs
+                .iter()
+                .flat_map(|seq| {
+                    seq.image_hashes()
+                        .map(|h| {
+                            let cached = seq.count_prefix_cached_mm_items();
+                            if cached < h.len() {
+                                h[cached..].to_vec()
+                            } else {
+                                vec![]
+                            }
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
         let inputs: Box<dyn Any> = Box::new(ModelInputs {
             input_ids: input,
             seqlen_offsets: positions,
             context_lens,
             position_ids,
             pixel_values,
-            model_specific_args: Box::new(pixel_attention_mask),
+            model_specific_args: Box::new(super::Idefics2SpecificArgs {
+                pixel_attention_mask,
+                image_hashes,
+            }),
             paged_attn_meta,
             flash_meta,
         });

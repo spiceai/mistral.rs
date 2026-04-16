@@ -13,9 +13,12 @@ use mistralrs_quant::{
 use crate::{
     amoe::{AnyMoeBaseModelMixin, AnyMoeConfig, AnyMoeExpertType, MlpLayer, MoeMlp},
     attention::SdpaParams,
-    device_map::DeviceMapper,
+    device_map::{DeviceMappedMask, DeviceMapper},
     get_delta_from_lora_ab,
-    layers::{embedding, Activation, CausalMasker, MatMul, Mlp, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{
+        embedding, Activation, CausalMasker, GemmaRmsNorm, MatMul, Mlp, RotaryEmbedding, Sdpa,
+    },
+    layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
         extract_logits,
@@ -158,6 +161,7 @@ impl Attention {
                 softcap: cfg.attn_logit_softcapping.map(|x| x as f32),
                 softmax_scale: 1.0 / (cfg.query_pre_attn_scalar as f32).sqrt(),
                 sliding_window,
+                sinks: None,
             },
         })
     }
@@ -274,10 +278,10 @@ impl Attention {
 struct DecoderLayer {
     self_attn: Attention,
     mlp: Box<dyn MlpLayer>,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
-    pre_feedforward_layernorm: RmsNorm,
-    post_feedforward_layernorm: RmsNorm,
+    input_layernorm: GemmaRmsNorm,
+    post_attention_layernorm: GemmaRmsNorm,
+    pre_feedforward_layernorm: GemmaRmsNorm,
+    post_feedforward_layernorm: GemmaRmsNorm,
 }
 
 impl DecoderLayer {
@@ -308,22 +312,22 @@ impl DecoderLayer {
             cfg.hidden_act()?,
             comm,
         )?;
-        let input_layernorm = RmsNorm::new_gemma(
+        let input_layernorm = GemmaRmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             mapper.set_device(layer_idx, vb.pp("input_layernorm"), false),
         )?;
-        let post_attention_layernorm = RmsNorm::new_gemma(
+        let post_attention_layernorm = GemmaRmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             mapper.set_device(layer_idx, vb.pp("post_attention_layernorm"), false),
         )?;
-        let pre_feedforward_layernorm = RmsNorm::new_gemma(
+        let pre_feedforward_layernorm = GemmaRmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             mapper.set_device(layer_idx, vb.pp("pre_feedforward_layernorm"), false),
         )?;
-        let post_feedforward_layernorm = RmsNorm::new_gemma(
+        let post_feedforward_layernorm = GemmaRmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             mapper.set_device(layer_idx, vb.pp("post_feedforward_layernorm"), false),
@@ -376,7 +380,7 @@ impl DecoderLayer {
 pub struct Model {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
+    norm: GemmaRmsNorm,
     lm_head: Arc<dyn QuantMethod>,
     hidden_size: usize,
     device: Device,
@@ -461,7 +465,7 @@ impl Model {
                 &comm,
             )
         })?;
-        let norm = RmsNorm::new_gemma(
+        let norm = GemmaRmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             mapper.set_nm_device(vb_m.pp("norm"), false),
@@ -494,7 +498,7 @@ impl Model {
                 num_attn_heads: cfg.num_attention_heads / mapper.get_comm_for(0)?.world_size(),
                 num_kv_heads: (cfg.num_key_value_heads / mapper.get_comm_for(0)?.world_size())
                     .max(1),
-                sliding_window: None,
+                sliding_window: Some(cfg.sliding_window),
                 k_head_dim: cfg.head_dim,
                 v_head_dim: cfg.head_dim,
                 kv_cache_layout: crate::paged_attention::KvCacheLayout::Standard,
@@ -516,7 +520,10 @@ impl Model {
         let cache = &mut self.cache.normal().0;
         let attention_mask = CausalMasker.make_causal_mask_matrix(
             input_ids,
-            &*cache,
+            metadata
+                .as_ref()
+                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
+                .unwrap_or(cache as &dyn PastKvLenCache),
             xs.dtype(),
             self.cfg.num_attn_heads,
         )?;
@@ -529,7 +536,10 @@ impl Model {
         });
         let sliding_attention_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
             input_ids,
-            &*cache,
+            metadata
+                .as_ref()
+                .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
+                .unwrap_or(cache as &dyn PastKvLenCache),
             Some(self.sliding_window),
             xs.dtype(),
             self.cfg.num_attn_heads,
@@ -541,18 +551,14 @@ impl Model {
                 .map(|(_, meta)| meta.is_first_prompt_chunk)
                 .unwrap_or(true)
         });
+        let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
+        let sliding_attention_mask = DeviceMappedMask::new(sliding_attention_mask, &*self.mapper)?;
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(
                 &xs,
-                attention_mask
-                    .as_ref()
-                    .map(|m| m.to_device(xs.device()).unwrap())
-                    .as_ref(),
-                sliding_attention_mask
-                    .as_ref()
-                    .map(|m| m.to_device(xs.device()).unwrap())
-                    .as_ref(),
+                attention_mask.as_ref().map(|m| m.get(xs.device())),
+                sliding_attention_mask.as_ref().map(|m| m.get(xs.device())),
                 seqlen_offsets,
                 &mut cache[i],
                 metadata
@@ -611,22 +617,20 @@ impl IsqModel for Model {
 
         let uvb_m = uvb.pp("model");
         uvb_m.pp("embed_tokens").add(&self.embed_tokens);
-        uvb_m.pp("norm").add(&self.norm.undo_gemma().unwrap());
+        uvb_m.pp("norm").add(&self.norm);
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
             let uvb_l = uvb_m.pp("layers").pp(layer_idx);
-            uvb_l
-                .pp("input_layernorm")
-                .add(&layer.input_layernorm.undo_gemma().unwrap());
+            uvb_l.pp("input_layernorm").add(&layer.input_layernorm);
             uvb_l
                 .pp("post_attention_layernorm")
-                .add(&layer.post_attention_layernorm.undo_gemma().unwrap());
+                .add(&layer.post_attention_layernorm);
             uvb_l
                 .pp("pre_feedforward_layernorm")
-                .add(&layer.pre_feedforward_layernorm.undo_gemma().unwrap());
+                .add(&layer.pre_feedforward_layernorm);
             uvb_l
                 .pp("post_feedforward_layernorm")
-                .add(&layer.post_feedforward_layernorm.undo_gemma().unwrap());
+                .add(&layer.post_feedforward_layernorm);
         }
 
         uvb.to_safetensors()

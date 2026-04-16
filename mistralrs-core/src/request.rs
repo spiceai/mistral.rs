@@ -5,11 +5,13 @@ use mistralrs_quant::IsqType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::VideoInput;
+
 use crate::{
     response::Response, sampler::SamplingParams, tools::ToolChoice, CustomLogitsProcessor,
     DiffusionGenerationParams, Tool,
 };
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, path::PathBuf, sync::Arc};
 use tokio::sync::mpsc::Sender;
 
 pub type LlguidanceGrammar = llguidance::api::TopLevelGrammar;
@@ -77,11 +79,13 @@ pub enum RequestMessage {
         best_of: Option<usize>,
     },
     CompletionTokens(Vec<u32>),
-    VisionChat {
+    MultimodalChat {
         #[serde(skip)] // TODO
         images: Vec<image::DynamicImage>,
         #[serde(skip)] // TODO
         audios: Vec<AudioInput>,
+        #[serde(skip)]
+        videos: Vec<VideoInput>,
         messages: Vec<IndexMap<String, MessageContent>>,
         enable_thinking: Option<bool>,
         /// Reasoning effort level for Harmony-format models
@@ -91,6 +95,7 @@ pub enum RequestMessage {
         prompt: String,
         format: ImageGenerationResponseFormat,
         generation_params: DiffusionGenerationParams,
+        save_file: Option<PathBuf>,
     },
     SpeechGeneration {
         prompt: String,

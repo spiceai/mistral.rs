@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
-    layers::{self, Activation, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{self, Activation, GemmaRmsNorm, RotaryEmbedding, Sdpa},
     lora::{linear_b as linear, LinearLayerLike, LoraConfig, Ordering},
     paged_attention::ModelConfigMetadata,
     pipeline::{
@@ -20,7 +20,7 @@ use tqdm::Iter;
 use tracing::info;
 
 use crate::{
-    device_map::DeviceMapper,
+    device_map::{DeviceMappedMask, DeviceMapper},
     layers::CausalMasker,
     models::gemma::Config,
     pipeline::{extract_logits, Cache, NormalModel},
@@ -226,6 +226,7 @@ impl Attention {
                 softcap: None,
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window: None,
+                sinks: None,
             },
         })
     }
@@ -323,8 +324,8 @@ impl Attention {
 struct DecoderLayer {
     self_attn: Attention,
     mlp: MLP,
-    input_layernorm: RmsNorm,
-    post_attention_layernorm: RmsNorm,
+    input_layernorm: GemmaRmsNorm,
+    post_attention_layernorm: GemmaRmsNorm,
 }
 
 impl DecoderLayer {
@@ -364,12 +365,12 @@ impl DecoderLayer {
             loading_isq,
             preload_adapters,
         )?;
-        let input_layernorm = RmsNorm::new_gemma(
+        let input_layernorm = GemmaRmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             mapper.set_device(layer_idx, vb.pp("input_layernorm"), false),
         )?;
-        let post_attention_layernorm = RmsNorm::new_gemma(
+        let post_attention_layernorm = GemmaRmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             mapper.set_device(layer_idx, vb.pp("post_attention_layernorm"), false),
@@ -421,7 +422,7 @@ impl DecoderLayer {
 pub struct XLoraModel {
     embed_tokens: candle_nn::Embedding,
     layers: Vec<DecoderLayer>,
-    norm: RmsNorm,
+    norm: GemmaRmsNorm,
     lm_head: Arc<dyn LinearLayerLike + Send + Sync>,
     dtype: DType,
     hidden_size: usize,
@@ -536,7 +537,7 @@ impl XLoraModel {
                     .merge_weights()?;
             }
         }
-        let norm = RmsNorm::new_gemma(
+        let norm = GemmaRmsNorm::new(
             cfg.hidden_size,
             cfg.rms_norm_eps,
             mapper.set_nm_device(vb_m.pp("norm"), false),
@@ -616,15 +617,13 @@ impl XLoraModel {
             xs.dtype(),
             self.cfg.num_attn_heads,
         )?;
+        let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(
                 &xs,
-                attention_mask
-                    .as_ref()
-                    .map(|m| m.to_device(xs.device()).unwrap())
-                    .as_ref(),
+                attention_mask.as_ref().map(|m| m.get(xs.device())),
                 seqlen_offsets,
                 &mut cache[i],
                 scalings.clone(),

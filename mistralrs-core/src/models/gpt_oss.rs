@@ -1,6 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_core::{Device, Module, Result, Tensor, D};
 use candle_nn::Linear;
 use mistralrs_quant::{
     ColumnParallelLayer, MXFP4Layer, QuantMethod, QuantizedConfig, ReplicatedLayer,
@@ -12,8 +12,12 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     amoe::AnyMoeBaseModelMixin,
     attention::SdpaParams,
-    device_map::DeviceMapper,
-    layers::{self, embedding, GptOssRotaryEmbedding, MatMul, RmsNorm, RotaryEmbedding},
+    device_map::{DeviceMappedMask, DeviceMapper},
+    layers::{
+        self, embedding, CausalMasker, GptOssRotaryEmbedding, MatMul, RmsNorm, RotaryEmbedding,
+        Sdpa,
+    },
+    layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
         extract_logits,
@@ -132,13 +136,11 @@ fn gptoss_swiglu(gate: &Tensor, up: &Tensor, alpha: f32, limit: f32) -> Result<T
     up_plus_one.mul(&glu)
 }
 
-/// Attention with per-head sinks
 struct Attention {
     q_proj: Arc<dyn QuantMethod>,
     k_proj: Arc<dyn QuantMethod>,
     v_proj: Arc<dyn QuantMethod>,
     o_proj: Arc<dyn QuantMethod>,
-    sinks: Tensor, // [num_heads] - per-head attention sink values
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
@@ -221,7 +223,6 @@ impl Attention {
             k_proj,
             v_proj,
             o_proj,
-            sinks,
             num_heads: num_heads / comm.world_size(),
             num_kv_heads: (num_kv_heads / comm.world_size()).max(1),
             head_dim,
@@ -236,13 +237,12 @@ impl Attention {
                 softcap: None,
                 softmax_scale: 1.0 / (head_dim as f32).sqrt(),
                 sliding_window,
+                sinks: Some(sinks),
             },
             is_sliding,
         })
     }
 
-    /// GPT-OSS specific attention forward with sinks
-    /// The sinks are added to attention logits before softmax, then dropped after
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -252,7 +252,7 @@ impl Attention {
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
-        layer_idx: usize,
+        _layer_idx: usize,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
@@ -321,14 +321,13 @@ impl Attention {
             None => {
                 let (k, v) = kv_cache.append(&k, &v)?;
 
-                self.attention_with_sinks(
+                Sdpa.run_attention(
                     &q,
                     &k,
                     &v,
                     attention_mask,
-                    seqlen_offsets,
-                    flash_params,
-                    layer_idx,
+                    Some(flash_params),
+                    &self.sdpa_params,
                 )?
             }
         };
@@ -346,89 +345,6 @@ impl Attention {
             res = res.to_dtype(original_dtype)?;
         }
         Ok(res)
-    }
-
-    /// Attention with sinks: sinks are added as extra logits, softmaxed, then dropped
-    #[allow(clippy::too_many_arguments)]
-    fn attention_with_sinks(
-        &self,
-        q: &Tensor,
-        k: &Tensor,
-        v: &Tensor,
-        attention_mask: Option<&Tensor>,
-        _seqlen_offsets: &[usize],
-        _flash_params: &FlashParams,
-        _layer_idx: usize,
-    ) -> Result<Tensor> {
-        let (b_sz, num_heads, q_len, _head_dim) = q.dims4()?;
-        let (_, _, k_len, _) = k.dims4()?;
-
-        let k_expanded;
-        let v_expanded;
-        let (k_ref, v_ref): (&Tensor, &Tensor) = if self.sdpa_params.n_kv_groups > 1 {
-            k_expanded = crate::layers::repeat_kv(k.clone(), self.sdpa_params.n_kv_groups)?;
-            v_expanded = crate::layers::repeat_kv(v.clone(), self.sdpa_params.n_kv_groups)?;
-            (&k_expanded, &v_expanded)
-        } else {
-            (k, v)
-        };
-
-        let attn_weights = (q.matmul(&k_ref.transpose(D::Minus2, D::Minus1)?)?
-            * self.sdpa_params.softmax_scale as f64)?;
-
-        #[cfg(feature = "cuda")]
-        let scores = if let Some(mask) = attention_mask {
-            let mask_last_dim = mask.dim(D::Minus1)?;
-            let causal_mask = if mask_last_dim > k_len {
-                mask.narrow(D::Minus1, 0, k_len)?
-                    .to_dtype(attn_weights.dtype())?
-            } else {
-                mask.to_dtype(attn_weights.dtype())?
-            };
-            let attn_weights = attn_weights.broadcast_add(&causal_mask)?;
-
-            let sinks_expanded = self
-                .sinks
-                .reshape((1, num_heads, 1, 1))?
-                .broadcast_as((b_sz, num_heads, q_len, 1))?
-                .to_dtype(attn_weights.dtype())?;
-            let combined_logits = Tensor::cat(&[&attn_weights, &sinks_expanded], D::Minus1)?;
-
-            let max_logits = combined_logits.max_keepdim(D::Minus1)?;
-            let combined_logits = combined_logits.broadcast_sub(&max_logits)?;
-            let probs = candle_nn::ops::softmax_last_dim(&combined_logits)?;
-
-            probs.narrow(D::Minus1, 0, k_len)?.contiguous()?
-        } else {
-            let sinks = self.sinks.to_dtype(attn_weights.dtype())?;
-            mistralrs_quant::softmax_with_sinks(&attn_weights, &sinks, None)?
-        };
-
-        #[cfg(not(feature = "cuda"))]
-        let scores = {
-            let attn_weights = if let Some(mask) = attention_mask {
-                attn_weights.broadcast_add(mask)?
-            } else {
-                attn_weights
-            };
-
-            let sinks_expanded = self
-                .sinks
-                .reshape((1, num_heads, 1, 1))?
-                .broadcast_as((b_sz, num_heads, q_len, 1))?
-                .to_dtype(attn_weights.dtype())?;
-
-            let combined_logits = Tensor::cat(&[&attn_weights, &sinks_expanded], D::Minus1)?;
-
-            let max_logits = combined_logits.max_keepdim(D::Minus1)?;
-            let combined_logits = combined_logits.broadcast_sub(&max_logits)?;
-
-            let probs = candle_nn::ops::softmax_last_dim(&combined_logits)?;
-
-            probs.narrow(D::Minus1, 0, k_len)?.contiguous()?
-        };
-
-        scores.matmul(v_ref)
     }
 }
 
@@ -498,6 +414,7 @@ impl GptOssMoE {
         #[cfg(not(feature = "cuda"))]
         let (topk_weights, topk_ids) = {
             use crate::ops::TopKLastDimOp;
+            use candle_core::DType;
             let router_f32 = router_logits.to_dtype(DType::F32)?;
             let topk_result = router_f32.topk(self.num_experts_per_tok)?;
             let topk_weights = candle_nn::ops::softmax_last_dim(&topk_result.values)?;
@@ -825,60 +742,24 @@ impl Model {
         let mut xs = self.embed_tokens.forward(input_ids)?;
         let cache = &mut self.cache.normal().0;
 
-        let (_b_sz, tgt_len) = input_ids.dims2()?;
         let sliding_window = self.cfg.sliding_window;
 
-        let (causal_mask, sliding_mask) = if tgt_len == 1 {
-            (None, None)
-        } else {
-            let past_kv_len = cache[0].current_seq_len();
-            let kv_len = tgt_len + past_kv_len;
+        // Use the `_as_attn_bias` variants which always construct real masks.
+        // The standard `make_causal_mask_matrix` returns a dummy (1,1) tensor when
+        // flash-attn is enabled on CUDA, but the CPU sinks fallback needs a real mask.
+        let mask_cache: &dyn PastKvLenCache = metadata
+            .as_ref()
+            .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
+            .unwrap_or(cache as &dyn PastKvLenCache);
+        let causal_mask =
+            CausalMasker.make_causal_mask_as_attn_bias(input_ids, mask_cache, xs.dtype())?;
 
-            let q_pos = Tensor::arange(
-                past_kv_len as u32,
-                (past_kv_len + tgt_len) as u32,
-                input_ids.device(),
-            )?
-            .to_dtype(DType::I64)?
-            .reshape((tgt_len, 1))?;
-            let k_pos = Tensor::arange(0u32, kv_len as u32, input_ids.device())?
-                .to_dtype(DType::I64)?
-                .reshape((1, kv_len))?;
-
-            let causal_mask_bool = k_pos.broadcast_gt(&q_pos)?;
-            let zeros = Tensor::zeros((tgt_len, kv_len), xs.dtype(), input_ids.device())?;
-            let neg_inf = Tensor::full(f32::NEG_INFINITY, (tgt_len, kv_len), input_ids.device())?
-                .to_dtype(xs.dtype())?;
-            let causal_mask = Some(
-                causal_mask_bool
-                    .where_cond(&neg_inf, &zeros)?
-                    .unsqueeze(0)?
-                    .unsqueeze(0)?,
-            );
-
-            let sliding_mask = if let Some(window) = sliding_window {
-                let window_tensor = Tensor::full(window as i64, q_pos.shape(), input_ids.device())?;
-                let min_k = q_pos.sub(&window_tensor)?.maximum(0i64)?;
-
-                let too_far_left = k_pos.broadcast_lt(&min_k)?;
-                let too_far_right = k_pos.broadcast_gt(&q_pos)?;
-                let sliding_mask_bool = too_far_left
-                    .to_dtype(DType::U8)?
-                    .add(&too_far_right.to_dtype(DType::U8)?)?
-                    .gt(0u8)?;
-
-                Some(
-                    sliding_mask_bool
-                        .where_cond(&neg_inf, &zeros)?
-                        .unsqueeze(0)?
-                        .unsqueeze(0)?,
-                )
-            } else {
-                None
-            };
-
-            (causal_mask, sliding_mask)
-        };
+        let sliding_mask = CausalMasker.make_sliding_window_causal_mask_as_attn_bias(
+            input_ids,
+            mask_cache,
+            sliding_window,
+            xs.dtype(),
+        )?;
 
         let should_use_mask = metadata
             .as_ref()
@@ -886,6 +767,8 @@ impl Model {
             .unwrap_or(true);
         let causal_mask = if should_use_mask { causal_mask } else { None };
         let sliding_mask = if should_use_mask { sliding_mask } else { None };
+        let causal_mask = DeviceMappedMask::new(causal_mask, &*self.mapper)?;
+        let sliding_mask = DeviceMappedMask::new(sliding_mask, &*self.mapper)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
@@ -898,9 +781,7 @@ impl Model {
 
             xs = layer.forward(
                 &xs,
-                layer_mask
-                    .map(|m| m.to_device(xs.device()).unwrap())
-                    .as_ref(),
+                layer_mask.map(|m| m.get(xs.device())),
                 seqlen_offsets,
                 &mut cache[i],
                 metadata.as_ref().map(|(kv, m)| (kv[i].clone(), *m)),

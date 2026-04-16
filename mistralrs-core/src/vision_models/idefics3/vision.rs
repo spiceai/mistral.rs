@@ -6,6 +6,7 @@ use std::{ops::Mul, sync::Arc};
 use crate::{
     attention::SdpaParams,
     layers::{self, conv2d, embedding, layer_norm, Activation, CausalMasker, Sdpa},
+    pipeline::text_models_inputs_processor::FlashParams,
     utils::unvarbuilder::UnVarBuilder,
 };
 
@@ -97,7 +98,7 @@ fn bucketize_right(xs: &[f32], boundaries: &[f32], device: &Device) -> Result<Te
             // For robust handling of NaNs, you might need a custom comparison.
             val.partial_cmp(&x).unwrap_or(Ordering::Less)
         }) {
-            Ok(i) => i,
+            Ok(i) => i + 1,
             Err(i) => i,
         };
 
@@ -262,6 +263,7 @@ impl Attention {
                 softcap: None,
                 softmax_scale: scale,
                 sliding_window: None,
+                sinks: None,
             },
         })
     }
@@ -283,8 +285,16 @@ impl Attention {
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
 
-        let attn_output =
-            Sdpa.run_attention(&q, &k, &v, attention_mask, None, &self.sdpa_params)?;
+        let flash_params = FlashParams::empty(false);
+
+        let attn_output = Sdpa.run_attention(
+            &q,
+            &k,
+            &v,
+            attention_mask,
+            Some(&flash_params),
+            &self.sdpa_params,
+        )?;
 
         self.o_proj
             .forward_autocast(&attn_output.transpose(1, 2)?.reshape((

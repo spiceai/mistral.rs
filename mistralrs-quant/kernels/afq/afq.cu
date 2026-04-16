@@ -7,11 +7,11 @@
 
 #include "afq_utils.cuh"
 #include <cfloat>
+#include <cstdint>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <cstdint>
 
 // ============================================================================
 // Dequantization Kernels
@@ -22,10 +22,10 @@
 // Output layout: [rows, cols]
 template <typename T, int bits, int group_size>
 __global__ void afq_dequantize_kernel(const uint32_t *__restrict__ w_q,
-                                       const T *__restrict__ scales,
-                                       const T *__restrict__ biases,
-                                       T *__restrict__ output, int rows,
-                                       int cols) {
+                                      const T *__restrict__ scales,
+                                      const T *__restrict__ biases,
+                                      T *__restrict__ output, int rows,
+                                      int cols) {
   constexpr int values_per_u32 = 32 / bits;
   const int packed_cols = cols * bits / 32;
   const int groups_per_row = cols / group_size;
@@ -62,10 +62,10 @@ __global__ void afq_dequantize_kernel(const uint32_t *__restrict__ w_q,
 // 8 values packed into 3 bytes (24 bits)
 template <typename T, int group_size>
 __global__ void afq_dequantize_3bit_kernel(const uint8_t *__restrict__ w_q,
-                                            const T *__restrict__ scales,
-                                            const T *__restrict__ biases,
-                                            T *__restrict__ output, int rows,
-                                            int cols) {
+                                           const T *__restrict__ scales,
+                                           const T *__restrict__ biases,
+                                           T *__restrict__ output, int rows,
+                                           int cols) {
   const int groups_per_row = cols / group_size;
   // 8 values per 3 bytes
   const int packed_cols = (cols * 3 + 7) / 8;
@@ -95,10 +95,10 @@ __global__ void afq_dequantize_3bit_kernel(const uint8_t *__restrict__ w_q,
 // 4 values packed into 3 bytes (24 bits)
 template <typename T, int group_size>
 __global__ void afq_dequantize_6bit_kernel(const uint8_t *__restrict__ w_q,
-                                            const T *__restrict__ scales,
-                                            const T *__restrict__ biases,
-                                            T *__restrict__ output, int rows,
-                                            int cols) {
+                                           const T *__restrict__ scales,
+                                           const T *__restrict__ biases,
+                                           T *__restrict__ output, int rows,
+                                           int cols) {
   const int groups_per_row = cols / group_size;
   // 4 values per 3 bytes
   const int packed_cols = (cols * 6 + 7) / 8;
@@ -131,8 +131,8 @@ __global__ void afq_dequantize_6bit_kernel(const uint8_t *__restrict__ w_q,
 // Compute scale and bias for a group using warp reduction
 template <typename T>
 __device__ void compute_scale_bias_warp(const T *w, int group_start, int cols,
-                                         int group_size, float &scale,
-                                         float &bias) {
+                                        int group_size, float &scale,
+                                        float &bias) {
   int lane = threadIdx.x % AFQ_WARP_SIZE;
 
   float local_min = FLT_MAX;
@@ -142,7 +142,7 @@ __device__ void compute_scale_bias_warp(const T *w, int group_start, int cols,
   for (int i = lane; i < group_size; i += AFQ_WARP_SIZE) {
     int col = group_start + i;
     if (col < cols) {
-      float val;
+      float val = 0.0f;
       if constexpr (std::is_same_v<T, float>) {
         val = w[col];
       } else if constexpr (std::is_same_v<T, __half>) {
@@ -229,7 +229,7 @@ afq_quantize_kernel(const T *__restrict__ w, uint32_t *__restrict__ w_q,
     if (col >= cols)
       continue;
 
-    float val;
+    float val = 0.0f;
     if constexpr (std::is_same_v<T, float>) {
       val = row_w[col];
     } else if constexpr (std::is_same_v<T, __half>) {
@@ -327,6 +327,7 @@ DEFINE_DEQUANT_LAUNCHER(8, 64, __half, f16)
 DEFINE_DEQUANT_LAUNCHER(8, 128, __half, f16)
 
 // BFloat16 versions
+#if defined(COMPUTE_CAP) && COMPUTE_CAP >= 80
 DEFINE_DEQUANT_LAUNCHER(2, 32, __nv_bfloat16, bf16)
 DEFINE_DEQUANT_LAUNCHER(2, 64, __nv_bfloat16, bf16)
 DEFINE_DEQUANT_LAUNCHER(2, 128, __nv_bfloat16, bf16)
@@ -342,6 +343,23 @@ DEFINE_DEQUANT_6BIT_LAUNCHER(128, __nv_bfloat16, bf16)
 DEFINE_DEQUANT_LAUNCHER(8, 32, __nv_bfloat16, bf16)
 DEFINE_DEQUANT_LAUNCHER(8, 64, __nv_bfloat16, bf16)
 DEFINE_DEQUANT_LAUNCHER(8, 128, __nv_bfloat16, bf16)
+#else
+// Stub implementations for SM < 80 (bf16 not supported)
+#define BF16_DEQUANT_STUB(bits, gs) \
+  extern "C" void afq_dequantize_##bits##bit_gs##gs##_bf16( \
+      const void *, const void *, const void *, void *, int, int) {}
+#define BF16_DEQUANT_3BIT_STUB(gs) \
+  extern "C" void afq_dequantize_3bit_gs##gs##_bf16( \
+      const void *, const void *, const void *, void *, int, int) {}
+#define BF16_DEQUANT_6BIT_STUB(gs) \
+  extern "C" void afq_dequantize_6bit_gs##gs##_bf16( \
+      const void *, const void *, const void *, void *, int, int) {}
+BF16_DEQUANT_STUB(2, 32) BF16_DEQUANT_STUB(2, 64) BF16_DEQUANT_STUB(2, 128)
+BF16_DEQUANT_3BIT_STUB(32) BF16_DEQUANT_3BIT_STUB(64) BF16_DEQUANT_3BIT_STUB(128)
+BF16_DEQUANT_STUB(4, 32) BF16_DEQUANT_STUB(4, 64) BF16_DEQUANT_STUB(4, 128)
+BF16_DEQUANT_6BIT_STUB(32) BF16_DEQUANT_6BIT_STUB(64) BF16_DEQUANT_6BIT_STUB(128)
+BF16_DEQUANT_STUB(8, 32) BF16_DEQUANT_STUB(8, 64) BF16_DEQUANT_STUB(8, 128)
+#endif // COMPUTE_CAP >= 80
 
 // ============================================================================
 // Extern "C" Launch Functions - Quantize
@@ -358,7 +376,7 @@ DEFINE_DEQUANT_LAUNCHER(8, 128, __nv_bfloat16, bf16)
     int blocks = cdiv(threads, AFQ_BLOCK_SIZE);                                \
     /* Zero out w_q first */                                                   \
     int packed_cols = cols * bits / 32;                                        \
-    cudaMemset(w_q, 0, rows *packed_cols * sizeof(uint32_t));                  \
+    cudaMemset(w_q, 0, rows * packed_cols * sizeof(uint32_t));                 \
     afq_quantize_kernel<dtype, bits, gs>                                       \
         <<<blocks, AFQ_BLOCK_SIZE>>>(w, w_q, scales, biases, rows, cols);      \
   }
@@ -388,6 +406,7 @@ DEFINE_QUANT_LAUNCHER(8, 64, __half, f16)
 DEFINE_QUANT_LAUNCHER(8, 128, __half, f16)
 
 // BFloat16 quantize
+#if defined(COMPUTE_CAP) && COMPUTE_CAP >= 80
 DEFINE_QUANT_LAUNCHER(2, 32, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(2, 64, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(2, 128, __nv_bfloat16, bf16)
@@ -397,6 +416,14 @@ DEFINE_QUANT_LAUNCHER(4, 128, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(8, 32, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(8, 64, __nv_bfloat16, bf16)
 DEFINE_QUANT_LAUNCHER(8, 128, __nv_bfloat16, bf16)
+#else
+#define BF16_QUANT_STUB(bits, gs) \
+  extern "C" void afq_quantize_##bits##bit_gs##gs##_bf16( \
+      const void *, void *, void *, void *, int, int) {}
+BF16_QUANT_STUB(2, 32) BF16_QUANT_STUB(2, 64) BF16_QUANT_STUB(2, 128)
+BF16_QUANT_STUB(4, 32) BF16_QUANT_STUB(4, 64) BF16_QUANT_STUB(4, 128)
+BF16_QUANT_STUB(8, 32) BF16_QUANT_STUB(8, 64) BF16_QUANT_STUB(8, 128)
+#endif
 
 // Note: 3-bit and 6-bit quantization kernels require special byte packing
 // and are more complex. For now, these are handled by the CPU fallback

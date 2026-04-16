@@ -5,7 +5,7 @@ AnyMoE is technique to dynamically and efficiently create MoE models. By providi
 It has the following features:
 - Apply AnyMoE to any supported model
     - `plain`
-    - `vision-plain`
+    - `multimodal-plain`
 - Specify the layers to apply AnyMoE to for efficient training
 
 Paper: https://arxiv.org/abs/2405.19076
@@ -32,7 +32,7 @@ Currently, AnyMoE expects a JSON dataset with one top-level key `row`, which is 
   
 ```
 
-For a vision model, `image_urls` may contain an array of image URLs/local paths or Base64 encoded images.
+For a multimodal model, `image_urls` may contain an array of image URLs/local paths or Base64 encoded images.
 
 ## Experts
 AnyMoE experts can be either fine-tuned models or LoRA adapter models. Only the mlp layers will be loaded from each. The experts must be homogeneous: they must be all fine-tuned or all adapter. Additionally, certain layers can be specified to apply AnyMoE.
@@ -155,7 +155,7 @@ async fn main() -> Result<()> {
     let text_builder = TextModelBuilder::new("mistralai/Mistral-7B-Instruct-v0.1")
         .with_isq(IsqType::Q8_0)
         .with_logging()
-        .with_paged_attn(|| PagedAttentionMetaBuilder::default().build())?;
+        .with_paged_attn(PagedAttentionMetaBuilder::default().build()?);
 
     let model = AnyMoeModelBuilder::from_text_builder(
         text_builder,

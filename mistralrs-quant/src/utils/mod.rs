@@ -5,11 +5,12 @@ pub mod log;
 mod ops;
 mod uqff;
 
+pub use ops::flash_attn_sinks_metal;
+pub use ops::flash_attn_sinks_varlen_metal;
 #[cfg(feature = "cuda")]
 pub use ops::gptoss_swiglu_fused;
 #[cfg(feature = "cuda")]
 pub use ops::gptoss_swiglu_interleaved;
-#[cfg(feature = "cuda")]
 pub use ops::softmax_with_sinks;
 pub use ops::{fused_glu, GluActivationType};
 pub use ops::{BitWiseOp, CumSumOp, LeftshiftOp, NonZeroOp, SortOp};

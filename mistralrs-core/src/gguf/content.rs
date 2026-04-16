@@ -4,16 +4,47 @@ use anyhow::Context;
 use candle_core::{
     quantized::{
         gguf_file::{self, TensorInfo, Value},
-        QTensor,
+        GgmlDType, QTensor,
     },
     Device, Result,
 };
 use indexmap::IndexMap;
-use tracing::info;
+use tracing::{event, info, Level};
 
 use crate::DEBUG;
 
 use super::GGUFArchitecture;
+
+/// List of all GgmlDType variants from Candle.
+/// This should be kept in sync with candle_core::quantized::GgmlDType.
+/// If Candle adds new dtype variants, add them here to include in error messages.
+/// Reference: candle-core/src/quantized/mod.rs in the Candle repository.
+const KNOWN_DTYPES: &[GgmlDType] = &[
+    GgmlDType::F32,
+    GgmlDType::F16,
+    GgmlDType::BF16,
+    GgmlDType::Q4_0,
+    GgmlDType::Q4_1,
+    GgmlDType::Q5_0,
+    GgmlDType::Q5_1,
+    GgmlDType::Q8_0,
+    GgmlDType::Q8_1,
+    GgmlDType::Q2K,
+    GgmlDType::Q3K,
+    GgmlDType::Q4K,
+    GgmlDType::Q5K,
+    GgmlDType::Q6K,
+    GgmlDType::Q8K,
+    // Add newer ones here if Candle adds more
+];
+
+fn get_supported_gguf_dtypes() -> String {
+    KNOWN_DTYPES
+        .iter()
+        .map(|dt| format!("{:?}", dt))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 fn parse_gguf_value(value: &Value) -> String {
     match value {
@@ -51,8 +82,34 @@ impl<'a, R: std::io::Seek + std::io::Read> Content<'a, R> {
     pub fn from_readers(readers: &'a mut [&'a mut R]) -> Result<Self> {
         let mut contents = Vec::new();
         let n_readers = readers.len();
-        for reader in readers.iter_mut() {
-            contents.push(gguf_file::Content::read(reader)?);
+        for (i, reader) in readers.iter_mut().enumerate() {
+            match gguf_file::Content::read(reader) {
+                Ok(c) => {
+                    contents.push(c);
+                }
+                Err(e) => {
+                    let error_msg = format!("{}", e);
+                    if error_msg.contains("unknown dtype for tensor") {
+                        {
+                            candle_core::bail!(
+                                "Critical failure loading model part {}\n\
+                                Verify you are using a supported quantization type\n\
+                                Supported types: {}\n\
+                                Candle error: {}",
+                                i,
+                                get_supported_gguf_dtypes(),
+                                e
+                            );
+                        }
+                    }
+                    candle_core::bail!(
+                        "Critical failure loading model part {}!\n\
+                        Check whether your current quantization format is supported: {}",
+                        i,
+                        e
+                    );
+                }
+            }
         }
         let n_splits = contents
             .iter()
@@ -165,7 +222,7 @@ impl<'a, R: std::io::Seek + std::io::Read> Content<'a, R> {
             }
         }
 
-        info!("Model config:");
+        event!(Level::DEBUG, "Model config:");
         keys.sort();
         let mut output_keys = IndexMap::new();
         for name in keys {
@@ -178,7 +235,7 @@ impl<'a, R: std::io::Seek + std::io::Read> Content<'a, R> {
             }
         }
         for (name, val) in output_keys {
-            println!("{name}: {val}")
+            event!(Level::DEBUG, "{name}: {val}")
         }
 
         if DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
