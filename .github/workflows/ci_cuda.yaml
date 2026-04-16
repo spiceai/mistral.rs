@@ -47,9 +47,9 @@ jobs:
       - name: Clippy (cuda)
         run: cargo clippy --features cuda
         env:
-          CUDAHOSTCXX: g++-12
+          NVCC_CCBIN: g++-12
 
       - name: Test (cuda)
         run: cargo test --features cuda
         env:
-          CUDAHOSTCXX: g++-12
+          NVCC_CCBIN: g++-12
