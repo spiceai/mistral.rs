@@ -199,6 +199,10 @@ impl VisionLoaderBuilder {
             lora_adapter_ids: self.lora_adapter_ids,
         })
     }
+
+    pub fn build(self, loader: VisionLoaderType) -> Box<dyn Loader> {
+        self.build_as_vision(loader)
+    }
 }
 
 impl Loader for VisionLoader {
@@ -855,6 +859,12 @@ impl Loader for VisionLoader {
 
     fn get_kind(&self) -> ModelKind {
         self.kind.clone()
+    }
+}
+
+impl VisionLoader {
+    pub fn get_prefixer(&self) -> Arc<dyn VisionPromptPrefixer> {
+        self.inner.prefixer()
     }
 }
 
