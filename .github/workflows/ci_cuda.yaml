@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl build-essential libssl-dev protobuf-compiler pkg-config
+          sudo apt-get install -y curl build-essential libssl-dev protobuf-compiler pkg-config gcc-12 g++-12
 
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@b6fc3a9f3f15256d9d94ffe1254f9c5a2565cde6 # v0.2.30
@@ -46,6 +46,10 @@ jobs:
 
       - name: Clippy (cuda)
         run: cargo clippy --features cuda
+        env:
+          CUDAHOSTCXX: g++-12
 
       - name: Test (cuda)
         run: cargo test --features cuda
+        env:
+          CUDAHOSTCXX: g++-12
