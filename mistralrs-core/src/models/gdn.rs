@@ -559,6 +559,7 @@ impl GatedDeltaNet {
     }
 
     #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
     fn recurrence_cuda(
         &self,
         q: &Tensor,
