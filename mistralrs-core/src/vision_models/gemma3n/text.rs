@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use crate::layers_masker::CausalMaskConfig;
 use candle_core::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::Linear;
 use mistralrs_quant::{
@@ -9,10 +10,10 @@ use statrs::distribution::{ContinuousCDF, Normal};
 
 use crate::{
     amoe::AnyMoeBaseModelMixin,
-    attention::SdpaParams,
+    attention::{AttentionMask, SdpaParams},
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{
-        self, embedding, Activation, CausalMasker, Gemma3nRotaryEmbedding, MatMul, RmsNorm,
+        self, embedding, Activation, CausalMasker, Gemma3nRotaryEmbedding, RmsNorm,
         RotaryEmbedding, ScaledEmbedding, Sdpa,
     },
     matformer::MatformerSliceConfig,
@@ -163,25 +164,17 @@ impl Mlp {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.gate.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let mut gate = self.gate.forward(&xs)?;
+        let mut gate = self.gate.forward(xs)?;
         if self.activation_sparsity > 0. {
             gate = self.gaussian_topk(&gate)?;
         }
-        let up = self.up.forward(&xs)?;
+        let up = self.up.forward(xs)?;
         // let mut res = self.down.forward(&crate::ops::mul_and_act(
         //     &gate,
         //     &up,
         //     self.act.try_into()?,
         // )?)?;
-        let mut res = self.down.forward(&(&gate.apply(&self.act)? * &up)?)?;
-        if self.gate.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.down.forward(&(&gate.apply(&self.act)? * &up)?)?;
         Ok(res)
     }
 }
@@ -386,15 +379,15 @@ impl Attention {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
-        sliding_attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
+        sliding_attention_mask: &AttentionMask,
         seqlen_offsets: &[usize],
         kv_caches: &mut [KvCache],
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
-        let mut q = self.q_proj.forward_autocast(xs)?;
+        let mut q = self.q_proj.forward(xs)?;
         q = q.reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
         q = q.apply(&self.q_norm)?;
         q = self.apply_rope(&q, seqlen_offsets, q_len)?;
@@ -413,13 +406,13 @@ impl Attention {
                 true,
             )
         } else {
-            let mut k = self.k_proj.forward_autocast(xs)?;
+            let mut k = self.k_proj.forward(xs)?;
             k = k.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
             k = k.apply(&self.k_norm)?;
             k = self.apply_rope(&k, seqlen_offsets, q_len)?;
             k = k.transpose(1, 2)?;
 
-            let mut v = self.v_proj.forward_autocast(xs)?;
+            let mut v = self.v_proj.forward(xs)?;
             v = v.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
             v = v.apply(&self.v_norm)?;
             v = v.transpose(1, 2)?;
@@ -435,56 +428,51 @@ impl Attention {
 
         // Adjust mask dimensions if using shared KV cache
         let mask = if is_shared_kv {
-            if let Some(mask) = mask {
+            if let AttentionMask::Custom(mask) = mask {
                 let kv_seq_len = k.dims()[2];
                 let mask_dims = mask.dims();
 
                 // Only narrow when the target dimension is strictly longer; otherwise reuse as-is.
-                match mask.rank() {
+                let narrowed = match mask.rank() {
                     2 => {
                         // 2D masks: (q_len, kv_len)
                         if mask_dims[1] > kv_seq_len {
-                            Some(mask.narrow(1, 0, kv_seq_len)?)
+                            mask.narrow(1, 0, kv_seq_len)?
                         } else {
-                            Some(mask.clone())
+                            mask.clone()
                         }
                     }
                     3 => {
                         // 3D masks: (batch, q_len, kv_len)
                         if mask_dims[2] > kv_seq_len {
-                            Some(mask.narrow(2, 0, kv_seq_len)?)
+                            mask.narrow(2, 0, kv_seq_len)?
                         } else {
-                            Some(mask.clone())
+                            mask.clone()
                         }
                     }
                     4 => {
                         // 4D masks: (batch, heads, q_len, kv_len)
                         if mask_dims[3] > kv_seq_len {
-                            Some(mask.narrow(3, 0, kv_seq_len)?)
+                            mask.narrow(3, 0, kv_seq_len)?
                         } else {
-                            Some(mask.clone())
+                            mask.clone()
                         }
                     }
-                    _ => Some(mask.clone()),
-                }
+                    _ => mask.clone(),
+                };
+                AttentionMask::Custom(narrowed)
             } else {
-                None
+                AttentionMask::None
             }
         } else {
-            mask.cloned()
+            mask.clone()
         };
 
-        let mut attn_output = Sdpa.run_attention(
-            &q,
-            &k,
-            &v,
-            mask.as_ref(),
-            Some(flash_params),
-            &self.sdpa_params,
-        )?;
+        let mut attn_output =
+            Sdpa.run_attention(&q, &k, &v, &mask, Some(flash_params), &self.sdpa_params)?;
 
         attn_output = attn_output.transpose(1, 2)?.reshape((b_sz, q_len, ()))?;
-        self.o_proj.forward_autocast(&attn_output)
+        self.o_proj.forward(&attn_output)
     }
 }
 
@@ -755,8 +743,8 @@ impl DecoderLayer {
         &self,
         xs: &Tensor,
         per_layer_input: &Tensor,
-        attention_mask: Option<&Tensor>,
-        sliding_attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
+        sliding_attention_mask: &AttentionMask,
         seqlen_offsets: &[usize],
         kv_caches: &mut [KvCache],
         flash_params: &FlashParams,
@@ -1290,7 +1278,7 @@ impl TextModel {
         per_layer_inputs: Option<Tensor>,
     ) -> Result<Tensor> {
         // Cast to float32 for per-layer projection scaling
-        let mut per_layer_projection = self.per_layer_model_projection.forward_autocast(xs)?;
+        let mut per_layer_projection = self.per_layer_model_projection.forward(xs)?;
         let original_dtype = per_layer_projection.dtype();
         let per_layer_projection_f32 = per_layer_projection.to_dtype(DType::F32)?;
         per_layer_projection = (per_layer_projection_f32 * self.per_layer_projection_scale)?;
@@ -1336,18 +1324,20 @@ impl TextModel {
         let per_layer_inputs = per_layer_inputs.to_dtype(xs.dtype())?;
 
         let cache = &mut self.cache.normal().0;
-        let attention_mask = CausalMasker.make_causal_mask_matrix(
+        let attention_mask = CausalMasker.make_causal_mask(
             input_ids,
             &*cache,
             xs.dtype(),
-            self.cfg.num_attn_heads,
+            &CausalMaskConfig::default(),
         )?;
-        let sliding_attention_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
+        let sliding_attention_mask = CausalMasker.make_causal_mask(
             input_ids,
             &*cache,
-            Some(self.sliding_window),
             xs.dtype(),
-            self.cfg.num_attn_heads,
+            &CausalMaskConfig {
+                sliding_window: Some(self.sliding_window),
+                ..Default::default()
+            },
         )?;
 
         // Already using float32 for magnitude calculations
@@ -1360,7 +1350,7 @@ impl TextModel {
 
         let mut temp_hidden_states = vec![xs.clone()];
         for altup_proj in &self.altup_projections {
-            let altup_proj = altup_proj.forward_autocast(&xs)?;
+            let altup_proj = altup_proj.forward(&xs)?;
             let new_magnitude = altup_proj
                 .to_dtype(DType::F32)?
                 .sqr()?
@@ -1385,8 +1375,8 @@ impl TextModel {
             xs = layer.forward(
                 &xs,
                 &per_layer_input.to_device(xs.device())?,
-                attention_mask.as_ref().map(|m| m.get(xs.device())),
-                sliding_attention_mask.as_ref().map(|m| m.get(xs.device())),
+                &attention_mask.get(xs.device()),
+                &sliding_attention_mask.get(xs.device()),
                 seqlen_offsets,
                 &mut *cache,
                 flash_params,
@@ -1403,7 +1393,7 @@ impl TextModel {
 
         let mut temp_hidden_states = vec![xs.i(0)?];
         for (i, altup_proj) in self.altup_unembed_projections.iter().enumerate() {
-            let altup_proj = altup_proj.forward_autocast(&xs.i(i + 1)?)?;
+            let altup_proj = altup_proj.forward(&xs.i(i + 1)?)?;
             let new_magnitude = altup_proj
                 .to_dtype(DType::F32)?
                 .sqr()?
@@ -1425,11 +1415,7 @@ impl TextModel {
 
         xs = xs.apply(&self.norm)?;
         let mut xs = extract_logits(&xs, context_lens)?;
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-
-        xs = MatMul.qmethod_matmul(&xs, &*self.lm_head)?;
+        xs = self.lm_head.forward(&xs)?;
 
         if let Some(final_logit_softcapping) = self.final_logit_softcapping {
             // Perform logit softcapping in float32 for precision

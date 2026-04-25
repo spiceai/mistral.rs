@@ -1,5 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+use crate::layers_masker::CausalMaskConfig;
 use candle_core::{Device, IndexOp, Result, Tensor};
 use candle_nn::{Embedding, Module};
 use mistralrs_quant::{
@@ -14,12 +15,12 @@ use std::{
 
 use crate::{
     amoe::{AnyMoeBaseModelMixin, AnyMoeConfig, AnyMoeExpertType, MlpLayer, MoeMlp},
-    attention::SdpaParams,
+    attention::{AttentionMask, SdpaParams},
     device_map::{DeviceMappedMask, DeviceMapper},
     kv_cache::{
         HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
     },
-    layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{embedding, CausalMasker, RmsNorm, RotaryEmbedding, Sdpa},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
     pipeline::{
@@ -207,19 +208,11 @@ impl GraniteMlp {
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let original_dtype = x.dtype();
-        let mut x = x.clone();
-        if let Some(t) = self.input_linear.quantized_act_type() {
-            x = x.to_dtype(t)?;
-        }
-        let projected = MatMul.qmethod_matmul(&x, &*self.input_linear)?;
+        let projected = self.input_linear.forward(x)?;
         let chunks = projected.chunk(2, candle_core::D::Minus1)?;
         let gated =
             crate::ops::mul_and_act(&chunks[0], &chunks[1], crate::layers::Activation::Silu)?;
-        let mut res = MatMul.qmethod_matmul(&gated, &*self.output_linear)?;
-        if self.input_linear.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.output_linear.forward(&gated)?;
         Ok(res)
     }
 }
@@ -1277,7 +1270,7 @@ impl CausalSelfAttention {
     fn forward(
         &self,
         x: &Tensor,
-        attention_mask: &Option<Tensor>,
+        attention_mask: &AttentionMask,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
@@ -1285,20 +1278,9 @@ impl CausalSelfAttention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
-        let original_dtype = x.dtype();
-        let mut x = x.clone();
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            x = x.to_dtype(t)?;
-        }
-        let mut q = MatMul.qmethod_matmul(&x, &*self.q_proj)?;
-        let mut k = MatMul.qmethod_matmul(&x, &*self.k_proj)?;
-        let mut v = MatMul.qmethod_matmul(&x, &*self.v_proj)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            q = q.to_dtype(original_dtype)?;
-            k = k.to_dtype(original_dtype)?;
-            v = v.to_dtype(original_dtype)?;
-        }
-
+        let mut q = self.q_proj.forward(x)?;
+        let mut k = self.k_proj.forward(x)?;
+        let mut v = self.v_proj.forward(x)?;
         (q, k, v) = if seq_len != 1 {
             let q = q
                 .reshape((b_sz, seq_len, self.num_attention_heads, self.head_dim))?
@@ -1330,7 +1312,7 @@ impl CausalSelfAttention {
                     &q,
                     &k,
                     &v,
-                    attention_mask.clone().as_ref(),
+                    attention_mask,
                     Some(key_cache),
                     Some(value_cache),
                     input_metadata,
@@ -1339,12 +1321,12 @@ impl CausalSelfAttention {
                 )?,
                 None => {
                     let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
-                    assert!(attention_mask.is_some());
+                    assert!(!matches!(attention_mask, AttentionMask::None));
                     paged_attn.forward(
                         &q,
                         &k,
                         &v,
-                        attention_mask.clone().as_ref(),
+                        attention_mask,
                         None,
                         None,
                         &input_metadata,
@@ -1360,25 +1342,19 @@ impl CausalSelfAttention {
                     &q,
                     &k,
                     &v,
-                    attention_mask.clone().as_ref(),
+                    attention_mask,
                     Some(flash_params),
                     &self.sdpa_params,
                 )?
             }
         };
 
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            y = y.to_dtype(t)?;
-        }
-        y = if attention_mask.is_some() {
+        y = if !matches!(attention_mask, AttentionMask::None) {
             y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
         } else {
             y.reshape((b_sz, seq_len, ()))?
         };
-        let mut res = MatMul.qmethod_matmul(&y, &*self.o_proj)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.o_proj.forward(&y)?;
         Ok(res)
     }
 
@@ -1469,7 +1445,7 @@ impl Block {
     fn forward(
         &self,
         x: &Tensor,
-        attention_mask: &Option<Tensor>,
+        attention_mask: &AttentionMask,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
@@ -1938,22 +1914,25 @@ impl GraniteMoeHybrid {
 
         // Build attention mask - use seqlen offsets for paged chunks, otherwise
         // derive past length from the pipeline hybrid cache (attention layers).
-        let mask = CausalMasker.make_causal_mask_matrix(
+        let mask = CausalMasker.make_causal_mask(
             input_ids,
             metadata
                 .as_ref()
                 .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
                 .unwrap_or(&*pipeline_cache as &dyn PastKvLenCache),
             x.dtype(),
-            self.num_attention_heads,
+            &CausalMaskConfig::default(),
         )?;
         // PagedAttention prompt chunking
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
+        let mask = if metadata
+            .as_ref()
+            .map(|(_, meta)| meta.is_first_prompt_chunk)
+            .unwrap_or(true)
+        {
+            mask
+        } else {
+            AttentionMask::None
+        };
         let mask = DeviceMappedMask::new(mask, &*self.mapper)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -1964,10 +1943,10 @@ impl GraniteMoeHybrid {
                     if let Some(HybridLayerCache::Attention(kv_cache)) =
                         pipeline_cache.get_mut(layer_idx)
                     {
-                        let mask_for_layer = mask.as_ref().map(|m| m.get(x.device()).clone());
+                        let mask_for_layer = &mask.get(x.device());
                         x = block.forward(
                             &x,
-                            &mask_for_layer,
+                            mask_for_layer,
                             seqlen_offsets,
                             kv_cache,
                             metadata.as_ref().map(|(kv_cache, metadata)| {
@@ -1979,10 +1958,10 @@ impl GraniteMoeHybrid {
                         &mut internal_cache.caches[layer_idx]
                     {
                         // Safety fallback: keep legacy path if layer-cache wiring is inconsistent.
-                        let mask_for_layer = mask.as_ref().map(|m| m.get(x.device()).clone());
+                        let mask_for_layer = &mask.get(x.device());
                         x = block.forward(
                             &x,
-                            &mask_for_layer,
+                            mask_for_layer,
                             seqlen_offsets,
                             kv_cache,
                             metadata.as_ref().map(|(kv_cache, metadata)| {
@@ -2042,12 +2021,9 @@ impl GraniteMoeHybrid {
 
         let x = x.to_device(&self.device)?;
         let x = self.ln_f.forward(&x)?;
-        let mut x = extract_logits(&x, context_lens)?;
+        let x = extract_logits(&x, context_lens)?;
 
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            x = x.to_dtype(t)?;
-        }
-        let mut logits = MatMul.qmethod_matmul(&x, &*self.lm_head)?;
+        let mut logits = self.lm_head.forward(&x)?;
 
         // Scale logits
         logits = scale_tensor(logits, self.logits_scaling)?;

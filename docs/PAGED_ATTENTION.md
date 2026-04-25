@@ -4,7 +4,7 @@ Mistral.rs supports PagedAttention ([paper here](https://arxiv.org/abs/2309.0618
 - CUDA (Unix-like platforms such as WSL, Linux)
 - Metal
 
-Our PagedAttention implementation has 2 inputs: GPU KV cache memory size, and block size. This enables you to have fine-tuned control over the available context length, by configuring the available memory for KV cache. When using a CUDA device, PagedAttention is actiated by default but can be disabled with `no_paged_attn` for Python or `no-paged-attn` for the CLI tools.
+Our PagedAttention implementation has 2 inputs: GPU KV cache memory size, and block size. This enables you to have fine-tuned control over the available context length, by configuring the available memory for KV cache. When using a CUDA device, PagedAttention is activated by default but can be disabled with `no_paged_attn` for Python or `no-paged-attn` for the CLI tools.
 
 ## KV Cache Quantization
 
@@ -99,6 +99,14 @@ The prefix cache operates at the block level (not token level) for efficiency:
 > - Python SDK: `prefix_cache_n=<N>` (default 16)
 > - Rust SDK: `.with_prefix_cache_n(Some(N))` (default 16)
 
+## Metal Memory Behavior
+
+On Metal (macOS Apple Silicon), the GPU and CPU share the same physical RAM (unified memory). Unlike CUDA GPUs with dedicated VRAM where unused memory would otherwise be wasted, allocating large KV caches on Metal wires physical RAM away from the OS and CPU, which can cause system-wide memory pressure and thrashing.
+
+To avoid this, mistral.rs automatically caps the PagedAttention KV cache on Metal to `max_seq_len * max_batch_size` tokens, which is just enough for the configured context length. On CUDA, the full available memory is used for maximum request concurrency (following the vLLM approach).
+
+You can override this behavior on any platform with `--pa-memory-mb` to set an explicit KV cache budget in megabytes.
+
 ## FlashAttention V2/V3 + PagedAttention in mistral.rs
 
 If mistral.rs is compiled with [FlashAttention](FLASH_ATTENTION.md) and PagedAttention is enabled, then FlashAttention will be used in tandem to accelerate
@@ -124,7 +132,7 @@ mistralrs run --paged-attn on --pa-memory-mb 4096 --pa-block-size 32 --pa-cache-
 ```
 
 ## Using the Rust SDK
-You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/paged_attn/main.rs).
+You can find this example [here](https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs/examples/advanced/paged_attn/main.rs).
 
 ```rust
 use anyhow::Result;
@@ -182,13 +190,13 @@ async fn main() -> Result<()> {
     let model = TextModelBuilder::new("microsoft/Phi-3.5-mini-instruct")
         .with_isq(IsqType::Q8_0)
         .with_logging()
-        .with_paged_attn(|| {
+        .with_paged_attn(
             PagedAttentionMetaBuilder::default()
                 .with_block_size(32)
                 .with_gpu_memory(MemoryGpuConfig::ContextSize(1024))
                 .with_cache_type(PagedCacheType::F8E4M3)
-                .build()
-        })?
+                .build()?,
+        )
         .build()
         .await?;
 
@@ -241,3 +249,9 @@ runner = Runner(
 
 # ... rest of the code remains the same
 ```
+## See Also
+
+- [Performance Guide](PERFORMANCE.md): How PagedAttention fits into the optimization stack
+- [FlashAttention](FLASH_ATTENTION.md): Accelerates prefill when used with PagedAttention
+- [MLA](MLA.md): KV cache compression for DeepSeek/GLM models
+- [Device Mapping](DEVICE_MAPPING.md): Multi-GPU and CPU offloading

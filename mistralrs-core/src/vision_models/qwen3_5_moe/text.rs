@@ -14,7 +14,7 @@ use mistralrs_quant::{
 
 use super::config::{LayerType, TextConfig};
 use crate::{
-    attention::SdpaParams,
+    attention::{AttentionMask, SdpaParams},
     device_map::{DeviceMappedMask, DeviceMapper},
     kv_cache::{
         HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
@@ -164,27 +164,16 @@ impl FullAttention {
     fn forward(
         &self,
         x: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         cos_sin: &(Tensor, Tensor),
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
-        let original_dtype = x.dtype();
-        let mut x = x.clone();
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            x = x.to_dtype(t)?;
-        }
-        let mut q_gate = mistralrs_quant::MatMul.qmethod_matmul(&x, &*self.q_proj)?;
-        let mut k = mistralrs_quant::MatMul.qmethod_matmul(&x, &*self.k_proj)?;
-        let mut v = mistralrs_quant::MatMul.qmethod_matmul(&x, &*self.v_proj)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            q_gate = q_gate.to_dtype(original_dtype)?;
-            k = k.to_dtype(original_dtype)?;
-            v = v.to_dtype(original_dtype)?;
-        }
-
+        let q_gate = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
         // Split q_gate into q and gate
         let q_gate = q_gate.reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
         let q = q_gate.narrow(D::Minus1, 0, self.head_dim)?;
@@ -242,7 +231,7 @@ impl FullAttention {
                 )?,
                 None => {
                     let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
-                    assert!(attention_mask.is_some());
+                    assert!(!matches!(attention_mask, AttentionMask::None));
                     paged_attn.forward(
                         &q,
                         &k,
@@ -269,10 +258,7 @@ impl FullAttention {
             }
         };
 
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            y = y.to_dtype(t)?;
-        }
-        y = if attention_mask.is_some() {
+        y = if !matches!(attention_mask, AttentionMask::None) {
             y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
         } else {
             y.reshape((b_sz, seq_len, ()))?
@@ -282,10 +268,7 @@ impl FullAttention {
         let gate = candle_nn::ops::sigmoid(&gate.to_dtype(y.dtype())?)?;
         y = y.broadcast_mul(&gate)?;
 
-        let mut res = mistralrs_quant::MatMul.qmethod_matmul(&y, &*self.o_proj)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.o_proj.forward(&y)?;
         Ok(res)
     }
 }
@@ -342,18 +325,10 @@ impl Mlp {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.gate_proj.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let gate = mistralrs_quant::MatMul.qmethod_matmul(&xs, &*self.gate_proj)?;
-        let up = mistralrs_quant::MatMul.qmethod_matmul(&xs, &*self.up_proj)?;
+        let gate = self.gate_proj.forward(xs)?;
+        let up = self.up_proj.forward(xs)?;
         let activated = crate::ops::mul_and_act(&gate, &up, self.act_fn)?;
-        let mut res = mistralrs_quant::MatMul.qmethod_matmul(&activated, &*self.down_proj)?;
-        if self.gate_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.down_proj.forward(&activated)?;
         Ok(res)
     }
 
@@ -497,7 +472,7 @@ impl DecoderLayer {
     fn forward_attention(
         &self,
         x: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         cos_sin: &(Tensor, Tensor),
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
@@ -783,7 +758,7 @@ impl Qwen3_5MoeTextModel {
     pub fn forward_embeds(
         &self,
         mut xs: Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         position_ids: &Tensor,
         _seqlen_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
@@ -820,7 +795,7 @@ impl Qwen3_5MoeTextModel {
             }
         };
 
-        let attention_mask = DeviceMappedMask::new(attention_mask.cloned(), &*self.mapper)?;
+        let attention_mask = DeviceMappedMask::new(attention_mask.clone(), &*self.mapper)?;
 
         // Precompute deepstack index tensors once to avoid repeated CPU-GPU syncs
         let deepstack_indices = if let Some(visual_pos_masks) = visual_pos_masks {
@@ -856,7 +831,7 @@ impl Qwen3_5MoeTextModel {
                     if let Some(HybridLayerCache::Attention(kv_cache)) = hybrid_cache.get_mut(i) {
                         xs = layer.forward_attention(
                             &xs,
-                            attention_mask.as_ref().map(|m| m.get(xs.device())),
+                            &attention_mask.get(xs.device()),
                             &cos_sin,
                             kv_cache,
                             metadata
@@ -924,11 +899,8 @@ impl Qwen3_5MoeTextModel {
         }
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
-        let mut xs = extract_logits(&xs, context_lens)?;
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        mistralrs_quant::MatMul.qmethod_matmul(&xs, &*self.lm_head)
+        let xs = extract_logits(&xs, context_lens)?;
+        self.lm_head.forward(&xs)
     }
 
     fn deepstack_process(

@@ -11,6 +11,7 @@ Complete reference for model support in mistral.rs.
 - DeepSeek V3
 - GPT-OSS
 - DeepSeek V2
+- Qwen 3 Next
 - Qwen 3 MoE
 - Phi 3.5 MoE
 - Qwen 3
@@ -27,9 +28,13 @@ Complete reference for model support in mistral.rs.
 - Llama
 - Mistral
 
-### Vision Models
+### Multimodal Models
 
 - Qwen 3-VL
+- Qwen 3-VL MoE
+- Qwen 3.5
+- Qwen 3.5 MoE
+- Gemma 4 (text, image, video, audio)
 - Gemma 3n
 - Llama 4
 - Gemma 3
@@ -47,6 +52,7 @@ Complete reference for model support in mistral.rs.
 
 ### Speech Models
 
+- Voxtral (ASR/speech-to-text)
 - Dia
 
 ### Image Generation Models
@@ -69,6 +75,7 @@ Complete reference for model support in mistral.rs.
 - starcoder2
 - qwen2
 - qwen3
+- qwen3moe
 
 **With adapters:**
 - llama
@@ -108,8 +115,15 @@ Complete reference for model support in mistral.rs.
 |Qwen 3|✅| |✅|
 |SmolLM3| | |✅|
 |Dia 1.6b| | |✅|
+|Voxtral| | |✅|
 |Gemma 3n| | |✅|
+|Gemma 4| | |✅|
 |Qwen 3 VL| | |✅|
+|Qwen 3 MoE|✅| |✅|
+|Qwen 3-VL MoE| | |✅|
+|Qwen 3.5| | |✅|
+|Qwen 3 Next| | |✅|
+|Phi 4 Multimodal| | |✅|
 |Granite 4.0| | |✅|
 |GPT-OSS| | |✅|
 
@@ -120,7 +134,7 @@ Complete reference for model support in mistral.rs.
 |Plain|✅|
 |GGUF|✅|
 |GGML| |
-|Vision Plain|✅|
+|Multimodal Plain|✅|
 
 ## X-LoRA and LoRA Support
 
@@ -155,7 +169,14 @@ Complete reference for model support in mistral.rs.
 |Qwen 3| | | |
 |SmolLM3|✅| | |
 |Gemma 3n| | | |
+|Gemma 4| | | |
+|Voxtral| | | |
 |Qwen 3 VL| | | |
+|Qwen 3-VL MoE| | | |
+|Qwen 3.5| | | |
+|Qwen 3 Next| | | |
+|Phi 4 Multimodal| | | |
+|Llama 3.2 Vision| | | |
 |Granite 4.0| | | |
 |GPT-OSS| | | |
 
@@ -192,7 +213,14 @@ Complete reference for model support in mistral.rs.
 |Qwen 3| |
 |SmolLM3|✅|
 |Gemma 3n| |
+|Gemma 4| |
+|Voxtral| |
 |Qwen 3 VL| |
+|Qwen 3-VL MoE| |
+|Qwen 3.5| |
+|Qwen 3 Next| |
+|Phi 4 Multimodal| |
+|Dia 1.6b| |
 |Granite 4.0| |
 |GPT-OSS| |
 

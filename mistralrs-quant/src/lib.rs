@@ -63,6 +63,11 @@ pub use fp8::FP8Linear;
 #[cfg(feature = "cuda")]
 pub use gemv::gemv;
 pub use gemv::{should_use_gemv, GEMV_CONTROLLER};
+#[cfg(feature = "cuda")]
+pub use gguf::cuda::{
+    grouped_moe_gemm_prequantized, indexed_moe_fused_decode, moe_dispatch_build,
+    quantize_input_q8_1, ACT_GELU_PYTORCH_TANH, ACT_SILU,
+};
 pub use gguf::GgufMatMul;
 pub use gptq::GptqLayer;
 pub use hqq::{HqqAxis, HqqBits, HqqConfig, HqqLayer};
@@ -527,11 +532,6 @@ impl MatMul {
     pub fn qmatmul(&self, x: &Tensor, matmul: &QMatMul) -> Result<Tensor> {
         matmul.forward(x)
     }
-
-    /// Compute quantized matrix-matrix product.
-    pub fn qmethod_matmul(&self, x: &Tensor, matmul: &dyn QuantMethod) -> Result<Tensor> {
-        matmul.forward(x)
-    }
 }
 
 /// Device/configurable intelligent convolution
@@ -971,44 +971,49 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
     fn dequantize_w(&self) -> Result<Tensor>;
 
     /// Compute matmul of `self` and `a`. `self` should contain the weights.
-    /// Automatically cast to required quantization activation type and back
-    fn forward_autocast(&self, a: &Tensor) -> Result<Tensor> {
-        let original_ty = a.dtype();
-        let a = if let Some(t) = self.quantized_act_type() {
-            a.to_dtype(t)?
+    /// Automatically casts to the required quantization activation type and back.
+    fn forward(&self, a: &Tensor) -> Result<Tensor> {
+        if let Some(t) = self.quantized_act_type() {
+            let original_ty = a.dtype();
+            self.forward_raw(&a.to_dtype(t)?)?.to_dtype(original_ty)
         } else {
-            a.clone()
-        };
-        self.forward(&a)?.to_dtype(original_ty)
+            self.forward_raw(a)
+        }
     }
 
-    /// Compute matmul of `self` and `a`. `self` should contain the weights.
-    fn forward(&self, a: &Tensor) -> Result<Tensor>;
+    /// Raw matmul without dtype casting. Implementors override this.
+    /// Callers should use `forward` instead.
+    fn forward_raw(&self, a: &Tensor) -> Result<Tensor>;
 
-    /// Compute matmul of `self` and `a`. `self` should contain the weights.
-    /// Automatically cast to required quantization activation type and back.
+    /// Compute gather matmul of `self` and `a`. `self` should contain the weights.
+    /// Automatically casts to the required quantization activation type and back.
     ///
     /// If `a` is (n_tokens, n_experts, cols), `self` weights are (n_experts, rows, cols),
     /// then the indices are (n_tokens, n_experts).
-    fn gather_forward_autocast(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
-        let original_ty = a.dtype();
-        let a = if let Some(t) = self.quantized_act_type() {
-            a.to_dtype(t)?
+    fn gather_forward(&self, a: &Tensor, indices: &Tensor) -> Result<Tensor> {
+        if let Some(t) = self.quantized_act_type() {
+            let original_ty = a.dtype();
+            self.gather_forward_raw(&a.to_dtype(t)?, indices)?
+                .to_dtype(original_ty)
         } else {
-            a.clone()
-        };
-        self.gather_forward(&a, indices)?.to_dtype(original_ty)
+            self.gather_forward_raw(a, indices)
+        }
     }
 
-    /// Compute matmul of `self` and `a`. `self` should contain the weights.
-    ///
-    /// If `a` is (n_tokens, n_experts, cols), `self` weights are (n_experts, rows, cols),
-    /// then the indices are (n_tokens, n_experts).
-    fn gather_forward(&self, _a: &Tensor, _indices: &Tensor) -> Result<Tensor> {
+    /// Raw gather matmul without dtype casting. Implementors override this.
+    /// Callers should use `gather_forward` instead.
+    fn gather_forward_raw(&self, _a: &Tensor, _indices: &Tensor) -> Result<Tensor> {
         candle_core::bail!(
             "{} does not support `gather_forward`. Please raise an issue.",
             self.name()
         )
+    }
+
+    /// Get the underlying QTensor if this is a GGUF quantized layer.
+    /// Used for direct kernel access in the grouped MoE prefill path.
+    #[cfg(feature = "cuda")]
+    fn get_qtensor(&self) -> Option<&candle_core::quantized::QTensor> {
+        None
     }
 
     /// If a quantized method, return the activation dtype.
@@ -1051,7 +1056,7 @@ pub trait QuantMethod: Send + Sync + Debug + QuantizedSerde {
 
 impl Module for dyn QuantMethod {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        Self::forward(self, xs)
+        QuantMethod::forward(self, xs)
     }
 }
 

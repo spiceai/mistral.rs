@@ -7,7 +7,7 @@ use mistralrs_quant::{
 };
 
 use crate::{
-    attention::SdpaParams,
+    attention::{AttentionMask, SdpaParams},
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{self, Activation, F32RmsNorm, Qwen2VLRotaryEmbedding, Sdpa},
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
@@ -65,10 +65,7 @@ impl Mlp {
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.gate_proj.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
+        let xs = xs.clone();
         let lhs = self.gate_proj.forward(&xs)?.apply(&self.act_fn)?;
         let rhs = self.up_proj.forward(&xs)?;
         self.down_proj
@@ -166,27 +163,16 @@ impl Attention {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         cos_sin: &(Tensor, Tensor),
         kv_cache: &mut KvCache,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let mut q = self.q_proj.forward(&xs)?;
-        let mut k = self.k_proj.forward(&xs)?;
-        let mut v = self.v_proj.forward(&xs)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            q = q.to_dtype(original_dtype)?;
-            k = k.to_dtype(original_dtype)?;
-            v = v.to_dtype(original_dtype)?;
-        }
-
+        let q = self.q_proj.forward(xs)?;
+        let k = self.k_proj.forward(xs)?;
+        let v = self.v_proj.forward(xs)?;
         let (mut q, mut k, v) = if q_len != 1 {
             let q = q
                 .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
@@ -210,31 +196,27 @@ impl Attention {
         let mut attn_output = {
             let (k, v) = kv_cache.append(&k, &v)?;
 
+            let f32_mask = match attention_mask {
+                AttentionMask::Custom(mask) => AttentionMask::Custom(mask.to_dtype(DType::F32)?),
+                other => other.clone(),
+            };
             Sdpa.run_attention(
                 &q.contiguous()?.to_dtype(DType::F32)?,
                 &k.contiguous()?.to_dtype(DType::F32)?,
                 &v.contiguous()?.to_dtype(DType::F32)?,
-                attention_mask
-                    .map(|mask| mask.to_dtype(DType::F32).unwrap())
-                    .as_ref(),
+                &f32_mask,
                 Some(flash_params),
                 &self.sdpa_params,
             )?
             .to_dtype(q.dtype())?
         };
 
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            attn_output = attn_output.to_dtype(t)?;
-        }
-        attn_output = if attention_mask.is_some() {
+        attn_output = if !matches!(attention_mask, AttentionMask::None) {
             attn_output.transpose(1, 2)?.reshape((b_sz, q_len, ()))?
         } else {
             attn_output.reshape((b_sz, q_len, ()))?
         };
-        let mut res = self.o_proj.forward(&attn_output)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.o_proj.forward(&attn_output)?;
         Ok(res)
     }
 }
@@ -289,7 +271,7 @@ impl DecoderLayer {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         cos_sin: &(Tensor, Tensor),
         kv_cache: &mut KvCache,
         flash_params: &FlashParams,
@@ -446,7 +428,7 @@ impl Qwen2VLTextModel {
     pub fn forward_embeds(
         &self,
         mut xs: Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         position_ids: &Tensor,
         context_lens: Vec<(usize, usize)>,
         flash_params: &FlashParams,
@@ -457,12 +439,12 @@ impl Qwen2VLTextModel {
             .rotary_emb
             .compute_cos_sin(position_ids, xs.dtype())?;
 
-        let attention_mask = DeviceMappedMask::new(attention_mask.cloned(), &*self.mapper)?;
+        let attention_mask = DeviceMappedMask::new(attention_mask.clone(), &*self.mapper)?;
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(
                 &xs,
-                attention_mask.as_ref().map(|m| m.get(xs.device())),
+                &attention_mask.get(xs.device()),
                 &cos_sin,
                 &mut cache[i],
                 flash_params,
@@ -470,10 +452,7 @@ impl Qwen2VLTextModel {
         }
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
-        let mut xs = extract_logits(&xs, context_lens)?;
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
+        let xs = extract_logits(&xs, context_lens)?;
         self.lm_head.forward(&xs)
     }
 }

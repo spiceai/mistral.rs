@@ -1,3 +1,4 @@
+use crate::attention::AttentionMask;
 use std::sync::Arc;
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
@@ -101,23 +102,13 @@ impl VisionMlp {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.gate_proj.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
         let lhs = self
             .gate_proj
             .forward(&xs.unsqueeze(0)?)?
             .apply(&self.act)?;
         let rhs = self.up_proj.forward(&xs.unsqueeze(0)?)?;
-        let mut res = self.down_proj.forward(&(lhs * rhs)?)?;
-
-        res = res.squeeze(0)?;
-        if self.gate_proj.quantized_act_type().is_some() {
-            res.to_dtype(original_dtype)?;
-        }
-        Ok(res)
+        let res = self.down_proj.forward(&(lhs * rhs)?)?;
+        res.squeeze(0)
     }
 }
 
@@ -155,7 +146,7 @@ impl VisionAttention {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         rotary_pos_emb: &Tensor,
     ) -> Result<Tensor> {
         let seq_len = xs.dim(0)?;
@@ -184,8 +175,8 @@ impl VisionAttention {
             let mut att =
                 (MatMul.matmul(&q, &k.transpose(1, 2)?)? / (self.head_dim as f64).sqrt())?;
             att = match attention_mask {
-                Some(m) => att.broadcast_add(m)?,
-                None => att,
+                AttentionMask::Custom(m) => att.broadcast_add(m)?,
+                _ => att,
             };
             att = candle_nn::ops::softmax_last_dim(&att)?;
             MatMul
@@ -236,7 +227,7 @@ impl VisionBlock {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         rotary_pos_emb: &Tensor,
     ) -> Result<Tensor> {
         let xs = (xs
@@ -548,7 +539,14 @@ impl Qwen2_5VLVisionModel {
             } else {
                 attention_mask_window.as_ref()
             };
-            xs = blk.forward(&xs, attention_mask, &rotary_pos_emb)?;
+            xs = blk.forward(
+                &xs,
+                &match attention_mask {
+                    Some(t) => AttentionMask::Custom(t.clone()),
+                    None => AttentionMask::None,
+                },
+                &rotary_pos_emb,
+            )?;
         }
 
         xs = self.patch_merger.forward(&xs)?;

@@ -1,5 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+use crate::layers_masker::CausalMaskConfig;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -9,9 +10,9 @@ use mistralrs_quant::{QuantMethod, ShardedVarBuilder};
 
 use crate::{
     amoe::AnyMoeBaseModelMixin,
-    attention::SdpaParams,
+    attention::{AttentionMask, SdpaParams},
     device_map::{DeviceMappedMask, DeviceMapper},
-    layers::{embedding, CausalMasker, MatMul, RmsNorm, RotaryEmbedding, Sdpa},
+    layers::{embedding, CausalMasker, RmsNorm, RotaryEmbedding, Sdpa},
     layers_masker::PastKvLenCache,
     paged_attention::{AttentionImplementation, ModelConfigMetadata},
     pipeline::{
@@ -112,27 +113,16 @@ impl DecoderAttention {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.wq.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let mut q = MatMul.qmethod_matmul(&xs, &*self.wq)?;
-        let mut k = MatMul.qmethod_matmul(&xs, &*self.wk)?;
-        let mut v = MatMul.qmethod_matmul(&xs, &*self.wv)?;
-        if self.wq.quantized_act_type().is_some() {
-            q = q.to_dtype(original_dtype)?;
-            k = k.to_dtype(original_dtype)?;
-            v = v.to_dtype(original_dtype)?;
-        }
-
+        let q = self.wq.forward(xs)?;
+        let k = self.wk.forward(xs)?;
+        let v = self.wv.forward(xs)?;
         let (q, k, v) = if q_len != 1 {
             let q = q
                 .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
@@ -164,18 +154,12 @@ impl DecoderAttention {
             &self.sdpa_params,
         )?;
 
-        if let Some(t) = self.wq.quantized_act_type() {
-            attn_output = attn_output.to_dtype(t)?;
-        }
-        attn_output = if attention_mask.is_some() {
+        attn_output = if !matches!(attention_mask, AttentionMask::None) {
             attn_output.transpose(1, 2)?.reshape((b_sz, q_len, ()))?
         } else {
             attn_output.reshape((b_sz, q_len, ()))?
         };
-        let mut res = MatMul.qmethod_matmul(&attn_output, &*self.wo)?;
-        if self.wq.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.wo.forward(&attn_output)?;
         Ok(res)
     }
 }
@@ -205,19 +189,11 @@ impl DecoderMlp {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let original_dtype = xs.dtype();
-        let mut xs_act = xs.clone();
-        if let Some(t) = self.w1.quantized_act_type() {
-            xs_act = xs_act.to_dtype(t)?;
-        }
-        let gate = MatMul.qmethod_matmul(&xs_act, &*self.w1)?;
+        let gate = self.w1.forward(xs)?;
         let gate = candle_nn::ops::silu(&gate)?;
-        let up = MatMul.qmethod_matmul(&xs_act, &*self.w3)?;
+        let up = self.w3.forward(xs)?;
         let xs = (gate * up)?;
-        let res = MatMul.qmethod_matmul(&xs, &*self.w2)?;
-        if self.w1.quantized_act_type().is_some() {
-            return res.to_dtype(original_dtype);
-        }
+        let res = self.w2.forward(&xs)?;
         Ok(res)
     }
 
@@ -242,9 +218,9 @@ impl AdaptiveNorm {
     }
 
     fn forward(&self, t_cond: &Tensor) -> Result<Tensor> {
-        let xs = MatMul.qmethod_matmul(t_cond, &*self.w0)?;
+        let xs = self.w0.forward(t_cond)?;
         let xs = xs.gelu_erf()?;
-        MatMul.qmethod_matmul(&xs, &*self.w2)
+        self.w2.forward(&xs)
     }
 }
 
@@ -324,7 +300,7 @@ impl DecoderLayer {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
         t_cond: Option<&Tensor>,
@@ -369,6 +345,7 @@ pub struct VoxtralModel {
     cfg: ModelConfigMetadata,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
     sliding_window: Option<usize>,
+    #[allow(dead_code)]
     num_heads: usize,
     model_dim: usize,
     ada_rms_norm_t_cond: bool,
@@ -616,12 +593,14 @@ impl VoxtralModel {
 
         // EitherCache::normal() returns MutexGuard via interior mutability
         let mut cache = self.cache.normal();
-        let attention_mask = CausalMasker.make_sliding_window_causal_mask_matrix(
+        let attention_mask = CausalMasker.make_causal_mask(
             &dummy_toks,
             &cache.0 as &dyn PastKvLenCache,
-            self.sliding_window,
             input_embeds.dtype(),
-            self.num_heads,
+            &CausalMaskConfig {
+                sliding_window: self.sliding_window,
+                ..Default::default()
+            },
         )?;
 
         let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
@@ -634,7 +613,7 @@ impl VoxtralModel {
                 .transpose()?;
             xs = layer.forward(
                 &xs,
-                attention_mask.as_ref().map(|m| m.get(xs.device())),
+                &attention_mask.get(xs.device()),
                 seqlen_offsets,
                 &mut cache.0[i],
                 t_cond_mapped.as_ref(),
@@ -644,11 +623,8 @@ impl VoxtralModel {
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
 
-        let mut xs = extract_logits(&xs, context_lens)?;
-        if let Some(t) = self.output.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let logits = MatMul.qmethod_matmul(&xs, &*self.output)?;
+        let xs = extract_logits(&xs, context_lens)?;
+        let logits = self.output.forward(&xs)?;
         Ok(logits)
     }
 }

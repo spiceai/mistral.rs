@@ -8,7 +8,7 @@ const KV_SCALE_UPDATE_ITERATION: i32 = 128;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::{
-    attention::SdpaParams,
+    attention::{AttentionMask, SdpaParams},
     layers::Sdpa,
     paged_attention::_PAD_SLOT_ID,
     pipeline::text_models_inputs_processor::{
@@ -137,7 +137,7 @@ impl PagedAttention {
         query: &Tensor,
         key: &Tensor,
         value: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         mut key_cache: Option<Tensor>,
         mut value_cache: Option<Tensor>,
         input_metadata: &PagedAttentionInputMetadata,
@@ -169,6 +169,9 @@ impl PagedAttention {
             slot_mapping_full
         };
 
+        let (batch_size, attention_heads, seq_len, head_size) = query.shape().dims4()?;
+        let (_, key_value_heads, _, _) = key.shape().dims4()?;
+
         // For models with per-layer sliding windows (GPT-OSS, Gemma2):
         // - Full-attention layers (sliding_window == None) use the full block tables.
         // - Sliding-window layers (sliding_window == Some) use the windowed block tables.
@@ -197,9 +200,6 @@ impl PagedAttention {
             None
         };
 
-        let (batch_size, attention_heads, seq_len, head_size) = query.shape().dims4()?;
-        let (_, key_value_heads, _, _) = key.shape().dims4()?;
-
         // === Prefix cache / donor-gather prompt path ===
         // Entered when:
         //  - write_cache=true  AND num_cached_tokens is set (prefix cache hit)
@@ -208,12 +208,11 @@ impl PagedAttention {
         // there is no paged cache, so block_tables is None — skip to the
         // regular prompt path.
         let has_block_tables = input_metadata.block_tables.is_some();
+        let mask_is_prefill = !matches!(attention_mask, AttentionMask::None);
         let use_gather_path = if write_cache {
-            input_metadata.num_cached_tokens.is_some()
-                && attention_mask.is_some()
-                && has_block_tables
+            input_metadata.num_cached_tokens.is_some() && mask_is_prefill && has_block_tables
         } else {
-            attention_mask.is_some() && has_block_tables
+            mask_is_prefill && has_block_tables
         };
 
         if use_gather_path {
@@ -312,7 +311,7 @@ impl PagedAttention {
                         cumulative_seqlens: cu_kv_map,
                     },
                     sliding_k: None,
-                    causal: flash_params.map_or(attention_mask.is_some(), |fp| fp.causal),
+                    causal: flash_params.map_or(mask_is_prefill, |fp| fp.causal),
                 };
 
                 return Sdpa.run_attention(
@@ -330,15 +329,16 @@ impl PagedAttention {
                 unpack_gathered_kv(&k_gathered, &kv_lens, key_value_heads, head_size, device)?;
             let v_batched =
                 unpack_gathered_kv(&v_gathered, &kv_lens, key_value_heads, head_size, device)?;
-            let adjusted_mask = attention_mask
-                .map(|mask| adjust_kv_mask(mask, max_kv))
-                .transpose()?;
+            let adjusted_mask = match attention_mask {
+                AttentionMask::Custom(t) => AttentionMask::Custom(adjust_kv_mask(t, max_kv)?),
+                other => other.clone(),
+            };
 
             return Sdpa.run_attention(
                 query,
                 &k_batched,
                 &v_batched,
-                adjusted_mask.as_ref(),
+                &adjusted_mask,
                 None,
                 sdpa_params,
             );
@@ -346,16 +346,17 @@ impl PagedAttention {
 
         // === Regular prompt path (no prefix cache, write_cache=true only) ===
         #[allow(clippy::cast_possible_truncation)]
-        let att = match attention_mask {
-            None => None,
-            Some(mask) => Some(Sdpa.run_attention(
+        let att = if matches!(attention_mask, AttentionMask::None) {
+            None
+        } else {
+            Some(Sdpa.run_attention(
                 query,
                 key,
                 value,
-                Some(mask),
+                attention_mask,
                 flash_params,
                 sdpa_params,
-            )?),
+            )?)
         };
 
         // paged-attn expects [batch_size, num_tokens, num_heads, head_size]
@@ -428,7 +429,7 @@ impl PagedAttention {
         query: &Tensor,
         key: &Tensor,
         value: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         key_cache: Option<Tensor>,
         value_cache: Option<Tensor>,
         input_metadata: &PagedAttentionInputMetadata,
@@ -459,7 +460,7 @@ impl PagedAttention {
         query: &Tensor,
         key_cache: &Tensor,
         value_cache: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         input_metadata: &PagedAttentionInputMetadata,
         sdpa_params: &SdpaParams,
         flash_params: Option<&FlashParams>,

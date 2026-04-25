@@ -1,5 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+use crate::layers_masker::CausalMaskConfig;
 use std::{collections::HashMap, sync::Arc};
 
 use candle_core::{DType, Device, Result, Tensor, D};
@@ -12,7 +13,7 @@ use serde::Deserialize;
 
 use crate::{
     amoe::AnyMoeBaseModelMixin,
-    attention::SdpaParams,
+    attention::{AttentionMask, SdpaParams},
     device_map::{DeviceMappedMask, DeviceMapper},
     layers::{
         embedding, Activation, CausalMasker, DeepSeekV2RopeConfig, DeepSeekV2RopeScaling,
@@ -132,10 +133,8 @@ enum QProj {
 impl QProj {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Lora { a, norm, b } => {
-                b.forward_autocast(&norm.forward(&a.forward_autocast(xs)?)?)
-            }
-            Self::Plain(lin) => lin.forward_autocast(xs),
+            Self::Lora { a, norm, b } => b.forward(&norm.forward(&a.forward(xs)?)?),
+            Self::Plain(lin) => lin.forward(xs),
         }
     }
 }
@@ -262,7 +261,7 @@ impl Attention {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
@@ -281,7 +280,7 @@ impl Attention {
         let q_nope = q_split[0].clone();
         let mut q_pe = q_split[1].clone();
 
-        let mut compressed_kv = self.kv_a_proj_with_mqa.forward_autocast(xs)?;
+        let mut compressed_kv = self.kv_a_proj_with_mqa.forward(xs)?;
         let ckv_split = compressed_kv.split(
             &[self.cfg.kv_lora_rank, self.cfg.qk_rope_head_dim],
             D::Minus1,
@@ -323,7 +322,7 @@ impl Attention {
                 seq_len,
             )?
         } else {
-            let mut kv = self.kv_b_proj.forward_autocast(&ckv)?;
+            let mut kv = self.kv_b_proj.forward(&ckv)?;
             kv = kv
                 .reshape((
                     bs,
@@ -398,7 +397,7 @@ impl Attention {
                             // Generating the dummy metadata with the assumption that we are not generating text (only processing prompts).
                             let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
                             // Sanity check.
-                            assert!(attention_mask.is_some());
+                            assert!(attention_mask.is_custom());
                             let v = v
                                 .pad_with_zeros(
                                     D::Minus1,
@@ -437,13 +436,13 @@ impl Attention {
             }
         };
 
-        attn_out = if attention_mask.is_some() {
+        attn_out = if attention_mask.is_custom() {
             attn_out.transpose(1, 2)?.reshape((bs, seq_len, ()))?
         } else {
             attn_out.reshape((bs, seq_len, ()))?
         };
 
-        self.o_proj.forward_autocast(&attn_out)
+        self.o_proj.forward(&attn_out)
     }
 }
 
@@ -712,7 +711,7 @@ impl DecoderLayer {
     fn forward(
         &self,
         xs: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
@@ -905,28 +904,31 @@ impl DeepSeekV2 {
     ) -> Result<Tensor> {
         let mut xs = self.embed_tokens.forward(input_ids)?;
         let cache = &mut self.cache.normal().0;
-        let attention_mask = CausalMasker.make_causal_mask_matrix(
+        let attention_mask = CausalMasker.make_causal_mask(
             input_ids,
             metadata
                 .as_ref()
                 .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
                 .unwrap_or(cache as &dyn PastKvLenCache),
             xs.dtype(),
-            self.cfg.num_attn_heads,
+            &CausalMaskConfig::default(),
         )?;
         // PagedAttention prompt chunking
-        let attention_mask = attention_mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
+        let attention_mask = if !metadata
+            .as_ref()
+            .map(|(_, meta)| meta.is_first_prompt_chunk)
+            .unwrap_or(true)
+        {
+            AttentionMask::None
+        } else {
+            attention_mask
+        };
         let attention_mask = DeviceMappedMask::new(attention_mask, &*self.mapper)?;
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
             xs = layer.forward(
                 &xs,
-                attention_mask.as_ref().map(|m| m.get(xs.device())),
+                &attention_mask.get(xs.device()),
                 seqlen_offsets,
                 &mut cache[i],
                 metadata
@@ -938,7 +940,7 @@ impl DeepSeekV2 {
         let xs = xs.to_device(&self.device)?;
         let xs = xs.apply(&self.norm)?;
         let xs = extract_logits(&xs, context_lens)?;
-        self.lm_head.forward_autocast(&xs)
+        self.lm_head.forward(&xs)
     }
 }
 

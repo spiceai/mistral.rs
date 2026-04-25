@@ -1,5 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+use crate::attention::AttentionMask;
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::Module;
 use mistralrs_quant::{NonZeroOp, QuantMethod, ShardedVarBuilder};
@@ -88,7 +89,7 @@ impl ClippableLinear {
         if let (Some(lo), Some(hi)) = (self.input_min, self.input_max) {
             x = x.clamp(lo, hi)?;
         }
-        let mut out = self.inner.forward_autocast(&x)?;
+        let mut out = self.inner.forward(&x)?;
         if let (Some(lo), Some(hi)) = (self.output_min, self.output_max) {
             out = out.clamp(lo, hi)?;
         }
@@ -358,7 +359,7 @@ impl VisionAttention {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = xs.dims3()?;
@@ -388,12 +389,25 @@ impl VisionAttention {
         let k = k.contiguous()?;
         let v = v.contiguous()?;
 
-        let attn_output = if attention_mask.is_some() {
+        let attn_output = if !matches!(attention_mask, AttentionMask::None) {
             // CUDA flash-attn in the shared backend does not consume arbitrary
             // dense masks, so padded vision batches must stay on the masked path.
-            Sdpa.run_attention_noflash(&q, &k, &v, attention_mask, &self.sdpa_params)?
+            Sdpa.run_attention_noflash(
+                &q,
+                &k,
+                &v,
+                attention_mask.as_option_tensor(),
+                &self.sdpa_params,
+            )?
         } else {
-            Sdpa.run_attention(&q, &k, &v, None, Some(flash_params), &self.sdpa_params)?
+            Sdpa.run_attention(
+                &q,
+                &k,
+                &v,
+                &AttentionMask::None,
+                Some(flash_params),
+                &self.sdpa_params,
+            )?
         };
 
         // Reshape back: (b, heads, seq, head_dim) -> (b, seq, hidden)
@@ -507,7 +521,7 @@ impl VisionEncoderLayer {
         xs: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        attention_mask: Option<&Tensor>,
+        attention_mask: &AttentionMask,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         // Pre-norm attention with post-norm
@@ -714,7 +728,13 @@ impl VisionTower {
         let flash_params = FlashParams::empty(false);
         let mut hidden_states = embeds;
         for layer in &self.encoder_layers {
-            hidden_states = layer.forward(&hidden_states, &cos, &sin, None, &flash_params)?;
+            hidden_states = layer.forward(
+                &hidden_states,
+                &cos,
+                &sin,
+                &AttentionMask::None,
+                &flash_params,
+            )?;
         }
 
         // Pool: output_length = num_patches / k² (computed from actual patches)

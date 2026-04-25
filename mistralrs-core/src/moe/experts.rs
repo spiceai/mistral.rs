@@ -9,7 +9,7 @@
 use candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_nn::Linear;
 use mistralrs_quant::{
-    apply_immediate_isq, should_apply_immediate_isq, FusedExperts, MatMul, PackedExperts,
+    apply_immediate_isq, should_apply_immediate_isq, DummyLayer, FusedExperts, PackedExperts,
     QuantMethod, QuantMethodConfig, QuantizedConfig, ShardedVarBuilder, SumAllReduce,
     UnquantLinear,
 };
@@ -95,6 +95,7 @@ struct SlowExpertsWeights {
 pub struct MoEExperts {
     backend: MoEExpertsBackendImpl,
     act: Activation,
+    num_experts: usize,
     num_experts_per_tok: usize,
     all_reduce: SumAllReduce,
     world_size: usize,
@@ -181,6 +182,7 @@ impl MoEExperts {
         Ok(Self {
             backend: backend_impl,
             act,
+            num_experts: cfg.num_experts,
             num_experts_per_tok: cfg.num_experts_per_tok,
             all_reduce: SumAllReduce::new(comm),
             world_size: comm.world_size(),
@@ -225,10 +227,7 @@ impl MoEExperts {
                         cfg, experts_vb,
                     )?)
                 } else {
-                    candle_core::bail!(
-                        "new_direct Fast backend requires combined stacked format \
-                         (gate_up_proj) or use new() with standard VB paths"
-                    )
+                    MoEExpertsBackendImpl::Fast(Self::load_fast_direct_standard(cfg, experts_vb)?)
                 }
             }
             MoEExpertsBackend::Slow => {
@@ -250,6 +249,7 @@ impl MoEExperts {
         Ok(Self {
             backend: backend_impl,
             act,
+            num_experts: cfg.num_experts,
             num_experts_per_tok: cfg.num_experts_per_tok,
             all_reduce: SumAllReduce::new(comm),
             world_size: comm.world_size(),
@@ -437,6 +437,82 @@ impl MoEExperts {
         fused_gate_proj = apply_immediate_isq(fused_gate_proj, vb_gate_up.clone())?;
         fused_up_proj = apply_immediate_isq(fused_up_proj, vb_gate_up)?;
         fused_down_proj = apply_immediate_isq(fused_down_proj, vb_down)?;
+
+        Ok(FastExpertsWeights {
+            fused_gate_proj,
+            fused_up_proj,
+            fused_down_proj,
+        })
+    }
+
+    /// Load fast (gather-based) weights in per-expert format from a VB already
+    /// at the experts level (no `.pp("experts")` applied).
+    ///
+    /// Handles both real per-expert weights and UQFF dummy layers.
+    fn load_fast_direct_standard(
+        cfg: &MoEExpertsConfig,
+        experts_vb: ShardedVarBuilder,
+    ) -> Result<FastExpertsWeights> {
+        let num_experts = cfg.num_experts;
+
+        // UQFF loading: experts have no real tensors yet, create dummy layers
+        // that will be replaced during deserialization.
+        if !experts_vb.pp("0").contains_tensor("gate_proj.weight") {
+            let fused_gate_proj: Arc<dyn QuantMethod> =
+                Arc::new(DummyLayer::new(QuantMethodConfig::Dummy)?);
+            let fused_up_proj: Arc<dyn QuantMethod> =
+                Arc::new(DummyLayer::new(QuantMethodConfig::Dummy)?);
+            let fused_down_proj: Arc<dyn QuantMethod> =
+                Arc::new(DummyLayer::new(QuantMethodConfig::Dummy)?);
+            return Ok(FastExpertsWeights {
+                fused_gate_proj,
+                fused_up_proj,
+                fused_down_proj,
+            });
+        }
+
+        // Real per-expert weights: load, stack, and optionally ISQ
+        let load_experts_vb =
+            if mistralrs_quant::get_immediate_isq().is_some() && !experts_vb.device().is_cpu() {
+                experts_vb.clone().set_device(Device::Cpu)
+            } else {
+                experts_vb.clone()
+            };
+
+        let mut gate_proj_vec = Vec::with_capacity(num_experts);
+        let mut up_proj_vec = Vec::with_capacity(num_experts);
+        let mut down_proj_vec = Vec::with_capacity(num_experts);
+
+        for i in 0..num_experts {
+            let expert_vb = load_experts_vb.pp(i.to_string());
+            gate_proj_vec.push(expert_vb.get(
+                (cfg.moe_intermediate_size, cfg.hidden_size),
+                "gate_proj.weight",
+            )?);
+            up_proj_vec.push(expert_vb.get(
+                (cfg.moe_intermediate_size, cfg.hidden_size),
+                "up_proj.weight",
+            )?);
+            down_proj_vec.push(expert_vb.get(
+                (cfg.hidden_size, cfg.moe_intermediate_size),
+                "down_proj.weight",
+            )?);
+        }
+
+        let mut fused_gate_proj: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
+            QuantMethodConfig::Unquantized(Linear::new(Tensor::stack(&gate_proj_vec, 0)?, None)),
+        )?);
+        let mut fused_up_proj: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
+            QuantMethodConfig::Unquantized(Linear::new(Tensor::stack(&up_proj_vec, 0)?, None)),
+        )?);
+        let mut fused_down_proj: Arc<dyn QuantMethod> = Arc::new(UnquantLinear::new(
+            QuantMethodConfig::Unquantized(Linear::new(Tensor::stack(&down_proj_vec, 0)?, None)),
+        )?);
+
+        let expert0_vb = experts_vb.pp("0");
+        fused_gate_proj = apply_immediate_isq(fused_gate_proj, expert0_vb.pp("gate_proj"))?;
+        fused_up_proj = apply_immediate_isq(fused_up_proj, expert0_vb.pp("up_proj"))?;
+        fused_down_proj = apply_immediate_isq(fused_down_proj, expert0_vb.pp("down_proj"))?;
 
         Ok(FastExpertsWeights {
             fused_gate_proj,
@@ -744,34 +820,58 @@ impl MoEExperts {
         let original_dtype = xs.dtype();
         let (b_size, seq_len, hidden_dim) = xs.dims3()?;
         let num_tokens = b_size * seq_len;
-
         let xs_flat = xs.reshape((num_tokens, hidden_dim))?;
+
+        #[cfg(feature = "cuda")]
+        if xs.device().is_cuda() {
+            let is_prefill = seq_len > 1;
+            // Try fused decode path for single-token decode (most impactful)
+            if !is_prefill {
+                if let Some(result) = self.forward_fast_decode(
+                    &xs_flat,
+                    topk_weights,
+                    topk_ids,
+                    weights,
+                    num_tokens,
+                    original_dtype,
+                )? {
+                    return Ok(result);
+                }
+            }
+
+            // Try grouped MoE path for CUDA prefill (much faster for many tokens)
+            // Only use for large prefills where the overhead is worthwhile
+            if is_prefill && num_tokens >= 32 {
+                if let Some(result) = self.forward_fast_grouped(
+                    &xs_flat,
+                    topk_weights,
+                    topk_ids,
+                    weights,
+                    num_tokens,
+                    original_dtype,
+                )? {
+                    return Ok(result);
+                }
+            }
+        }
 
         let ys = if xs.device().is_cuda() {
             // CUDA path: use indexed_moe_forward compatible shapes
             let xs = xs_flat.reshape((num_tokens, 1, hidden_dim))?;
-            let gate = weights
-                .fused_gate_proj
-                .gather_forward_autocast(&xs, topk_ids)?;
-            let up = weights
-                .fused_up_proj
-                .gather_forward_autocast(&xs, topk_ids)?;
+            let gate = weights.fused_gate_proj.gather_forward(&xs, topk_ids)?;
+            let up = weights.fused_up_proj.gather_forward(&xs, topk_ids)?;
             weights
                 .fused_down_proj
-                .gather_forward_autocast(&(up * gate.apply(&self.act)?)?, topk_ids)?
+                .gather_forward(&(up * gate.apply(&self.act)?)?, topk_ids)?
         } else {
             // Metal path: use broadcast gather shapes
             let xs = xs.reshape((b_size, seq_len, 1, 1, hidden_dim))?;
             let indices = topk_ids.reshape((b_size, seq_len, self.num_experts_per_tok))?;
-            let gate = weights
-                .fused_gate_proj
-                .gather_forward_autocast(&xs, &indices)?;
-            let up = weights
-                .fused_up_proj
-                .gather_forward_autocast(&xs, &indices)?;
+            let gate = weights.fused_gate_proj.gather_forward(&xs, &indices)?;
+            let up = weights.fused_up_proj.gather_forward(&xs, &indices)?;
             let xs = weights
                 .fused_down_proj
-                .gather_forward_autocast(&(up * gate.apply(&self.act)?)?, &indices)?;
+                .gather_forward(&(up * gate.apply(&self.act)?)?, &indices)?;
             xs.squeeze(D::Minus2)?
                 .reshape((num_tokens, self.num_experts_per_tok, hidden_dim))?
         };
@@ -780,6 +880,224 @@ impl MoEExperts {
             .broadcast_mul(&topk_weights.unsqueeze(D::Minus1)?)?
             .sum(D::Minus2)?
             .to_dtype(original_dtype)
+    }
+
+    /// Fused MoE decode path for CUDA.
+    ///
+    /// Reduces kernel launches from ~20 to 4 per MoE layer by:
+    /// 1. Quantizing input to Q8_1 once (shared between gate+up)
+    /// 2. Fusing gate+up projections with activation+multiply in one kernel
+    /// 3. Fusing down projection with topk_weights and cross-expert aggregation
+    ///
+    /// Returns Ok(Some(result)) if fused path succeeded, Ok(None) to fall back.
+    #[cfg(feature = "cuda")]
+    fn forward_fast_decode(
+        &self,
+        xs_flat: &Tensor,
+        topk_weights: &Tensor,
+        topk_ids: &Tensor,
+        weights: &FastExpertsWeights,
+        num_tokens: usize,
+        original_dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        use candle_core::cuda::cudarc::driver::DevicePtr;
+
+        let dev = xs_flat.device().as_cuda_device()?;
+
+        // Get QTensors - bail to fallback if not quantized
+        let gate_qt = match weights.fused_gate_proj.get_qtensor() {
+            Some(qt) => qt,
+            None => return Ok(None),
+        };
+        let up_qt = match weights.fused_up_proj.get_qtensor() {
+            Some(qt) => qt,
+            None => return Ok(None),
+        };
+        let down_qt = match weights.fused_down_proj.get_qtensor() {
+            Some(qt) => qt,
+            None => return Ok(None),
+        };
+
+        // Get topk_ids as contiguous u32 CudaSlice
+        let topk_ids_flat = topk_ids.flatten_all()?.contiguous()?;
+        let (ti_storage, ti_layout) = topk_ids_flat.storage_and_layout();
+        let ti_cuda = match &*ti_storage {
+            candle_core::Storage::Cuda(c) => c,
+            _ => return Ok(None),
+        };
+        let ti_u32_slice = ti_cuda.as_cuda_slice::<u32>()?;
+        assert!(ti_layout.start_offset() == 0, "expected contiguous tensor");
+
+        // Get topk_weights as contiguous f32 CudaSlice
+        let tw_f32 = topk_weights
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
+        let (tw_storage, tw_layout) = tw_f32.storage_and_layout();
+        let tw_cuda = match &*tw_storage {
+            candle_core::Storage::Cuda(c) => c,
+            _ => return Ok(None),
+        };
+        let tw_slice = tw_cuda.as_cuda_slice::<f32>()?;
+        let tw_ptr = tw_slice
+            .slice(tw_layout.start_offset()..)
+            .device_ptr(tw_slice.stream())
+            .0 as *const f32;
+
+        // Map activation to CUDA kernel act_type
+        let act_type = match self.act {
+            Activation::GeluPytorchTanh => mistralrs_quant::ACT_GELU_PYTORCH_TANH,
+            Activation::Silu | Activation::Swish => mistralrs_quant::ACT_SILU,
+            _ => return Ok(None), // Fall back for unsupported activations
+        };
+
+        // SAFETY: tw_ptr is a valid device pointer obtained from the topk_weights tensor above.
+        let result = unsafe {
+            mistralrs_quant::indexed_moe_fused_decode(
+                gate_qt,
+                up_qt,
+                down_qt,
+                xs_flat,
+                ti_u32_slice,
+                tw_ptr,
+                num_tokens,
+                self.num_experts_per_tok,
+                act_type,
+                dev,
+            )?
+        };
+
+        Ok(Some(result.to_dtype(original_dtype)?))
+    }
+
+    /// Grouped MoE forward for CUDA prefill.
+    ///
+    /// Returns Ok(Some(result)) if grouped path succeeded, Ok(None) to fall back.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn forward_fast_grouped(
+        &self,
+        xs_flat: &Tensor,
+        topk_weights: &Tensor,
+        topk_ids: &Tensor,
+        weights: &FastExpertsWeights,
+        num_tokens: usize,
+        original_dtype: DType,
+    ) -> Result<Option<Tensor>> {
+        let topk = self.num_experts_per_tok;
+        let num_experts = self.num_experts;
+        let total_assignments = num_tokens * topk;
+
+        let dev = xs_flat.device().as_cuda_device()?;
+
+        // Get topk_ids as contiguous u32 CudaSlice
+        let topk_ids_flat = topk_ids.flatten_all()?.contiguous()?;
+        let (ti_storage, ti_layout) = topk_ids_flat.storage_and_layout();
+        let ti_cuda = match &*ti_storage {
+            candle_core::Storage::Cuda(c) => c,
+            _ => return Ok(None),
+        };
+        let ti_u32_slice = ti_cuda.as_cuda_slice::<u32>()?;
+        assert!(ti_layout.start_offset() == 0, "expected contiguous tensor");
+
+        // Build dispatch tables on GPU (no CPU-GPU sync)
+        // moe_dispatch_build takes u32 and casts to i32 internally for the CUDA kernel
+        let (expert_bounds, sorted_token_ids) =
+            mistralrs_quant::moe_dispatch_build(ti_u32_slice, total_assignments, num_experts, dev)?;
+
+        // Use the pre-quantized Q8_0 grouped kernel path
+        let gate_qt = match weights.fused_gate_proj.get_qtensor() {
+            Some(qt) => qt,
+            None => return Ok(None),
+        };
+        let up_qt = match weights.fused_up_proj.get_qtensor() {
+            Some(qt) => qt,
+            None => return Ok(None),
+        };
+        let down_qt = match weights.fused_down_proj.get_qtensor() {
+            Some(qt) => qt,
+            None => return Ok(None),
+        };
+
+        // Quantize input to Q8_1 ONCE, shared between gate and up.
+        // quantize_input_q8_1 accepts BF16/F16/F32 directly (no conversion needed).
+        let (input_q8, k, k_padded) = mistralrs_quant::quantize_input_q8_1(xs_flat, dev)?;
+
+        // Gate projection using pre-quantized input
+        let gate = mistralrs_quant::grouped_moe_gemm_prequantized(
+            gate_qt,
+            &input_q8,
+            k,
+            k_padded,
+            &expert_bounds,
+            &sorted_token_ids,
+            None,
+            total_assignments,
+            topk,
+            num_experts,
+            1,
+            dev,
+        )?;
+
+        // Up projection reusing same pre-quantized input
+        let up = mistralrs_quant::grouped_moe_gemm_prequantized(
+            up_qt,
+            &input_q8,
+            k,
+            k_padded,
+            &expert_bounds,
+            &sorted_token_ids,
+            None,
+            total_assignments,
+            topk,
+            num_experts,
+            1,
+            dev,
+        )?;
+
+        drop(input_q8);
+
+        // Apply activation
+        let activated = (up * gate.apply(&self.act)?)?.contiguous()?;
+
+        // Quantize down projection input
+        let (down_input_q8, down_k, down_k_padded) =
+            mistralrs_quant::quantize_input_q8_1(&activated, dev)?;
+
+        // Get topk_weights pointer
+        use candle_core::cuda::cudarc::driver::DevicePtr;
+        let tw_f32 = topk_weights
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .contiguous()?;
+        let (tw_storage, tw_layout) = tw_f32.storage_and_layout();
+        let tw_cuda = match &*tw_storage {
+            candle_core::Storage::Cuda(c) => c,
+            _ => return Ok(None),
+        };
+        let tw_slice = tw_cuda.as_cuda_slice::<f32>()?;
+        let tw_ptr = tw_slice
+            .slice(tw_layout.start_offset()..)
+            .device_ptr(tw_slice.stream())
+            .0 as *const f32;
+
+        // Down projection with topk_weights + atomicAdd
+        let down = mistralrs_quant::grouped_moe_gemm_prequantized(
+            down_qt,
+            &down_input_q8,
+            down_k,
+            down_k_padded,
+            &expert_bounds,
+            &sorted_token_ids,
+            Some((tw_ptr, 0)),
+            total_assignments,
+            topk,
+            num_experts,
+            0,
+            dev,
+        )?;
+
+        Ok(Some(down.to_dtype(original_dtype)?))
     }
 
     /// Loop-based forward pass (quantized fallback)
@@ -829,26 +1147,13 @@ impl MoEExperts {
                 .reshape(((), hidden_dim))?;
 
             // Forward through expert MLP
-            let original_dtype = current_state.dtype();
-            let mut expert_input = current_state.clone();
-            if let Some(t) = weights.experts.gate_proj[expert_idx].quantized_act_type() {
-                expert_input = expert_input.to_dtype(t)?;
-            }
-            let gate_out = MatMul
-                .qmethod_matmul(&expert_input, &*weights.experts.gate_proj[expert_idx])?
+            let expert_input = current_state.clone();
+            let gate_out = weights.experts.gate_proj[expert_idx]
+                .forward(&expert_input)?
                 .apply(&self.act)?;
-            let up_out =
-                MatMul.qmethod_matmul(&expert_input, &*weights.experts.up_proj[expert_idx])?;
-            let mut current_hidden_states = MatMul.qmethod_matmul(
-                &(gate_out * up_out)?,
-                &*weights.experts.down_proj[expert_idx],
-            )?;
-            if weights.experts.gate_proj[expert_idx]
-                .quantized_act_type()
-                .is_some()
-            {
-                current_hidden_states = current_hidden_states.to_dtype(original_dtype)?;
-            }
+            let up_out = weights.experts.up_proj[expert_idx].forward(&expert_input)?;
+            let current_hidden_states =
+                weights.experts.down_proj[expert_idx].forward(&(gate_out * up_out)?)?;
 
             let current_hidden_states =
                 current_hidden_states.broadcast_mul(&selected_experts_tensor)?;

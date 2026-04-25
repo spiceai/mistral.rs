@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::attention::SdpaParams;
+use crate::attention::{AttentionMask, SdpaParams};
 use crate::device_map::{DeviceMappedMask, DeviceMapper};
 use crate::gguf::Content;
-use crate::layers::{CausalMasker, MatMul, QRmsNorm, RotaryEmbedding, Sdpa};
+use crate::layers::{CausalMaskConfig, CausalMasker, QRmsNorm, RotaryEmbedding, Sdpa};
 use crate::layers_masker::PastKvLenCache;
 use crate::ops::{TopKLastDimOp, TopKOutput};
 use crate::paged_attention::{AttentionImplementation, PagedAttention};
@@ -31,10 +31,10 @@ struct Mlp {
 
 impl Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let w1 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w1)?;
-        let w3 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w3)?;
+        let w1 = self.feed_forward_w1.forward(xs)?;
+        let w3 = self.feed_forward_w3.forward(xs)?;
         let y = crate::ops::mul_and_act(&w1, &w3, crate::layers::Activation::Silu)?;
-        MatMul.qmethod_matmul(&y, &*self.feed_forward_w2)
+        self.feed_forward_w2.forward(&y)
     }
 }
 
@@ -117,16 +117,16 @@ impl LayerWeights {
     fn forward_attn(
         &self,
         x: &Tensor,
-        mask: Option<&Tensor>,
+        mask: &AttentionMask,
         start_offsets: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
-        let q = MatMul.qmethod_matmul(x, &*self.attention_wq)?;
-        let k = MatMul.qmethod_matmul(x, &*self.attention_wk)?;
-        let v = MatMul.qmethod_matmul(x, &*self.attention_wv)?;
+        let q = self.attention_wq.forward(x)?;
+        let k = self.attention_wk.forward(x)?;
+        let v = self.attention_wv.forward(x)?;
 
         let (q, k, v) = if seq_len != 1 {
             let q = q
@@ -184,13 +184,13 @@ impl LayerWeights {
             }
         };
 
-        let y = if mask.is_some() {
+        let y = if mask.is_custom() {
             y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
         } else {
             y.reshape((b_sz, seq_len, ()))?
         };
 
-        let y = MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.attention_wo)?;
+        let y = self.attention_wo.forward(&y.to_dtype(x.dtype())?)?;
         Ok(y)
     }
 }
@@ -508,21 +508,24 @@ impl ModelWeights {
     ) -> Result<Tensor> {
         let mut layer_in = self.tok_embeddings.forward(x)?;
         let cache = &mut self.cache.normal().0;
-        let mask = CausalMasker.make_causal_mask_matrix(
+        let mask = CausalMasker.make_causal_mask(
             x,
             metadata
                 .as_ref()
                 .map(|(_, _)| &start_offsets as &dyn PastKvLenCache)
                 .unwrap_or(cache as &dyn PastKvLenCache),
             self.dtype,
-            self.layers[0].n_head,
+            &CausalMaskConfig::default(),
         )?;
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
+        let mask = if metadata
+            .as_ref()
+            .map(|(_, meta)| meta.is_first_prompt_chunk)
+            .unwrap_or(true)
+        {
+            mask
+        } else {
+            AttentionMask::None
+        };
         let mask = if let Some(ref mapper) = self.mapper {
             DeviceMappedMask::new(mask, &**mapper)?
         } else {
@@ -537,7 +540,7 @@ impl ModelWeights {
             let x = layer.attention_norm.forward(&x)?;
             let attn = layer.forward_attn(
                 &x,
-                mask.as_ref().map(|m| m.get(x.device())),
+                &mask.get(x.device()),
                 start_offsets,
                 &mut cache[i],
                 metadata
@@ -555,6 +558,6 @@ impl ModelWeights {
         }
         let x = self.norm.forward(&layer_in)?;
         let x = extract_logits(&x, context_lens)?;
-        MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)
+        self.output.forward(&x.contiguous()?)
     }
 }

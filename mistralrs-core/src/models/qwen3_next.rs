@@ -1,5 +1,6 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
+use crate::layers_masker::CausalMaskConfig;
 use candle_core::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{Embedding, Linear};
 use mistralrs_quant::{
@@ -15,14 +16,12 @@ use std::{
 use super::gdn::{GatedDeltaNet, GdnConfig, GdnLayerCache, GdnWeightMode};
 use crate::{
     amoe::AnyMoeBaseModelMixin,
-    attention::SdpaParams,
+    attention::{AttentionMask, SdpaParams},
     device_map::{DeviceMappedMask, DeviceMapper},
     kv_cache::{
         HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType, RecurrentLayerConfig,
     },
-    layers::{
-        embedding, linear_no_bias, CausalMasker, GemmaRmsNorm, MatMul, RotaryEmbedding, Sdpa,
-    },
+    layers::{embedding, linear_no_bias, CausalMasker, GemmaRmsNorm, RotaryEmbedding, Sdpa},
     layers_masker::PastKvLenCache,
     moe::{MoEExperts, MoEExpertsConfig},
     paged_attention::{AttentionImplementation, ModelConfigMetadata, PagedAttention},
@@ -257,27 +256,16 @@ impl FullAttention {
     fn forward(
         &self,
         x: &Tensor,
-        attention_mask: &Option<Tensor>,
+        attention_mask: &AttentionMask,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
         flash_params: &FlashParams,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
-        let original_dtype = x.dtype();
-        let mut x = x.clone();
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            x = x.to_dtype(t)?;
-        }
-        let mut q_gate = MatMul.qmethod_matmul(&x, &*self.q_proj)?;
-        let mut k = MatMul.qmethod_matmul(&x, &*self.k_proj)?;
-        let mut v = MatMul.qmethod_matmul(&x, &*self.v_proj)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            q_gate = q_gate.to_dtype(original_dtype)?;
-            k = k.to_dtype(original_dtype)?;
-            v = v.to_dtype(original_dtype)?;
-        }
-
+        let q_gate = self.q_proj.forward(x)?;
+        let k = self.k_proj.forward(x)?;
+        let v = self.v_proj.forward(x)?;
         // Split q_gate into q and gate: first reshape to per-head (head_dim*2), then chunk
         // Reference: view(*input_shape, -1, head_dim*2), chunk(2, dim=-1)
         let q_gate = q_gate.reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
@@ -330,7 +318,7 @@ impl FullAttention {
                     &q,
                     &k,
                     &v,
-                    attention_mask.clone().as_ref(),
+                    attention_mask,
                     Some(key_cache),
                     Some(value_cache),
                     input_metadata,
@@ -339,12 +327,12 @@ impl FullAttention {
                 )?,
                 None => {
                     let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
-                    assert!(attention_mask.is_some());
+                    assert!(!matches!(attention_mask, AttentionMask::None));
                     paged_attn.forward(
                         &q,
                         &k,
                         &v,
-                        attention_mask.clone().as_ref(),
+                        attention_mask,
                         None,
                         None,
                         &input_metadata,
@@ -359,17 +347,14 @@ impl FullAttention {
                     &q,
                     &k,
                     &v,
-                    attention_mask.clone().as_ref(),
+                    attention_mask,
                     Some(flash_params),
                     &self.sdpa_params,
                 )?
             }
         };
 
-        if let Some(t) = self.q_proj.quantized_act_type() {
-            y = y.to_dtype(t)?;
-        }
-        y = if attention_mask.is_some() {
+        y = if !matches!(attention_mask, AttentionMask::None) {
             y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
         } else {
             y.reshape((b_sz, seq_len, ()))?
@@ -379,10 +364,7 @@ impl FullAttention {
         let gate = candle_nn::ops::sigmoid(&gate.to_dtype(y.dtype())?)?;
         y = y.broadcast_mul(&gate)?;
 
-        let mut res = MatMul.qmethod_matmul(&y, &*self.o_proj)?;
-        if self.q_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.o_proj.forward(&y)?;
         Ok(res)
     }
 }
@@ -440,18 +422,10 @@ impl Mlp {
     }
 
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let original_dtype = xs.dtype();
-        let mut xs = xs.clone();
-        if let Some(t) = self.gate_proj.quantized_act_type() {
-            xs = xs.to_dtype(t)?;
-        }
-        let gate = MatMul.qmethod_matmul(&xs, &*self.gate_proj)?;
-        let up = MatMul.qmethod_matmul(&xs, &*self.up_proj)?;
+        let gate = self.gate_proj.forward(xs)?;
+        let up = self.up_proj.forward(xs)?;
         let activated = crate::ops::mul_and_act(&gate, &up, self.act_fn)?;
-        let mut res = MatMul.qmethod_matmul(&activated, &*self.down_proj)?;
-        if self.gate_proj.quantized_act_type().is_some() {
-            res = res.to_dtype(original_dtype)?;
-        }
+        let res = self.down_proj.forward(&activated)?;
         Ok(res)
     }
 
@@ -605,7 +579,7 @@ impl DecoderLayer {
     fn forward_attention(
         &self,
         x: &Tensor,
-        attention_mask: &Option<Tensor>,
+        attention_mask: &AttentionMask,
         seqlen_offsets: &[usize],
         kv_cache: &mut KvCache,
         metadata: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
@@ -923,21 +897,24 @@ impl Model {
             );
         }
 
-        let mask = CausalMasker.make_causal_mask_matrix(
+        let mask = CausalMasker.make_causal_mask(
             input_ids,
             metadata
                 .as_ref()
                 .map(|(_, _)| &seqlen_offsets as &dyn PastKvLenCache)
                 .unwrap_or(&*hybrid_cache as &dyn PastKvLenCache),
             x.dtype(),
-            self.num_attention_heads,
+            &CausalMaskConfig::default(),
         )?;
-        let mask = mask.filter(|_| {
-            metadata
-                .as_ref()
-                .map(|(_, meta)| meta.is_first_prompt_chunk)
-                .unwrap_or(true)
-        });
+        let mask = if metadata
+            .as_ref()
+            .map(|(_, meta)| meta.is_first_prompt_chunk)
+            .unwrap_or(true)
+        {
+            mask
+        } else {
+            AttentionMask::None
+        };
         let mask = DeviceMappedMask::new(mask, &*self.mapper)?;
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -948,10 +925,10 @@ impl Model {
                     if let Some(HybridLayerCache::Attention(kv_cache)) =
                         hybrid_cache.get_mut(layer_idx)
                     {
-                        let mask_for_layer = mask.as_ref().map(|m| m.get(x.device()).clone());
+                        let mask_for_layer = &mask.get(x.device());
                         x = layer.forward_attention(
                             &x,
-                            &mask_for_layer,
+                            mask_for_layer,
                             seqlen_offsets,
                             kv_cache,
                             metadata.as_ref().map(|(kv_cache, metadata)| {
@@ -1013,12 +990,9 @@ impl Model {
         let x = x.to_device(&self.device)?;
         let x = self.norm.forward(&x)?;
 
-        let mut x = extract_logits(&x, context_lens)?;
+        let x = extract_logits(&x, context_lens)?;
 
-        if let Some(t) = self.lm_head.quantized_act_type() {
-            x = x.to_dtype(t)?;
-        }
-        let logits = MatMul.qmethod_matmul(&x, &*self.lm_head)?;
+        let logits = self.lm_head.forward(&x)?;
 
         Ok(logits)
     }

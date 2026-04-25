@@ -594,9 +594,9 @@ checksum = "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
 
 [[package]]
 name = "bytes"
-version = "1.11.0"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
+checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cached"
@@ -1210,9 +1210,9 @@ dependencies = [
 
 [[package]]
 name = "cudaforge"
-version = "0.1.5"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f7a0d45b139b5beeeb1c34188717e12241c44a0120afb498815ce7f5373c691"
+checksum = "3ac9cd50bed6f024583322f1a5b8027eabef203086ccceb27aac1b0b58515a32"
 dependencies = [
  "anyhow",
  "fs2",
@@ -3413,7 +3413,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3439,7 +3439,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-audio"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "apodize",
@@ -3449,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-bench"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3464,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-cli"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3500,7 +3500,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "accelerate-src",
  "ahash",
@@ -3603,7 +3603,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-macros"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
@@ -3613,7 +3613,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-mcp"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3634,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-paged-attn"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -3650,7 +3650,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-pyo3"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "accelerate-src",
  "anyhow",
@@ -3676,7 +3676,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-quant"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -3705,7 +3705,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-server"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3728,7 +3728,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-server-core"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "accelerate-src",
  "anyhow",
@@ -3757,7 +3757,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-vision"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "candle-core",
  "image",
@@ -3766,7 +3766,7 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-web-chat"
-version = "0.7.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3981,9 +3981,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51d515d32fb182ee37cda2ccdcb92950d6a3c2893aa280e540671c2cd0f3b1d9"
+checksum = "cf97ec579c3c42f953ef76dbf8d55ac91fb219dde70e49aa4a6b7d74e9919050"
 
 [[package]]
 name = "num-derive"
@@ -6426,9 +6426,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.45"
+version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9e442fc33d7fdb45aa9bfeb312c095964abdf596f7567261062b2a7107aaabd"
+checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
  "itoa",
@@ -6443,15 +6443,15 @@ dependencies = [
 
 [[package]]
 name = "time-core"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b36ee98fd31ec7426d599183e8fe26932a8dc1fb76ddb6214d05493377d34ca"
+checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
 
 [[package]]
 name = "time-macros"
-version = "0.2.25"
+version = "0.2.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e552d1249bf61ac2a52db88179fd0673def1e1ad8243a00d9ec9ed71fee3dd"
+checksum = "2e70e4c5a0e0a8a4823ad65dfe1a6930e4f4d756dcd9dd7939022b5e8c501215"
 dependencies = [
  "num-conv",
  "time-core",
