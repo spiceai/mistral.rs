@@ -33,9 +33,14 @@ fn default_max_position_embeddings() -> usize {
 }
 
 serde_default_fn!(bool, word_emb_default, false);
+serde_default_fn!(bool, attention_bias_default, false);
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Default)]
 pub struct Config {
+    // Gemma 2/3 HuggingFace configs sometimes omit `attention_bias` entirely
+    // (it implicitly defaults to `false`). Make this field optional so loading
+    // does not fail on those configs.
+    #[serde(default = "attention_bias_default")]
     pub attention_bias: bool,
     pub head_dim: usize,
     // The code gemma configs include both hidden_act and hidden_activation.
