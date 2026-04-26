@@ -79,7 +79,8 @@ pub struct Gemma4TextConfig {
     pub tie_word_embeddings: bool,
     #[serde(default = "sliding_window_pattern", alias = "_sliding_window_pattern")]
     pub sliding_window_pattern: usize,
-    pub layer_types: Vec<String>,
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
     #[serde(default = "global_head_dim")]
     pub global_head_dim: usize,
     #[serde(default = "attention_k_eq_v")]
@@ -102,6 +103,23 @@ pub struct Gemma4TextConfig {
 }
 
 impl Gemma4TextConfig {
+    /// Returns layer types, computing from `sliding_window_pattern` when absent from config.
+    /// Gemma 3 configs omit `layer_types` and use `sliding_window_pattern` instead.
+    pub fn effective_layer_types(&self) -> Vec<String> {
+        self.layer_types.clone().unwrap_or_else(|| {
+            (0..self.num_hidden_layers)
+                .map(|i| {
+                    if (i + 1) % self.sliding_window_pattern == 0 {
+                        "full_attention"
+                    } else {
+                        "sliding_attention"
+                    }
+                    .to_string()
+                })
+                .collect()
+        })
+    }
+
     /// Effective sliding window size, adjusted for bidirectional attention.
     /// `self.sliding_window = (self.sliding_window // 2) + 1` only when `use_bidirectional_attention == "all"`.
     pub fn effective_sliding_window(&self) -> usize {
@@ -126,6 +144,50 @@ impl Gemma4TextConfig {
             .and_then(|rp| rp.sliding_attention.as_ref())
             .and_then(|sa| sa.rope_theta)
             .unwrap_or(10000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_text_config(num_hidden_layers: usize, sliding_window_pattern: usize) -> Gemma4TextConfig {
+        serde_json::from_str(&format!(
+            r#"{{"hidden_size":3072,"intermediate_size":8192,"num_hidden_layers":{num_hidden_layers},"sliding_window":1024,"sliding_window_pattern":{sliding_window_pattern}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn effective_layer_types_explicit() {
+        let explicit = vec!["full_attention".to_string(), "sliding_attention".to_string()];
+        let mut cfg = minimal_text_config(2, 6);
+        cfg.layer_types = Some(explicit.clone());
+        assert_eq!(cfg.effective_layer_types(), explicit);
+    }
+
+    #[test]
+    fn effective_layer_types_computed_from_pattern() {
+        // sliding_window_pattern=6: every 6th layer (1-indexed) is full_attention
+        let cfg = minimal_text_config(12, 6);
+        assert!(cfg.layer_types.is_none());
+        let types = cfg.effective_layer_types();
+        assert_eq!(types.len(), 12);
+        for (i, ty) in types.iter().enumerate() {
+            if (i + 1) % 6 == 0 {
+                assert_eq!(ty, "full_attention", "layer {i} should be full_attention");
+            } else {
+                assert_eq!(ty, "sliding_attention", "layer {i} should be sliding_attention");
+            }
+        }
+    }
+
+    #[test]
+    fn effective_layer_types_pattern_1_all_full() {
+        // sliding_window_pattern=1: every layer is full_attention
+        let cfg = minimal_text_config(4, 1);
+        let types = cfg.effective_layer_types();
+        assert!(types.iter().all(|t| t == "full_attention"));
     }
 }
 
