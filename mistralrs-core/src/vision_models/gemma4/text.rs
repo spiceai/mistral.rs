@@ -36,7 +36,7 @@ use super::config::Gemma4TextConfig;
 
 macro_rules! is_sliding {
     ($layer_idx:expr, $cfg:expr) => {
-        $cfg.layer_types[$layer_idx] == "sliding_attention"
+        $cfg.effective_layer_types()[$layer_idx] == "sliding_attention"
     };
 }
 
@@ -51,8 +51,9 @@ fn kv_shared_layer_index(cfg: &Gemma4TextConfig, layer_idx: usize) -> Result<Opt
         return Ok(None);
     }
 
-    let attention_type = &cfg.layer_types[layer_idx];
-    cfg.layer_types[..first_kv_shared_layer_idx]
+    let layer_types = cfg.effective_layer_types();
+    let attention_type = &layer_types[layer_idx];
+    layer_types[..first_kv_shared_layer_idx]
         .iter()
         .rposition(|ty| ty == attention_type)
         .map(Some)
@@ -1284,9 +1285,10 @@ impl TextModel {
         let first_shared = first_kv_shared_layer_idx(cfg);
         let mut donor_layers = std::collections::HashSet::<usize>::new();
         if first_shared < cfg.num_hidden_layers {
+            let layer_types = cfg.effective_layer_types();
             for shared_idx in first_shared..cfg.num_hidden_layers {
-                let attention_type = &cfg.layer_types[shared_idx];
-                if let Some(donor_idx) = cfg.layer_types[..first_shared]
+                let attention_type = &layer_types[shared_idx];
+                if let Some(donor_idx) = layer_types[..first_shared]
                     .iter()
                     .rposition(|ty| ty == attention_type)
                 {

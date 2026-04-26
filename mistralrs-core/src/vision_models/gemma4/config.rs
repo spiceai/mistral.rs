@@ -79,7 +79,8 @@ pub struct Gemma4TextConfig {
     pub tie_word_embeddings: bool,
     #[serde(default = "sliding_window_pattern", alias = "_sliding_window_pattern")]
     pub sliding_window_pattern: usize,
-    pub layer_types: Vec<String>,
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
     #[serde(default = "global_head_dim")]
     pub global_head_dim: usize,
     #[serde(default = "attention_k_eq_v")]
@@ -102,6 +103,23 @@ pub struct Gemma4TextConfig {
 }
 
 impl Gemma4TextConfig {
+    /// Returns layer types, computing from `sliding_window_pattern` when absent from config.
+    /// Gemma 3 configs omit `layer_types` and use `sliding_window_pattern` instead.
+    pub fn effective_layer_types(&self) -> Vec<String> {
+        self.layer_types.clone().unwrap_or_else(|| {
+            (0..self.num_hidden_layers)
+                .map(|i| {
+                    if (i + 1) % self.sliding_window_pattern == 0 {
+                        "full_attention"
+                    } else {
+                        "sliding_attention"
+                    }
+                    .to_string()
+                })
+                .collect()
+        })
+    }
+
     /// Effective sliding window size, adjusted for bidirectional attention.
     /// `self.sliding_window = (self.sliding_window // 2) + 1` only when `use_bidirectional_attention == "all"`.
     pub fn effective_sliding_window(&self) -> usize {
