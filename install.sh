@@ -11,6 +11,11 @@ can_prompt() {
 
 # Read user input, using /dev/tty if stdin is not a terminal (e.g., piped from curl)
 read_input() {
+    # MISTRALRS_INSTALL_YES=1 auto-confirms every prompt (non-interactive installs, `mistralrs update`).
+    if [ "${MISTRALRS_INSTALL_YES:-}" = "1" ]; then
+        REPLY="y"
+        return
+    fi
     if [ -t 0 ]; then
         read -r REPLY
     else
@@ -61,7 +66,10 @@ detect_os() {
 }
 
 # Minimum required Rust version
-REQUIRED_RUST_VERSION="1.88"
+REQUIRED_RUST_VERSION="1.94"
+MISTRALRS_REPO_URL="https://github.com/EricLBuehler/mistral.rs"
+MISTRALRS_BRANCH="master"
+MISTRALRS_CLI_PACKAGE="mistralrs-cli"
 
 # Check if Rust is installed
 check_rust() {
@@ -115,6 +123,76 @@ detect_cuda_compute_cap() {
 
     if [ -n "$cc" ]; then
         echo "$cc"
+    fi
+}
+
+# Detect CUDA toolkit major version from nvcc (e.g. 13). Empty if nvcc is unavailable.
+# CUDA toolkit version as major*100+minor (e.g. 13.1 -> 1301), empty if nvcc absent.
+detect_cuda_version_code() {
+    if command -v nvcc >/dev/null 2>&1; then
+        ver=$(nvcc --version 2>/dev/null | grep -oE "release [0-9]+\.[0-9]+" | head -1 | grep -oE "[0-9]+\.[0-9]+")
+        if [ -n "$ver" ]; then
+            echo $(( ${ver%%.*} * 100 + ${ver#*.} ))
+        fi
+    fi
+}
+
+# Detect the maximum CUDA runtime version supported by the installed NVIDIA driver.
+detect_cuda_driver_version_code() {
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo ""
+        return
+    fi
+
+    ver=$(nvidia-smi 2>/dev/null | grep -oE "CUDA.*Version:[[:space:]]*[0-9]+\.[0-9]+" | head -1 | grep -oE "[0-9]+\.[0-9]+")
+    if [ -n "$ver" ]; then
+        echo $(( ${ver%%.*} * 100 + ${ver#*.} ))
+    fi
+}
+
+version_code_to_str() {
+    code="$1"
+    if [ -n "$code" ]; then
+        printf "%s.%s" $(( code / 100 )) $(( code % 100 ))
+    fi
+}
+
+cutile_supported_for_cuda() {
+    cuda_ver_code="$1"
+    cuda_cc="$2"
+
+    [ -n "$cuda_ver_code" ] && [ -n "$cuda_cc" ] || return 1
+
+    if [ "$cuda_cc" -ge 80 ] 2>/dev/null && [ "$cuda_cc" -lt 90 ] 2>/dev/null && [ "$cuda_ver_code" -ge 1302 ] 2>/dev/null; then
+        return 0
+    fi
+    if [ "$cuda_cc" -eq 90 ] 2>/dev/null && [ "$cuda_ver_code" -ge 1303 ] 2>/dev/null; then
+        return 0
+    fi
+    if [ "$cuda_cc" -ge 100 ] 2>/dev/null && [ "$cuda_ver_code" -ge 1301 ] 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+check_cuda_source_build_versions() {
+    os="$1"
+    [ "$os" = "linux" ] || return 0
+
+    cuda_cc=$(detect_cuda_compute_cap)
+    [ -n "$cuda_cc" ] || return 0
+
+    cuda_ver_code=$(detect_cuda_version_code)
+    driver_cuda_code=$(detect_cuda_driver_version_code)
+    [ -n "$cuda_ver_code" ] && [ -n "$driver_cuda_code" ] || return 0
+
+    if [ "$cuda_ver_code" -gt "$driver_cuda_code" ] 2>/dev/null; then
+        if [ "${MISTRALRS_INSTALL_ALLOW_CUDA_MISMATCH:-}" = "1" ]; then
+            warn "Local nvcc CUDA $(version_code_to_str "$cuda_ver_code") is newer than the NVIDIA driver supports ($(version_code_to_str "$driver_cuda_code")); continuing because MISTRALRS_INSTALL_ALLOW_CUDA_MISMATCH=1."
+        else
+            error "Local nvcc CUDA $(version_code_to_str "$cuda_ver_code") is newer than the NVIDIA driver supports ($(version_code_to_str "$driver_cuda_code")). Source builds can fail with CUDA_ERROR_UNSUPPORTED_PTX_VERSION; upgrade the driver, install a matching CUDA toolkit, use a prebuilt, or set MISTRALRS_INSTALL_ALLOW_CUDA_MISMATCH=1 to override."
+        fi
     fi
 }
 
@@ -193,14 +271,36 @@ detect_cudnn() {
     return 1
 }
 
+# Check if NCCL is installed
+detect_nccl() {
+    for root in "$NCCL_ROOT" "$NCCL_HOME" "$CUDA_HOME" "$CUDA_PATH" /usr/local/cuda; do
+        [ -n "$root" ] || continue
+        for subdir in lib lib64 lib/x86_64-linux-gnu; do
+            if ls "$root/$subdir"/libnccl.so* >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+    done
+
+    if command -v ldconfig >/dev/null 2>&1 && ldconfig -p 2>/dev/null | grep -q "libnccl\\.so"; then
+        return 0
+    fi
+
+    for path in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/local/lib /usr/local/lib64 /usr/lib64; do
+        if ls "$path"/libnccl.so* >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # Build feature string based on detected hardware
 build_features() {
     os="$1"
     features=""
 
     if [ "$os" = "macos" ]; then
-        check_xcode_cli_tools
-        check_metal_toolchain
         features="metal"
         info "macOS detected - enabling metal"
     else
@@ -212,6 +312,18 @@ build_features() {
             cc_major=$(echo "$cuda_cc" | cut -c1)
             cc_minor=$(echo "$cuda_cc" | cut -c2-)
             info "CUDA detected (compute capability: ${cc_major}.${cc_minor})"
+
+            if [ "${MISTRALRS_INSTALL_NO_NCCL:-}" = "1" ]; then
+                info "MISTRALRS_INSTALL_NO_NCCL=1 set - skipping nccl"
+            elif detect_nccl; then
+                features="$features nccl"
+                info "NCCL detected - enabling nccl for CUDA multi-GPU tensor parallelism"
+            elif [ "${MISTRALRS_INSTALL_NCCL:-}" = "1" ]; then
+                features="$features nccl"
+                warn "MISTRALRS_INSTALL_NCCL=1 set but NCCL was not detected; the build may fail unless libnccl is on the linker path"
+            else
+                warn "NCCL not found - skipping nccl. Install NCCL or set MISTRALRS_INSTALL_NCCL=1 to force it; NCCL is the preferred CUDA multi-GPU path."
+            fi
 
             # Check for cuDNN
             if detect_cudnn; then
@@ -229,6 +341,12 @@ build_features() {
                 features="$features flash-attn"
                 info "Ampere+ GPU detected - enabling flash-attn"
             fi
+            
+            cuda_ver_code=$(detect_cuda_version_code)
+            if cutile_supported_for_cuda "$cuda_ver_code" "$cuda_cc"; then
+                features="$features cutile"
+                info "CUDA $(version_code_to_str "$cuda_ver_code") and supported arch - enabling cutile"
+            fi
         else
             info "No NVIDIA GPU detected"
         fi
@@ -244,26 +362,237 @@ build_features() {
     echo "$features" | xargs
 }
 
-# Install mistralrs-cli
-install_mistralrs() {
-    features="$1"
+# Check if ffmpeg is installed
+check_ffmpeg() {
+    command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version >/dev/null 2>&1
+}
 
-    if [ -n "$features" ]; then
-        info "Installing mistralrs-cli with features: $features"
-        cargo install mistralrs-cli@0.8.1 --features "$features"
+# Install ffmpeg using the system package manager
+install_ffmpeg() {
+    os="$1"
+    if [ "$os" = "macos" ]; then
+        if command -v brew >/dev/null 2>&1; then
+            if brew list ffmpeg >/dev/null 2>&1; then
+                info "Reinstalling FFmpeg via Homebrew..."
+                brew reinstall ffmpeg
+            else
+                info "Installing FFmpeg via Homebrew..."
+                brew install ffmpeg
+            fi
+        else
+            warn "Homebrew not found. Install FFmpeg manually: https://ffmpeg.org/download.html"
+            return 1
+        fi
     else
-        info "Installing mistralrs-cli with default features"
-        cargo install mistralrs-cli@0.8.1
+        if command -v apt-get >/dev/null 2>&1; then
+            info "Installing FFmpeg via apt..."
+            sudo apt-get update && sudo apt-get install -y ffmpeg
+        elif command -v dnf >/dev/null 2>&1; then
+            info "Installing FFmpeg via dnf..."
+            sudo dnf install -y ffmpeg
+        else
+            warn "Could not detect package manager. Install FFmpeg manually: https://ffmpeg.org/download.html"
+            return 1
+        fi
     fi
 }
 
-# Main installation flow
-main() {
-    print_banner
+# Install mistralrs-cli
+install_mistralrs() {
+    features="$1"
+    SOURCE_INSTALL_ROOT=$(mktemp -d)
+    SOURCE_MISTRALRS="$SOURCE_INSTALL_ROOT/bin/mistralrs"
 
-    # Detect OS
-    os=$(detect_os)
-    info "Detected OS: $os"
+    # MISTRALRS_INSTALL_TAG pins a git tag; otherwise build the latest master.
+    if [ -n "$MISTRALRS_INSTALL_TAG" ]; then
+        git_ref="--tag $MISTRALRS_INSTALL_TAG"
+        ref_desc="tag $MISTRALRS_INSTALL_TAG"
+    else
+        git_ref="--branch $MISTRALRS_BRANCH"
+        ref_desc="branch $MISTRALRS_BRANCH"
+    fi
+
+    if [ -n "$features" ]; then
+        info "Installing mistralrs-cli from GitHub $ref_desc with features: $features"
+        cargo install --root "$SOURCE_INSTALL_ROOT" --force --locked --git "$MISTRALRS_REPO_URL" $git_ref "$MISTRALRS_CLI_PACKAGE" --features "$features"
+    else
+        info "Installing mistralrs-cli from GitHub $ref_desc with default features"
+        cargo install --root "$SOURCE_INSTALL_ROOT" --force --locked --git "$MISTRALRS_REPO_URL" $git_ref "$MISTRALRS_CLI_PACKAGE"
+    fi
+}
+
+install_source_from_staging() {
+    if [ ! -f "$SOURCE_MISTRALRS" ]; then
+        error "cargo install succeeded but $SOURCE_MISTRALRS was not found"
+    fi
+    rm -rf "$PREBUILT_DIR"
+    mkdir -p "$PREBUILT_DIR" "$BIN_DIR"
+    cp "$SOURCE_MISTRALRS" "$PREBUILT_DIR/mistralrs"
+    chmod +x "$PREBUILT_DIR/mistralrs" 2>/dev/null || true
+    ln -sf "$PREBUILT_DIR/mistralrs" "$BIN_DIR/mistralrs"
+    rm -f "$BIN_DIR/tileiras"
+    rm -rf "$SOURCE_INSTALL_ROOT"
+    if ! "$PREBUILT_DIR/mistralrs" --version >/dev/null 2>&1; then
+        error "source-built binary did not run after installation"
+    fi
+}
+
+# Prebuilt binaries: SMs we publish a CUDA build for, per arch (see .github/workflows/release.yml).
+# aarch64 covers the Grace parts only (GH200/GB200/GB10).
+PREBUILT_CUDA_SMS_X86="80 86 89 90 100 120"
+PREBUILT_CUDA_SMS_AARCH64="90 100 121"
+# Newest first. Format is asset-token:minimum-driver-cuda-code.
+PREBUILT_CUDA_VARIANTS="133:1303 132:1302 131:1301 130:1300 129:1209 128:1208"
+# MISTRALRS_INSTALL_TAG pins a specific release (e.g. v0.8.9); default is the latest stable release.
+if [ -n "$MISTRALRS_INSTALL_TAG" ]; then
+    RELEASE_BASE="https://github.com/EricLBuehler/mistral.rs/releases/download/$MISTRALRS_INSTALL_TAG"
+else
+    RELEASE_BASE="https://github.com/EricLBuehler/mistral.rs/releases/latest/download"
+fi
+PREBUILT_DIR="$HOME/.mistralrs"
+BIN_DIR="$HOME/.local/bin"
+CARGO_BIN_DIR="${CARGO_HOME:-$HOME/.cargo}/bin"
+CARGO_MISTRALRS="$CARGO_BIN_DIR/mistralrs"
+MISTRALRS_ENV="$PREBUILT_DIR/env"
+REPLACE_DUPLICATE_INSTALLS=""
+SOURCE_INSTALL_ROOT=""
+SOURCE_MISTRALRS=""
+
+cuda_sms_for_variant() {
+    cuda_token="$1"
+    arch="$2"
+
+    case "$cuda_token:$arch" in
+        128:x86_64) echo "80 86 89 90 100 120" ;;
+        128:aarch64|128:arm64) echo "90 100" ;;
+        129:aarch64|129:arm64) echo "121" ;;
+        130:x86_64) echo "$PREBUILT_CUDA_SMS_X86" ;;
+        130:aarch64|130:arm64) echo "$PREBUILT_CUDA_SMS_AARCH64" ;;
+        131:x86_64) echo "$PREBUILT_CUDA_SMS_X86" ;;
+        131:aarch64|131:arm64) echo "$PREBUILT_CUDA_SMS_AARCH64" ;;
+        132:x86_64) echo "80 86 89" ;;
+        133:x86_64) echo "90" ;;
+        133:aarch64|133:arm64) echo "90" ;;
+    esac
+}
+
+# Echo the prebuilt asset name for this platform, or empty if none is published for it.
+detect_prebuilt_asset() {
+    os="$1"
+    arch=$(uname -m)
+    if [ "$os" = "macos" ]; then
+        # Only Apple Silicon has a prebuilt; Intel Macs build from source.
+        [ "$arch" = "arm64" ] && echo "mistralrs-metal-aarch64-apple-darwin.tar.gz"
+        return 0
+    fi
+    # Linux x86_64 and aarch64 have prebuilts; other arches build from source.
+    case "$arch" in
+        x86_64) triple="x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64) triple="aarch64-unknown-linux-gnu" ;;
+        *) return ;;
+    esac
+    cc=$(detect_cuda_compute_cap)
+    if [ -n "$cc" ]; then
+        driver_cuda_code=$(detect_cuda_driver_version_code)
+        if [ -z "$driver_cuda_code" ]; then
+            warn "Could not detect the CUDA version supported by the NVIDIA driver; building from source."
+            return 0
+        fi
+
+        for variant in $PREBUILT_CUDA_VARIANTS; do
+            cuda_token=${variant%:*}
+            cuda_min_code=${variant#*:}
+            if [ "$driver_cuda_code" -ge "$cuda_min_code" ] 2>/dev/null; then
+                cuda_sms=$(cuda_sms_for_variant "$cuda_token" "$arch")
+                for sm in $cuda_sms; do
+                    if [ "$cc" = "$sm" ]; then
+                        echo "mistralrs-cuda${cuda_token}-sm${cc}-${triple}.tar.gz"
+                        return 0
+                    fi
+                done
+            fi
+        done
+        if [ "$driver_cuda_code" -lt 1208 ] 2>/dev/null; then
+            warn "NVIDIA driver supports CUDA $(version_code_to_str "$driver_cuda_code"), but the oldest CUDA prebuilt requires CUDA 12.8; building from source."
+        else
+            warn "No CUDA prebuilt matches compute capability $cc and driver CUDA $(version_code_to_str "$driver_cuda_code"); building from source."
+        fi
+        return 0
+    fi
+    if [ "$triple" = "aarch64-unknown-linux-gnu" ]; then
+        # the default aarch64 asset assumes ARMv8.2 (dotprod); A72-class boards
+        # (Pi 4, Graviton1) get the compat build
+        if ! grep -qw asimddp /proc/cpuinfo 2>/dev/null; then
+            echo "mistralrs-cpu-${triple}-v8_0.tar.gz"
+            return 0
+        fi
+    fi
+    echo "mistralrs-cpu-${triple}.tar.gz"
+}
+
+detect_legacy_cuda_prebuilt_asset() {
+    os="$1"
+    arch=$(uname -m)
+    [ "$os" = "linux" ] || return 0
+    case "$arch" in
+        x86_64) triple="x86_64-unknown-linux-gnu"; cuda_sms="$PREBUILT_CUDA_SMS_X86" ;;
+        aarch64|arm64) triple="aarch64-unknown-linux-gnu"; cuda_sms="$PREBUILT_CUDA_SMS_AARCH64" ;;
+        *) return 0 ;;
+    esac
+    cc=$(detect_cuda_compute_cap)
+    [ -n "$cc" ] || return 0
+    driver_cuda_code=$(detect_cuda_driver_version_code)
+    [ -n "$driver_cuda_code" ] && [ "$driver_cuda_code" -ge 1301 ] 2>/dev/null || return 0
+    for sm in $cuda_sms; do
+        if [ "$cc" = "$sm" ]; then
+            echo "mistralrs-cuda-sm${cc}-${triple}.tar.gz"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# Download and install a prebuilt asset. Returns 0 on success, 1 on failure.
+install_prebuilt() {
+    asset="$1"
+    tmp=$(mktemp -d)
+    info "Downloading $asset"
+    if ! curl --proto '=https' --tlsv1.2 -fSL --progress-bar "$RELEASE_BASE/$asset" -o "$tmp/$asset"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$PREBUILT_DIR"
+    mkdir -p "$PREBUILT_DIR"
+    # CPU/Metal tarballs contain a bare `mistralrs`; CUDA tarballs add lib/ and bin/tileiras.
+    if ! tar xzf "$tmp/$asset" -C "$PREBUILT_DIR"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    chmod +x "$PREBUILT_DIR/mistralrs" 2>/dev/null || true
+    [ -f "$PREBUILT_DIR/bin/tileiras" ] && chmod +x "$PREBUILT_DIR/bin/tileiras" 2>/dev/null || true
+    mkdir -p "$BIN_DIR"
+    # Symlink onto PATH; $ORIGIN/lib resolves through the symlink to the real lib dir, and a
+    # tileiras symlink lets cutile's PATH probe find the bundled assembler.
+    ln -sf "$PREBUILT_DIR/mistralrs" "$BIN_DIR/mistralrs"
+    rm -f "$BIN_DIR/tileiras"
+    [ -f "$PREBUILT_DIR/bin/tileiras" ] && ln -sf "$PREBUILT_DIR/bin/tileiras" "$BIN_DIR/tileiras" || true
+    if ! "$PREBUILT_DIR/mistralrs" --version >/dev/null 2>&1; then
+        warn "Prebuilt binary did not run; falling back to source build."
+        return 1
+    fi
+    return 0
+}
+
+# Build and install from source via cargo. Used when no prebuilt matches or when forced.
+# Builds the latest `master` (bleeding edge), unlike the prebuilt path which is the stable release.
+build_from_source() {
+    os="$1"
+    if [ -n "$MISTRALRS_INSTALL_TAG" ]; then
+        info "Building from source: tag $MISTRALRS_INSTALL_TAG."
+    else
+        info "Building from source: latest $MISTRALRS_BRANCH (bleeding edge)."
+    fi
 
     # Check for Rust
     if check_rust; then
@@ -271,7 +600,6 @@ main() {
         rust_version=$(get_rust_version)
         info "Rust is installed: $rust_version_full"
 
-        # Check if version meets minimum requirement
         if [ -n "$rust_version" ] && ! version_gte "$rust_version" "$REQUIRED_RUST_VERSION"; then
             warn "Rust $rust_version is below the required version $REQUIRED_RUST_VERSION"
             echo ""
@@ -283,7 +611,6 @@ main() {
                     ;;
             esac
             update_rust
-            # Re-check version after update
             rust_version=$(get_rust_version)
             if ! version_gte "$rust_version" "$REQUIRED_RUST_VERSION"; then
                 error "Failed to update Rust to required version $REQUIRED_RUST_VERSION"
@@ -296,16 +623,21 @@ main() {
         read_input
         case "$REPLY" in
             [Nn]*)
-                error "Rust is required to install mistral.rs"
+                error "Rust is required to build mistral.rs from source"
                 ;;
         esac
         install_rust
     fi
 
+    # Run prereq installers outside any $() so xcodebuild stdout (asset paths with slashes) can't leak into the captured feature string.
+    if [ "$os" = "macos" ]; then
+        check_xcode_cli_tools
+        check_metal_toolchain
+    fi
+
     echo ""
     info "Detecting hardware capabilities..."
-
-    # Build features
+    check_cuda_source_build_versions "$os"
     features=$(build_features "$os")
 
     echo ""
@@ -317,8 +649,6 @@ main() {
         printf "Features: ${YELLOW}(none - CPU only)${NC}\n"
     fi
     echo ""
-
-    # Confirm installation
     printf "Proceed with installation? [Y/n] "
     read_input
     case "$REPLY" in
@@ -330,26 +660,275 @@ main() {
 
     echo ""
     install_mistralrs "$features"
-
-    # Ensure cargo bin is in PATH for this session
     if [ -f "$HOME/.cargo/env" ]; then
         . "$HOME/.cargo/env"
     fi
+}
 
+# Offer FFmpeg (optional, video input). Sets FFMPEG_SKIPPED. Shared by both install paths.
+maybe_install_ffmpeg() {
+    os="$1"
+    FFMPEG_SKIPPED=""
+    # MISTRALRS_INSTALL_IGNORE_FFMPEG=1 leaves ffmpeg untouched (CI, `mistralrs update`).
+    if [ "${MISTRALRS_INSTALL_IGNORE_FFMPEG:-}" = "1" ]; then
+        if check_ffmpeg; then
+            info "FFmpeg is installed (enables video input support)"
+        else
+            FFMPEG_SKIPPED=1
+        fi
+        return
+    fi
+    if check_ffmpeg; then
+        info "FFmpeg is installed (enables video input support)"
+        return
+    fi
     echo ""
-    success "mistral.rs installed successfully!"
+    printf "${YELLOW}(Optional)${NC} FFmpeg is required for video input support.\n"
+    printf "Would you like to install FFmpeg? [y/N] "
+    read_input
+    case "$REPLY" in
+        [Yy]*)
+            install_ffmpeg "$os"
+            if check_ffmpeg; then
+                success "FFmpeg installed successfully"
+            else
+                warn "FFmpeg installation failed - you can install it manually later"
+                FFMPEG_SKIPPED=1
+            fi
+            ;;
+        *)
+            info "Skipping FFmpeg installation"
+            FFMPEG_SKIPPED=1
+            ;;
+    esac
+}
+
+# Render a path with $HOME collapsed to ~ for readability.
+tildify() {
+    case "$1" in
+        "$HOME"/*) printf '~%s' "${1#$HOME}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+write_env_script() {
+    printf '%s\n' \
+        '#!/bin/sh' \
+        '# mistral.rs shell setup' \
+        'case ":${PATH}:" in' \
+        '    *:"$HOME/.local/bin":*) ;;' \
+        '    *) export PATH="$HOME/.local/bin:$PATH" ;;' \
+        'esac' \
+        > "$MISTRALRS_ENV"
+}
+
+append_source_line() {
+    rc="$1"
+    [ -n "$rc" ] || return 0
+    mkdir -p "$(dirname "$rc")"
+    touch "$rc"
+    source_line='. "$HOME/.mistralrs/env"'
+    if ! grep -Fqx "$source_line" "$rc"; then
+        printf '\n%s\n' "$source_line" >> "$rc"
+        PATH_RCS="${PATH_RCS}${PATH_RCS:+, }$(tildify "$rc")"
+    fi
+}
+
+setup_shell_path() {
+    PATH_RCS=""
+    write_env_script
+    append_source_line "$HOME/.profile"
+    for rc in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.bashrc"; do
+        [ -f "$rc" ] && append_source_line "$rc"
+    done
+    if command -v zsh >/dev/null 2>&1 || [ "${SHELL##*/}" = "zsh" ]; then
+        append_source_line "${ZDOTDIR:-$HOME}/.zshenv"
+    fi
+    printf '%s' "$PATH_RCS"
+}
+
+warn_if_shadowed() {
+    resolved=$(command -v mistralrs 2>/dev/null || true)
+    [ -n "$resolved" ] || return 0
+    case "$resolved" in
+        "$BIN_DIR/mistralrs"|"$PREBUILT_DIR/mistralrs") ;;
+        *)
+            printf "${YELLOW}Note:${NC} another mistralrs appears earlier on PATH: %s\n" "$(tildify "$resolved")"
+            printf "      The managed install is available at: %s\n\n" "$(tildify "$PREBUILT_DIR/mistralrs")"
+            ;;
+    esac
+}
+
+add_duplicate_install() {
+    candidate="$1"
+    [ -n "$candidate" ] && [ -f "$candidate" ] || return 0
+    case "$candidate" in
+        "$BIN_DIR/mistralrs"|"$PREBUILT_DIR/mistralrs") return 0 ;;
+    esac
+    case "
+$DUPLICATE_INSTALLS
+" in
+        *"
+$candidate
+"*) return 0 ;;
+    esac
+    DUPLICATE_INSTALLS="${DUPLICATE_INSTALLS}${DUPLICATE_INSTALLS:+
+}$candidate"
+}
+
+find_duplicate_installs() {
+    DUPLICATE_INSTALLS=""
+    add_duplicate_install "$CARGO_MISTRALRS"
+    old_ifs=$IFS
+    IFS=:
+    for dir in $PATH; do
+        [ -n "$dir" ] && add_duplicate_install "$dir/mistralrs"
+    done
+    IFS=$old_ifs
+}
+
+confirm_duplicate_replacement() {
+    find_duplicate_installs
+    [ -n "$DUPLICATE_INSTALLS" ] || return 0
+    echo ""
+    printf "${YELLOW}warning:${NC} Found duplicate mistralrs installs:\n"
+    printf '%s\n' "$DUPLICATE_INSTALLS" | while IFS= read -r duplicate; do
+        printf "  %s\n" "$(tildify "$duplicate")"
+    done
+    echo ""
+    printf "Replace duplicate installs? [Y/n] "
+    read_input
+    case "$REPLY" in
+        [Nn]*)
+            error "duplicate mistralrs installs must be resolved before installing"
+            ;;
+    esac
+    REPLACE_DUPLICATE_INSTALLS=1
+}
+
+remove_duplicate_installs() {
+    [ "$REPLACE_DUPLICATE_INSTALLS" = "1" ] || return 0
+    find_duplicate_installs
+    [ -n "$DUPLICATE_INSTALLS" ] || return 0
+    while IFS= read -r duplicate; do
+        [ -n "$duplicate" ] || continue
+        if rm -f "$duplicate"; then
+            info "Removed duplicate install: $(tildify "$duplicate")"
+        else
+            error "failed to remove duplicate install: $(tildify "$duplicate")"
+        fi
+    done <<EOF
+$DUPLICATE_INSTALLS
+EOF
+}
+
+# Shared success message + examples + PATH guidance, tailored to how the binary was installed.
+print_success() {
+    method="$1"
+    success_bin="$PREBUILT_DIR/mistralrs"
+    ver=$("$success_bin" --version 2>/dev/null | head -1)
+    [ -n "$ver" ] || ver="mistral.rs"
+    echo ""
+    if [ "$method" = "prebuilt" ]; then
+        success "$ver installed successfully (prebuilt binary)!"
+    else
+        success "$ver installed successfully (built from source)!"
+    fi
+    echo ""
+    printf "${BOLD}Installed${NC}\n"
+    echo "========="
+    if [ "$method" = "prebuilt" ]; then
+        printf "  binary      %s\n" "$(tildify "$PREBUILT_DIR/mistralrs")"
+        if [ -L "$BIN_DIR/tileiras" ]; then
+            printf "  cutile JIT  %s -> %s\n" "$(tildify "$BIN_DIR/tileiras")" "$(tildify "$PREBUILT_DIR/bin/tileiras")"
+        fi
+    else
+        printf "  binary      %s\n" "$(tildify "$PREBUILT_DIR/mistralrs")"
+    fi
+    printf "  on PATH     %s -> %s\n" "$(tildify "$BIN_DIR/mistralrs")" "$(tildify "$PREBUILT_DIR/mistralrs")"
     echo ""
     printf "${BOLD}Quick Start${NC}\n"
     echo "==========="
     echo ""
+    echo "  # Chat in your terminal (downloads the model on first run)"
     echo "  mistralrs run -m Qwen/Qwen3-4B"
     echo ""
-    echo "  mistralrs serve --ui -m google/gemma-3-4b-it"
+    echo "  # Serve an OpenAI-compatible + Anthropic-compatible API on port 1234"
+    echo "  mistralrs serve -m Qwen/Qwen3-4B"
     echo ""
-    echo "For more information, visit: https://github.com/EricLBuehler/mistral.rs"
+    echo "  # Run as a local agent (tools, web search, code execution)"
+    echo "  mistralrs serve --agent -m google/gemma-4-E4B-it"
     echo ""
-    printf "${YELLOW}Note:${NC} To use 'mistralrs' now, run: ${BOLD}. \"\$HOME/.cargo/env\"${NC}\n"
-    printf "      Or restart your terminal.\n"
+    echo "Docs:     https://ericlbuehler.github.io/mistral.rs/"
+    echo "Source:   https://github.com/EricLBuehler/mistral.rs"
+    echo ""
+    if [ -n "$FFMPEG_SKIPPED" ]; then
+        printf "${YELLOW}Note:${NC} FFmpeg was not installed; video input will be unavailable. Install it later to enable video.\n\n"
+    fi
+    path_rcs=$(setup_shell_path)
+    case ":$PATH:" in
+        *":$BIN_DIR:"*)
+            if [ -n "$path_rcs" ]; then
+                printf "${YELLOW}Note:${NC} configured future shells via %s.\n" "$(tildify "$MISTRALRS_ENV")"
+                printf "      Updated: %s\n\n" "$path_rcs"
+            fi
+            ;;
+        *)
+            printf "${YELLOW}Note:${NC} added %s to your PATH via %s.\n" "$(tildify "$BIN_DIR")" "$(tildify "$MISTRALRS_ENV")"
+            if [ -n "$path_rcs" ]; then
+                printf "      Updated: %s\n" "$path_rcs"
+            fi
+            printf "      Restart your terminal or run: . \"%s\"\n\n" "$MISTRALRS_ENV"
+            ;;
+    esac
+    warn_if_shadowed
+}
+
+# Main installation flow
+main() {
+    print_banner
+
+    os=$(detect_os)
+    info "Detected OS: $os"
+    confirm_duplicate_replacement
+
+    # Bifurcate only on where the binary comes from: a prebuilt download (no toolchain), or a
+    # source build. Everything after (FFmpeg, examples, PATH guidance) is shared.
+    # Set MISTRALRS_INSTALL_FROM_SOURCE=1 to force a source build.
+    method=""
+    if [ -z "$MISTRALRS_INSTALL_FROM_SOURCE" ]; then
+        info "Checking for a prebuilt binary for your platform..."
+        asset=$(detect_prebuilt_asset "$os")
+        if [ -n "$asset" ]; then
+            info "Prebuilt available: $asset"
+            if install_prebuilt "$asset"; then
+                method="prebuilt"
+            else
+                legacy_asset=$(detect_legacy_cuda_prebuilt_asset "$os")
+                if [ -n "$legacy_asset" ] && [ "$legacy_asset" != "$asset" ]; then
+                    warn "Versioned CUDA prebuilt was not found; trying legacy prebuilt name $legacy_asset."
+                    if install_prebuilt "$legacy_asset"; then
+                        method="prebuilt"
+                    fi
+                fi
+                if [ "$method" != "prebuilt" ]; then
+                    warn "Prebuilt install failed; building from source instead."
+                fi
+            fi
+        else
+            info "No prebuilt for this platform; building from source."
+        fi
+    fi
+
+    if [ "$method" != "prebuilt" ]; then
+        build_from_source "$os"
+        install_source_from_staging
+        method="source"
+    fi
+
+    remove_duplicate_installs
+    maybe_install_ffmpeg "$os"
+    print_success "$method"
 }
 
 main "$@"
