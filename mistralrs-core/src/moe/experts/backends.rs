@@ -12,6 +12,21 @@ use crate::cuda::moe;
 use crate::layers::Activation;
 
 use super::checkpoint::ExpertCheckpoint;
+
+/// i-quant GGUF dtypes have no fused CUDA MoE kernel, so the fast-decode/grouped
+/// paths must fall back to the generic gather path (which dequantizes per-expert).
+#[cfg(feature = "cuda")]
+fn is_iquant_dtype(dtype: candle_core::quantized::GgmlDType) -> bool {
+    use candle_core::quantized::GgmlDType;
+    matches!(
+        dtype,
+        GgmlDType::Iq2Xxs
+            | GgmlDType::Iq3Xxs
+            | GgmlDType::Iq4Xs
+            | GgmlDType::Iq1S
+            | GgmlDType::Iq1M
+    )
+}
 use super::config::{ExpertProj, MoEExpertsConfig};
 #[cfg(feature = "cuda")]
 use super::forward::MoECudaFastPath;
@@ -583,6 +598,15 @@ impl FastExpertsWeights {
             None => return Ok(None),
         };
 
+        // i-quants have no fused-decode kernel; fall back to the generic gather
+        // path (which dequantizes per-expert to f32). See gguf/cuda.rs.
+        if is_iquant_dtype(gate_qt.dtype())
+            || is_iquant_dtype(up_qt.dtype())
+            || is_iquant_dtype(down_qt.dtype())
+        {
+            return Ok(None);
+        }
+
         // Get topk_ids as contiguous u32 CudaSlice
         let topk_ids_flat = forward.topk_ids.flatten_all()?.contiguous()?;
         let (ti_storage, ti_layout) = topk_ids_flat.storage_and_layout();
@@ -683,6 +707,15 @@ impl FastExpertsWeights {
             Some(qt) => qt,
             None => return Ok(None),
         };
+
+        // i-quants have no grouped-prefill kernel; fall back to the generic gather
+        // path (which dequantizes per-expert to f32). See gguf/cuda.rs.
+        if is_iquant_dtype(gate_qt.dtype())
+            || is_iquant_dtype(up_qt.dtype())
+            || is_iquant_dtype(down_qt.dtype())
+        {
+            return Ok(None);
+        }
 
         let use_mmq_gate_up =
             gate_qt.dtype() == up_qt.dtype() && mistralrs_quant::supports_mmq(gate_qt.dtype());

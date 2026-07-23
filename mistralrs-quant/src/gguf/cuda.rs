@@ -451,6 +451,26 @@ fn indexed_moe_forward_fused_q8_1_input(
 pub fn qtensor_indexed_moe_forward(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
     let dtype = qtensor.dtype();
 
+    // i-quants have no fused q8_1 indexed-MoE kernel (and no CPU vec_dot), so the
+    // GPU path below cannot run them. Dequantize the expert weights to f32 (via
+    // candle's CPU `to_float` fallback) and use the unquantized gathered matmul.
+    // The weight stays quantized in memory; only this tensor is materialized as a
+    // transient f32 buffer for the call.
+    if matches!(
+        dtype,
+        GgmlDType::Iq2Xxs
+            | GgmlDType::Iq3Xxs
+            | GgmlDType::Iq4Xs
+            | GgmlDType::Iq1S
+            | GgmlDType::Iq1M
+    ) {
+        let weights = qtensor.dequantize(x.device())?;
+        let unquant = <crate::UnquantLinear as crate::QuantMethod>::new(
+            crate::QuantMethodConfig::Unquantized(candle_nn::Linear::new(weights, None)),
+        )?;
+        return crate::QuantMethod::gather_forward(&unquant, x, ids);
+    }
+
     // Check supported dtypes
     if !matches!(
         dtype,
