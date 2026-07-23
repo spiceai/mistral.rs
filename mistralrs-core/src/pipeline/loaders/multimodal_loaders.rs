@@ -8179,7 +8179,7 @@ pub struct DiffusionGemmaLoader;
 
 impl DiffusionGemmaLoader {
     fn is_sliding(tc: &crate::vision_models::gemma4::config::Gemma4TextConfig, i: usize) -> bool {
-        tc.layer_types[i] == "sliding_attention"
+        tc.effective_layer_types()[i] == "sliding_attention"
     }
 }
 

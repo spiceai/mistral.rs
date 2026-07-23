@@ -498,9 +498,11 @@ fn donor_indices(
     draft_cfg: &Gemma4TextConfig,
 ) -> Result<Vec<usize>> {
     let first_shared = first_kv_shared_layer_idx(target_cfg);
-    let target_layer_types = &target_cfg.layer_types[..first_shared];
+    let target_all_layer_types = target_cfg.effective_layer_types();
+    let target_layer_types = &target_all_layer_types[..first_shared];
     let mut result = Vec::with_capacity(draft_cfg.num_hidden_layers);
-    for (draft_idx, draft_layer_type) in draft_cfg.layer_types.iter().enumerate() {
+    let draft_layer_types = draft_cfg.effective_layer_types();
+    for (draft_idx, draft_layer_type) in draft_layer_types.iter().enumerate() {
         let Some(target_idx) = target_layer_types
             .iter()
             .rposition(|layer_type| layer_type == draft_layer_type)
@@ -621,7 +623,7 @@ impl Gemma4MtpAttention {
         vb: ShardedVarBuilder,
         device: &Device,
     ) -> Result<Self> {
-        let is_sliding = cfg.layer_types[layer_idx] == "sliding_attention";
+        let is_sliding = cfg.effective_layer_types()[layer_idx] == "sliding_attention";
         let head_dim = if is_sliding {
             cfg.head_dim
         } else {

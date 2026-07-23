@@ -8,7 +8,7 @@ use minijinja::{context, value::Kwargs, Environment, Error, ErrorKind, Value};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
-use tracing::{info, trace, warn};
+use tracing::{trace, warn};
 
 use crate::{tools::ToolCallFormat, MessageContent, ModelGenerationDefaults, Tool};
 

@@ -31,11 +31,11 @@ license = "MIT"
 rust-version = "1.94"
 
 [workspace.dependencies]
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "5869e3dcc834649263550f9703bb91ff9ccb6553" }
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "5869e3dcc834649263550f9703bb91ff9ccb6553" }
-candle-flash-attn-v3 = { git = "https://github.com/spiceai/candle.git", rev = "5869e3dcc834649263550f9703bb91ff9ccb6553" }
-candle-flash-attn = { git = "https://github.com/spiceai/candle.git", rev = "5869e3dcc834649263550f9703bb91ff9ccb6553" }
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "5869e3dcc834649263550f9703bb91ff9ccb6553" }
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "0d021562465d1ffc9873010ff9d58a8aaa1af37c" }
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "0d021562465d1ffc9873010ff9d58a8aaa1af37c" }
+candle-flash-attn-v3 = { git = "https://github.com/spiceai/candle.git", rev = "0d021562465d1ffc9873010ff9d58a8aaa1af37c" }
+candle-flash-attn = { git = "https://github.com/spiceai/candle.git", rev = "0d021562465d1ffc9873010ff9d58a8aaa1af37c" }
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "0d021562465d1ffc9873010ff9d58a8aaa1af37c" }
 
 axum = "0.8.8"
 mimalloc = "0.1"
