@@ -362,6 +362,26 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 };
                 token_embd + output_norm + output
             }
+            // GLM-MoE (`glm-dsa`): MLA attention + sigmoid MoE. The non-mapped
+            // (global) tensors are the same trio as the other decoder archs:
+            // token embeddings, the final norm, and the output head (tied to the
+            // embeddings when `output.weight` is absent).
+            GGUFArchitecture::GlmDsa => {
+                let token_embd = tensor_info_size_in_bytes!(
+                    self.model.tensor_info("token_embd.weight")?,
+                    DType::F32
+                );
+                let output_norm = tensor_info_size_in_bytes!(
+                    self.model.tensor_info("output_norm.weight")?,
+                    DType::F32
+                );
+                let output = if !self.model.has_tensor("output.weight") {
+                    tensor_info_size_in_bytes!(self.model.tensor_info("token_embd.weight")?)
+                } else {
+                    tensor_info_size_in_bytes!(self.model.tensor_info("output.weight")?)
+                };
+                token_embd + output_norm + output
+            }
             _ => unimplemented!(),
         };
         Ok(size_in_bytes)
@@ -643,6 +663,128 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     + ffn_up
                     + ffn_down
                     + ffn_gate
+            }
+
+            // GLM-MoE (`glm-dsa`): MLA attention (+ a per-layer sparse-attention
+            // "indexer" sub-block) and a sigmoid MoE FFN. The first
+            // `leading_dense_block_count` (=3) layers are dense and layers >= 3 are
+            // MoE; the surrounding code returns a single per-layer size replicated
+            // `num_layers` times (a uniform estimate). The MoE layers dominate, so
+            // we measure a representative MoE layer (`blk.3`) and replicate it — a
+            // safe over-estimate for device-map memory planning (never undercounts
+            // the large expert tensors). Attention/indexer shapes are identical
+            // across all layers, so only the FFN portion is an over-estimate for
+            // the three dense layers.
+            GGUFArchitecture::GlmDsa => {
+                // First MoE layer (after the leading dense layers).
+                let l = "blk.3";
+
+                // --- MLA attention ---
+                let attn_norm = tensor_info_size_in_bytes!(
+                    self.model.tensor_info(&format!("{l}.attn_norm.weight"))?,
+                    DType::F32
+                );
+                let attn_q_a = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_q_a.weight"))?);
+                let attn_q_a_norm = tensor_info_size_in_bytes!(
+                    self.model.tensor_info(&format!("{l}.attn_q_a_norm.weight"))?,
+                    DType::F32
+                );
+                let attn_q_b = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_q_b.weight"))?);
+                let attn_kv_a_mqa = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_kv_a_mqa.weight"))?);
+                let attn_kv_a_norm = tensor_info_size_in_bytes!(
+                    self.model
+                        .tensor_info(&format!("{l}.attn_kv_a_norm.weight"))?,
+                    DType::F32
+                );
+                let attn_k_b = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_k_b.weight"))?);
+                let attn_v_b = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_v_b.weight"))?);
+                let attn_output = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_output.weight"))?);
+                let attn = attn_norm
+                    + attn_q_a
+                    + attn_q_a_norm
+                    + attn_q_b
+                    + attn_kv_a_mqa
+                    + attn_kv_a_norm
+                    + attn_k_b
+                    + attn_v_b
+                    + attn_output;
+
+                // --- DSA sparse-attention indexer (present on every layer) ---
+                let indexer = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.indexer.attn_k.weight"))?)
+                    + tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info(&format!("{l}.indexer.attn_q_b.weight"))?)
+                    + tensor_info_size_in_bytes!(
+                        self.model
+                            .tensor_info(&format!("{l}.indexer.k_norm.weight"))?,
+                        DType::F32
+                    )
+                    + tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info(&format!("{l}.indexer.proj.weight"))?);
+
+                // --- MoE FFN: router + 256 routed experts + 1 shared expert ---
+                let ffn_norm = tensor_info_size_in_bytes!(
+                    self.model.tensor_info(&format!("{l}.ffn_norm.weight"))?,
+                    DType::F32
+                );
+                let ffn_gate_inp = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_gate_inp.weight"))?);
+                // Routed experts: stacked [hidden, ffn, n_expert] tensors.
+                let ffn_gate_exps = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_gate_exps.weight"))?);
+                let ffn_up_exps = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_up_exps.weight"))?);
+                let ffn_down_exps = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_down_exps.weight"))?);
+                // Shared expert (always active).
+                let ffn_gate_shexp = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_gate_shexp.weight"))?);
+                let ffn_up_shexp = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_up_shexp.weight"))?);
+                let ffn_down_shexp = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_down_shexp.weight"))?);
+                let ffn = ffn_norm
+                    + ffn_gate_inp
+                    + ffn_gate_exps
+                    + ffn_up_exps
+                    + ffn_down_exps
+                    + ffn_gate_shexp
+                    + ffn_up_shexp
+                    + ffn_down_shexp;
+
+                // Tensor parallelism: under the ring (or NCCL) backend the linear
+                // layers are sharded across ranks (Column/Row-ParallelLayer split by
+                // world_size), so each rank only holds ~1/world_size of every layer's
+                // weights. The full-model figure above would size the whole model
+                // against a single node's memory and reject the load. Divide by the
+                // global tensor-parallel size; `get_global_tp_size_from_devices`
+                // returns the ring `world_size` when ring is active, the device count
+                // for NCCL, and 1 otherwise (so the single-node estimate is unchanged).
+                let world_size =
+                    mistralrs_quant::distributed::get_global_tp_size_from_devices().unwrap_or(1);
+                (attn + indexer + ffn) / world_size.max(1)
             }
 
             _ => unimplemented!(),

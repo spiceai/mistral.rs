@@ -1,4 +1,5 @@
 mod chat_template;
+pub(crate) mod glm_moe;
 mod content;
 mod gguf_tokenizer;
 use strum::EnumString;
@@ -30,6 +31,8 @@ pub enum GGUFArchitecture {
     Qwen3,
     Qwen3MoE,
     Mistral3,
+    #[strum(serialize = "glm-dsa")]
+    GlmDsa,
 }
 
 // Wraps from_str() for some convenience:

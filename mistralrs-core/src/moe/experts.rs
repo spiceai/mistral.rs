@@ -19,6 +19,21 @@ use crate::cuda::moe;
 use crate::layers::Activation;
 use crate::moe::shard;
 
+/// i-quant GGUF dtypes have no fused CUDA MoE kernel, so the fast decode/grouped
+/// paths must fall back to the generic gather path (which dequantizes per-expert).
+#[cfg(feature = "cuda")]
+fn is_iquant_dtype(dtype: candle_core::quantized::GgmlDType) -> bool {
+    use candle_core::quantized::GgmlDType;
+    matches!(
+        dtype,
+        GgmlDType::Iq2Xxs
+            | GgmlDType::Iq3Xxs
+            | GgmlDType::Iq4Xs
+            | GgmlDType::Iq1S
+            | GgmlDType::Iq1M
+    )
+}
+
 /// Configuration for MoEExperts
 pub struct MoEExpertsConfig {
     pub num_experts: usize,
@@ -918,6 +933,15 @@ impl MoEExperts {
             None => return Ok(None),
         };
 
+        // i-quants have no fused-decode kernel; fall back to the generic gather
+        // path (which dequantizes per-expert to f32). See gguf/cuda.rs.
+        if is_iquant_dtype(gate_qt.dtype())
+            || is_iquant_dtype(up_qt.dtype())
+            || is_iquant_dtype(down_qt.dtype())
+        {
+            return Ok(None);
+        }
+
         // Get topk_ids as contiguous u32 CudaSlice
         let topk_ids_flat = topk_ids.flatten_all()?.contiguous()?;
         let (ti_storage, ti_layout) = topk_ids_flat.storage_and_layout();
@@ -1018,6 +1042,15 @@ impl MoEExperts {
             Some(qt) => qt,
             None => return Ok(None),
         };
+
+        // i-quants have no grouped-prefill kernel; fall back to the generic gather
+        // path (which dequantizes per-expert to f32). See gguf/cuda.rs.
+        if is_iquant_dtype(gate_qt.dtype())
+            || is_iquant_dtype(up_qt.dtype())
+            || is_iquant_dtype(down_qt.dtype())
+        {
+            return Ok(None);
+        }
 
         // Quantize input to Q8_1 ONCE, shared between gate and up.
         // quantize_input_q8_1 accepts BF16/F16/F32 directly (no conversion needed).

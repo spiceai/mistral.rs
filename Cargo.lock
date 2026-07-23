@@ -634,7 +634,7 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "candle-core"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
+source = "git+https://github.com/spiceai/candle.git?rev=37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4#37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -666,7 +666,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
+source = "git+https://github.com/spiceai/candle.git?rev=37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4#37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -677,7 +677,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn-v3"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
+source = "git+https://github.com/spiceai/candle.git?rev=37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4#37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -690,7 +690,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
+source = "git+https://github.com/spiceai/candle.git?rev=37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4#37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4"
 dependencies = [
  "cudaforge",
 ]
@@ -698,7 +698,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
+source = "git+https://github.com/spiceai/candle.git?rev=37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4#37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4"
 dependencies = [
  "half",
  "objc2",
@@ -712,7 +712,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
+source = "git+https://github.com/spiceai/candle.git?rev=37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4#37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -731,7 +731,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.10.1"
-source = "git+https://github.com/spiceai/candle.git?rev=6ee27a4d621a3470cbf83596722c16de7cf97f12#6ee27a4d621a3470cbf83596722c16de7cf97f12"
+source = "git+https://github.com/spiceai/candle.git?rev=37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4#37db2e16bbd1945dab9f8a4fc872cbf0b255d6b4"
 dependencies = [
  "ug",
  "ug-cuda",
