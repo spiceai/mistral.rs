@@ -15,15 +15,37 @@ use super::DeviceMappedModelLoader;
 const GPU_RESERVE_FRACTION: f64 = 0.02;
 const GPU_MIN_RESERVE_BYTES: usize = 512 * 1024 * 1024; // 512MB safety buffer
 
-/// Usable device capacity after subtracting a small safety reserve for GPUs.
+/// Per-GPU reserve fraction, overridable via `MISTRALRS_GPU_RESERVE_FRACTION`.
+fn gpu_reserve_fraction() -> f64 {
+    std::env::var("MISTRALRS_GPU_RESERVE_FRACTION")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|f| (0.0..=0.5).contains(f))
+        .unwrap_or(GPU_RESERVE_FRACTION)
+}
+
+/// Absolute per-GPU reserve floor in bytes, overridable via `MISTRALRS_GPU_MIN_RESERVE_MB`.
+/// This is the effective knob for CUDA context + cuBLAS workspaces + distributed
+/// (ring) all-reduce buffers, which are roughly fixed rather than proportional to
+/// device size — on unified-memory (iGPU) systems the auto-mapper otherwise packs
+/// weights up to the physical pool and OOMs when that fixed runtime overhead lands.
+fn gpu_min_reserve_bytes() -> usize {
+    std::env::var("MISTRALRS_GPU_MIN_RESERVE_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(GPU_MIN_RESERVE_BYTES)
+}
+
+/// Usable device capacity after subtracting a safety reserve for GPUs.
 /// CPU devices return `avail_bytes` unchanged.
 #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn device_cap(avail_bytes: usize, dev: &Device) -> usize {
     if dev.is_cpu() {
         avail_bytes
     } else {
-        let reserve_frac = (avail_bytes as f64 * GPU_RESERVE_FRACTION) as usize;
-        let reserve = reserve_frac.max(GPU_MIN_RESERVE_BYTES).min(avail_bytes);
+        let reserve_frac = (avail_bytes as f64 * gpu_reserve_fraction()) as usize;
+        let reserve = reserve_frac.max(gpu_min_reserve_bytes()).min(avail_bytes);
         avail_bytes.saturating_sub(reserve)
     }
 }
