@@ -415,12 +415,30 @@ impl NormalCache {
     /// The number of tokens to grow the cache by
     pub const CACHE_GROW_SIZE: usize = 512;
 
+    /// Tokens the KV cache is allocated and grown in, overridable with
+    /// `MISTRALRS_KV_CACHE_BLOCK`.
+    ///
+    /// This is the floor on KV memory: a sequence preallocates its cache rounded up to a
+    /// whole block. That is immaterial for ordinary GQA models, but a dense-MLA GGUF
+    /// materializes full per-head K/V, so one 512-token block can cost gigabytes per rank.
+    /// Lowering it trades a few more reallocations for a much smaller floor.
+    pub fn cache_grow_size() -> usize {
+        static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *SIZE.get_or_init(|| {
+            std::env::var("MISTRALRS_KV_CACHE_BLOCK")
+                .ok()
+                .and_then(|x| x.parse::<usize>().ok())
+                .filter(|x| *x > 0)
+                .unwrap_or(Self::CACHE_GROW_SIZE)
+        })
+    }
+
     pub fn new(len: usize, max_seq_len: usize) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Self(vec![
             KvCache::new_normal(
                 2,
                 max_seq_len,
-                Self::CACHE_GROW_SIZE
+                Self::cache_grow_size()
             );
             len
         ])))
@@ -436,7 +454,7 @@ impl NormalCache {
                 KvCache::new_rotating(
                     2,
                     sliding_window,
-                    Self::CACHE_GROW_SIZE
+                    Self::cache_grow_size()
                 );
                 len
             ]))),
@@ -444,7 +462,7 @@ impl NormalCache {
                 KvCache::new_normal(
                     2,
                     max_seq_len,
-                    Self::CACHE_GROW_SIZE
+                    Self::cache_grow_size()
                 );
                 len
             ]))),
@@ -456,10 +474,10 @@ impl NormalCache {
         for ty in types {
             match ty {
                 NormalCacheType::Normal { max_seq_len } => {
-                    caches.push(KvCache::new_normal(2, max_seq_len, Self::CACHE_GROW_SIZE));
+                    caches.push(KvCache::new_normal(2, max_seq_len, Self::cache_grow_size()));
                 }
                 NormalCacheType::SlidingWindow { window } => {
-                    caches.push(KvCache::new_rotating(2, window, Self::CACHE_GROW_SIZE));
+                    caches.push(KvCache::new_rotating(2, window, Self::cache_grow_size()));
                 }
                 NormalCacheType::Shared { owner } => {
                     caches.push(KvCache::new_shared(owner));

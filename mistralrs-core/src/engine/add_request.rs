@@ -566,8 +566,8 @@ impl Engine {
                     .as_ref()
                     .expect("If a model has a NormalCache it must have a model metadata");
                 let n_tokens = prompt_tokens.len();
-                let required_blocks = n_tokens.div_ceil(NormalCache::CACHE_GROW_SIZE);
-                let max_seq_len = required_blocks * NormalCache::CACHE_GROW_SIZE;
+                let required_blocks = n_tokens.div_ceil(NormalCache::cache_grow_size());
+                let max_seq_len = required_blocks * NormalCache::cache_grow_size();
                 let mut dtype = metadata.activation_dtype;
                 // matches the f16 conversion KvCache::append applies on CPU
                 if device.is_cpu()
