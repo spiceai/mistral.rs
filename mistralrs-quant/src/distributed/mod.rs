@@ -897,7 +897,11 @@ mod ring_ops {
             dims: &[usize],
             device: &Device,
         ) -> Result<Tensor> {
-            let nbytes = x.len() * std::mem::size_of_val(x);
+            // `size_of_val` on a slice is already `len * size_of::<T>()`; multiplying by
+            // `len` again asks the socket to send len^2 elements' worth of bytes from a
+            // buffer that only holds `len`, which faults (EFAULT) for any tensor bigger
+            // than one element.
+            let nbytes = std::mem::size_of_val(x);
 
             // --- ping‑pong to overlap latency ---------------------------------------
             // Clone the Arc references
@@ -1031,7 +1035,9 @@ mod ring_ops {
                 );
             }
             let elem_cnt = x.len();
-            let nbytes = elem_cnt * std::mem::size_of_val(x);
+            // See the note in SumAllReduce::run: `size_of_val` on a slice already accounts
+            // for its length.
+            let nbytes = std::mem::size_of_val(x);
 
             // Prepare output buffer that will hold slices from every rank.
             let mut out: Vec<T> = vec![T::default(); elem_cnt * self.world_size];
