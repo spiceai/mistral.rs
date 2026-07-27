@@ -23,7 +23,14 @@ fn cuda_topk(input: &Tensor, k: usize) -> Result<TopKOutput> {
     use candle_core::cuda_backend::CudaStorageSlice;
     use std::ffi::c_void;
 
-    let input = final_logits_row(input)?;
+    // NOT `final_logits_row`: that helper keeps only the *last* row and drops to rank 1,
+    // which is right for sampling from `[.., vocab]` logits but wrong for the generic
+    // last-dim topk this trait method promises. Routing every input through it silently
+    // discarded all rows but the last (so a MoE router would route every token by the last
+    // token's scores) and returned rank-1 indices, which then fail to `gather` against the
+    // rank-2 scores. The kernel already takes `nrows`, so batched input needs no reshaping;
+    // just match the CPU fallback and preserve the input's shape with the last dim = k.
+    let input = input.contiguous()?;
     let dims = input.dims();
     let ncols = *dims
         .last()
