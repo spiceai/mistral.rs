@@ -383,6 +383,33 @@ impl Loader for GGUFLoader {
             device_map::get_all_similar_devices(device)?
         };
 
+        // Distributed (ring) tensor parallelism. The safetensors pipelines build a real
+        // multi-rank communicator via `distributed::prepare_distributed_mapper`; the GGUF
+        // path has no such step, so without this every rank gets a single-rank
+        // (`world_size == 1`) mapper and loads the *full* model — OOMing on large MoE
+        // GGUFs. Mirror the ring branch of `prepare_distributed_mapper` here so
+        // `mapper.get_comm_for(..)` yields the real `world_size`, letting TP-capable GGUF
+        // models (glm-dsa expert-parallel MoE) shard across ranks.
+        let mut tp_world_size = 1;
+        if mistralrs_quant::distributed::use_ring() {
+            let ring = mistralrs_quant::RingConfig::load();
+            let comm = mistralrs_quant::Comm::from_device(
+                mistralrs_quant::Id::new(),
+                &available_devices[0],
+                ring.rank,
+                ring.world_size,
+            )?;
+            info!(
+                "GGUF ring tensor parallelism: rank {} of world size {}.",
+                ring.rank, ring.world_size
+            );
+            tp_world_size = ring.world_size;
+            mapper = DeviceMapSetting::Nccl {
+                nm_device: available_devices[0].clone(),
+                comm: Arc::new(comm),
+            };
+        }
+
         let pipeline_mapper = mapper.into_mapper(
             num_layers,
             device,
@@ -443,7 +470,12 @@ impl Loader for GGUFLoader {
             paged_attn_config
         };
 
-        let model_config_metadata: ContentConfig = (&model).into();
+        let mut model_config_metadata: ContentConfig = (&model).into();
+        if matches!(arch, GGUFArchitecture::GlmDsa) {
+            // glm-dsa is the only GGUF arch here with head-parallel attention, so it is the
+            // only one whose per-rank KV cache is narrower than the model's head count.
+            model_config_metadata.split_kv_heads(tp_world_size);
+        }
         let internal_dtype = mapper.get_min_dtype(dtype)?;
 
         let model_config = {

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, fs};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{Read, Seek},
+};
 
 use anyhow::Context;
 use candle_core::{
@@ -185,6 +189,104 @@ impl<'a, R: std::io::Seek + std::io::Read> Content<'a, R> {
         for (ct, reader) in self.contents.iter().zip(self.readers.iter_mut()) {
             if let Some(tensor_info) = ct.tensor_infos.get(name) {
                 return tensor_info.read(reader, ct.tensor_data_offset, device);
+            }
+        }
+        candle_core::bail!("Cannot find tensor info for {name}")
+    }
+
+    /// Retrieve a tensor sharded along its outer (dim-0) axis: only indices
+    /// `[start, start + len)` are read from disk and materialized on `device`, so a rank
+    /// never stages the whole tensor — essential on unified-memory GPUs where host and
+    /// device share the same DRAM.
+    ///
+    /// This is the loading primitive for tensor parallelism over GGUF weights. Candle
+    /// reverses GGUF's `ne` order, so dim 0 is the slowest-varying axis and each dim-0
+    /// index occupies a contiguous byte range; the slice therefore needs no dequantization
+    /// and no quant-block re-alignment (asserted below). Two uses:
+    ///   - stacked routed-expert tensors, where dim 0 is the expert index
+    ///     (`[n_experts, out, in]`), giving expert parallelism;
+    ///   - column-parallel linears, where dim 0 is the output-feature axis
+    ///     (`[out, in]`), giving each rank a slice of the output features.
+    ///
+    /// Requesting the full extent falls back to an ordinary read.
+    pub fn tensor_dim0_shard(
+        &mut self,
+        name: &str,
+        start: usize,
+        len: usize,
+        device: &Device,
+    ) -> Result<QTensor> {
+        self.read_dim0_range(name, start, len, true, device)
+    }
+
+    fn read_dim0_range(
+        &mut self,
+        name: &str,
+        start: usize,
+        len: usize,
+        keep_outer: bool,
+        device: &Device,
+    ) -> Result<QTensor> {
+        for (ct, reader) in self.contents.iter().zip(self.readers.iter_mut()) {
+            if let Some(info) = ct.tensor_infos.get(name) {
+                let dims = info.shape.dims();
+                if dims.is_empty() {
+                    candle_core::bail!("cannot shard {name}: tensor has no dimensions");
+                }
+                if !keep_outer && dims.len() < 2 {
+                    candle_core::bail!(
+                        "cannot index {name} along dim 0: rank {} leaves no trailing dimensions",
+                        dims.len()
+                    );
+                }
+                let outer = dims[0];
+                if start + len > outer {
+                    candle_core::bail!(
+                        "shard [{start}, {}) of {name} is out of range for outer dimension {outer}",
+                        start + len
+                    );
+                }
+                if keep_outer && start == 0 && len == outer {
+                    return info.read(reader, ct.tensor_data_offset, device);
+                }
+                let block_size = info.ggml_dtype.block_size();
+                let type_size = info.ggml_dtype.type_size();
+                let elems_per_index = info.shape.elem_count() / outer;
+                if elems_per_index % block_size != 0 {
+                    candle_core::bail!(
+                        "cannot shard {name}: per-index element count {elems_per_index} is not divisible by block size {block_size}"
+                    );
+                }
+                let bytes_per_index = elems_per_index / block_size * type_size;
+                let shard_start = ct
+                    .tensor_data_offset
+                    .saturating_add(info.offset)
+                    .saturating_add((start * bytes_per_index) as u64);
+                let shard_bytes = len * bytes_per_index;
+
+                let file_size = reader.seek(std::io::SeekFrom::End(0))?;
+                if shard_start.saturating_add(shard_bytes as u64) > file_size {
+                    candle_core::bail!(
+                        "shard of {name} needs {shard_bytes} bytes at offset {shard_start}, exceeds file size {file_size}"
+                    );
+                }
+                let mut raw = vec![0u8; shard_bytes];
+                reader.seek(std::io::SeekFrom::Start(shard_start))?;
+                reader.read_exact(&mut raw)?;
+
+                let shard_dims = if keep_outer {
+                    let mut d = dims.to_vec();
+                    d[0] = len;
+                    d
+                } else {
+                    dims[1..].to_vec()
+                };
+                return candle_core::quantized::ggml_file::qtensor_from_ggml(
+                    info.ggml_dtype,
+                    &raw,
+                    shard_dims,
+                    device,
+                );
             }
         }
         candle_core::bail!("Cannot find tensor info for {name}")

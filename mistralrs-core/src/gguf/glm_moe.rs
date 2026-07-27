@@ -14,13 +14,28 @@
 //! per-layer `indexer.*` tensors and the `nextn.*` (MTP) tensors are therefore loaded
 //! by name but intentionally skipped — they are not consumed by the dense forward.
 //!
+//! Tensor parallelism: under a multi-rank communicator this loads *sharded*, since the whole
+//! model does not fit one device. Three axes are split, all of them dim-0 slices — contiguous
+//! byte ranges in GGUF, so they need no dequantization or quant-block re-alignment (see
+//! [`Content::tensor_dim0_shard`]), and each rank reads only its own slice off disk:
+//!   - routed experts, by expert index;
+//!   - attention, by head (`attn_q_b`/`attn_k_b`/`attn_v_b`), which also narrows the KV cache
+//!     to this rank's heads;
+//!   - `o_proj`, by output feature.
+//!
+//! The shared/dense MLPs stay replicated. Because attention and `o_proj` are split along
+//! *different* axes, `forward_attn` reduces the per-head outputs together before applying
+//! `o_proj` and then reduces its output shards — see [`all_gather_by_sum`], which uses the
+//! sum-only ring collective as an all-gather. The routed MoE output is reduced the same way.
+//!
 //! Structure mirrors `models::quantized_qwen3_moe` (GGUF reading idioms, `GgufMatMul`,
 //! the block loop, KV cache) and `models::deepseek3` (the MLA attention forward and the
-//! sigmoid/bias/group MoE gate). Routed experts are built as [`GgufMatMul`] and run
-//! through `QuantMethod::gather_forward`, so i-quant expert dtypes (IQ1_S / IQ1_M /
-//! IQ2_XXS / IQ3_XXS / IQ4_XS) flow through the i-quant gather fallback in
-//! `mistralrs-quant/src/gguf/cuda.rs` (dequantize-per-expert), rather than candle's
-//! fused `QMatMul::indexed_moe_forward` (which has no i-quant kernel).
+//! sigmoid/bias/group MoE gate). Routed experts are stored in small groups (see
+//! [`expert_group`]) and dispatched by bucketing tokens per group on the host, rather than as
+//! one stacked tensor per projection. That is deliberate: i-quant expert dtypes (IQ1_S /
+//! IQ1_M / IQ2_XXS / IQ3_XXS / IQ4_XS) have no fused indexed-MoE kernel, so
+//! `QuantMethod::gather_forward` falls back to dequantizing whichever tensor it is handed —
+//! for one stacked shard that is the entire local expert stack (gigabytes of f32 per call).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,10 +55,77 @@ use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::{new_multi_progress, NiceProgressBar};
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::{Embedding, Module};
-use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig};
+use mistralrs_quant::{GgufMatMul, QuantMethod, QuantMethodConfig, SumAllReduce};
 
 // Default fallback for models that don't specify context_length.
 const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
+
+/// How many routed experts share one stacked tensor.
+///
+/// Two costs pull in opposite directions here. i-quant experts have no fused indexed-MoE
+/// kernel, so a forward dequantizes whichever stacked tensor it touches — smaller groups
+/// waste less dequantization work, since only the experts a token routed to get expanded.
+/// But CUDA rounds allocations up to a ~2MB granularity, and one tensor per expert (~3MB
+/// each here) wastes 25-40% of *resident* memory across the tens of thousands of tensors a
+/// 256-expert model needs, which is tens of gigabytes and does not fit. Grouping keeps each
+/// allocation comfortably above that granularity while bounding the transient dequantization
+/// to this many experts.
+const EXPERT_GROUP_DEFAULT: usize = 8;
+
+/// [`EXPERT_GROUP_DEFAULT`], overridable with `MISTRALRS_EXPERT_GROUP` so the memory/compute
+/// balance can be retuned for a given box without a rebuild.
+fn expert_group() -> usize {
+    static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("MISTRALRS_EXPERT_GROUP")
+            .ok()
+            .and_then(|x| x.parse::<usize>().ok())
+            .filter(|x| *x > 0)
+            .unwrap_or(EXPERT_GROUP_DEFAULT)
+    })
+}
+
+/// Uniform tensor-parallel split of `total` items over `world_size` ranks; returns this
+/// rank's `(offset, len)`. A single rank owns everything.
+fn tp_split(total: usize, rank: usize, world_size: usize, what: &str) -> Result<(usize, usize)> {
+    if world_size <= 1 {
+        return Ok((0, total));
+    }
+    if total % world_size != 0 {
+        candle_core::bail!(
+            "{what} ({total}) is not divisible by the tensor-parallel world size {world_size}"
+        );
+    }
+    let len = total / world_size;
+    Ok((rank * len, len))
+}
+
+/// Rebuild a full `[batch, seq, total]` tensor from per-rank column shards: pad this rank's
+/// slice into its place with zeros and sum across the group. Every column is produced by
+/// exactly one rank, so the sum is exactly the concatenation of the shards — which lets the
+/// sum-only ring collective stand in for an all-gather.
+fn all_gather_by_sum(
+    all_reduce: &SumAllReduce,
+    shard: Tensor,
+    offset: usize,
+    total: usize,
+) -> Result<Tensor> {
+    let (b_sz, seq_len, len) = shard.dims3()?;
+    if len == total {
+        return Ok(shard);
+    }
+    let (dtype, device) = (shard.dtype(), shard.device().clone());
+    let mut parts = Vec::with_capacity(3);
+    if offset > 0 {
+        parts.push(Tensor::zeros((b_sz, seq_len, offset), dtype, &device)?);
+    }
+    parts.push(shard);
+    let trailing = total - offset - len;
+    if trailing > 0 {
+        parts.push(Tensor::zeros((b_sz, seq_len, trailing), dtype, &device)?);
+    }
+    all_reduce.sum_all_reduce(&Tensor::cat(&parts, D::Minus1)?.contiguous()?)
+}
 
 fn gguf_linear(qt: candle_core::quantized::QTensor) -> Result<Arc<dyn QuantMethod>> {
     Ok(Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
@@ -105,12 +187,27 @@ impl MoeGate {
 }
 
 /// Routed MoE: top-k experts (i-quant-capable gather) + a single shared expert.
+/// One group of routed experts: `[group_len, out, in]` per projection.
+struct ExpertGroup {
+    gate: Arc<dyn QuantMethod>,
+    up: Arc<dyn QuantMethod>,
+    down: Arc<dyn QuantMethod>,
+}
+
 struct Moe {
     gate: MoeGate,
-    gate_experts: Arc<dyn QuantMethod>,
-    up_experts: Arc<dyn QuantMethod>,
-    down_experts: Arc<dyn QuantMethod>,
+    /// The routed experts this rank owns, in groups of [`expert_group`] rather than one
+    /// stacked tensor: the i-quant fallback dequantizes whatever tensor it is handed, and
+    /// the whole local stack would be ~6.4GB of f32 per call.
+    expert_groups: Vec<ExpertGroup>,
     shared: Mlp,
+    // Expert-parallel tensor parallelism: this rank owns routed experts
+    // `[experts_offset, experts_offset + n_local_experts)`. When `world_size == 1` it owns
+    // them all and `all_reduce` is a no-op.
+    all_reduce: SumAllReduce,
+    world_size: usize,
+    experts_offset: usize,
+    n_local_experts: usize,
 }
 
 impl Moe {
@@ -121,21 +218,65 @@ impl Moe {
         let (topk_idx, topk_weight) = self.gate.forward(xs)?;
 
         let num_tokens = bs * seq_len;
-        let xs_flat = xs.reshape((num_tokens, 1, hidden))?;
+        let xs_flat = xs.reshape((num_tokens, hidden))?;
 
-        // gather_forward -> qmatmul_indexed_moe_forward (i-quant fallback lives there).
-        let gate = self.gate_experts.gather_forward(&xs_flat, &topk_idx)?;
-        let up = self.up_experts.gather_forward(&xs_flat, &topk_idx)?;
-        let activated = crate::ops::mul_and_act(&gate, &up, crate::layers::Activation::Silu)?;
-        let ys = self.down_experts.gather_forward(&activated, &topk_idx)?;
+        // Resolve the routing on the host and bucket the (token, weight) pairs by the local
+        // expert that owns them. Experts that live on another rank are simply skipped: each
+        // expert is resident on exactly one rank, so the all-reduce below sums this rank's
+        // partial contribution with the peers' to recover the full routed output.
+        let selected = topk_idx.to_dtype(DType::U32)?.to_vec2::<u32>()?;
+        let scores = topk_weight.to_dtype(DType::F32)?.to_vec2::<f32>()?;
+        // (token, index within the group, routing weight), bucketed per expert group.
+        let mut buckets: Vec<Vec<(u32, u32, f32)>> = vec![Vec::new(); self.expert_groups.len()];
+        for (token, (token_experts, token_scores)) in selected.iter().zip(scores.iter()).enumerate()
+        {
+            for (expert, score) in token_experts.iter().zip(token_scores.iter()) {
+                let expert = *expert as usize;
+                if expert < self.experts_offset
+                    || expert >= self.experts_offset + self.n_local_experts
+                {
+                    continue;
+                }
+                let local = expert - self.experts_offset;
+                buckets[local / expert_group()].push((
+                    token as u32,
+                    (local % expert_group()) as u32,
+                    *score,
+                ));
+            }
+        }
 
-        // Weight by routing scores and sum over the selected experts.
-        let topk_weight = topk_weight.to_dtype(ys.dtype())?;
-        let routed = ys
-            .broadcast_mul(&topk_weight.unsqueeze(D::Minus1)?)?
-            .sum(D::Minus2)?
-            .reshape((bs, seq_len, hidden))?;
+        // Touch only the groups something actually routed to, each over just its own tokens.
+        let mut routed = Tensor::zeros((num_tokens, hidden), xs.dtype(), xs.device())?;
+        for (group_idx, bucket) in buckets.iter().enumerate() {
+            if bucket.is_empty() {
+                continue;
+            }
+            let group = &self.expert_groups[group_idx];
+            let rows = Tensor::from_iter(bucket.iter().map(|(token, _, _)| *token), xs.device())?;
+            let ids = Tensor::from_iter(bucket.iter().map(|(_, expert, _)| *expert), xs.device())?
+                .reshape((bucket.len(), 1))?;
+            let weights = Tensor::from_iter(bucket.iter().map(|(_, _, score)| *score), xs.device())?
+                .reshape((bucket.len(), 1))?;
+            // `gather_forward` takes [n_rows, experts_per_row, cols] activations against
+            // [n_rows, experts_per_row] ids; one expert per row here.
+            let group_in = xs_flat.index_select(&rows, 0)?.unsqueeze(1)?;
+            let gate_out = group.gate.gather_forward(&group_in, &ids)?;
+            let up_out = group.up.gather_forward(&group_in, &ids)?;
+            let act = crate::ops::mul_and_act(&gate_out, &up_out, crate::layers::Activation::Silu)?;
+            let group_out = group.down.gather_forward(&act, &ids)?.squeeze(1)?;
+            let group_out = group_out.broadcast_mul(&weights.to_dtype(group_out.dtype())?)?;
+            routed = routed.index_add(&rows, &group_out.to_dtype(routed.dtype())?, 0)?;
+        }
+        let mut routed = routed.reshape((bs, seq_len, hidden))?;
 
+        // Sum the per-rank partial routed contributions across the tensor-parallel group.
+        if self.world_size > 1 {
+            routed = self.all_reduce.sum_all_reduce(&routed.contiguous()?)?;
+        }
+
+        // The shared expert is replicated on every rank (added after the all-reduce so it
+        // is counted once, not once per rank).
         routed + self.shared.forward(&identity)?
     }
 }
@@ -163,23 +304,34 @@ struct LayerWeights {
     // KV path: down-proj (to kv_lora + rope) -> RMSNorm on the kv_lora part.
     kv_a_proj_with_mqa: Arc<dyn QuantMethod>,
     kv_a_norm: QRmsNorm,
-    // Latent K/V up-projections, per head, dequantized to f32 at load.
-    // k_b: [n_head, kv_lora, qk_nope]   (k_nope = ckv @ k_b[h])
-    // v_b_t: [n_head, kv_lora, v_head]  (v      = ckv @ v_b_t[h])
+    // Latent K/V up-projections, for this rank's heads, dequantized to the model dtype.
+    // k_b: [n_head_local, kv_lora, qk_nope]   (k_nope = ckv @ k_b[h])
+    // v_b_t: [n_head_local, kv_lora, v_head]  (v      = ckv @ v_b_t[h])
     k_b: Tensor,
     v_b_t: Tensor,
+    // Column-parallel: holds output features [o_out_offset, o_out_offset + o_out_len) of
+    // o_out_total, reduced back to the full hidden size in `forward_attn`.
     o_proj: Arc<dyn QuantMethod>,
+    o_all_reduce: SumAllReduce,
+    o_world_size: usize,
+    o_out_offset: usize,
+    o_out_total: usize,
 
     attn_norm: QRmsNorm,
     ffn_norm: QRmsNorm,
     mlp: MoeOrMlp,
 
     rotary: Arc<RotaryEmbedding>,
+    /// Global attention head count; `n_head_local` of them live on this rank, starting at
+    /// `head_offset`. Head-parallel attention halves both the Q/K/V up-projections and the
+    /// KV cache, at the cost of one extra reduction to reassemble the per-head outputs
+    /// before `o_proj` (which is sharded along a different axis and needs all heads).
     n_head: usize,
+    n_head_local: usize,
+    head_offset: usize,
     kv_lora_rank: usize,
     qk_nope_head_dim: usize,
     qk_rope_head_dim: usize,
-    #[allow(dead_code)]
     v_head_dim: usize,
     sdpa_params: SdpaParams,
     dtype: DType,
@@ -199,7 +351,7 @@ impl LayerWeights {
         // --- Query: x -> q_a -> norm -> q_b -> [b, n_head, s, q_head_dim] ---
         let q = self.q_b_proj.forward(&self.q_a_norm.forward(&self.q_a_proj.forward(x)?)?)?;
         let q = q
-            .reshape((b_sz, seq_len, self.n_head, q_head_dim))?
+            .reshape((b_sz, seq_len, self.n_head_local, q_head_dim))?
             .transpose(1, 2)?;
         let q_nope = q.narrow(D::Minus1, 0, self.qk_nope_head_dim)?;
         let q_pe = q.narrow(D::Minus1, self.qk_nope_head_dim, self.qk_rope_head_dim)?;
@@ -230,7 +382,8 @@ impl LayerWeights {
 
         // --- Assemble full Q, K (broadcast k_pe across heads) ---
         let q = Tensor::cat(&[&q_nope, &q_pe], D::Minus1)?.contiguous()?; // [b, n_head, s, q_head_dim]
-        let k_pe_full = k_pe.broadcast_as((b_sz, self.n_head, seq_len, self.qk_rope_head_dim))?;
+        let k_pe_full =
+            k_pe.broadcast_as((b_sz, self.n_head_local, seq_len, self.qk_rope_head_dim))?;
         let k = Tensor::cat(&[&k_nope, &k_pe_full], D::Minus1)?.contiguous()?; // [b, n_head, s, q_head_dim]
 
         let (q, k, v) = (
@@ -249,7 +402,28 @@ impl LayerWeights {
         } else {
             y.reshape((b_sz, seq_len, ()))?
         };
-        self.o_proj.forward(&y.to_dtype(x.dtype())?)
+        // `o_proj` is sharded by output feature, so it needs *every* head's slice of the
+        // attention output — reassemble those first. (Sharding both by head and by output
+        // feature would make each rank hold a partial product of two different axes, which
+        // no single sum can reconstruct, hence the separate reduction here.)
+        let y = if self.o_world_size > 1 {
+            all_gather_by_sum(
+                &self.o_all_reduce,
+                y,
+                self.head_offset * self.v_head_dim,
+                self.n_head * self.v_head_dim,
+            )?
+        } else {
+            y
+        };
+
+        let y = self.o_proj.forward(&y.to_dtype(x.dtype())?)?;
+
+        // Then rebuild the full hidden vector from the column-parallel o_proj shards.
+        if self.o_world_size > 1 {
+            return all_gather_by_sum(&self.o_all_reduce, y, self.o_out_offset, self.o_out_total);
+        }
+        Ok(y)
     }
 }
 
@@ -403,7 +577,14 @@ impl ModelConfig::FromGGUF for ModelWeights {
 
         let q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
 
-        let tok_embeddings = ct.tensor("token_embd.weight", device)?.dequantize(device)?;
+        // Dequantize to the model dtype rather than leaving the f32 that `dequantize`
+        // returns: this matrix is vocab x hidden (~0.95B params for GLM-5.2), so f32 costs
+        // ~3.5GB of device memory against ~1.8GB at bf16, and the embedding output is cast
+        // to `dtype` on the very first use anyway.
+        let tok_embeddings = ct
+            .tensor("token_embd.weight", device)?
+            .dequantize(device)?
+            .to_dtype(dtype)?;
         let norm = QRmsNorm::new(ct.tensor("output_norm.weight", device)?, rms_norm_eps)?;
         let output = if ct.has_tensor("output.weight") {
             ct.tensor("output.weight", device)?
@@ -442,13 +623,30 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 .expect("No RoPE for device location!")
                 .clone();
 
+            // Per-layer tensor-parallel communicator. Under ring/NCCL distributed this
+            // reports the real `world_size`; otherwise it is a single-rank no-op.
+            let comm = mapper.get_comm_for(layer_idx)?;
+            let rank = comm.rank();
+            let world_size = comm.world_size();
+
             // --- Attention (MLA) ---
             let q_a_proj = gguf_linear(ct.tensor(&format!("{prefix}.attn_q_a.weight"), device)?)?;
             let q_a_norm = QRmsNorm::new(
                 ct.tensor(&format!("{prefix}.attn_q_a_norm.weight"), device)?,
                 rms_norm_eps,
             )?;
-            let q_b_proj = gguf_linear(ct.tensor(&format!("{prefix}.attn_q_b.weight"), device)?)?;
+            // Head-parallel attention: this rank owns heads
+            // [head_offset, head_offset + n_head_local). `attn_q_b` has candle dims
+            // [n_head * q_head_dim, q_lora_rank] with the head axis outermost, so a head range
+            // is a contiguous dim-0 slice; `attn_k_b`/`attn_v_b` are indexed by head directly.
+            let (head_offset, n_head_local) =
+                tp_split(head_count, rank, world_size, "glm-dsa attention head count")?;
+            let q_b_proj = gguf_linear(ct.tensor_dim0_shard(
+                &format!("{prefix}.attn_q_b.weight"),
+                head_offset * q_head_dim,
+                n_head_local * q_head_dim,
+                device,
+            )?)?;
             let kv_a_proj_with_mqa =
                 gguf_linear(ct.tensor(&format!("{prefix}.attn_kv_a_mqa.weight"), device)?)?;
             let kv_a_norm = QRmsNorm::new(
@@ -460,12 +658,18 @@ impl ModelConfig::FromGGUF for ModelWeights {
             // [n_head, kv_lora, *] so K_nope/V = ckv @ W per head.
             //   k_b GGUF candle dims = [n_head, kv_lora, qk_nope] (already [h, kv_lora, qk_nope]).
             //   v_b GGUF candle dims = [n_head, v_head, kv_lora]  -> transpose last two to [h, kv_lora, v_head].
+            // Kept at the model dtype, not the f32 `dequantize` returns: across 79 layers
+            // these two are ~1.16B params, i.e. ~4.6GB at f32 versus ~2.3GB at bf16. The
+            // forward previously cast them to the activation dtype on every call, so
+            // storing them cast also removes that per-forward conversion.
             let k_b = ct
                 .tensor(&format!("{prefix}.attn_k_b.weight"), device)?
-                .dequantize(device)?;
+                .dequantize(device)?
+                .to_dtype(dtype)?;
             let v_b = ct
                 .tensor(&format!("{prefix}.attn_v_b.weight"), device)?
-                .dequantize(device)?;
+                .dequantize(device)?
+                .to_dtype(dtype)?;
             // Validate the assumed layout against the metadata-derived dims.
             {
                 let kd = k_b.dims();
@@ -481,10 +685,24 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     );
                 }
             }
-            let v_b_t = v_b.transpose(1, 2)?.contiguous()?; // [n_head, kv_lora, v_head]
+            // Keep only this rank's heads (narrowing after dequantize: the transient is the
+            // full tensor, but only the shard stays resident).
+            let k_b = k_b.narrow(0, head_offset, n_head_local)?.contiguous()?;
+            let v_b = v_b.narrow(0, head_offset, n_head_local)?;
+            let v_b_t = v_b.transpose(1, 2)?.contiguous()?; // [n_head_local, kv_lora, v_head]
 
+            // Column-parallel o_proj. Candle dims are [hidden_out, n_head * v_head_dim], so
+            // dim 0 is the output-feature axis: each rank owns a contiguous slice of the
+            // output hidden features of what is the largest attention tensor (~5.1GB summed
+            // over layers). Its input axis is every head's output, which head-parallel
+            // attention leaves split across ranks, so `forward_attn` reduces those together
+            // first and then zero-pads and sums these output shards.
+            let o_proj_name = format!("{prefix}.attn_output.weight");
+            let o_out_total = ct.tensor_info(&o_proj_name)?.shape.dims()[0];
+            let (o_out_offset, o_out_len) =
+                tp_split(o_out_total, rank, world_size, "attn_output output features")?;
             let o_proj =
-                gguf_linear(ct.tensor(&format!("{prefix}.attn_output.weight"), device)?)?;
+                gguf_linear(ct.tensor_dim0_shard(&o_proj_name, o_out_offset, o_out_len, device)?)?;
 
             // --- FFN: leading dense layers vs MoE layers ---
             let mlp = if layer_idx < leading_dense_block_count {
@@ -509,12 +727,41 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     weights_norm: expert_weights_norm,
                     weights_scale: expert_weights_scale,
                 };
-                let gate_experts =
-                    gguf_linear(ct.tensor(&format!("{prefix}.ffn_gate_exps.weight"), device)?)?;
-                let up_experts =
-                    gguf_linear(ct.tensor(&format!("{prefix}.ffn_up_exps.weight"), device)?)?;
-                let down_experts =
-                    gguf_linear(ct.tensor(&format!("{prefix}.ffn_down_exps.weight"), device)?)?;
+                // Expert-parallel: each rank loads only its slice of the routed experts
+                // (`n_experts / world_size`), reading just those bytes off disk so the
+                // full expert stack is never materialized on any single device.
+                let gate_exps_name = format!("{prefix}.ffn_gate_exps.weight");
+                let up_exps_name = format!("{prefix}.ffn_up_exps.weight");
+                let down_exps_name = format!("{prefix}.ffn_down_exps.weight");
+                let n_experts = ct.tensor_info(&gate_exps_name)?.shape.dims()[0];
+                let (experts_offset, n_local_experts) =
+                    tp_split(n_experts, rank, world_size, "glm-dsa expert count")?;
+                let mut expert_groups = Vec::with_capacity(n_local_experts.div_ceil(expert_group()));
+                let mut group_start = experts_offset;
+                while group_start < experts_offset + n_local_experts {
+                    let len = expert_group().min(experts_offset + n_local_experts - group_start);
+                    expert_groups.push(ExpertGroup {
+                        gate: gguf_linear(ct.tensor_dim0_shard(
+                            &gate_exps_name,
+                            group_start,
+                            len,
+                            device,
+                        )?)?,
+                        up: gguf_linear(ct.tensor_dim0_shard(
+                            &up_exps_name,
+                            group_start,
+                            len,
+                            device,
+                        )?)?,
+                        down: gguf_linear(ct.tensor_dim0_shard(
+                            &down_exps_name,
+                            group_start,
+                            len,
+                            device,
+                        )?)?,
+                    });
+                    group_start += len;
+                }
                 let shared = Mlp {
                     gate: gguf_linear(
                         ct.tensor(&format!("{prefix}.ffn_gate_shexp.weight"), device)?,
@@ -526,10 +773,12 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 };
                 MoeOrMlp::Moe(Box::new(Moe {
                     gate,
-                    gate_experts,
-                    up_experts,
-                    down_experts,
+                    expert_groups,
                     shared,
+                    all_reduce: SumAllReduce::new(&comm),
+                    world_size,
+                    experts_offset,
+                    n_local_experts,
                 }))
             };
 
@@ -555,11 +804,17 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 k_b,
                 v_b_t,
                 o_proj,
+                o_all_reduce: SumAllReduce::new(&comm),
+                o_world_size: world_size,
+                o_out_offset,
+                o_out_total,
                 attn_norm,
                 ffn_norm,
                 mlp,
                 rotary: rotary.clone(),
                 n_head: head_count,
+                n_head_local,
+                head_offset,
                 kv_lora_rank,
                 qk_nope_head_dim,
                 qk_rope_head_dim,
@@ -597,7 +852,12 @@ impl ModelWeights {
         context_lens: Vec<(usize, usize)>,
         _metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        let mut layer_in = self.tok_embeddings.forward(x)?;
+        // The embedding table is stored at `dtype` (bf16) to halve its footprint, but the
+        // residual stream is f32 — every `QRmsNorm` weight is a dequantized f32 tensor, and
+        // `rms_norm` is an elementwise op2 that requires both operands to share a dtype. So
+        // bring the looked-up rows back to f32 here. This gives up no memory: the saving is
+        // in the table itself, whereas this activation is only [batch, seq, hidden].
+        let mut layer_in = self.tok_embeddings.forward(x)?.to_dtype(DType::F32)?;
         let cache = &mut self.cache.normal().0;
         let mask = CausalMasker.make_causal_mask(
             x,

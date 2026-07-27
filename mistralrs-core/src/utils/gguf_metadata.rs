@@ -15,6 +15,10 @@ use crate::pipeline::AutoDeviceMapParams;
 use crate::pipeline::DeviceMappedModelLoader;
 use crate::GGUFArchitecture;
 
+/// Per-head decompressed K/V width for `glm-dsa` when the GGUF omits the `*_mla` keys.
+/// Matches the default in [`crate::gguf::glm_moe`].
+const GLM_DSA_DEFAULT_MLA_HEAD_DIM: usize = 256;
+
 #[derive(Debug)]
 pub struct ContentConfig {
     max_seq_len: usize,
@@ -31,6 +35,39 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
     fn from(value: &Content<'a, R>) -> Self {
         let metadata = value.get_metadata();
         let arch = metadata["general.architecture"].to_string().unwrap();
+        let num_attn_heads = metadata[&format!("{arch}.attention.head_count")]
+            .to_u64()
+            .unwrap() as usize;
+        let mut num_kv_heads = metadata[&format!("{arch}.attention.head_count_kv")]
+            .to_u64()
+            .unwrap() as usize;
+        let mut key_length = metadata
+            .get(&format!("{arch}.attention.key_length"))
+            .map(|x| x.to_u64().unwrap() as usize);
+        let mut value_length = metadata
+            .get(&format!("{arch}.attention.value_length"))
+            .map(|x| x.to_u64().unwrap() as usize);
+
+        // `glm-dsa` (GLM-4.x/5.x MoE) is a Multi-head Latent Attention model, but this GGUF
+        // loader evaluates it DENSE: `gguf::glm_moe` reconstructs full per-head K/V from the
+        // compressed latent and caches *those*. The GGUF's `head_count_kv` (1) and
+        // `key_length` describe the compressed latent instead, so reporting them verbatim
+        // sizes the preallocated KV cache as a single head of the wrong width, and the
+        // model's `KvCache::append` then fails on a shape mismatch. Report what is actually
+        // cached: one entry per attention head, `key_length_mla`/`value_length_mla` wide.
+        if arch == "glm-dsa" {
+            let mla_dim = |key: &str| {
+                metadata
+                    .get(&format!("{arch}.attention.{key}"))
+                    .and_then(|x| x.to_u64().ok())
+                    .map(|x| x as usize)
+                    .unwrap_or(GLM_DSA_DEFAULT_MLA_HEAD_DIM)
+            };
+            num_kv_heads = num_attn_heads;
+            key_length = Some(mla_dim("key_length_mla"));
+            value_length = Some(mla_dim("value_length_mla"));
+        }
+
         Self {
             max_seq_len: metadata[&format!("{arch}.context_length")]
                 .to_u64()
@@ -38,19 +75,24 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
             hidden_size: metadata[&format!("{arch}.embedding_length")]
                 .to_u64()
                 .unwrap() as usize,
-            num_attn_heads: metadata[&format!("{arch}.attention.head_count")]
-                .to_u64()
-                .unwrap() as usize,
-            num_kv_heads: metadata[&format!("{arch}.attention.head_count_kv")]
-                .to_u64()
-                .unwrap() as usize,
+            num_attn_heads,
+            num_kv_heads,
             num_layers: metadata[&format!("{arch}.block_count")].to_u64().unwrap() as usize,
-            key_length: metadata
-                .get(&format!("{arch}.attention.key_length"))
-                .map(|x| x.to_u64().unwrap() as usize),
-            value_length: metadata
-                .get(&format!("{arch}.attention.value_length"))
-                .map(|x| x.to_u64().unwrap() as usize),
+            key_length,
+            value_length,
+        }
+    }
+}
+
+impl ContentConfig {
+    /// Divide the KV head count by the tensor-parallel world size.
+    ///
+    /// The preallocated per-sequence KV cache is shaped from this, and under head-parallel
+    /// attention each rank only ever caches its own heads, so reporting the global count
+    /// would both over-allocate and mismatch what the model appends.
+    pub fn split_kv_heads(&mut self, world_size: usize) {
+        if world_size > 1 && self.num_kv_heads % world_size == 0 {
+            self.num_kv_heads /= world_size;
         }
     }
 }
