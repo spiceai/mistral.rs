@@ -85,18 +85,21 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
 }
 
 impl ContentConfig {
-    /// Divide the KV head count by the tensor-parallel world size.
+    /// Narrow the KV head count to *this rank's* share under tensor parallelism.
     ///
-    /// The preallocated per-sequence KV cache is shaped from this, and under head-parallel
-    /// attention each rank only ever caches its own heads, so reporting the global count
-    /// would both over-allocate and mismatch what the model appends.
-    pub fn split_kv_heads(&mut self, world_size: usize) {
+    /// The preallocated per-sequence KV cache is shaped from this, and the engine also
+    /// derives its prefill key/value head count from it, so it has to match exactly what
+    /// this rank's attention produces. Under head-parallel attention that is this rank's
+    /// own slice — neither the global count (which over-allocates and mismatches on every
+    /// rank) nor the widest rank's count (which mismatches on the narrow ranks whenever
+    /// the world size does not divide the head count).
+    pub fn split_kv_heads(&mut self, rank: usize, world_size: usize) {
         if world_size > 1 && self.num_kv_heads >= world_size {
-            // Uneven splits hand the first `num_kv_heads % world_size` ranks one extra
-            // head, so plan against the ceiling: that is the widest per-rank KV cache.
-            // Keeping the un-split count instead would size the cache for the whole model
-            // on every rank and skew the device map by a factor of the world size.
-            self.num_kv_heads = self.num_kv_heads.div_ceil(world_size);
+            // Same split as the loader's `tp_split`: the first `num_kv_heads % world_size`
+            // ranks take one extra head.
+            let base = self.num_kv_heads / world_size;
+            let remainder = self.num_kv_heads % world_size;
+            self.num_kv_heads = base + usize::from(rank < remainder);
         }
     }
 }
@@ -841,5 +844,64 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
     fn model_config(&self, _config: &str) -> Result<Box<dyn ModelConfigLike>> {
         let model_config_metadata: ContentConfig = self.model.into();
         Ok(Box::new(model_config_metadata))
+    }
+}
+
+#[cfg(test)]
+mod split_kv_heads_tests {
+    use super::ContentConfig;
+
+    fn config(num_kv_heads: usize) -> ContentConfig {
+        ContentConfig {
+            max_seq_len: 4096,
+            hidden_size: 6144,
+            num_attn_heads: num_kv_heads,
+            num_kv_heads,
+            num_layers: 78,
+            key_length: Some(256),
+            value_length: Some(256),
+        }
+    }
+
+    /// Each rank must report exactly the heads it owns: the engine shapes its prefill KV
+    /// path from this, so a rank claiming one head more than it computes fails the first
+    /// prompt step with a dim-1 shape mismatch.
+    #[test]
+    fn reports_each_rank_its_own_share() {
+        // 64 heads over 3 ranks is the split that has a remainder: 22, 21, 21.
+        let shares: Vec<usize> = (0..3)
+            .map(|rank| {
+                let mut cfg = config(64);
+                cfg.split_kv_heads(rank, 3);
+                cfg.num_kv_heads
+            })
+            .collect();
+        assert_eq!(shares, vec![22, 21, 21]);
+        assert_eq!(shares.iter().sum::<usize>(), 64);
+    }
+
+    #[test]
+    fn is_a_no_op_without_tensor_parallelism() {
+        let mut cfg = config(64);
+        cfg.split_kv_heads(0, 1);
+        assert_eq!(cfg.num_kv_heads, 64);
+    }
+
+    #[test]
+    fn leaves_head_counts_smaller_than_the_world_alone() {
+        // Fewer heads than ranks cannot be split; the loader rejects that case, and this
+        // must not silently report zero heads in the meantime.
+        let mut cfg = config(2);
+        cfg.split_kv_heads(0, 3);
+        assert_eq!(cfg.num_kv_heads, 2);
+    }
+
+    #[test]
+    fn divides_evenly_when_the_world_size_divides_the_heads() {
+        for rank in 0..4 {
+            let mut cfg = config(64);
+            cfg.split_kv_heads(rank, 4);
+            assert_eq!(cfg.num_kv_heads, 16, "rank {rank}");
+        }
     }
 }

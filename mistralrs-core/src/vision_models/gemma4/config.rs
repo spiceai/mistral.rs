@@ -163,7 +163,10 @@ impl Gemma4TextConfig {
 mod tests {
     use super::*;
 
-    fn minimal_text_config(num_hidden_layers: usize, sliding_window_pattern: usize) -> Gemma4TextConfig {
+    fn minimal_text_config(
+        num_hidden_layers: usize,
+        sliding_window_pattern: usize,
+    ) -> Gemma4TextConfig {
         serde_json::from_str(&format!(
             r#"{{"hidden_size":3072,"intermediate_size":8192,"num_hidden_layers":{num_hidden_layers},"sliding_window":1024,"sliding_window_pattern":{sliding_window_pattern}}}"#
         ))
@@ -172,7 +175,10 @@ mod tests {
 
     #[test]
     fn effective_layer_types_explicit() {
-        let explicit = vec!["full_attention".to_string(), "sliding_attention".to_string()];
+        let explicit = vec![
+            "full_attention".to_string(),
+            "sliding_attention".to_string(),
+        ];
         let mut cfg = minimal_text_config(2, 6);
         cfg.layer_types = Some(explicit.clone());
         assert_eq!(cfg.effective_layer_types(), explicit);
@@ -189,7 +195,10 @@ mod tests {
             if (i + 1) % 6 == 0 {
                 assert_eq!(ty, "full_attention", "layer {i} should be full_attention");
             } else {
-                assert_eq!(ty, "sliding_attention", "layer {i} should be sliding_attention");
+                assert_eq!(
+                    ty, "sliding_attention",
+                    "layer {i} should be sliding_attention"
+                );
             }
         }
     }

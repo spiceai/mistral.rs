@@ -11,10 +11,10 @@ use super::{
 use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
 use crate::distributed::WorkerTransferData;
+use crate::gguf::glm_moe::ModelWeights as QGlmDsa;
 use crate::gguf::{
     get_gguf_chat_template, {convert_gguf_to_hf_tokenizer, GgufTokenizerConversion},
 };
-use crate::gguf::glm_moe::ModelWeights as QGlmDsa;
 use crate::gguf::{Content, GGUFArchitecture};
 use crate::kv_cache::{FullCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
@@ -391,6 +391,7 @@ impl Loader for GGUFLoader {
         // `mapper.get_comm_for(..)` yields the real `world_size`, letting TP-capable GGUF
         // models (glm-dsa expert-parallel MoE) shard across ranks.
         let mut tp_world_size = 1;
+        let mut tp_rank = 0;
         if mistralrs_quant::distributed::use_ring() {
             let ring = mistralrs_quant::RingConfig::load();
             let comm = mistralrs_quant::Comm::from_device(
@@ -404,6 +405,7 @@ impl Loader for GGUFLoader {
                 ring.rank, ring.world_size
             );
             tp_world_size = ring.world_size;
+            tp_rank = ring.rank;
             mapper = DeviceMapSetting::Nccl {
                 nm_device: available_devices[0].clone(),
                 comm: Arc::new(comm),
@@ -474,7 +476,7 @@ impl Loader for GGUFLoader {
         if matches!(arch, GGUFArchitecture::GlmDsa) {
             // glm-dsa is the only GGUF arch here with head-parallel attention, so it is the
             // only one whose per-rank KV cache is narrower than the model's head count.
-            model_config_metadata.split_kv_heads(tp_world_size);
+            model_config_metadata.split_kv_heads(tp_rank, tp_world_size);
         }
         let internal_dtype = mapper.get_min_dtype(dtype)?;
 
