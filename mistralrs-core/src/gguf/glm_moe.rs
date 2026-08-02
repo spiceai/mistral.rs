@@ -85,19 +85,28 @@ fn expert_group() -> usize {
     })
 }
 
-/// Uniform tensor-parallel split of `total` items over `world_size` ranks; returns this
-/// rank's `(offset, len)`. A single rank owns everything.
+/// Tensor-parallel split of `total` items over `world_size` ranks; returns this rank's
+/// `(offset, len)`. Shards are contiguous and balanced within one item, so the split does
+/// not require `world_size` to divide `total`. A single rank owns everything.
 fn tp_split(total: usize, rank: usize, world_size: usize, what: &str) -> Result<(usize, usize)> {
     if world_size <= 1 {
         return Ok((0, total));
     }
-    if total % world_size != 0 {
+    // Every rank must own at least one unit: a zero-width shard would leave a rank
+    // with no heads (or no experts) and empty tensors to slice.
+    if total < world_size {
         candle_core::bail!(
-            "{what} ({total}) is not divisible by the tensor-parallel world size {world_size}"
+            "{what} ({total}) is smaller than the tensor-parallel world size {world_size}; each rank needs at least one"
         );
     }
-    let len = total / world_size;
-    Ok((rank * len, len))
+    // Uneven splits are allowed: the first `total % world_size` ranks take one extra
+    // unit. Attention head counts and expert counts are rarely divisible by 3, and
+    // rejecting that would cap tensor parallelism at power-of-two node counts.
+    let base = total / world_size;
+    let remainder = total % world_size;
+    let len = base + usize::from(rank < remainder);
+    let offset = rank * base + remainder.min(rank);
+    Ok((offset, len))
 }
 
 /// Rebuild a full `[batch, seq, total]` tensor from per-rank column shards: pad this rank's
@@ -173,7 +182,8 @@ impl MoeGate {
         let scores = candle_nn::ops::sigmoid(&logits)?;
 
         // Selection uses scores + correction bias; the returned weights use raw scores.
-        let scores_for_choice = scores.broadcast_add(&self.e_score_correction_bias.unsqueeze(0)?)?;
+        let scores_for_choice =
+            scores.broadcast_add(&self.e_score_correction_bias.unsqueeze(0)?)?;
         let topk_idx = scores_for_choice.topk(self.top_k)?.indices;
         let mut topk_weight = scores.gather(&topk_idx, 1)?;
 
@@ -256,8 +266,9 @@ impl Moe {
             let rows = Tensor::from_iter(bucket.iter().map(|(token, _, _)| *token), xs.device())?;
             let ids = Tensor::from_iter(bucket.iter().map(|(_, expert, _)| *expert), xs.device())?
                 .reshape((bucket.len(), 1))?;
-            let weights = Tensor::from_iter(bucket.iter().map(|(_, _, score)| *score), xs.device())?
-                .reshape((bucket.len(), 1))?;
+            let weights =
+                Tensor::from_iter(bucket.iter().map(|(_, _, score)| *score), xs.device())?
+                    .reshape((bucket.len(), 1))?;
             // `gather_forward` takes [n_rows, experts_per_row, cols] activations against
             // [n_rows, experts_per_row] ids; one expert per row here.
             let group_in = xs_flat.index_select(&rows, 0)?.unsqueeze(1)?;
@@ -349,7 +360,9 @@ impl LayerWeights {
         let q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim;
 
         // --- Query: x -> q_a -> norm -> q_b -> [b, n_head, s, q_head_dim] ---
-        let q = self.q_b_proj.forward(&self.q_a_norm.forward(&self.q_a_proj.forward(x)?)?)?;
+        let q = self
+            .q_b_proj
+            .forward(&self.q_a_norm.forward(&self.q_a_proj.forward(x)?)?)?;
         let q = q
             .reshape((b_sz, seq_len, self.n_head_local, q_head_dim))?
             .transpose(1, 2)?;
@@ -368,9 +381,10 @@ impl LayerWeights {
         // --- RoPE (NeoX / rotate-half) on the rope slices only ---
         // candle 0.11 / mistral v0.9.0: RotaryEmbedding::forward takes positions
         // as a &Tensor; build it from the per-sequence start offsets.
-        let positions =
-            crate::pipeline::text_positions_tensor(start_offsets, seq_len, x.device())?;
-        let (q_pe, k_pe) = self.rotary.forward(&q_pe.contiguous()?, &k_pe, &positions)?;
+        let positions = crate::pipeline::text_positions_tensor(start_offsets, seq_len, x.device())?;
+        let (q_pe, k_pe) = self
+            .rotary
+            .forward(&q_pe.contiguous()?, &k_pe, &positions)?;
 
         // --- Reconstruct per-head K_nope and V from the latent (dense MLA) ---
         // ckv: [b, s, kv_lora] -> [b, 1, s, kv_lora] to broadcast against [1, n_head, kv_lora, *]
@@ -701,8 +715,12 @@ impl ModelConfig::FromGGUF for ModelWeights {
             let o_out_total = ct.tensor_info(&o_proj_name)?.shape.dims()[0];
             let (o_out_offset, o_out_len) =
                 tp_split(o_out_total, rank, world_size, "attn_output output features")?;
-            let o_proj =
-                gguf_linear(ct.tensor_dim0_shard(&o_proj_name, o_out_offset, o_out_len, device)?)?;
+            let o_proj = gguf_linear(ct.tensor_dim0_shard(
+                &o_proj_name,
+                o_out_offset,
+                o_out_len,
+                device,
+            )?)?;
 
             // --- FFN: leading dense layers vs MoE layers ---
             let mlp = if layer_idx < leading_dense_block_count {
@@ -736,7 +754,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 let n_experts = ct.tensor_info(&gate_exps_name)?.shape.dims()[0];
                 let (experts_offset, n_local_experts) =
                     tp_split(n_experts, rank, world_size, "glm-dsa expert count")?;
-                let mut expert_groups = Vec::with_capacity(n_local_experts.div_ceil(expert_group()));
+                let mut expert_groups =
+                    Vec::with_capacity(n_local_experts.div_ceil(expert_group()));
                 let mut group_start = experts_offset;
                 while group_start < experts_offset + n_local_experts {
                     let len = expert_group().min(experts_offset + n_local_experts - group_start);
@@ -893,5 +912,73 @@ impl ModelWeights {
         let x = self.norm.forward(&layer_in)?;
         let x = extract_logits(&x, context_lens)?;
         self.output.forward(&x.contiguous()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tp_split;
+
+    /// Every rank's shard must be contiguous, non-empty, and the shards together must
+    /// tile `total` exactly — including when `total` is not divisible by `world_size`.
+    #[test]
+    fn tp_split_tiles_total_for_any_world_size() {
+        for world_size in 1..=8 {
+            for total in world_size..=64 {
+                let mut next_offset = 0;
+                for rank in 0..world_size {
+                    let (offset, len) = tp_split(total, rank, world_size, "test")
+                        .expect("a total at least as large as the world size splits");
+                    assert_eq!(
+                        offset, next_offset,
+                        "total {total}, world {world_size}, rank {rank}"
+                    );
+                    assert!(len > 0, "total {total}, world {world_size}, rank {rank}");
+                    next_offset = offset + len;
+                }
+                assert_eq!(
+                    next_offset, total,
+                    "shards do not cover total {total} at world size {world_size}"
+                );
+            }
+        }
+    }
+
+    /// Shard widths differ by at most one, so no rank does materially more work.
+    #[test]
+    fn tp_split_is_balanced_within_one() {
+        // 64 attention heads / 256 experts over 3 ranks is the case that used to be rejected.
+        for total in [64usize, 96, 256, 78] {
+            for world_size in 2..=8 {
+                let lens: Vec<usize> = (0..world_size)
+                    .map(|rank| {
+                        tp_split(total, rank, world_size, "test")
+                            .expect("total exceeds the world size")
+                            .1
+                    })
+                    .collect();
+                let (min, max) = (
+                    lens.iter().copied().min().unwrap_or_default(),
+                    lens.iter().copied().max().unwrap_or_default(),
+                );
+                assert!(
+                    max - min <= 1,
+                    "total {total} over {world_size} ranks: {lens:?}"
+                );
+                assert_eq!(lens.iter().sum::<usize>(), total);
+            }
+        }
+    }
+
+    /// A world size wider than the thing being split would leave a rank empty, which the
+    /// loader cannot represent — that must be an error, not a zero-width tensor slice.
+    #[test]
+    fn tp_split_rejects_a_world_wider_than_the_split() {
+        assert!(tp_split(2, 0, 3, "expert count").is_err());
+        // Single-rank always owns everything, whatever the total.
+        assert_eq!(
+            tp_split(2, 0, 1, "expert count").expect("single rank is always valid"),
+            (0, 2)
+        );
     }
 }

@@ -91,8 +91,12 @@ impl ContentConfig {
     /// attention each rank only ever caches its own heads, so reporting the global count
     /// would both over-allocate and mismatch what the model appends.
     pub fn split_kv_heads(&mut self, world_size: usize) {
-        if world_size > 1 && self.num_kv_heads % world_size == 0 {
-            self.num_kv_heads /= world_size;
+        if world_size > 1 && self.num_kv_heads >= world_size {
+            // Uneven splits hand the first `num_kv_heads % world_size` ranks one extra
+            // head, so plan against the ceiling: that is the widest per-rank KV cache.
+            // Keeping the un-split count instead would size the cache for the whole model
+            // on every rank and skew the device map by a factor of the world size.
+            self.num_kv_heads = self.num_kv_heads.div_ceil(world_size);
         }
     }
 }
@@ -730,7 +734,8 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     .model
                     .tensor_info(&format!("{l}.attn_q_a.weight"))?);
                 let attn_q_a_norm = tensor_info_size_in_bytes!(
-                    self.model.tensor_info(&format!("{l}.attn_q_a_norm.weight"))?,
+                    self.model
+                        .tensor_info(&format!("{l}.attn_q_a_norm.weight"))?,
                     DType::F32
                 );
                 let attn_q_b = tensor_info_size_in_bytes!(self

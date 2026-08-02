@@ -335,12 +335,6 @@ mod ring {
                     config.world_size
                 );
             }
-            if !config.world_size.is_power_of_two() {
-                candle_core::bail!(
-                    "Ring backend requires world_size to be a power of 2, got {}",
-                    config.world_size
-                );
-            }
             Ok(Self { config })
         }
 
@@ -823,6 +817,8 @@ mod ring_ops {
     // Friendly aliases to tame type complexity.
     type SharedTcpStream = Arc<Mutex<TcpStream>>;
     type LeftRight = (SharedTcpStream, SharedTcpStream);
+    /// Reusable wire scratch keyed by payload size: `(receive, forward)`.
+    type SizedBuffers = Arc<Mutex<HashMap<usize, (Vec<u8>, Vec<u8>)>>>;
 
     use candle_core::{
         backend::BackendStorage, CpuStorage, Device, Result, Storage, Tensor, WithDType,
@@ -873,7 +869,11 @@ mod ring_ops {
     pub struct SumAllReduce {
         left: SharedTcpStream,
         right: SharedTcpStream,
-        buffers: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
+        /// `.0` receives from the left neighbour, `.1` holds the previous hop's payload
+        /// while it is forwarded to the right. `.1` stays empty at `world_size == 2`,
+        /// where nothing is ever forwarded.
+        buffers: SizedBuffers,
+        world_size: usize,
     }
 
     impl SumAllReduce {
@@ -885,6 +885,7 @@ mod ring_ops {
                         left,
                         right,
                         buffers: Arc::new(Mutex::new(HashMap::new())),
+                        world_size: ring_comm.world_size(),
                     }
                 }
                 _ => panic!("SumAllReduce requires Ring backend"),
@@ -911,13 +912,20 @@ mod ring_ops {
             // View the local slice as bytes that can be written on the wire.
             let data_bytes = unsafe { std::slice::from_raw_parts(x.as_ptr() as *const u8, nbytes) };
 
-            // Re‑use (or allocate) a receive buffer of identical size.
+            // Re‑use (or allocate) the receive buffer, plus a forward buffer for the
+            // rotation when there is more than one other rank to hear from.
             let mut buffers_guard = self.buffers.lock().map_err(|e| {
                 candle_core::Error::msg(format!("Failed to lock buffers mutex: {:?}", e))
             })?;
-            let recv_buf = buffers_guard
-                .entry(nbytes)
-                .or_insert_with(|| vec![0u8; nbytes]);
+            let (mut recv_buf, mut fwd_buf) = buffers_guard.remove(&nbytes).unwrap_or_else(|| {
+                let fwd = if self.world_size > 2 {
+                    vec![0u8; nbytes]
+                } else {
+                    Vec::new()
+                };
+                (vec![0u8; nbytes], fwd)
+            });
+            drop(buffers_guard);
 
             // Lock both sockets once to avoid per-call mutex overhead.
             let mut right_guard = right.lock().map_err(|e| {
@@ -927,50 +935,85 @@ mod ring_ops {
                 candle_core::Error::msg(format!("Failed to lock left stream mutex: {:?}", e))
             })?;
 
-            // For the typical tensor size we see (~ 6 KiB) a single
-            // write/read pair is faster than chunking because the extra
-            // system‑call and loop overhead dominates.  Only fall back to the
-            // chunked "ping‑pong" pipeline for larger transfers.
-            if nbytes <= 8 * 1024 {
-                // --- fast path: one shot ------------------------------------
-                right_guard
-                    .write_all(data_bytes)
-                    .map_err(|e| candle_core::Error::msg(format!("write error: {:?}", e)))?;
+            // Rotate the ring `world_size - 1` times: each rank sends its own contribution
+            // on the first hop and then forwards what it just received, so every rank sums
+            // every other rank's payload exactly once. With `world_size == 2` this is the
+            // single exchange it has always been; at 3+ ranks a single exchange would only
+            // reach the left neighbour and silently drop the rest of the ring.
+            let mut delta: Option<Tensor> = None;
+            for hop in 0..self.world_size - 1 {
+                let send_bytes: &[u8] = if hop == 0 { data_bytes } else { &fwd_buf };
 
-                left_guard
-                    .read_exact(recv_buf)
-                    .map_err(|e| candle_core::Error::msg(format!("read error: {:?}", e)))?;
-            } else {
-                // --- slow path: chunked ping‑pong ---------------------------
-                const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
-                let mut offset = 0;
-
-                while offset < nbytes {
-                    let len = std::cmp::min(CHUNK_SIZE, nbytes - offset);
-
-                    // send this chunk to the right neighbour
+                // For the typical tensor size we see (~ 6 KiB) a single
+                // write/read pair is faster than chunking because the extra
+                // system‑call and loop overhead dominates.  Only fall back to the
+                // chunked "ping‑pong" pipeline for larger transfers.
+                if nbytes <= 8 * 1024 {
+                    // --- fast path: one shot ------------------------------------
                     right_guard
-                        .write_all(&data_bytes[offset..offset + len])
+                        .write_all(send_bytes)
                         .map_err(|e| candle_core::Error::msg(format!("write error: {:?}", e)))?;
 
-                    // receive the matching chunk from the left neighbour
                     left_guard
-                        .read_exact(&mut recv_buf[offset..offset + len])
+                        .read_exact(&mut recv_buf)
                         .map_err(|e| candle_core::Error::msg(format!("read error: {:?}", e)))?;
+                } else {
+                    // --- slow path: chunked ping‑pong ---------------------------
+                    const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
+                    let mut offset = 0;
 
-                    offset += len;
+                    while offset < nbytes {
+                        let len = std::cmp::min(CHUNK_SIZE, nbytes - offset);
+
+                        // send this chunk to the right neighbour
+                        right_guard
+                            .write_all(&send_bytes[offset..offset + len])
+                            .map_err(|e| {
+                                candle_core::Error::msg(format!("write error: {:?}", e))
+                            })?;
+
+                        // receive the matching chunk from the left neighbour
+                        left_guard
+                            .read_exact(&mut recv_buf[offset..offset + len])
+                            .map_err(|e| candle_core::Error::msg(format!("read error: {:?}", e)))?;
+
+                        offset += len;
+                    }
+                }
+
+                // ---------------------------------------------------------------------
+                // Interpret the received bytes as a slice of T and accumulate them.
+                let received: &[T] =
+                    unsafe { std::slice::from_raw_parts(recv_buf.as_ptr() as *const T, x.len()) };
+                let hop_delta = Tensor::from_slice(received, dims, device)?;
+                delta = Some(match delta {
+                    None => hop_delta,
+                    Some(acc) => (acc + hop_delta)?,
+                });
+
+                // Hand this payload on to the right neighbour on the next hop. Copying
+                // frees `recv_buf` to receive again while the bytes are still needed.
+                if hop + 2 < self.world_size {
+                    fwd_buf.copy_from_slice(&recv_buf);
                 }
             }
 
             drop(left_guard);
             drop(right_guard);
 
-            // -------------------------------------------------------------------------
-            // Interpret the received bytes as a slice of T and add element‑wise into x
-            let received: &[T] =
-                unsafe { std::slice::from_raw_parts(recv_buf.as_ptr() as *const T, x.len()) };
+            // Return the buffers for reuse by the next collective of this size.
+            let mut buffers_guard = self.buffers.lock().map_err(|e| {
+                candle_core::Error::msg(format!("Failed to lock buffers mutex: {:?}", e))
+            })?;
+            buffers_guard.insert(nbytes, (recv_buf, fwd_buf));
+            drop(buffers_guard);
 
-            Tensor::from_slice(received, dims, device)
+            delta.ok_or_else(|| {
+                candle_core::Error::msg(format!(
+                    "ring all-reduce needs world_size >= 2, got {}",
+                    self.world_size
+                ))
+            })
         }
 
         pub fn sum_all_reduce(&self, xs: &Tensor) -> Result<Tensor> {

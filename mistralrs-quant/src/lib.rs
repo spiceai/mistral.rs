@@ -932,14 +932,16 @@ impl TryFrom<GgmlDType> for IsqType {
             GgmlDType::BF16 | GgmlDType::F32 | GgmlDType::F16 => {
                 candle_core::bail!("Expected valid GGML ISQ type.")
             }
-            // i-quants (IQ2_XXS/IQ3_XXS/IQ4_XS/IQ1_S/IQ1_M) are load/dequant-only here;
-            // mistralrs has no i-quant ISQ quantizer, so they are not valid ISQ targets.
+            // i-quants (IQ2_XXS/IQ3_XXS/IQ4_XS/IQ1_S/IQ1_M) and MXFP4 are
+            // load/dequant-only here; mistralrs has no quantizer for them, so they are
+            // not valid ISQ targets.
             GgmlDType::Iq2Xxs
             | GgmlDType::Iq3Xxs
             | GgmlDType::Iq4Xs
             | GgmlDType::Iq1S
-            | GgmlDType::Iq1M => {
-                candle_core::bail!("i-quant types are not a valid GGML ISQ target.")
+            | GgmlDType::Iq1M
+            | GgmlDType::Mxfp4 => {
+                candle_core::bail!("i-quant and MXFP4 types are not a valid GGML ISQ target.")
             }
         }
     }
