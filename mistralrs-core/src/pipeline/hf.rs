@@ -2,7 +2,12 @@ use std::{
     env, fs,
     ops::Range,
     path::{Component, Path, PathBuf},
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        Arc, OnceLock,
+    },
+    thread,
+    time::Duration,
 };
 
 use anyhow::{anyhow, Result};
@@ -16,6 +21,7 @@ use hf_hub::{
     },
     Cache, Repo, RepoType,
 };
+use signal_hook::consts::TERM_SIGNALS;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{trace, warn};
 
@@ -286,11 +292,11 @@ pub fn get_model_file(
     token_source: &crate::pipeline::TokenSource,
 ) -> Result<PathBuf> {
     let api = build_api(token_source, true)?;
-    let repo = api.repo(Repo::with_revision(
+    let repo = Arc::new(api.repo(Repo::with_revision(
         model_id.to_string(),
         RepoType::Model,
         revision.to_string(),
-    ));
+    )));
     get_file(&repo, Path::new(model_id), file, revision)
 }
 
@@ -700,8 +706,90 @@ pub(crate) async fn list_repo_files_async(
     }
 }
 
+/// How often [`cancellable_get`] polls [`download_cancel_flag`] while a blocking Hugging Face
+/// file download runs on its own thread.
+const DOWNLOAD_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Returns the process-wide flag that is flipped when this process receives SIGTERM, SIGINT, or
+/// SIGQUIT. `spiced` (the runtime embedding this crate) installs its own signal handler for
+/// graceful shutdown, but has no way to interrupt a blocking OS thread buried in this crate's
+/// blocking Hugging Face download call. Registering our own handler here gives that download a
+/// local, self-contained way to notice the same signals and return a clean cancellation error
+/// instead of hanging indefinitely.
+fn download_cancel_flag() -> &'static Arc<AtomicBool> {
+    static FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    FLAG.get_or_init(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        for sig in TERM_SIGNALS {
+            if let Err(err) = signal_hook::flag::register(*sig, Arc::clone(&flag)) {
+                warn!(
+                    "Could not register a termination-signal handler for cancelling in-flight Hugging Face downloads: {err}"
+                );
+            }
+        }
+        flag
+    })
+}
+
+/// Outcome of [`cancellable_get`] when the blocking request did not complete because it was
+/// cancelled by a termination signal, as opposed to failing on its own.
+enum CancellableGetError {
+    Api(ApiError),
+    Cancelled,
+}
+
+/// Waits for `handle` to finish, polling `should_terminate` every
+/// [`DOWNLOAD_CANCEL_POLL_INTERVAL`]. Returns the handle's result if it finishes first, or `None`
+/// if a termination signal fires first -- in which case `handle` is dropped and abandoned to
+/// finish (or fail) on its own; its eventual result is discarded.
+fn poll_until_finished_or_cancelled<T: Send + 'static>(
+    handle: thread::JoinHandle<T>,
+    should_terminate: &AtomicBool,
+) -> Option<T> {
+    loop {
+        if handle.is_finished() {
+            return Some(match handle.join() {
+                Ok(result) => result,
+                Err(panic) => std::panic::resume_unwind(panic),
+            });
+        }
+        if should_terminate.load(AtomicOrdering::SeqCst) {
+            return None;
+        }
+        thread::sleep(DOWNLOAD_CANCEL_POLL_INTERVAL);
+    }
+}
+
+/// Runs the blocking `ApiRepo::get(file)` call on a dedicated thread so this function can poll
+/// [`download_cancel_flag`] and return promptly on SIGTERM/SIGINT/SIGQUIT instead of blocking
+/// until a (potentially very large) download finishes. The spawned thread owns an `Arc` clone of
+/// `api`, so if cancellation fires first, the download thread is simply abandoned to finish (or
+/// fail) on its own; its result is discarded.
+fn cancellable_get(
+    api: &Arc<ApiRepo>,
+    file: &str,
+) -> std::result::Result<PathBuf, CancellableGetError> {
+    let handle = {
+        let api = Arc::clone(api);
+        let file = file.to_string();
+        thread::spawn(move || api.get(&file))
+    };
+
+    match poll_until_finished_or_cancelled(handle, download_cancel_flag()) {
+        Some(result) => result.map_err(CancellableGetError::Api),
+        None => Err(CancellableGetError::Cancelled),
+    }
+}
+
+fn hf_download_cancelled_error(model_id: &Path, file: &str, revision: &str) -> anyhow::Error {
+    anyhow!(
+        "Download of `{file}` for `{}` (revision `{revision}`) was cancelled because mistral.rs received a termination signal (SIGTERM/SIGINT/SIGQUIT).",
+        model_id.display()
+    )
+}
+
 pub(crate) fn get_file(
-    api: &ApiRepo,
+    api: &Arc<ApiRepo>,
     model_id: &Path,
     file: &str,
     revision: &str,
@@ -726,13 +814,20 @@ pub(crate) fn get_file(
         return Err(offline_missing_file_error(model_id, file, revision));
     }
 
-    api.get(file)
-        .map_err(|err| hf_api_error(model_id, Some(file), revision, &err))
+    match cancellable_get(api, file) {
+        Ok(path) => Ok(path),
+        Err(CancellableGetError::Api(err)) => {
+            Err(hf_api_error(model_id, Some(file), revision, &err))
+        }
+        Err(CancellableGetError::Cancelled) => {
+            Err(hf_download_cancelled_error(model_id, file, revision))
+        }
+    }
 }
 
 /// Like [`get_file`] but returns `Ok(None)` (instead of an error) when the file is genuinely missing, and used with `HF_HUB_OFFLINE`.
 pub(crate) fn try_get_file(
-    api: &ApiRepo,
+    api: &Arc<ApiRepo>,
     model_id: &Path,
     file: &str,
     revision: &str,
@@ -750,12 +845,18 @@ pub(crate) fn try_get_file(
         return Ok(offline_cache_repo(model_id, revision).get(file));
     }
 
-    match api.get(file) {
+    match cancellable_get(api, file) {
         Ok(p) => Ok(Some(p)),
-        Err(err) => match api_error_status_code(&err) {
+        Err(CancellableGetError::Api(err)) => match api_error_status_code(&err) {
             Some(404) => Ok(None),
             _ => Err(err),
         },
+        Err(CancellableGetError::Cancelled) => Err(ApiError::IoError(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            format!(
+                "Download of `{file}` was cancelled because mistral.rs received a termination signal (SIGTERM/SIGINT/SIGQUIT)."
+            ),
+        ))),
     }
 }
 
@@ -809,4 +910,42 @@ pub fn probe_hf_repo_files(
     repo.info()
         .ok()
         .map(|info| info.siblings.into_iter().map(|s| s.rfilename).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A termination signal that is already set before the "download" thread has any chance to
+    /// finish must win the race: [`poll_until_finished_or_cancelled`] returns `None` (the
+    /// cancelled outcome) instead of waiting for the thread. Uses a thread that sleeps far longer
+    /// than the poll interval so the test is deterministic without touching the network or the
+    /// process-wide signal-registered flag from [`download_cancel_flag`].
+    #[test]
+    fn poll_until_finished_or_cancelled_returns_none_when_already_cancelled() {
+        let should_terminate = AtomicBool::new(true);
+        let handle = thread::spawn(|| {
+            thread::sleep(Duration::from_secs(5));
+            "unused"
+        });
+
+        let result = poll_until_finished_or_cancelled(handle, &should_terminate);
+
+        assert!(
+            result.is_none(),
+            "expected cancellation to win the race, got {result:?}"
+        );
+    }
+
+    /// When the handle finishes before any termination signal arrives, its result is returned
+    /// normally.
+    #[test]
+    fn poll_until_finished_or_cancelled_returns_result_when_not_cancelled() {
+        let should_terminate = AtomicBool::new(false);
+        let handle = thread::spawn(|| 42);
+
+        let result = poll_until_finished_or_cancelled(handle, &should_terminate);
+
+        assert_eq!(result, Some(42));
+    }
 }

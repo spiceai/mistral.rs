@@ -96,6 +96,7 @@ parking_lot.workspace = true
 ahash.workspace = true
 num-traits.workspace = true
 libc.workspace = true
+signal-hook.workspace = true
 bm25.workspace = true
 rubato.workspace = true
 rustfft.workspace = true
