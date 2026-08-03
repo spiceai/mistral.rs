@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use hf_hub::{api::sync::ApiRepo, Repo, RepoType};
 
@@ -37,13 +40,13 @@ impl MtpConfig {
     }
 }
 
-fn build_hf_api(id: &str, revision: &str) -> candle_core::Result<ApiRepo> {
+fn build_hf_api(id: &str, revision: &str) -> candle_core::Result<Arc<ApiRepo>> {
     let api = build_api(&TokenSource::CacheToken, true).map_err(candle_core::Error::msg)?;
-    Ok(api.repo(Repo::with_revision(
+    Ok(Arc::new(api.repo(Repo::with_revision(
         id.to_string(),
         RepoType::Model,
         revision.to_string(),
-    )))
+    ))))
 }
 
 fn resolve_hf_mtp_path(id: &str) -> candle_core::Result<PathBuf> {

@@ -2,6 +2,7 @@ use std::{
     fmt::Debug,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
@@ -44,14 +45,14 @@ pub trait DiffusionModelLoader: Send + Sync {
     /// If the model is being loaded with `load_model_from_hf` (so manual paths not provided), this will be called.
     fn get_model_paths(
         &self,
-        api: &ApiRepo,
+        api: &Arc<ApiRepo>,
         model_id: &Path,
         revision: &str,
     ) -> Result<Vec<PathBuf>>;
     /// If the model is being loaded with `load_model_from_hf` (so manual paths not provided), this will be called.
     fn get_config_filenames(
         &self,
-        api: &ApiRepo,
+        api: &Arc<ApiRepo>,
         model_id: &Path,
         revision: &str,
     ) -> Result<Vec<PathBuf>>;
@@ -171,7 +172,7 @@ pub struct FluxLoader {
 impl DiffusionModelLoader for FluxLoader {
     fn get_model_paths(
         &self,
-        api: &ApiRepo,
+        api: &Arc<ApiRepo>,
         model_id: &Path,
         revision: &str,
     ) -> Result<Vec<PathBuf>> {
@@ -188,7 +189,7 @@ impl DiffusionModelLoader for FluxLoader {
     }
     fn get_config_filenames(
         &self,
-        api: &ApiRepo,
+        api: &Arc<ApiRepo>,
         model_id: &Path,
         revision: &str,
     ) -> Result<Vec<PathBuf>> {

@@ -148,6 +148,7 @@ parking_lot = "0.12.5"
 ahash = "0.8.12"
 num-traits = "0.2.19"
 libc = "0.2.180"
+signal-hook = "0.3.17"
 bm25 = "2.3.2"
 symphonia = { version = "0.5.5", default-features = false, features = ["mp3", "flac", "vorbis", "wav", "isomp4", "ogg", "pcm"] }
 lazy_static = "1.5"

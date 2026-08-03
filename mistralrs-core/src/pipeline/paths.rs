@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::Result;
@@ -61,11 +62,11 @@ pub fn get_xlora_paths(
     match (lora_adapter_ids, xlora_model_id, xlora_order) {
         (None, Some(xlora_id), Some(xlora_order)) => {
             let api = build_api(token_source, true).map_err(candle_core::Error::msg)?;
-            let api = api.repo(Repo::with_revision(
+            let api = Arc::new(api.repo(Repo::with_revision(
                 xlora_id.clone(),
                 RepoType::Model,
                 revision.clone(),
-            ));
+            )));
             let model_id = Path::new(&xlora_id);
             let dir_list = api_dir_list!(api, model_id, true, &revision).collect::<Vec<_>>();
             // Get the path for the xlora classifier
@@ -266,11 +267,11 @@ pub fn get_xlora_paths(
                 info!("Loading adapter at `{adapter_id}`");
 
                 let api = build_api(token_source, true).map_err(candle_core::Error::msg)?;
-                let api = api.repo(Repo::with_revision(
+                let api = Arc::new(api.repo(Repo::with_revision(
                     adapter_id.clone(),
                     RepoType::Model,
                     revision.clone(),
-                ));
+                )));
 
                 let adapter_path_buf = std::path::Path::new(adapter_id);
                 let config_path = crate::pipeline::hf::get_file(
@@ -308,7 +309,7 @@ pub fn get_model_paths(
     token_source: &TokenSource,
     quantized_model_id: Option<&String>,
     quantized_filename: Option<&Vec<String>>,
-    api: &ApiRepo,
+    api: &Arc<ApiRepo>,
     model_id: &Path,
     loading_from_uqff: bool,
 ) -> Result<Vec<PathBuf>> {
@@ -319,11 +320,11 @@ pub fn get_model_paths(
 
             for name in names {
                 let qapi = build_api(token_source, true).map_err(candle_core::Error::msg)?;
-                let qapi = qapi.repo(Repo::with_revision(
+                let qapi = Arc::new(qapi.repo(Repo::with_revision(
                     id.to_string(),
                     RepoType::Model,
                     revision.clone(),
-                ));
+                )));
                 let model_id = Path::new(&id);
                 files.push(api_get_file!(qapi, name, model_id, &revision));
             }
