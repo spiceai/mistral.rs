@@ -72,6 +72,36 @@ impl GGUFArchitecture {
             .map_err(anyhow::Error::msg)
     }
 
+    /// Whether this architecture's loader can be given a `PagedAttentionConfig`.
+    ///
+    /// Multi-head Latent Attention GGUFs are evaluated dense here — the loader reconstructs
+    /// full per-head K/V from the compressed latent and caches that, and there is no paged
+    /// kernel for it — so handing one a paged config fails the load outright. Callers should
+    /// not have to know which architectures those are: the answer belongs with the loaders,
+    /// and the match is exhaustive so a new architecture cannot be added without deciding.
+    pub fn supports_paged_attention(self) -> bool {
+        match self {
+            // MLA + sigmoid-gated MoE, run dense; see `gguf::glm_moe`.
+            Self::GlmDsa => false,
+            Self::Llama
+            | Self::Mpt
+            | Self::Gptneox
+            | Self::Gptj
+            | Self::Gpt2
+            | Self::Bloom
+            | Self::Falcon
+            | Self::Mamba
+            | Self::Rwkv
+            | Self::Phi2
+            | Self::Phi3
+            | Self::Starcoder2
+            | Self::Qwen2
+            | Self::Qwen3
+            | Self::Qwen3MoE
+            | Self::Mistral3 => true,
+        }
+    }
+
     /// The `general.architecture` values this build can actually run, for error messages.
     fn supported() -> String {
         Self::iter()
@@ -108,6 +138,16 @@ mod tests {
         assert!(msg.contains("Unknown GGUF architecture"), "{msg}");
         assert!(msg.contains("llama"), "{msg}");
         assert!(msg.contains("glm-dsa"), "{msg}");
+    }
+
+    /// The dense-attention rule has to live with the loaders, not with callers: a caller
+    /// holding a list of architecture strings goes stale silently in both directions when
+    /// the engine gains an architecture or grows a paged kernel.
+    #[test]
+    fn mla_architectures_report_no_paged_attention_support() {
+        assert!(!GGUFArchitecture::GlmDsa.supports_paged_attention());
+        assert!(GGUFArchitecture::Llama.supports_paged_attention());
+        assert!(GGUFArchitecture::Qwen3MoE.supports_paged_attention());
     }
 
     #[test]

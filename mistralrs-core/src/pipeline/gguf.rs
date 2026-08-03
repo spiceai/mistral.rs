@@ -468,6 +468,11 @@ impl Loader for GGUFLoader {
         let paged_attn_config = if matches!(self.kind, ModelKind::GgufAdapter { .. }) {
             warn!("Adapter models do not currently support PagedAttention, running without");
             None
+        } else if paged_attn_config.is_some() && !arch.supports_paged_attention() {
+            // Downgrade rather than fail: the architecture is known-good, it just has no
+            // paged kernel, and the caller cannot be expected to track which ones do.
+            info!("{arch} does not support PagedAttention, running with dense attention");
+            None
         } else {
             paged_attn_config
         };
