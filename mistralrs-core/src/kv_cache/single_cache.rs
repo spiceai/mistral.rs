@@ -3,6 +3,11 @@ use candle_core::{Result, Tensor};
 use super::NormalCache;
 
 #[derive(Debug, Clone)]
+pub struct SingleCacheSnapshot {
+    pub current_seq_len: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct SingleCache {
     // all_data is an option on a Tensor, this makes it possible to only create the actual tensor
     // on the first call where the batch size is easily known.
@@ -50,6 +55,28 @@ impl SingleCache {
         Ok(data)
     }
 
+    pub fn snapshot(&self) -> SingleCacheSnapshot {
+        SingleCacheSnapshot {
+            current_seq_len: self.current_seq_len,
+        }
+    }
+
+    pub fn can_append_from_snapshot(
+        &self,
+        snapshot: &SingleCacheSnapshot,
+        append_len: usize,
+    ) -> bool {
+        snapshot.current_seq_len == self.current_seq_len
+            && snapshot
+                .current_seq_len
+                .checked_add(append_len)
+                .is_some_and(|len| len <= self.max_seq_len)
+    }
+
+    pub fn rollback_to(&mut self, keep_len: usize) -> candle_core::Result<()> {
+        self.set_len(keep_len)
+    }
+
     pub fn reset(&mut self) {
         self.current_seq_len = 0;
         self.all_data = None;
@@ -86,8 +113,8 @@ impl SingleCache {
         // Expand kv cache
         if self.current_seq_len + seq_len > self.capacity_seq_len {
             let diff = self.current_seq_len + seq_len - self.capacity_seq_len;
-            let n_blocks_needed = diff.div_ceil(NormalCache::CACHE_GROW_SIZE);
-            self.capacity_seq_len += n_blocks_needed * NormalCache::CACHE_GROW_SIZE;
+            let n_blocks_needed = diff.div_ceil(NormalCache::cache_grow_size());
+            self.capacity_seq_len += n_blocks_needed * NormalCache::cache_grow_size();
             if self.capacity_seq_len > self.max_seq_len {
                 candle_core::bail!(
                     "kv-cache: requested capacity ({}) above max seq len ({})",

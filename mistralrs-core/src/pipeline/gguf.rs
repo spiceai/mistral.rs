@@ -11,6 +11,7 @@ use super::{
 use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
 use crate::distributed::WorkerTransferData;
+use crate::gguf::glm_moe::ModelWeights as QGlmDsa;
 use crate::gguf::{
     get_gguf_chat_template, {convert_gguf_to_hf_tokenizer, GgufTokenizerConversion},
 };
@@ -44,13 +45,12 @@ use crate::{
     models::quantized_qwen3::ModelWeights as QQwen3,
     models::quantized_qwen3_moe::ModelWeights as QQwen3MoE,
     models::quantized_starcoder2::ModelWeights as QStarcoder2,
-    utils::tokens::get_token,
     xlora_models::{XLoraQLlama, XLoraQPhi3},
 };
 use anyhow::{bail, Result};
 use candle_core::{Device, Tensor};
 use either::Either;
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use hf_hub::{Repo, RepoType};
 use mistralrs_quant::IsqType;
 use rand_isaac::Isaac64Rng;
 use std::any::Any;
@@ -60,7 +60,7 @@ use std::sync::Arc;
 use std::{env, fs};
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 enum Model {
     Llama(QLlama),
@@ -72,6 +72,7 @@ enum Model {
     Qwen(QQwen),
     Qwen3(QQwen3),
     Qwen3MoE(QQwen3MoE),
+    GlmDsa(QGlmDsa),
 }
 
 pub struct GGUFPipeline {
@@ -314,7 +315,7 @@ impl Loader for GGUFLoader {
             );
         }
 
-        info!("Prompt chunk size is {ATTENTION_CHUNK_SIZE}.");
+        debug!("Prompt chunk size is {ATTENTION_CHUNK_SIZE}.");
 
         let mut readers = Vec::new();
         for filename in paths.get_weight_filenames() {
@@ -374,13 +375,42 @@ impl Loader for GGUFLoader {
         let use_nccl = mistralrs_quant::distributed::use_nccl();
         let available_devices = if let Ok(payload) = env::var(distributed::IS_DAEMON_FLAG) {
             let payload: WorkerTransferData = serde_json::from_str(&payload)?;
-            let WorkerTransferData::Init { id: _, worker_rank } = payload;
+            let WorkerTransferData::Init { worker_rank, .. } = payload;
             vec![candle_core::Device::new_cuda(worker_rank + 1)?]
         } else if use_nccl {
             vec![candle_core::Device::new_cuda(0)?]
         } else {
             device_map::get_all_similar_devices(device)?
         };
+
+        // Distributed (ring) tensor parallelism. The safetensors pipelines build a real
+        // multi-rank communicator via `distributed::prepare_distributed_mapper`; the GGUF
+        // path has no such step, so without this every rank gets a single-rank
+        // (`world_size == 1`) mapper and loads the *full* model — OOMing on large MoE
+        // GGUFs. Mirror the ring branch of `prepare_distributed_mapper` here so
+        // `mapper.get_comm_for(..)` yields the real `world_size`, letting TP-capable GGUF
+        // models (glm-dsa expert-parallel MoE) shard across ranks.
+        let mut tp_world_size = 1;
+        let mut tp_rank = 0;
+        if mistralrs_quant::distributed::use_ring() {
+            let ring = mistralrs_quant::RingConfig::load();
+            let comm = mistralrs_quant::Comm::from_device(
+                mistralrs_quant::Id::new(),
+                &available_devices[0],
+                ring.rank,
+                ring.world_size,
+            )?;
+            info!(
+                "GGUF ring tensor parallelism: rank {} of world size {}.",
+                ring.rank, ring.world_size
+            );
+            tp_world_size = ring.world_size;
+            tp_rank = ring.rank;
+            mapper = DeviceMapSetting::Nccl {
+                nm_device: available_devices[0].clone(),
+                comm: Arc::new(comm),
+            };
+        }
 
         let pipeline_mapper = mapper.into_mapper(
             num_layers,
@@ -438,11 +468,21 @@ impl Loader for GGUFLoader {
         let paged_attn_config = if matches!(self.kind, ModelKind::GgufAdapter { .. }) {
             warn!("Adapter models do not currently support PagedAttention, running without");
             None
+        } else if paged_attn_config.is_some() && !arch.supports_paged_attention() {
+            // Downgrade rather than fail: the architecture is known-good, it just has no
+            // paged kernel, and the caller cannot be expected to track which ones do.
+            info!("{arch} does not support PagedAttention, running with dense attention");
+            None
         } else {
             paged_attn_config
         };
 
-        let model_config_metadata: ContentConfig = (&model).into();
+        let mut model_config_metadata: ContentConfig = (&model).into();
+        if matches!(arch, GGUFArchitecture::GlmDsa) {
+            // glm-dsa is the only GGUF arch here with head-parallel attention, so it is the
+            // only one whose per-rank KV cache is narrower than the model's head count.
+            model_config_metadata.split_kv_heads(tp_rank, tp_world_size);
+        }
         let internal_dtype = mapper.get_min_dtype(dtype)?;
 
         let model_config = {
@@ -483,6 +523,7 @@ impl Loader for GGUFLoader {
                 GGUFArchitecture::Qwen2 => Model::Qwen(QQwen::try_from(model_config)?),
                 GGUFArchitecture::Qwen3 => Model::Qwen3(QQwen3::try_from(model_config)?),
                 GGUFArchitecture::Qwen3MoE => Model::Qwen3MoE(QQwen3MoE::try_from(model_config)?),
+                GGUFArchitecture::GlmDsa => Model::GlmDsa(QGlmDsa::try_from(model_config)?),
                 a => bail!("Unsupported architecture `{a:?}` for GGUF"),
             },
             ModelKind::GgufAdapter { adapter, .. } => match arch {
@@ -549,6 +590,7 @@ impl Loader for GGUFLoader {
             Model::Qwen(ref p) => p.max_seq_len,
             Model::Qwen3(ref p) => p.max_seq_len,
             Model::Qwen3MoE(ref p) => p.max_seq_len,
+            Model::GlmDsa(ref p) => p.max_seq_len,
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model {
@@ -561,6 +603,7 @@ impl Loader for GGUFLoader {
             Model::Qwen(ref model) => model.cache.normal().0.len(),
             Model::Qwen3(ref model) => model.cache.normal().0.len(),
             Model::Qwen3MoE(ref model) => model.cache.normal().0.len(),
+            Model::GlmDsa(ref model) => model.cache.normal().0.len(),
         };
 
         if chat_template.bos_token.is_none() {
@@ -698,6 +741,7 @@ impl CacheManagerMixin for GGUFPipeline {
             Model::Qwen(ref model) => &model.cache,
             Model::Qwen3(ref model) => &model.cache,
             Model::Qwen3MoE(ref model) => &model.cache,
+            Model::GlmDsa(ref model) => &model.cache,
         }
     }
 }
@@ -714,6 +758,7 @@ impl MetadataMixin for GGUFPipeline {
             Model::Qwen(ref model) => model.device.clone(),
             Model::Qwen3(ref model) => model.device.clone(),
             Model::Qwen3MoE(ref model) => model.device.clone(),
+            Model::GlmDsa(ref model) => model.device.clone(),
         }
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
@@ -756,6 +801,7 @@ impl Pipeline for GGUFPipeline {
             paged_attn_meta,
             flash_meta,
             flash_meta_full,
+            recurrent_batch_kind: _,
         } = *inputs.downcast().expect("Downcast failed.");
         let metadata = self.get_metadata();
         let paged_attn_meta = match (&metadata.cache_engine, &paged_attn_meta) {
@@ -812,6 +858,9 @@ impl Pipeline for GGUFPipeline {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
             Model::Qwen3MoE(ref model) => {
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+            }
+            Model::GlmDsa(ref model) => {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
         };

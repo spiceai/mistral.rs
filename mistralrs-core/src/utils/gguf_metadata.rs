@@ -15,6 +15,10 @@ use crate::pipeline::AutoDeviceMapParams;
 use crate::pipeline::DeviceMappedModelLoader;
 use crate::GGUFArchitecture;
 
+/// Per-head decompressed K/V width for `glm-dsa` when the GGUF omits the `*_mla` keys.
+/// Matches the default in [`crate::gguf::glm_moe`].
+const GLM_DSA_DEFAULT_MLA_HEAD_DIM: usize = 256;
+
 #[derive(Debug)]
 pub struct ContentConfig {
     max_seq_len: usize,
@@ -31,6 +35,39 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
     fn from(value: &Content<'a, R>) -> Self {
         let metadata = value.get_metadata();
         let arch = metadata["general.architecture"].to_string().unwrap();
+        let num_attn_heads = metadata[&format!("{arch}.attention.head_count")]
+            .to_u64()
+            .unwrap() as usize;
+        let mut num_kv_heads = metadata[&format!("{arch}.attention.head_count_kv")]
+            .to_u64()
+            .unwrap() as usize;
+        let mut key_length = metadata
+            .get(&format!("{arch}.attention.key_length"))
+            .map(|x| x.to_u64().unwrap() as usize);
+        let mut value_length = metadata
+            .get(&format!("{arch}.attention.value_length"))
+            .map(|x| x.to_u64().unwrap() as usize);
+
+        // `glm-dsa` (GLM-4.x/5.x MoE) is a Multi-head Latent Attention model, but this GGUF
+        // loader evaluates it DENSE: `gguf::glm_moe` reconstructs full per-head K/V from the
+        // compressed latent and caches *those*. The GGUF's `head_count_kv` (1) and
+        // `key_length` describe the compressed latent instead, so reporting them verbatim
+        // sizes the preallocated KV cache as a single head of the wrong width, and the
+        // model's `KvCache::append` then fails on a shape mismatch. Report what is actually
+        // cached: one entry per attention head, `key_length_mla`/`value_length_mla` wide.
+        if arch == "glm-dsa" {
+            let mla_dim = |key: &str| {
+                metadata
+                    .get(&format!("{arch}.attention.{key}"))
+                    .and_then(|x| x.to_u64().ok())
+                    .map(|x| x as usize)
+                    .unwrap_or(GLM_DSA_DEFAULT_MLA_HEAD_DIM)
+            };
+            num_kv_heads = num_attn_heads;
+            key_length = Some(mla_dim("key_length_mla"));
+            value_length = Some(mla_dim("value_length_mla"));
+        }
+
         Self {
             max_seq_len: metadata[&format!("{arch}.context_length")]
                 .to_u64()
@@ -38,19 +75,31 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
             hidden_size: metadata[&format!("{arch}.embedding_length")]
                 .to_u64()
                 .unwrap() as usize,
-            num_attn_heads: metadata[&format!("{arch}.attention.head_count")]
-                .to_u64()
-                .unwrap() as usize,
-            num_kv_heads: metadata[&format!("{arch}.attention.head_count_kv")]
-                .to_u64()
-                .unwrap() as usize,
+            num_attn_heads,
+            num_kv_heads,
             num_layers: metadata[&format!("{arch}.block_count")].to_u64().unwrap() as usize,
-            key_length: metadata
-                .get(&format!("{arch}.attention.key_length"))
-                .map(|x| x.to_u64().unwrap() as usize),
-            value_length: metadata
-                .get(&format!("{arch}.attention.value_length"))
-                .map(|x| x.to_u64().unwrap() as usize),
+            key_length,
+            value_length,
+        }
+    }
+}
+
+impl ContentConfig {
+    /// Narrow the KV head count to *this rank's* share under tensor parallelism.
+    ///
+    /// The preallocated per-sequence KV cache is shaped from this, and the engine also
+    /// derives its prefill key/value head count from it, so it has to match exactly what
+    /// this rank's attention produces. Under head-parallel attention that is this rank's
+    /// own slice — neither the global count (which over-allocates and mismatches on every
+    /// rank) nor the widest rank's count (which mismatches on the narrow ranks whenever
+    /// the world size does not divide the head count).
+    pub fn split_kv_heads(&mut self, rank: usize, world_size: usize) {
+        if world_size > 1 && self.num_kv_heads >= world_size {
+            // Same split as the loader's `tp_split`: the first `num_kv_heads % world_size`
+            // ranks take one extra head.
+            let base = self.num_kv_heads / world_size;
+            let remainder = self.num_kv_heads % world_size;
+            self.num_kv_heads = base + usize::from(rank < remainder);
         }
     }
 }
@@ -362,6 +411,26 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 };
                 token_embd + output_norm + output
             }
+            // GLM-MoE (`glm-dsa`): MLA attention + sigmoid MoE. The non-mapped
+            // (global) tensors are the same trio as the other decoder archs:
+            // token embeddings, the final norm, and the output head (tied to the
+            // embeddings when `output.weight` is absent).
+            GGUFArchitecture::GlmDsa => {
+                let token_embd = tensor_info_size_in_bytes!(
+                    self.model.tensor_info("token_embd.weight")?,
+                    DType::F32
+                );
+                let output_norm = tensor_info_size_in_bytes!(
+                    self.model.tensor_info("output_norm.weight")?,
+                    DType::F32
+                );
+                let output = if !self.model.has_tensor("output.weight") {
+                    tensor_info_size_in_bytes!(self.model.tensor_info("token_embd.weight")?)
+                } else {
+                    tensor_info_size_in_bytes!(self.model.tensor_info("output.weight")?)
+                };
+                token_embd + output_norm + output
+            }
             _ => unimplemented!(),
         };
         Ok(size_in_bytes)
@@ -645,6 +714,129 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                     + ffn_gate
             }
 
+            // GLM-MoE (`glm-dsa`): MLA attention (+ a per-layer sparse-attention
+            // "indexer" sub-block) and a sigmoid MoE FFN. The first
+            // `leading_dense_block_count` (=3) layers are dense and layers >= 3 are
+            // MoE; the surrounding code returns a single per-layer size replicated
+            // `num_layers` times (a uniform estimate). The MoE layers dominate, so
+            // we measure a representative MoE layer (`blk.3`) and replicate it — a
+            // safe over-estimate for device-map memory planning (never undercounts
+            // the large expert tensors). Attention/indexer shapes are identical
+            // across all layers, so only the FFN portion is an over-estimate for
+            // the three dense layers.
+            GGUFArchitecture::GlmDsa => {
+                // First MoE layer (after the leading dense layers).
+                let l = "blk.3";
+
+                // --- MLA attention ---
+                let attn_norm = tensor_info_size_in_bytes!(
+                    self.model.tensor_info(&format!("{l}.attn_norm.weight"))?,
+                    DType::F32
+                );
+                let attn_q_a = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_q_a.weight"))?);
+                let attn_q_a_norm = tensor_info_size_in_bytes!(
+                    self.model
+                        .tensor_info(&format!("{l}.attn_q_a_norm.weight"))?,
+                    DType::F32
+                );
+                let attn_q_b = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_q_b.weight"))?);
+                let attn_kv_a_mqa = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_kv_a_mqa.weight"))?);
+                let attn_kv_a_norm = tensor_info_size_in_bytes!(
+                    self.model
+                        .tensor_info(&format!("{l}.attn_kv_a_norm.weight"))?,
+                    DType::F32
+                );
+                let attn_k_b = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_k_b.weight"))?);
+                let attn_v_b = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_v_b.weight"))?);
+                let attn_output = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.attn_output.weight"))?);
+                let attn = attn_norm
+                    + attn_q_a
+                    + attn_q_a_norm
+                    + attn_q_b
+                    + attn_kv_a_mqa
+                    + attn_kv_a_norm
+                    + attn_k_b
+                    + attn_v_b
+                    + attn_output;
+
+                // --- DSA sparse-attention indexer (present on every layer) ---
+                let indexer = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.indexer.attn_k.weight"))?)
+                    + tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info(&format!("{l}.indexer.attn_q_b.weight"))?)
+                    + tensor_info_size_in_bytes!(
+                        self.model
+                            .tensor_info(&format!("{l}.indexer.k_norm.weight"))?,
+                        DType::F32
+                    )
+                    + tensor_info_size_in_bytes!(self
+                        .model
+                        .tensor_info(&format!("{l}.indexer.proj.weight"))?);
+
+                // --- MoE FFN: router + 256 routed experts + 1 shared expert ---
+                let ffn_norm = tensor_info_size_in_bytes!(
+                    self.model.tensor_info(&format!("{l}.ffn_norm.weight"))?,
+                    DType::F32
+                );
+                let ffn_gate_inp = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_gate_inp.weight"))?);
+                // Routed experts: stacked [hidden, ffn, n_expert] tensors.
+                let ffn_gate_exps = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_gate_exps.weight"))?);
+                let ffn_up_exps = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_up_exps.weight"))?);
+                let ffn_down_exps = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_down_exps.weight"))?);
+                // Shared expert (always active).
+                let ffn_gate_shexp = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_gate_shexp.weight"))?);
+                let ffn_up_shexp = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_up_shexp.weight"))?);
+                let ffn_down_shexp = tensor_info_size_in_bytes!(self
+                    .model
+                    .tensor_info(&format!("{l}.ffn_down_shexp.weight"))?);
+                let ffn = ffn_norm
+                    + ffn_gate_inp
+                    + ffn_gate_exps
+                    + ffn_up_exps
+                    + ffn_down_exps
+                    + ffn_gate_shexp
+                    + ffn_up_shexp
+                    + ffn_down_shexp;
+
+                // Tensor parallelism: under the ring (or NCCL) backend the linear
+                // layers are sharded across ranks (Column/Row-ParallelLayer split by
+                // world_size), so each rank only holds ~1/world_size of every layer's
+                // weights. The full-model figure above would size the whole model
+                // against a single node's memory and reject the load. Divide by the
+                // global tensor-parallel size; `get_global_tp_size_from_devices`
+                // returns the ring `world_size` when ring is active, the device count
+                // for NCCL, and 1 otherwise (so the single-node estimate is unchanged).
+                let world_size =
+                    mistralrs_quant::distributed::get_global_tp_size_from_devices().unwrap_or(1);
+                (attn + indexer + ffn) / world_size.max(1)
+            }
+
             _ => unimplemented!(),
         };
         Ok(vec![size_in_bytes; self.num_layers(config)?])
@@ -652,5 +844,64 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
     fn model_config(&self, _config: &str) -> Result<Box<dyn ModelConfigLike>> {
         let model_config_metadata: ContentConfig = self.model.into();
         Ok(Box::new(model_config_metadata))
+    }
+}
+
+#[cfg(test)]
+mod split_kv_heads_tests {
+    use super::ContentConfig;
+
+    fn config(num_kv_heads: usize) -> ContentConfig {
+        ContentConfig {
+            max_seq_len: 4096,
+            hidden_size: 6144,
+            num_attn_heads: num_kv_heads,
+            num_kv_heads,
+            num_layers: 78,
+            key_length: Some(256),
+            value_length: Some(256),
+        }
+    }
+
+    /// Each rank must report exactly the heads it owns: the engine shapes its prefill KV
+    /// path from this, so a rank claiming one head more than it computes fails the first
+    /// prompt step with a dim-1 shape mismatch.
+    #[test]
+    fn reports_each_rank_its_own_share() {
+        // 64 heads over 3 ranks is the split that has a remainder: 22, 21, 21.
+        let shares: Vec<usize> = (0..3)
+            .map(|rank| {
+                let mut cfg = config(64);
+                cfg.split_kv_heads(rank, 3);
+                cfg.num_kv_heads
+            })
+            .collect();
+        assert_eq!(shares, vec![22, 21, 21]);
+        assert_eq!(shares.iter().sum::<usize>(), 64);
+    }
+
+    #[test]
+    fn is_a_no_op_without_tensor_parallelism() {
+        let mut cfg = config(64);
+        cfg.split_kv_heads(0, 1);
+        assert_eq!(cfg.num_kv_heads, 64);
+    }
+
+    #[test]
+    fn leaves_head_counts_smaller_than_the_world_alone() {
+        // Fewer heads than ranks cannot be split; the loader rejects that case, and this
+        // must not silently report zero heads in the meantime.
+        let mut cfg = config(2);
+        cfg.split_kv_heads(0, 3);
+        assert_eq!(cfg.num_kv_heads, 2);
+    }
+
+    #[test]
+    fn divides_evenly_when_the_world_size_divides_the_heads() {
+        for rank in 0..4 {
+            let mut cfg = config(64);
+            cfg.split_kv_heads(rank, 4);
+            assert_eq!(cfg.num_kv_heads, 16, "rank {rank}");
+        }
     }
 }
