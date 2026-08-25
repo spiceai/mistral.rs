@@ -868,16 +868,50 @@ impl Engine {
 
     fn replicate_request_to_daemons(&self, request: &Request) {
         if !distributed::is_daemon() && mistralrs_quant::distributed::use_nccl() {
-            let name = distributed::ipc_name().unwrap();
-            let num_workers =
-                mistralrs_quant::distributed::get_global_tp_size_from_devices().unwrap() - 1;
-            let listener = ListenerOptions::new().name(name).create_sync().unwrap();
+            // Same-machine daemons (one per extra local accelerator) take the IPC socket.
+            let num_local = distributed::local_daemon_count();
+            if num_local > 0 {
+                let name = distributed::ipc_name().unwrap();
+                let listener = ListenerOptions::new().name(name).create_sync().unwrap();
 
-            for _ in 0..num_workers {
-                let stream = listener.accept().unwrap();
-                let mut writer = BufWriter::new(stream);
-                let req = format!("{}\n", serde_json::to_string(&request).unwrap());
-                writer.write_all(req.as_bytes()).unwrap();
+                for _ in 0..num_local {
+                    let stream = listener.accept().unwrap();
+                    let mut writer = BufWriter::new(stream);
+                    let req = format!("{}\n", serde_json::to_string(&request).unwrap());
+                    writer.write_all(req.as_bytes()).unwrap();
+                }
+            }
+
+            // Worker NODES are separate processes on other machines and cannot see the
+            // IPC socket, so the same request goes out over TCP. Without this the remote
+            // ranks never learn there is work and every collective blocks forever.
+            let num_remote = distributed::mn_head_num_workers();
+            if num_remote > 0 {
+                let port = distributed::mn_request_port().expect("multi-node request port");
+                match TcpListener::bind(format!("0.0.0.0:{port}")) {
+                    Ok(listener) => {
+                        for _ in 0..num_remote {
+                            match listener.accept() {
+                                Ok((stream, _)) => {
+                                    let mut writer = BufWriter::new(stream);
+                                    let req =
+                                        format!("{}\n", serde_json::to_string(&request).unwrap());
+                                    if let Err(e) = writer.write_all(req.as_bytes()) {
+                                        tracing::error!(
+                                            "Failed to replicate request to a worker node: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    "Failed to accept a worker node for replication: {e}"
+                                ),
+                            }
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        "Failed to bind the multi-node request port {port}: {e}"
+                    ),
+                }
             }
         } else if !distributed::is_daemon() && cfg!(feature = "ring") {
             let num_workers =
