@@ -47,7 +47,7 @@ use crate::{
     models::quantized_starcoder2::ModelWeights as QStarcoder2,
     xlora_models::{XLoraQLlama, XLoraQPhi3},
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use candle_core::{Device, Tensor};
 use either::Either;
 use hf_hub::{Repo, RepoType};
@@ -378,7 +378,15 @@ impl Loader for GGUFLoader {
             let WorkerTransferData::Init { worker_rank, .. } = payload;
             vec![candle_core::Device::new_cuda(worker_rank + 1)?]
         } else if use_nccl {
-            vec![candle_core::Device::new_cuda(0)?]
+            // Reuse the pipeline's OWN device rather than minting a second handle for the
+            // same ordinal: candle compares devices by handle, so tensors built on one
+            // (the position ids) refuse to meet tensors built on the other with
+            // "positions must be on the same cuda device as query".
+            if matches!(device, candle_core::Device::Cuda(_)) {
+                vec![device.clone()]
+            } else {
+                vec![candle_core::Device::new_cuda(0)?]
+            }
         } else {
             device_map::get_all_similar_devices(device)?
         };
@@ -410,6 +418,44 @@ impl Loader for GGUFLoader {
                 nm_device: available_devices[0].clone(),
                 comm: Arc::new(comm),
             };
+        } else if mistralrs_quant::distributed::use_nccl() {
+            // Multi-node NCCL takes the same shape as the ring branch above, with one
+            // extra step: every rank must join the communicator with the SAME unique id,
+            // and the GGUF path never runs the handshake that distributes it. The head
+            // mints the id and serves it; the workers fetch it before joining.
+            let topology = crate::distributed::mn_global_world_size()
+                .zip(crate::distributed::mn_rank())
+                .filter(|(world_size, _)| *world_size > 1);
+            if let Some((world_size, rank)) = topology {
+            let n_workers = world_size - 1;
+            let id = if rank == 0 {
+                let addr = crate::distributed::mn_head_bind_addr()
+                    .context("multi-node head address")?;
+                let id = mistralrs_quant::Id::new();
+                let server = mistralrs_quant::Server::new(&addr, n_workers, 1)?;
+                server.broadcast_id(&id)?;
+                id
+            } else {
+                let addr = crate::distributed::mn_worker_server_addr()
+                    .context("multi-node worker server address")?;
+                let client = mistralrs_quant::Client::new(addr.parse()?, 1)?;
+                client.receive_id()?
+            };
+
+            let comm = mistralrs_quant::Comm::from_device(
+                id,
+                &available_devices[0],
+                rank,
+                world_size,
+            )?;
+            info!("GGUF NCCL tensor parallelism: rank {rank} of world size {world_size}.");
+            tp_world_size = world_size;
+            tp_rank = rank;
+            mapper = DeviceMapSetting::Nccl {
+                nm_device: available_devices[0].clone(),
+                comm: Arc::new(comm),
+            };
+            }
         }
 
         let pipeline_mapper = mapper.into_mapper(

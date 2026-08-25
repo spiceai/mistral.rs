@@ -161,9 +161,102 @@ fn select_compatible_tensor_parallel_size(
     Ok(None)
 }
 
+/// `MISTRALRS_MN_*` names the multi-node NCCL wiring. The id-exchange port carries the
+/// NCCL unique id once, at load; requests need their own channel, and remote workers are
+/// separate processes on separate machines, so the local IPC socket cannot reach them.
+/// The request channel sits one port above the id-exchange port on both sides.
+const MISTRALRS_MN_HEAD_PORT: &str = "MISTRALRS_MN_HEAD_PORT";
+const MISTRALRS_MN_HEAD_NUM_WORKERS: &str = "MISTRALRS_MN_HEAD_NUM_WORKERS";
+const MISTRALRS_MN_WORKER_SERVER_ADDR: &str = "MISTRALRS_MN_WORKER_SERVER_ADDR";
+
+/// Port the head serves requests on, derived from whichever end's variable is set.
+pub(crate) fn mn_request_port() -> Option<u16> {
+    if let Ok(port) = env::var(MISTRALRS_MN_HEAD_PORT) {
+        return u16::from_str(&port).ok()?.checked_add(1);
+    }
+    let addr = env::var(MISTRALRS_MN_WORKER_SERVER_ADDR).ok()?;
+    let (_, port) = addr.rsplit_once(':')?;
+    u16::from_str(port).ok()?.checked_add(1)
+}
+
+/// `host:port` a remote worker dials to receive replicated requests.
+pub(crate) fn mn_worker_request_addr() -> Option<String> {
+    let addr = env::var(MISTRALRS_MN_WORKER_SERVER_ADDR).ok()?;
+    let (host, _) = addr.rsplit_once(':')?;
+    Some(format!("{host}:{}", mn_request_port()?))
+}
+
+/// True when this process is a tensor-parallel worker on a DIFFERENT machine from the
+/// head. Such a worker is a replica exactly like a locally spawned daemon, but it was
+/// started independently and so never carries [`IS_DAEMON_FLAG`].
+pub(crate) fn is_mn_remote_worker() -> bool {
+    env::var(MISTRALRS_MN_WORKER_SERVER_ADDR).is_ok()
+}
+
+/// Number of remote worker nodes this head replicates to (0 when not a multi-node head).
+pub(crate) fn mn_head_num_workers() -> usize {
+    env::var(MISTRALRS_MN_HEAD_NUM_WORKERS)
+        .ok()
+        .and_then(|x| usize::from_str(&x).ok())
+        .unwrap_or(0)
+}
+
+/// Number of same-machine daemon peers: one per local accelerator beyond this process's.
+pub(crate) fn local_daemon_count() -> usize {
+    mistralrs_quant::distributed::local_device_count()
+        .unwrap_or(1)
+        .saturating_sub(1)
+}
+
+/// Tensor-parallel world size of a multi-node run, from the head/worker environment.
+pub(crate) fn mn_global_world_size() -> Option<usize> {
+    env::var(MISTRALRS_MN_GLOBAL_WORLD_SIZE)
+        .ok()
+        .and_then(|x| usize::from_str(&x).ok())
+}
+
+/// This node's global rank: the head is 0, and worker `w` is `w + 1` because Spice runs
+/// exactly one rank per node.
+pub(crate) fn mn_rank() -> Option<usize> {
+    if let Ok(id) = env::var("MISTRALRS_MN_WORKER_ID") {
+        return usize::from_str(&id).ok()?.checked_add(1);
+    }
+    env::var(MISTRALRS_MN_HEAD_PORT).ok().map(|_| 0)
+}
+
+/// `0.0.0.0:port` the head binds to hand out the NCCL unique id.
+pub(crate) fn mn_head_bind_addr() -> Option<String> {
+    let port = env::var(MISTRALRS_MN_HEAD_PORT).ok()?;
+    Some(format!("0.0.0.0:{port}"))
+}
+
+/// `host:port` a worker dials for the NCCL unique id.
+pub(crate) fn mn_worker_server_addr() -> Option<String> {
+    env::var(MISTRALRS_MN_WORKER_SERVER_ADDR).ok()
+}
+
+/// Read one newline-delimited [`Request`] from a replication stream.
+fn read_replicated_request<R: BufRead>(mut reader: R) -> Option<Request> {
+    let mut buf = String::new();
+    if let Err(e) = reader.read_line(&mut buf) {
+        tracing::error!("Failed to read replicated request: {e}");
+        return None;
+    }
+    match serde_json::from_str(&buf) {
+        Ok(req) => Some(req),
+        Err(e) => {
+            tracing::error!("Failed to parse request JSON: {e}");
+            None
+        }
+    }
+}
+
 pub fn is_daemon() -> bool {
     if cfg!(feature = "cuda") && !cfg!(feature = "ring") {
-        std::env::var(IS_DAEMON_FLAG).is_ok()
+        // A locally spawned child carries the flag. A remote multi-node worker is just as
+        // much a replica, but it was launched on its own machine and never sees the flag;
+        // without this it would believe it is the head and try to serve its own API.
+        std::env::var(IS_DAEMON_FLAG).is_ok() || is_mn_remote_worker()
     } else if use_ring() {
         !RingConfig::load().is_master_rank()
     } else {
@@ -189,6 +282,25 @@ pub fn nccl_daemon_replicator(request_sender: Sender<Request>) {
             };
 
             loop {
+                // A remote multi-node worker has no IPC socket to the head: the head is on
+                // another machine, so requests arrive over TCP instead.
+                if let Some(addr) = mn_worker_request_addr() {
+                    match TcpStream::connect(&addr) {
+                        Ok(stream) => {
+                            if let Some(req) = read_replicated_request(BufReader::new(stream)) {
+                                handle_daemon_request(req, &dispatch).await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Waiting for head at {addr}: {e}");
+                            tokio::time::sleep(Duration::from_millis(
+                                WORKER_READY_CONNECT_SLEEP_MS,
+                            ))
+                            .await;
+                        }
+                    }
+                    continue;
+                }
                 let name = match ipc_name() {
                     Ok(name) => name,
                     Err(e) => {
@@ -197,20 +309,9 @@ pub fn nccl_daemon_replicator(request_sender: Sender<Request>) {
                     }
                 };
                 if let Ok(stream) = LocalStream::connect(name) {
-                    let mut reader = BufReader::new(stream);
-                    let mut buf = String::new();
-                    if let Err(e) = reader.read_line(&mut buf) {
-                        tracing::error!("Failed to read line from IPC stream: {e}");
-                        continue;
+                    if let Some(req) = read_replicated_request(BufReader::new(stream)) {
+                        handle_daemon_request(req, &dispatch).await;
                     }
-                    let req: Request = match serde_json::from_str(&buf) {
-                        Ok(req) => req,
-                        Err(e) => {
-                            tracing::error!("Failed to parse request JSON: {e}");
-                            continue;
-                        }
-                    };
-                    handle_daemon_request(req, &dispatch).await;
                 }
             }
         });
@@ -235,6 +336,25 @@ pub fn nccl_daemon_replicator_mistralrs(mistralrs: Arc<crate::MistralRs>) {
             };
 
             loop {
+                // A remote multi-node worker has no IPC socket to the head: the head is on
+                // another machine, so requests arrive over TCP instead.
+                if let Some(addr) = mn_worker_request_addr() {
+                    match TcpStream::connect(&addr) {
+                        Ok(stream) => {
+                            if let Some(req) = read_replicated_request(BufReader::new(stream)) {
+                                handle_daemon_request(req, &dispatch).await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Waiting for head at {addr}: {e}");
+                            tokio::time::sleep(Duration::from_millis(
+                                WORKER_READY_CONNECT_SLEEP_MS,
+                            ))
+                            .await;
+                        }
+                    }
+                    continue;
+                }
                 let name = match ipc_name() {
                     Ok(name) => name,
                     Err(e) => {
@@ -243,20 +363,9 @@ pub fn nccl_daemon_replicator_mistralrs(mistralrs: Arc<crate::MistralRs>) {
                     }
                 };
                 if let Ok(stream) = LocalStream::connect(name) {
-                    let mut reader = BufReader::new(stream);
-                    let mut buf = String::new();
-                    if let Err(e) = reader.read_line(&mut buf) {
-                        tracing::error!("Failed to read line from IPC stream: {e}");
-                        continue;
+                    if let Some(req) = read_replicated_request(BufReader::new(stream)) {
+                        handle_daemon_request(req, &dispatch).await;
                     }
-                    let req: Request = match serde_json::from_str(&buf) {
-                        Ok(req) => req,
-                        Err(e) => {
-                            tracing::error!("Failed to parse request JSON: {e}");
-                            continue;
-                        }
-                    };
-                    handle_daemon_request(req, &dispatch).await;
                 }
             }
         });
@@ -448,7 +557,9 @@ pub fn begin_tensor_parallel_session(model_slots: usize) -> anyhow::Result<()> {
 }
 
 fn spawn_tensor_parallel_workers(ids: &[mistralrs_quant::Id]) -> anyhow::Result<()> {
-    let num_workers = mistralrs_quant::distributed::get_global_tp_size_from_devices()? - 1;
+    // Node-local spawn: one child per extra LOCAL accelerator. The global width spans
+    // machines, and using it here would fork phantom children on every node.
+    let num_workers = local_daemon_count();
     if num_workers == 0 {
         return Ok(());
     }
@@ -624,7 +735,11 @@ pub(crate) fn prepare_distributed_mapper<T: DeviceMappedModelLoader + IsqModelLo
         config.rank
     } else if let Some(session_id) = next_tensor_parallel_id()? {
         id = session_id;
-        let num_workers = global_world_size - 1;
+        // Workers spawned/awaited here are LOCAL to this node, so the count is this
+        // node's own device count, not the global world. With one GPU per node
+        // (multi-node tensor parallelism) `global_world_size - 1` made every node
+        // spawn or block on phantom local daemons that never appear, hanging the load.
+        let num_workers = local_world_size - 1;
         let listener = ListenerOptions::new().name(name).create_sync()?;
         let mut ready_count = 0;
 
@@ -642,7 +757,11 @@ pub(crate) fn prepare_distributed_mapper<T: DeviceMappedModelLoader + IsqModelLo
         0
     } else {
         id = mistralrs_quant::Id::new();
-        let num_workers = global_world_size - 1;
+        // Workers spawned/awaited here are LOCAL to this node, so the count is this
+        // node's own device count, not the global world. With one GPU per node
+        // (multi-node tensor parallelism) `global_world_size - 1` made every node
+        // spawn or block on phantom local daemons that never appear, hanging the load.
+        let num_workers = local_world_size - 1;
         let mut children = Vec::new();
         for worker_rank in 0..num_workers {
             let exe_path = env::current_exe().expect("Failed to get current exe");

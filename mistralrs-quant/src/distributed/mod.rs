@@ -64,6 +64,26 @@ impl BarrierLike for Barrier {
     }
 }
 
+/// Number of accelerators on THIS node.
+///
+/// Distinct from [`get_global_tp_size_from_devices`], which reports the tensor-parallel
+/// width and spans every node in a multi-node run. Anything sizing a node-local resource
+/// (how many local worker processes to spawn, how many local IPC peers to await) wants
+/// this one; anything sharding the model wants the global width.
+pub fn local_device_count() -> Result<usize> {
+    #[cfg(feature = "cuda")]
+    {
+        use candle_core::cuda::WrapErr;
+        candle_core::cuda::cudarc::driver::result::device::get_count()
+            .w()
+            .map(|x| x as usize)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        Ok(1)
+    }
+}
+
 pub fn get_global_tp_size_from_devices() -> Result<usize> {
     #[cfg(all(feature = "cuda", feature = "ring"))]
     {
@@ -78,15 +98,20 @@ pub fn get_global_tp_size_from_devices() -> Result<usize> {
 
     #[cfg(all(feature = "cuda", feature = "nccl"))]
     {
+        // In a multi-node run the tensor-parallel width is the GLOBAL world size. The
+        // local device count describes only this node's share, so using it would size the
+        // whole model against a single node and reject a model that does fit once split.
+        if let Ok(x) = std::env::var(MISTRALRS_MN_GLOBAL_WORLD_SIZE) {
+            use std::str::FromStr;
+            return Ok(usize::from_str(&x)
+                .expect("Not a number for MISTRALRS_MN_GLOBAL_WORLD_SIZE!"));
+        }
         // In case we have manual set of TP size
         if let Ok(x) = std::env::var(MISTRALRS_MN_LOCAL_WORLD_SIZE) {
             use std::str::FromStr;
             Ok(usize::from_str(&x).expect("Not a number for MISTRALRS_MN_LOCAL_WORLD_SIZE!"))
         } else {
-            use candle_core::cuda::WrapErr;
-            candle_core::cuda::cudarc::driver::result::device::get_count()
-                .w()
-                .map(|x| x as usize)
+            local_device_count()
         }
     }
 
@@ -261,10 +286,19 @@ mod nccl {
             }
             let stream = dev.as_cuda_device()?.cuda_stream();
             let device_ordinal = stream.context().ordinal();
-            if rank != device_ordinal {
+            // The global rank spans machines; a device ordinal is node-local. The real
+            // invariant is that this rank's position WITHIN its own node matches the
+            // ordinal it runs on. Single-node runs are unaffected (there the local world
+            // is the whole world), while multi-node runs -- where every node has a
+            // `cuda:0` but only one of them is global rank 0 -- now pass.
+            let local_world_size = super::local_device_count().unwrap_or(1).max(1);
+            let local_rank = rank % local_world_size;
+            if local_rank != device_ordinal {
                 candle_core::bail!(
-                    "NCCL rank {} must match device ordinal, but device ordinal is {}. \
-                     Ensure GPUs are visible in the correct order (check CUDA_VISIBLE_DEVICES).",
+                    "NCCL local rank {} (global rank {}) must match device ordinal, but \
+                     device ordinal is {}. Ensure GPUs are visible in the correct order \
+                     (check CUDA_VISIBLE_DEVICES).",
+                    local_rank,
                     rank,
                     device_ordinal
                 );
@@ -560,7 +594,12 @@ mod nccl_ops {
                                 candle_core::bail!("NCCL all_reduce: elem_count must be > 0");
                             }
                             let device_ordinal = dev.cuda_stream().context().ordinal();
-                            if device_ordinal != nccl_comm.rank() {
+                            // The global rank spans machines while a device ordinal is
+                            // node-local, so compare this rank's position WITHIN its node.
+                            // Single-node runs are unchanged (local world == whole world).
+                            let local_world_size =
+                                super::local_device_count().unwrap_or(1).max(1);
+                            if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
                                      Ensure each rank uses the correct GPU.",
@@ -591,7 +630,12 @@ mod nccl_ops {
                                 candle_core::bail!("NCCL all_reduce: elem_count must be > 0");
                             }
                             let device_ordinal = dev.cuda_stream().context().ordinal();
-                            if device_ordinal != nccl_comm.rank() {
+                            // The global rank spans machines while a device ordinal is
+                            // node-local, so compare this rank's position WITHIN its node.
+                            // Single-node runs are unchanged (local world == whole world).
+                            let local_world_size =
+                                super::local_device_count().unwrap_or(1).max(1);
+                            if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
                                      Ensure each rank uses the correct GPU.",
@@ -622,7 +666,12 @@ mod nccl_ops {
                                 candle_core::bail!("NCCL all_reduce: elem_count must be > 0");
                             }
                             let device_ordinal = dev.cuda_stream().context().ordinal();
-                            if device_ordinal != nccl_comm.rank() {
+                            // The global rank spans machines while a device ordinal is
+                            // node-local, so compare this rank's position WITHIN its node.
+                            // Single-node runs are unchanged (local world == whole world).
+                            let local_world_size =
+                                super::local_device_count().unwrap_or(1).max(1);
+                            if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
                                      Ensure each rank uses the correct GPU.",
@@ -709,7 +758,12 @@ mod nccl_ops {
                                 candle_core::bail!("NCCL all_gather: elem_count must be > 0");
                             }
                             let device_ordinal = dev.cuda_stream().context().ordinal();
-                            if device_ordinal != nccl_comm.rank() {
+                            // The global rank spans machines while a device ordinal is
+                            // node-local, so compare this rank's position WITHIN its node.
+                            // Single-node runs are unchanged (local world == whole world).
+                            let local_world_size =
+                                super::local_device_count().unwrap_or(1).max(1);
+                            if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
                                      Ensure each rank uses the correct GPU.",
@@ -740,7 +794,12 @@ mod nccl_ops {
                                 candle_core::bail!("NCCL all_gather: elem_count must be > 0");
                             }
                             let device_ordinal = dev.cuda_stream().context().ordinal();
-                            if device_ordinal != nccl_comm.rank() {
+                            // The global rank spans machines while a device ordinal is
+                            // node-local, so compare this rank's position WITHIN its node.
+                            // Single-node runs are unchanged (local world == whole world).
+                            let local_world_size =
+                                super::local_device_count().unwrap_or(1).max(1);
+                            if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
                                      Ensure each rank uses the correct GPU.",
@@ -771,7 +830,12 @@ mod nccl_ops {
                                 candle_core::bail!("NCCL all_gather: elem_count must be > 0");
                             }
                             let device_ordinal = dev.cuda_stream().context().ordinal();
-                            if device_ordinal != nccl_comm.rank() {
+                            // The global rank spans machines while a device ordinal is
+                            // node-local, so compare this rank's position WITHIN its node.
+                            // Single-node runs are unchanged (local world == whole world).
+                            let local_world_size =
+                                super::local_device_count().unwrap_or(1).max(1);
+                            if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
                                      Ensure each rank uses the correct GPU.",
