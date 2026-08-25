@@ -451,11 +451,17 @@ fn indexed_moe_forward_fused_q8_1_input(
 pub fn qtensor_indexed_moe_forward(qtensor: &QTensor, x: &Tensor, ids: &Tensor) -> Result<Tensor> {
     let dtype = qtensor.dtype();
 
-    // i-quants have no fused q8_1 indexed-MoE kernel (and no CPU vec_dot), so the
-    // GPU path below cannot run them. Dequantize the expert weights to f32 (via
-    // candle's CPU `to_float` fallback) and use the unquantized gathered matmul.
-    // The weight stays quantized in memory; only this tensor is materialized as a
-    // transient f32 buffer for the call.
+    // i-quants have no fused q8_1 indexed-MoE kernel, so the GPU path below cannot run
+    // them and the weights have to be expanded before the matmul.
+    //
+    // Expand the routed experts directly, in routing order. The obvious route --
+    // `UnquantLinear::gather_forward` -- expands the tensor and then `index_select`s the
+    // routed rows out of it, and that select was the single most expensive kernel in the
+    // decode profile (`is_u32_f32`, ~30% of GPU time): it copies the whole gathered weight
+    // regardless of how few experts were routed to. Expanding straight into routing order
+    // produces the same `[tokens * topk, out, in]` operand with no select at all. A token
+    // routed to the same expert twice expands it twice, which costs a little dequantize to
+    // save the copy -- dequantize is a few percent of the profile, the select was thirty.
     if matches!(
         dtype,
         GgmlDType::Iq2Xxs
@@ -464,11 +470,47 @@ pub fn qtensor_indexed_moe_forward(qtensor: &QTensor, x: &Tensor, ids: &Tensor) 
             | GgmlDType::Iq1S
             | GgmlDType::Iq1M
     ) {
-        let weights = qtensor.dequantize(x.device())?;
-        let unquant = <crate::UnquantLinear as crate::QuantMethod>::new(
-            crate::QuantMethodConfig::Unquantized(candle_nn::Linear::new(weights, None)),
-        )?;
-        return crate::QuantMethod::gather_forward(&unquant, x, ids);
+        let expert_count = qtensor.shape().dims()[0];
+        let (token_count, topk) = ids.dims2()?;
+        let routed = ids.flatten_all()?.to_vec1::<u32>()?;
+        for &expert in &routed {
+            if expert as usize >= expert_count {
+                candle_core::bail!(
+                    "MoE routed to expert {expert}, but the weight holds {expert_count}"
+                )
+            }
+        }
+
+        // `[tokens * topk, out, in]`, already in the order the matmul consumes.
+        let selected = qtensor.dequantize_rows(&routed, x.device())?;
+        let (_, out_features, _) = selected.dims3()?;
+
+        let rows = token_count * topk;
+        let a = match x.dims() {
+            // One input per token, shared across that token's experts.
+            &[tokens, 1, hidden] if tokens == token_count => x
+                .broadcast_as((token_count, topk, hidden))?
+                .reshape((rows, hidden))?,
+            // One input per (token, expert) slot, from a previous gather.
+            &[tokens, slots, hidden] if tokens == token_count && slots == topk => {
+                x.reshape((rows, hidden))?
+            }
+            other => candle_core::bail!(
+                "indexed_moe_forward: input shape {other:?} does not match indices {:?}",
+                ids.dims()
+            ),
+        };
+
+        // Multiply as `W @ a` rather than `a @ W^T`. The transposed form needs the weight
+        // in `[in, out]`, and `transpose(1, 2)` on a `[rows, out, in]` tensor is not a
+        // layout the matmul can consume directly, so it was materialized as a copy --
+        // `copy2d_f32`, 20% of the decode profile, on the largest operand in the call.
+        // This orientation leaves the weight untouched and unsqueezes the activation
+        // instead, which is a view of a vector rather than a copy of a matrix.
+        return selected
+            .matmul(&a.unsqueeze(2)?)?
+            .squeeze(2)?
+            .reshape((token_count, topk, out_features));
     }
 
     // Check supported dtypes
