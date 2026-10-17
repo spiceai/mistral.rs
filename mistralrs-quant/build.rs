@@ -187,6 +187,8 @@ fn main() -> Result<(), String> {
             .arg(&header_hash_arg);
 
         let compute_cap = builder.get_compute_cap().unwrap_or(80);
+        // Pass compute cap to CUDA kernels so they can guard bf16 code
+        builder = builder.arg(&format!("-DCOMPUTE_CAP={compute_cap}"));
         // ======== Handle optional kernel compilation via rustc-cfg flags
         let cc_over_80 = compute_cap >= 80;
         let target = std::env::var("TARGET").unwrap();

@@ -1,9 +1,9 @@
-from mistralrs import Runner, Which, ChatCompletionRequest, MultimodalArchitecture
+from mistralrs import Runner, Which, ChatCompletionRequest, VisionArchitecture
 
 runner = Runner(
-    which=Which.MultimodalPlain(
+    which=Which.VisionPlain(
         model_id="mistralai/Mistral-Small-3.1-24B-Instruct-2503",
-        arch=MultimodalArchitecture.Gemma3,
+        arch=VisionArchitecture.Gemma3,
     ),
     in_situ_quant="Q4K",
 )

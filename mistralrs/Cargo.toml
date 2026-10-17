@@ -12,6 +12,7 @@ categories.workspace = true
 license.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/mistralrs"
+autoexamples = false
 
 [dependencies]
 mistralrs-core.workspace = true

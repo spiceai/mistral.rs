@@ -28,6 +28,7 @@ use crate::{
 };
 
 serde_default_fn!(bool, word_emb_default, false);
+serde_default_fn!(bool, attention_bias_default, false);
 
 fn layers_support_packed_prefill(
     head_dim: usize,
@@ -64,6 +65,10 @@ fn cache_types(
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 pub struct Config {
+    // Gemma 2/3 HuggingFace configs sometimes omit `attention_bias` entirely
+    // (it implicitly defaults to `false`). Make this field optional so loading
+    // does not fail on those configs.
+    #[serde(default = "attention_bias_default")]
     pub attention_bias: bool,
     pub head_dim: usize,
     // The code gemma configs include both hidden_act and hidden_activation.

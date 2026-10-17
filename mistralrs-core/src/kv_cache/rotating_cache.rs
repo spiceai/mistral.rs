@@ -52,7 +52,7 @@ impl RotatingCache {
 
     // Slack beyond the window bounds how often the window is relocated to the front.
     fn max_capacity(&self) -> usize {
-        self.max_seq_len + NormalCache::CACHE_GROW_SIZE
+        self.max_seq_len + NormalCache::cache_grow_size()
     }
 
     pub fn dim(&self) -> usize {
@@ -300,10 +300,10 @@ impl RotatingCache {
                 if self.capacity_seq_len < max_capacity {
                     let needed = keep_len + seq_len;
                     let n_blocks = needed
-                        .div_ceil(NormalCache::CACHE_GROW_SIZE)
-                        .max(self.capacity_seq_len / NormalCache::CACHE_GROW_SIZE + 1);
+                        .div_ceil(NormalCache::cache_grow_size())
+                        .max(self.capacity_seq_len / NormalCache::cache_grow_size() + 1);
                     self.capacity_seq_len =
-                        (n_blocks * NormalCache::CACHE_GROW_SIZE).min(max_capacity);
+                        (n_blocks * NormalCache::cache_grow_size()).min(max_capacity);
                     let mut shape = src.dims().to_vec();
                     shape[self.dim] = self.capacity_seq_len;
                     let old = self.all_data.take().unwrap();

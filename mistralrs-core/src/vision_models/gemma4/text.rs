@@ -50,7 +50,7 @@ fn gemma4_moe_weight_prefix(vb: &ShardedVarBuilder) -> &'static str {
 
 macro_rules! is_sliding {
     ($layer_idx:expr, $cfg:expr) => {
-        $cfg.layer_types[$layer_idx] == "sliding_attention"
+        $cfg.effective_layer_types()[$layer_idx] == "sliding_attention"
     };
 }
 
@@ -65,8 +65,9 @@ fn kv_shared_layer_index(cfg: &Gemma4TextConfig, layer_idx: usize) -> Result<Opt
         return Ok(None);
     }
 
-    let attention_type = &cfg.layer_types[layer_idx];
-    cfg.layer_types[..first_kv_shared_layer_idx]
+    let layer_types = cfg.effective_layer_types();
+    let attention_type = &layer_types[layer_idx];
+    layer_types[..first_kv_shared_layer_idx]
         .iter()
         .rposition(|ty| ty == attention_type)
         .map(Some)
@@ -123,7 +124,7 @@ impl ProportionalRotaryEmbedding {
             inv_freq_vec.push(1f32 / base.powf((2 * i) as f32 / head_dim as f32));
         }
         // Pad with zeros for non-rotated dimensions
-        inv_freq_vec.extend(std::iter::repeat_n(0f32, half_dim - rope_angles));
+        inv_freq_vec.resize(half_dim, 0f32);
 
         let inv_freq = Tensor::from_vec(inv_freq_vec, (1, half_dim), device)?;
         let t = Tensor::arange(0u32, max_position_embeddings as u32, device)?
@@ -1774,9 +1775,10 @@ impl TextModel {
         let first_shared = first_kv_shared_layer_idx(cfg);
         let mut donor_layers = std::collections::HashSet::<usize>::new();
         if first_shared < cfg.num_hidden_layers {
+            let layer_types = cfg.effective_layer_types();
             for shared_idx in first_shared..cfg.num_hidden_layers {
-                let attention_type = &cfg.layer_types[shared_idx];
-                if let Some(donor_idx) = cfg.layer_types[..first_shared]
+                let attention_type = &layer_types[shared_idx];
+                if let Some(donor_idx) = layer_types[..first_shared]
                     .iter()
                     .rposition(|ty| ty == attention_type)
                 {

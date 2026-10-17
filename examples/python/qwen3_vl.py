@@ -1,11 +1,11 @@
-from mistralrs import Runner, Which, ChatCompletionRequest, MultimodalArchitecture
+from mistralrs import Runner, Which, ChatCompletionRequest, VisionArchitecture
 
 MODEL_ID = "Qwen/Qwen3-VL-4B-Thinking"
 
 runner = Runner(
-    which=Which.MultimodalPlain(
+    which=Which.VisionPlain(
         model_id=MODEL_ID,
-        arch=MultimodalArchitecture.Qwen3VL,
+        arch=VisionArchitecture.Qwen3VL,
     ),
 )
 

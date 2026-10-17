@@ -269,6 +269,7 @@ impl<R: std::io::Seek + std::io::Read> Config<ParamsGGUF<'_, R>, Adapter<'_>> {
 }
 
 use crate::{
+    gguf::glm_moe::ModelWeights as QGlmDsa,
     models::quantized_llama::ModelWeights as QLlama,
     xlora_models::{XLoraQLlama, XLoraQPhi3},
 };
@@ -289,6 +290,19 @@ impl TryFrom<ModelParams<'_, ParamsGGML>> for XLoraQLlama {
     fn try_from(params: ModelParams<'_, ParamsGGML>) -> Result<Self, Self::Error> {
         let config = params.expect_adapted("`Config` should be GGML Quantized with an Adapter");
         config.try_into_model()
+    }
+}
+
+akin! {
+    let &models_gguf = [QGlmDsa];
+
+    impl<R: std::io::Seek + std::io::Read> TryFrom<ModelParams<'_, ParamsGGUF<'_, R>>> for *models_gguf {
+        type Error = candle_core::Error;
+
+        fn try_from(params: ModelParams<'_, ParamsGGUF<'_, R>>) -> Result<Self, Self::Error> {
+            let config = params.expect_quantized("`Config` should be GGUF Quantized");
+            config.try_into_model()
+        }
     }
 }
 

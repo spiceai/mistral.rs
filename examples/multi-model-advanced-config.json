@@ -21,23 +21,23 @@
   {
     "model_id": "qwen2-vl",
     "model": {
-      "MultimodalPlain": {
+      "VisionPlain": {
         "model_id": "Qwen/Qwen2-VL-2B-Instruct"
       }
     }
   },
   {
-    "model_id": "gemma4-E4B-multimodal",
+    "model_id": "gemma3-4b-vision",
     "model": {
-      "MultimodalPlain": {
-        "model_id": "google/gemma-4-E4B-it"
+      "VisionPlain": {
+        "model_id": "google/gemma-3-4b-it"
       }
     }
   },
   {
-    "model_id": "phi3-multimodal",
+    "model_id": "phi3-vision",
     "model": {
-      "MultimodalPlain": {
+      "VisionPlain": {
         "model_id": "microsoft/Phi-3-vision-128k-instruct"
       }
     }

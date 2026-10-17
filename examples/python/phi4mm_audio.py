@@ -1,11 +1,11 @@
-from mistralrs import Runner, Which, ChatCompletionRequest, MultimodalArchitecture
+from mistralrs import Runner, Which, ChatCompletionRequest, VisionArchitecture
 
 
-# Choose a multimodal model that supports both modalities
+# Choose a Vision model that supports both modalities
 runner = Runner(
-    which=Which.MultimodalPlain(
+    which=Which.VisionPlain(
         model_id="microsoft/Phi-4-multimodal-instruct",
-        arch=MultimodalArchitecture.Phi4MM,
+        arch=VisionArchitecture.Phi4MM,
     ),
 )
 

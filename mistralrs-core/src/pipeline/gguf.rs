@@ -9,6 +9,7 @@ use super::{
 };
 use crate::device_map::{self, DeviceMapper};
 use crate::distributed::WorkerTransferData;
+use crate::gguf::glm_moe::ModelWeights as QGlmDsa;
 use crate::gguf::{
     base_model::infer_hf_base_model_id,
     convert_gguf_metadata_to_hf_tokenizer,
@@ -129,6 +130,7 @@ fn requires_multimodal_projector(architecture: &str) -> bool {
 enum Model {
     XLoraLlama(XLoraQLlama),
     XLoraPhi3(XLoraQPhi3),
+    GlmDsa(QGlmDsa),
 }
 
 pub struct GGUFPipeline {
@@ -1201,15 +1203,23 @@ impl Loader for GGUFLoader {
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
         let _progress_guard = ProgressScopeGuard::new(silent);
         if matches!(self.kind, ModelKind::GgufQuantized { .. }) || self.dynamic_lora.is_some() {
-            return self.load_native_normal(NativeNormalLoadArgs {
-                paths,
-                dtype,
-                device,
-                silent,
-                mapper,
-                in_situ_quant,
-                paged_attn_config,
-            });
+            let archive = mistralrs_quant::GgufArchive::open(paths.get_weight_filenames())?;
+            let architecture = match archive.metadata_value("general.architecture") {
+                Some(candle_core::quantized::gguf_file::Value::String(value)) => value,
+                _ => String::new(),
+            };
+            // glm-dsa is not in the native registry. The legacy match below owns its graph.
+            if !architecture.eq_ignore_ascii_case("glm-dsa") {
+                return self.load_native_normal(NativeNormalLoadArgs {
+                    paths,
+                    dtype,
+                    device,
+                    silent,
+                    mapper,
+                    in_situ_quant,
+                    paged_attn_config,
+                });
+            }
         }
         if in_situ_quant.is_some()
             || self.config.write_uqff.is_some()
@@ -1281,10 +1291,85 @@ impl Loader for GGUFLoader {
             let WorkerTransferData::Init { worker_rank, .. } = payload;
             vec![candle_core::Device::new_cuda(worker_rank + 1)?]
         } else if use_nccl {
-            vec![candle_core::Device::new_cuda(0)?]
+            // Reuse the pipeline's OWN device rather than minting a second handle for the
+            // same ordinal: candle compares devices by handle, so tensors built on one
+            // (the position ids) refuse to meet tensors built on the other with
+            // "positions must be on the same cuda device as query".
+            if matches!(device, candle_core::Device::Cuda(_)) {
+                vec![device.clone()]
+            } else {
+                vec![candle_core::Device::new_cuda(0)?]
+            }
         } else {
             device_map::get_all_similar_devices(device)?
         };
+
+        // Distributed (ring) tensor parallelism. The safetensors pipelines build a real
+        // multi-rank communicator via `distributed::prepare_distributed_mapper`; the GGUF
+        // path has no such step, so without this every rank gets a single-rank
+        // (`world_size == 1`) mapper and loads the *full* model — OOMing on large MoE
+        // GGUFs. Mirror the ring branch of `prepare_distributed_mapper` here so
+        // `mapper.get_comm_for(..)` yields the real `world_size`, letting TP-capable GGUF
+        // models (glm-dsa expert-parallel MoE) shard across ranks.
+        let mut tp_world_size = 1;
+        let mut tp_rank = 0;
+        if mistralrs_quant::distributed::use_ring() {
+            let ring = mistralrs_quant::RingConfig::load();
+            let comm = mistralrs_quant::Comm::from_device(
+                mistralrs_quant::Id::new(),
+                &available_devices[0],
+                ring.rank,
+                ring.world_size,
+            )?;
+            info!(
+                "GGUF ring tensor parallelism: rank {} of world size {}.",
+                ring.rank, ring.world_size
+            );
+            tp_world_size = ring.world_size;
+            tp_rank = ring.rank;
+            mapper = DeviceMapSetting::Nccl {
+                nm_device: available_devices[0].clone(),
+                comm: Arc::new(comm),
+            };
+        } else if mistralrs_quant::distributed::use_nccl() {
+            // Multi-node NCCL takes the same shape as the ring branch above, with one
+            // extra step: every rank must join the communicator with the SAME unique id,
+            // and the GGUF path never runs the handshake that distributes it. The head
+            // mints the id and serves it; the workers fetch it before joining.
+            let topology = crate::distributed::mn_global_world_size()
+                .zip(crate::distributed::mn_rank())
+                .filter(|(world_size, _)| *world_size > 1);
+            if let Some((world_size, rank)) = topology {
+            let n_workers = world_size - 1;
+            let id = if rank == 0 {
+                let addr = crate::distributed::mn_head_bind_addr()
+                    .context("multi-node head address")?;
+                let id = mistralrs_quant::Id::new();
+                let server = mistralrs_quant::Server::new(&addr, n_workers, 1)?;
+                server.broadcast_id(&id)?;
+                id
+            } else {
+                let addr = crate::distributed::mn_worker_server_addr()
+                    .context("multi-node worker server address")?;
+                let client = mistralrs_quant::Client::new(addr.parse()?, 1)?;
+                client.receive_id()?
+            };
+
+            let comm = mistralrs_quant::Comm::from_device(
+                id,
+                &available_devices[0],
+                rank,
+                world_size,
+            )?;
+            info!("GGUF NCCL tensor parallelism: rank {rank} of world size {world_size}.");
+            tp_world_size = world_size;
+            tp_rank = rank;
+            mapper = DeviceMapSetting::Nccl {
+                nm_device: available_devices[0].clone(),
+                comm: Arc::new(comm),
+            };
+            }
+        }
 
         let pipeline_mapper = mapper.into_mapper(
             num_layers,
@@ -1318,7 +1403,24 @@ impl Loader for GGUFLoader {
 
         let is_xlora = self.kind.is_adapted_and(|a| a.is_x_lora());
 
-        let model_config_metadata: ContentConfig = (&model).into();
+        let paged_attn_config = if matches!(self.kind, ModelKind::GgufAdapter { .. }) {
+            warn!("Adapter models do not currently support PagedAttention, running without");
+            None
+        } else if paged_attn_config.is_some() && !arch.supports_paged_attention() {
+            // Downgrade rather than fail: the architecture is known-good, it just has no
+            // paged kernel, and the caller cannot be expected to track which ones do.
+            info!("{arch} does not support PagedAttention, running with dense attention");
+            None
+        } else {
+            paged_attn_config
+        };
+
+        let mut model_config_metadata: ContentConfig = (&model).into();
+        if matches!(arch, GGUFArchitecture::GlmDsa) {
+            // glm-dsa is the only GGUF arch here with head-parallel attention, so it is the
+            // only one whose per-rank KV cache is narrower than the model's head count.
+            model_config_metadata.split_kv_heads(tp_rank, tp_world_size);
+        }
         let internal_dtype = mapper.get_min_dtype(dtype)?;
 
         let quant = ModelConfig::ParamsGGUF(model, (device, mapper).into(), internal_dtype);
@@ -1326,6 +1428,12 @@ impl Loader for GGUFLoader {
         let model_config = ModelConfig::ModelParams::new(quant, Some(adapter));
 
         let model = match self.kind {
+            ModelKind::GgufQuantized { .. } => match arch {
+                GGUFArchitecture::GlmDsa => Model::GlmDsa(QGlmDsa::try_from(model_config)?),
+                a => bail!(
+                    "GGUF architecture `{a:?}` should have been loaded by the native registry"
+                ),
+            },
             ModelKind::GgufAdapter { adapter, .. } => match arch {
                 GGUFArchitecture::Llama | GGUFArchitecture::Mistral3 => {
                     Model::XLoraLlama(XLoraQLlama::try_from(model_config)?)
@@ -1354,11 +1462,13 @@ impl Loader for GGUFLoader {
         let max_seq_len = match model {
             Model::XLoraLlama(ref xl) => xl.max_seq_len,
             Model::XLoraPhi3(ref p) => p.max_seq_len,
+            Model::GlmDsa(ref p) => p.max_seq_len,
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model {
             Model::XLoraLlama(ref model) => model.cache.full().lock().len(),
             Model::XLoraPhi3(ref model) => model.cache.full().lock().len(),
+            Model::GlmDsa(ref model) => model.cache.normal().0.len(),
         };
 
         if chat_template.bos_token.is_none() {
@@ -1471,6 +1581,7 @@ impl CacheManagerMixin for GGUFPipeline {
         match self.model {
             Model::XLoraLlama(ref model) => &model.cache,
             Model::XLoraPhi3(ref model) => &model.cache,
+            Model::GlmDsa(ref model) => &model.cache,
         }
     }
 }
@@ -1480,6 +1591,7 @@ impl MetadataMixin for GGUFPipeline {
         match self.model {
             Model::XLoraLlama(ref model) => model.device.clone(),
             Model::XLoraPhi3(ref model) => model.device.clone(),
+            Model::GlmDsa(ref model) => model.device.clone(),
         }
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
@@ -1527,7 +1639,7 @@ impl Pipeline for GGUFPipeline {
             seqlen_offsets_full,
             context_lens,
             position_ids: _, // NOTE(EricLBuehler): ignore, it is for phi3
-            paged_attn_meta: _,
+            paged_attn_meta,
             flash_meta,
             flash_meta_full,
             recurrent_batch_kind: _,
@@ -1556,6 +1668,9 @@ impl Pipeline for GGUFPipeline {
                 &flash_meta,
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
+            Model::GlmDsa(ref model) => {
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+            }
         };
         if return_raw_logits {
             Ok(ForwardInputsResult::RawLogits { logits })

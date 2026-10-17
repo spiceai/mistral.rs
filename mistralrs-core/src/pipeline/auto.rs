@@ -249,7 +249,7 @@ fn supports_dynamic_lora(detected: &Detected) -> bool {
 
 impl AutoLoader {
     fn try_get_file(
-        api: &ApiRepo,
+        api: &Arc<ApiRepo>,
         model_id: &Path,
         file: &str,
         revision: &str,
@@ -323,11 +323,11 @@ impl AutoLoader {
             .unwrap_or_default();
         let api = build_api_with_cache(token_source, !silent, Some(cache))?;
         let revision = revision.unwrap_or_else(|| "main".to_string());
-        let api = api.repo(Repo::with_revision(
+        let api = Arc::new(api.repo(Repo::with_revision(
             self.model_id.clone(),
             RepoType::Model,
             revision.clone(),
-        ));
+        )));
         let model_id = Path::new(&self.model_id);
         let mut remote_access_issue = None;
         let contents = match Self::try_get_file(&api, model_id, "config.json", &revision) {

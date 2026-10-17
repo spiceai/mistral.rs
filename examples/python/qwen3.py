@@ -1,19 +1,19 @@
-from mistralrs import Runner, Which, ChatCompletionRequest, MultimodalArchitecture
+from mistralrs import Runner, Which, ChatCompletionRequest, VisionArchitecture
 
 # Non-MoE model
 runner = Runner(
-    which=Which.MultimodalPlain(
+    which=Which.VisionPlain(
         model_id="https://huggingface.co/Qwen/Qwen3-4B",
-        arch=MultimodalArchitecture.Qwen3,
+        arch=VisionArchitecture.Qwen3,
     ),
     in_situ_quant="Q4K",
 )
 
 # MoE model
 # runner = Runner(
-#     which=Which.MultimodalPlain(
+#     which=Which.VisionPlain(
 #         model_id="https://huggingface.co/Qwen/Qwen3-30B-A3B",
-#         arch=MultimodalArchitecture.Qwen3Moe,
+#         arch=VisionArchitecture.Qwen3Moe,
 #     ),
 #     in_situ_quant="Q4K",
 # )

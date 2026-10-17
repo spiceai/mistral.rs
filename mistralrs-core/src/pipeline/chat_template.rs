@@ -870,6 +870,9 @@ pub fn apply_chat_template_to(
             reasoning_strength => &reasoning_effort_value,
         })?
     } else {
+        if !tools_are_supported(&tmpl) {
+            warn!("tools were provided to a 'chat_template' that does not support them. Tools will be ignored...");
+        }
         tmpl.render(context! {
             messages => new_messages,
             add_generation_prompt => add_generation_prompt,
@@ -896,6 +899,10 @@ pub fn apply_chat_template_to(
     }
 
     Ok(rendered)
+}
+
+fn tools_are_supported(t: &minijinja::Template) -> bool {
+    t.undeclared_variables(true).contains("tools")
 }
 
 #[cfg(test)]
