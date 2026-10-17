@@ -31,13 +31,13 @@ license = "MIT"
 rust-version = "1.94"
 
 [workspace.dependencies]
-# Pinned to the spiceai candle fork (i-quant and MXFP4 dequant). Upstream v0.9.4
-# uses huggingface/candle 66a8cf18; rebasing this fork onto that rev is separate.
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" }
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" }
-candle-flash-attn-v3 = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" }
-candle-flash-attn = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" }
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "efbb9a72e92789eafed0806c3e16f14640c504f6" }
+# spiceai/candle lock-step with huggingface/candle 66a8cf18 (mistral.rs v0.9.4),
+# plus the i-quant and MXFP4 dequant patches.
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "ae1f307e41a8908cbd8b1cbda3ceb98d6ddf7490" }
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "ae1f307e41a8908cbd8b1cbda3ceb98d6ddf7490" }
+candle-flash-attn-v3 = { git = "https://github.com/spiceai/candle.git", rev = "ae1f307e41a8908cbd8b1cbda3ceb98d6ddf7490" }
+candle-flash-attn = { git = "https://github.com/spiceai/candle.git", rev = "ae1f307e41a8908cbd8b1cbda3ceb98d6ddf7490" }
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "ae1f307e41a8908cbd8b1cbda3ceb98d6ddf7490" }
 
 axum = "0.8.8"
 http-body-util = "0.1.3"
