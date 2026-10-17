@@ -3969,7 +3969,7 @@ struct mmq_args {
 };
 
 #define DEFINE_MMQ_MOE_LAUNCHER(suffix, type, launch_case)                    \
-  extern "C" void launch_mmq_gguf_##suffix##_moe(                             \
+  extern "C" void mrs_launch_mmq_gguf_##suffix##_moe(                         \
       void *tmp_fixup_ptr, const void *x, const void *y_q8_1_mmq,             \
       const int32_t *ids_dst, const int32_t *expert_bounds, void *dst,        \
       int64_t ncols_x, int64_t nrows_x, int64_t ncols_dst,                   \

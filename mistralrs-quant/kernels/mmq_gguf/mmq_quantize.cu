@@ -392,7 +392,7 @@ launch_mmq_quantize_glu_q8_1_typed(const void *gate, const void *up,
 
 // C-linkage quantize launchers
 
-extern "C" void launch_mmq_quantize_q8_1_D4(const void *x, const int32_t *ids,
+extern "C" void mrs_launch_mmq_quantize_q8_1_D4(const void *x, const int32_t *ids,
                                             void *vy, int type_x, int64_t ne00,
                                             int64_t s01, int64_t s02,
                                             int64_t s03, int64_t ne0,
@@ -402,7 +402,7 @@ extern "C" void launch_mmq_quantize_q8_1_D4(const void *x, const int32_t *ids,
       x, ids, vy, type_x, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, stream);
 }
 
-extern "C" void launch_mmq_quantize_q8_1_DS4(const void *x, const int32_t *ids,
+extern "C" void mrs_launch_mmq_quantize_q8_1_DS4(const void *x, const int32_t *ids,
                                              void *vy, int type_x, int64_t ne00,
                                              int64_t s01, int64_t s02,
                                              int64_t s03, int64_t ne0,
@@ -412,7 +412,7 @@ extern "C" void launch_mmq_quantize_q8_1_DS4(const void *x, const int32_t *ids,
       x, ids, vy, type_x, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, stream);
 }
 
-extern "C" void launch_mmq_quantize_q8_1_D2S6(
+extern "C" void mrs_launch_mmq_quantize_q8_1_D2S6(
     const void *x, const int32_t *ids, void *vy, int type_x, int64_t ne00,
     int64_t s01, int64_t s02, int64_t s03, int64_t ne0, int64_t ne1,
     int64_t ne2, int64_t ne3, void *stream) {
@@ -421,7 +421,7 @@ extern "C" void launch_mmq_quantize_q8_1_D2S6(
 }
 
 extern "C" void
-launch_mmq_quantize_glu_q8_1_D4_f32(const float *gate, const float *up,
+mrs_launch_mmq_quantize_glu_q8_1_D4_f32(const float *gate, const float *up,
                                     const int32_t *ids, void *vy, int64_t ne00,
                                     int64_t s01, int64_t ne0, int64_t ne1,
                                     int activation, void *stream) {
@@ -431,7 +431,7 @@ launch_mmq_quantize_glu_q8_1_D4_f32(const float *gate, const float *up,
 }
 
 extern "C" void
-launch_mmq_quantize_glu_q8_1_DS4_f32(const float *gate, const float *up,
+mrs_launch_mmq_quantize_glu_q8_1_DS4_f32(const float *gate, const float *up,
                                      const int32_t *ids, void *vy, int64_t ne00,
                                      int64_t s01, int64_t ne0, int64_t ne1,
                                      int activation, void *stream) {
@@ -440,7 +440,7 @@ launch_mmq_quantize_glu_q8_1_DS4_f32(const float *gate, const float *up,
       stream);
 }
 
-extern "C" void launch_mmq_quantize_glu_q8_1_D2S6_f32(
+extern "C" void mrs_launch_mmq_quantize_glu_q8_1_D2S6_f32(
     const float *gate, const float *up, const int32_t *ids, void *vy,
     int64_t ne00, int64_t s01, int64_t ne0, int64_t ne1, int activation,
     void *stream) {
@@ -450,7 +450,7 @@ extern "C" void launch_mmq_quantize_glu_q8_1_D2S6_f32(
 }
 
 extern "C" void
-launch_mmq_quantize_glu_q8_1_D4(const void *gate, const void *up,
+mrs_launch_mmq_quantize_glu_q8_1_D4(const void *gate, const void *up,
                                 const int32_t *ids, void *vy, int type_x,
                                 int64_t ne00, int64_t s01, int64_t ne0,
                                 int64_t ne1, int activation, void *stream) {
@@ -459,7 +459,7 @@ launch_mmq_quantize_glu_q8_1_D4(const void *gate, const void *up,
 }
 
 extern "C" void
-launch_mmq_quantize_glu_q8_1_DS4(const void *gate, const void *up,
+mrs_launch_mmq_quantize_glu_q8_1_DS4(const void *gate, const void *up,
                                  const int32_t *ids, void *vy, int type_x,
                                  int64_t ne00, int64_t s01, int64_t ne0,
                                  int64_t ne1, int activation, void *stream) {
@@ -468,7 +468,7 @@ launch_mmq_quantize_glu_q8_1_DS4(const void *gate, const void *up,
 }
 
 extern "C" void
-launch_mmq_quantize_glu_q8_1_D2S6(const void *gate, const void *up,
+mrs_launch_mmq_quantize_glu_q8_1_D2S6(const void *gate, const void *up,
                                   const int32_t *ids, void *vy, int type_x,
                                   int64_t ne00, int64_t s01, int64_t ne0,
                                   int64_t ne1, int activation, void *stream) {

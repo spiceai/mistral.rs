@@ -144,25 +144,25 @@ type QuantizeGluLauncher = unsafe extern "C" fn(
 
 fn quantize_launcher(layout: DsLayout) -> QuantizeLauncher {
     match layout {
-        DsLayout::D4 => ffi::launch_mmq_quantize_q8_1_D4,
-        DsLayout::DS4 => ffi::launch_mmq_quantize_q8_1_DS4,
-        DsLayout::D2S6 => ffi::launch_mmq_quantize_q8_1_D2S6,
+        DsLayout::D4 => ffi::mrs_launch_mmq_quantize_q8_1_D4,
+        DsLayout::DS4 => ffi::mrs_launch_mmq_quantize_q8_1_DS4,
+        DsLayout::D2S6 => ffi::mrs_launch_mmq_quantize_q8_1_D2S6,
     }
 }
 
 fn quantize_glu_f32_launcher(layout: DsLayout) -> QuantizeGluF32Launcher {
     match layout {
-        DsLayout::D4 => ffi::launch_mmq_quantize_glu_q8_1_D4_f32,
-        DsLayout::DS4 => ffi::launch_mmq_quantize_glu_q8_1_DS4_f32,
-        DsLayout::D2S6 => ffi::launch_mmq_quantize_glu_q8_1_D2S6_f32,
+        DsLayout::D4 => ffi::mrs_launch_mmq_quantize_glu_q8_1_D4_f32,
+        DsLayout::DS4 => ffi::mrs_launch_mmq_quantize_glu_q8_1_DS4_f32,
+        DsLayout::D2S6 => ffi::mrs_launch_mmq_quantize_glu_q8_1_D2S6_f32,
     }
 }
 
 fn quantize_glu_launcher(layout: DsLayout) -> QuantizeGluLauncher {
     match layout {
-        DsLayout::D4 => ffi::launch_mmq_quantize_glu_q8_1_D4,
-        DsLayout::DS4 => ffi::launch_mmq_quantize_glu_q8_1_DS4,
-        DsLayout::D2S6 => ffi::launch_mmq_quantize_glu_q8_1_D2S6,
+        DsLayout::D4 => ffi::mrs_launch_mmq_quantize_glu_q8_1_D4,
+        DsLayout::DS4 => ffi::mrs_launch_mmq_quantize_glu_q8_1_DS4,
+        DsLayout::D2S6 => ffi::mrs_launch_mmq_quantize_glu_q8_1_D2S6,
     }
 }
 
@@ -207,16 +207,16 @@ type MmqMoeLauncher = unsafe extern "C" fn(
 
 fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
     let f: MmqLauncher = match dtype {
-        GgmlDType::Q4_0 => ffi::launch_mmq_gguf_q4_0,
-        GgmlDType::Q4_1 => ffi::launch_mmq_gguf_q4_1,
-        GgmlDType::Q5_0 => ffi::launch_mmq_gguf_q5_0,
-        GgmlDType::Q5_1 => ffi::launch_mmq_gguf_q5_1,
-        GgmlDType::Q8_0 => ffi::launch_mmq_gguf_q8_0,
-        GgmlDType::Q2K => ffi::launch_mmq_gguf_q2_k,
-        GgmlDType::Q3K => ffi::launch_mmq_gguf_q3_k,
-        GgmlDType::Q4K => ffi::launch_mmq_gguf_q4_k,
-        GgmlDType::Q5K => ffi::launch_mmq_gguf_q5_k,
-        GgmlDType::Q6K => ffi::launch_mmq_gguf_q6_k,
+        GgmlDType::Q4_0 => ffi::mrs_launch_mmq_gguf_q4_0,
+        GgmlDType::Q4_1 => ffi::mrs_launch_mmq_gguf_q4_1,
+        GgmlDType::Q5_0 => ffi::mrs_launch_mmq_gguf_q5_0,
+        GgmlDType::Q5_1 => ffi::mrs_launch_mmq_gguf_q5_1,
+        GgmlDType::Q8_0 => ffi::mrs_launch_mmq_gguf_q8_0,
+        GgmlDType::Q2K => ffi::mrs_launch_mmq_gguf_q2_k,
+        GgmlDType::Q3K => ffi::mrs_launch_mmq_gguf_q3_k,
+        GgmlDType::Q4K => ffi::mrs_launch_mmq_gguf_q4_k,
+        GgmlDType::Q5K => ffi::mrs_launch_mmq_gguf_q5_k,
+        GgmlDType::Q6K => ffi::mrs_launch_mmq_gguf_q6_k,
         _ => return None,
     };
     Some(f)
@@ -224,16 +224,16 @@ fn mmq_launcher(dtype: GgmlDType) -> Option<MmqLauncher> {
 
 fn mmq_moe_launcher(dtype: GgmlDType) -> Option<MmqMoeLauncher> {
     let f: MmqMoeLauncher = match dtype {
-        GgmlDType::Q4_0 => ffi::launch_mmq_gguf_q4_0_moe,
-        GgmlDType::Q4_1 => ffi::launch_mmq_gguf_q4_1_moe,
-        GgmlDType::Q5_0 => ffi::launch_mmq_gguf_q5_0_moe,
-        GgmlDType::Q5_1 => ffi::launch_mmq_gguf_q5_1_moe,
-        GgmlDType::Q8_0 => ffi::launch_mmq_gguf_q8_0_moe,
-        GgmlDType::Q2K => ffi::launch_mmq_gguf_q2_k_moe,
-        GgmlDType::Q3K => ffi::launch_mmq_gguf_q3_k_moe,
-        GgmlDType::Q4K => ffi::launch_mmq_gguf_q4_k_moe,
-        GgmlDType::Q5K => ffi::launch_mmq_gguf_q5_k_moe,
-        GgmlDType::Q6K => ffi::launch_mmq_gguf_q6_k_moe,
+        GgmlDType::Q4_0 => ffi::mrs_launch_mmq_gguf_q4_0_moe,
+        GgmlDType::Q4_1 => ffi::mrs_launch_mmq_gguf_q4_1_moe,
+        GgmlDType::Q5_0 => ffi::mrs_launch_mmq_gguf_q5_0_moe,
+        GgmlDType::Q5_1 => ffi::mrs_launch_mmq_gguf_q5_1_moe,
+        GgmlDType::Q8_0 => ffi::mrs_launch_mmq_gguf_q8_0_moe,
+        GgmlDType::Q2K => ffi::mrs_launch_mmq_gguf_q2_k_moe,
+        GgmlDType::Q3K => ffi::mrs_launch_mmq_gguf_q3_k_moe,
+        GgmlDType::Q4K => ffi::mrs_launch_mmq_gguf_q4_k_moe,
+        GgmlDType::Q5K => ffi::mrs_launch_mmq_gguf_q5_k_moe,
+        GgmlDType::Q6K => ffi::mrs_launch_mmq_gguf_q6_k_moe,
         _ => return None,
     };
     Some(f)

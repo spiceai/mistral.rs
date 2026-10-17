@@ -158,16 +158,16 @@ type FusedQkvLauncher = unsafe extern "C" fn(
 
 fn plain_launcher_bf16(dtype: GgmlDType) -> Option<PlainLauncher> {
     let f: PlainLauncher = match dtype {
-        GgmlDType::Q4_0 => ffi::launch_mmvq_gguf_q4_0_bf16_plain,
-        GgmlDType::Q4_1 => ffi::launch_mmvq_gguf_q4_1_bf16_plain,
-        GgmlDType::Q5_0 => ffi::launch_mmvq_gguf_q5_0_bf16_plain,
-        GgmlDType::Q5_1 => ffi::launch_mmvq_gguf_q5_1_bf16_plain,
-        GgmlDType::Q8_0 => ffi::launch_mmvq_gguf_q8_0_bf16_plain,
-        GgmlDType::Q2K => ffi::launch_mmvq_gguf_q2_k_bf16_plain,
-        GgmlDType::Q3K => ffi::launch_mmvq_gguf_q3_k_bf16_plain,
-        GgmlDType::Q4K => ffi::launch_mmvq_gguf_q4_k_bf16_plain,
-        GgmlDType::Q5K => ffi::launch_mmvq_gguf_q5_k_bf16_plain,
-        GgmlDType::Q6K => ffi::launch_mmvq_gguf_q6_k_bf16_plain,
+        GgmlDType::Q4_0 => ffi::mrs_launch_mmvq_gguf_q4_0_bf16_plain,
+        GgmlDType::Q4_1 => ffi::mrs_launch_mmvq_gguf_q4_1_bf16_plain,
+        GgmlDType::Q5_0 => ffi::mrs_launch_mmvq_gguf_q5_0_bf16_plain,
+        GgmlDType::Q5_1 => ffi::mrs_launch_mmvq_gguf_q5_1_bf16_plain,
+        GgmlDType::Q8_0 => ffi::mrs_launch_mmvq_gguf_q8_0_bf16_plain,
+        GgmlDType::Q2K => ffi::mrs_launch_mmvq_gguf_q2_k_bf16_plain,
+        GgmlDType::Q3K => ffi::mrs_launch_mmvq_gguf_q3_k_bf16_plain,
+        GgmlDType::Q4K => ffi::mrs_launch_mmvq_gguf_q4_k_bf16_plain,
+        GgmlDType::Q5K => ffi::mrs_launch_mmvq_gguf_q5_k_bf16_plain,
+        GgmlDType::Q6K => ffi::mrs_launch_mmvq_gguf_q6_k_bf16_plain,
         _ => return None,
     };
     Some(f)
@@ -175,16 +175,16 @@ fn plain_launcher_bf16(dtype: GgmlDType) -> Option<PlainLauncher> {
 
 fn plain_launcher_f16(dtype: GgmlDType) -> Option<PlainLauncher> {
     let f: PlainLauncher = match dtype {
-        GgmlDType::Q4_0 => ffi::launch_mmvq_gguf_q4_0_f16_plain,
-        GgmlDType::Q4_1 => ffi::launch_mmvq_gguf_q4_1_f16_plain,
-        GgmlDType::Q5_0 => ffi::launch_mmvq_gguf_q5_0_f16_plain,
-        GgmlDType::Q5_1 => ffi::launch_mmvq_gguf_q5_1_f16_plain,
-        GgmlDType::Q8_0 => ffi::launch_mmvq_gguf_q8_0_f16_plain,
-        GgmlDType::Q2K => ffi::launch_mmvq_gguf_q2_k_f16_plain,
-        GgmlDType::Q3K => ffi::launch_mmvq_gguf_q3_k_f16_plain,
-        GgmlDType::Q4K => ffi::launch_mmvq_gguf_q4_k_f16_plain,
-        GgmlDType::Q5K => ffi::launch_mmvq_gguf_q5_k_f16_plain,
-        GgmlDType::Q6K => ffi::launch_mmvq_gguf_q6_k_f16_plain,
+        GgmlDType::Q4_0 => ffi::mrs_launch_mmvq_gguf_q4_0_f16_plain,
+        GgmlDType::Q4_1 => ffi::mrs_launch_mmvq_gguf_q4_1_f16_plain,
+        GgmlDType::Q5_0 => ffi::mrs_launch_mmvq_gguf_q5_0_f16_plain,
+        GgmlDType::Q5_1 => ffi::mrs_launch_mmvq_gguf_q5_1_f16_plain,
+        GgmlDType::Q8_0 => ffi::mrs_launch_mmvq_gguf_q8_0_f16_plain,
+        GgmlDType::Q2K => ffi::mrs_launch_mmvq_gguf_q2_k_f16_plain,
+        GgmlDType::Q3K => ffi::mrs_launch_mmvq_gguf_q3_k_f16_plain,
+        GgmlDType::Q4K => ffi::mrs_launch_mmvq_gguf_q4_k_f16_plain,
+        GgmlDType::Q5K => ffi::mrs_launch_mmvq_gguf_q5_k_f16_plain,
+        GgmlDType::Q6K => ffi::mrs_launch_mmvq_gguf_q6_k_f16_plain,
         _ => return None,
     };
     Some(f)
@@ -192,16 +192,16 @@ fn plain_launcher_f16(dtype: GgmlDType) -> Option<PlainLauncher> {
 
 fn plain_launcher_f32(dtype: GgmlDType) -> Option<PlainLauncher> {
     let f: PlainLauncher = match dtype {
-        GgmlDType::Q4_0 => ffi::launch_mmvq_gguf_q4_0_f32_plain,
-        GgmlDType::Q4_1 => ffi::launch_mmvq_gguf_q4_1_f32_plain,
-        GgmlDType::Q5_0 => ffi::launch_mmvq_gguf_q5_0_f32_plain,
-        GgmlDType::Q5_1 => ffi::launch_mmvq_gguf_q5_1_f32_plain,
-        GgmlDType::Q8_0 => ffi::launch_mmvq_gguf_q8_0_f32_plain,
-        GgmlDType::Q2K => ffi::launch_mmvq_gguf_q2_k_f32_plain,
-        GgmlDType::Q3K => ffi::launch_mmvq_gguf_q3_k_f32_plain,
-        GgmlDType::Q4K => ffi::launch_mmvq_gguf_q4_k_f32_plain,
-        GgmlDType::Q5K => ffi::launch_mmvq_gguf_q5_k_f32_plain,
-        GgmlDType::Q6K => ffi::launch_mmvq_gguf_q6_k_f32_plain,
+        GgmlDType::Q4_0 => ffi::mrs_launch_mmvq_gguf_q4_0_f32_plain,
+        GgmlDType::Q4_1 => ffi::mrs_launch_mmvq_gguf_q4_1_f32_plain,
+        GgmlDType::Q5_0 => ffi::mrs_launch_mmvq_gguf_q5_0_f32_plain,
+        GgmlDType::Q5_1 => ffi::mrs_launch_mmvq_gguf_q5_1_f32_plain,
+        GgmlDType::Q8_0 => ffi::mrs_launch_mmvq_gguf_q8_0_f32_plain,
+        GgmlDType::Q2K => ffi::mrs_launch_mmvq_gguf_q2_k_f32_plain,
+        GgmlDType::Q3K => ffi::mrs_launch_mmvq_gguf_q3_k_f32_plain,
+        GgmlDType::Q4K => ffi::mrs_launch_mmvq_gguf_q4_k_f32_plain,
+        GgmlDType::Q5K => ffi::mrs_launch_mmvq_gguf_q5_k_f32_plain,
+        GgmlDType::Q6K => ffi::mrs_launch_mmvq_gguf_q6_k_f32_plain,
         _ => return None,
     };
     Some(f)
@@ -209,38 +209,38 @@ fn plain_launcher_f32(dtype: GgmlDType) -> Option<PlainLauncher> {
 
 fn fused_glu_launcher(input_ty: DType, dtype: GgmlDType) -> Option<FusedGluLauncher> {
     match (input_ty, dtype) {
-        (DType::BF16, GgmlDType::Q4_0) => Some(ffi::launch_mmvq_gguf_q4_0_bf16_fused_glu),
-        (DType::BF16, GgmlDType::Q4_1) => Some(ffi::launch_mmvq_gguf_q4_1_bf16_fused_glu),
-        (DType::BF16, GgmlDType::Q5_0) => Some(ffi::launch_mmvq_gguf_q5_0_bf16_fused_glu),
-        (DType::BF16, GgmlDType::Q5_1) => Some(ffi::launch_mmvq_gguf_q5_1_bf16_fused_glu),
-        (DType::BF16, GgmlDType::Q8_0) => Some(ffi::launch_mmvq_gguf_q8_0_bf16_fused_glu),
-        (DType::BF16, GgmlDType::Q2K) => Some(ffi::launch_mmvq_gguf_q2_k_bf16_fused_glu),
-        (DType::BF16, GgmlDType::Q3K) => Some(ffi::launch_mmvq_gguf_q3_k_bf16_fused_glu),
-        (DType::BF16, GgmlDType::Q4K) => Some(ffi::launch_mmvq_gguf_q4_k_bf16_fused_glu),
-        (DType::BF16, GgmlDType::Q5K) => Some(ffi::launch_mmvq_gguf_q5_k_bf16_fused_glu),
-        (DType::BF16, GgmlDType::Q6K) => Some(ffi::launch_mmvq_gguf_q6_k_bf16_fused_glu),
+        (DType::BF16, GgmlDType::Q4_0) => Some(ffi::mrs_launch_mmvq_gguf_q4_0_bf16_fused_glu),
+        (DType::BF16, GgmlDType::Q4_1) => Some(ffi::mrs_launch_mmvq_gguf_q4_1_bf16_fused_glu),
+        (DType::BF16, GgmlDType::Q5_0) => Some(ffi::mrs_launch_mmvq_gguf_q5_0_bf16_fused_glu),
+        (DType::BF16, GgmlDType::Q5_1) => Some(ffi::mrs_launch_mmvq_gguf_q5_1_bf16_fused_glu),
+        (DType::BF16, GgmlDType::Q8_0) => Some(ffi::mrs_launch_mmvq_gguf_q8_0_bf16_fused_glu),
+        (DType::BF16, GgmlDType::Q2K) => Some(ffi::mrs_launch_mmvq_gguf_q2_k_bf16_fused_glu),
+        (DType::BF16, GgmlDType::Q3K) => Some(ffi::mrs_launch_mmvq_gguf_q3_k_bf16_fused_glu),
+        (DType::BF16, GgmlDType::Q4K) => Some(ffi::mrs_launch_mmvq_gguf_q4_k_bf16_fused_glu),
+        (DType::BF16, GgmlDType::Q5K) => Some(ffi::mrs_launch_mmvq_gguf_q5_k_bf16_fused_glu),
+        (DType::BF16, GgmlDType::Q6K) => Some(ffi::mrs_launch_mmvq_gguf_q6_k_bf16_fused_glu),
 
-        (DType::F16, GgmlDType::Q4_0) => Some(ffi::launch_mmvq_gguf_q4_0_f16_fused_glu),
-        (DType::F16, GgmlDType::Q4_1) => Some(ffi::launch_mmvq_gguf_q4_1_f16_fused_glu),
-        (DType::F16, GgmlDType::Q5_0) => Some(ffi::launch_mmvq_gguf_q5_0_f16_fused_glu),
-        (DType::F16, GgmlDType::Q5_1) => Some(ffi::launch_mmvq_gguf_q5_1_f16_fused_glu),
-        (DType::F16, GgmlDType::Q8_0) => Some(ffi::launch_mmvq_gguf_q8_0_f16_fused_glu),
-        (DType::F16, GgmlDType::Q2K) => Some(ffi::launch_mmvq_gguf_q2_k_f16_fused_glu),
-        (DType::F16, GgmlDType::Q3K) => Some(ffi::launch_mmvq_gguf_q3_k_f16_fused_glu),
-        (DType::F16, GgmlDType::Q4K) => Some(ffi::launch_mmvq_gguf_q4_k_f16_fused_glu),
-        (DType::F16, GgmlDType::Q5K) => Some(ffi::launch_mmvq_gguf_q5_k_f16_fused_glu),
-        (DType::F16, GgmlDType::Q6K) => Some(ffi::launch_mmvq_gguf_q6_k_f16_fused_glu),
+        (DType::F16, GgmlDType::Q4_0) => Some(ffi::mrs_launch_mmvq_gguf_q4_0_f16_fused_glu),
+        (DType::F16, GgmlDType::Q4_1) => Some(ffi::mrs_launch_mmvq_gguf_q4_1_f16_fused_glu),
+        (DType::F16, GgmlDType::Q5_0) => Some(ffi::mrs_launch_mmvq_gguf_q5_0_f16_fused_glu),
+        (DType::F16, GgmlDType::Q5_1) => Some(ffi::mrs_launch_mmvq_gguf_q5_1_f16_fused_glu),
+        (DType::F16, GgmlDType::Q8_0) => Some(ffi::mrs_launch_mmvq_gguf_q8_0_f16_fused_glu),
+        (DType::F16, GgmlDType::Q2K) => Some(ffi::mrs_launch_mmvq_gguf_q2_k_f16_fused_glu),
+        (DType::F16, GgmlDType::Q3K) => Some(ffi::mrs_launch_mmvq_gguf_q3_k_f16_fused_glu),
+        (DType::F16, GgmlDType::Q4K) => Some(ffi::mrs_launch_mmvq_gguf_q4_k_f16_fused_glu),
+        (DType::F16, GgmlDType::Q5K) => Some(ffi::mrs_launch_mmvq_gguf_q5_k_f16_fused_glu),
+        (DType::F16, GgmlDType::Q6K) => Some(ffi::mrs_launch_mmvq_gguf_q6_k_f16_fused_glu),
 
-        (DType::F32, GgmlDType::Q4_0) => Some(ffi::launch_mmvq_gguf_q4_0_f32_fused_glu),
-        (DType::F32, GgmlDType::Q4_1) => Some(ffi::launch_mmvq_gguf_q4_1_f32_fused_glu),
-        (DType::F32, GgmlDType::Q5_0) => Some(ffi::launch_mmvq_gguf_q5_0_f32_fused_glu),
-        (DType::F32, GgmlDType::Q5_1) => Some(ffi::launch_mmvq_gguf_q5_1_f32_fused_glu),
-        (DType::F32, GgmlDType::Q8_0) => Some(ffi::launch_mmvq_gguf_q8_0_f32_fused_glu),
-        (DType::F32, GgmlDType::Q2K) => Some(ffi::launch_mmvq_gguf_q2_k_f32_fused_glu),
-        (DType::F32, GgmlDType::Q3K) => Some(ffi::launch_mmvq_gguf_q3_k_f32_fused_glu),
-        (DType::F32, GgmlDType::Q4K) => Some(ffi::launch_mmvq_gguf_q4_k_f32_fused_glu),
-        (DType::F32, GgmlDType::Q5K) => Some(ffi::launch_mmvq_gguf_q5_k_f32_fused_glu),
-        (DType::F32, GgmlDType::Q6K) => Some(ffi::launch_mmvq_gguf_q6_k_f32_fused_glu),
+        (DType::F32, GgmlDType::Q4_0) => Some(ffi::mrs_launch_mmvq_gguf_q4_0_f32_fused_glu),
+        (DType::F32, GgmlDType::Q4_1) => Some(ffi::mrs_launch_mmvq_gguf_q4_1_f32_fused_glu),
+        (DType::F32, GgmlDType::Q5_0) => Some(ffi::mrs_launch_mmvq_gguf_q5_0_f32_fused_glu),
+        (DType::F32, GgmlDType::Q5_1) => Some(ffi::mrs_launch_mmvq_gguf_q5_1_f32_fused_glu),
+        (DType::F32, GgmlDType::Q8_0) => Some(ffi::mrs_launch_mmvq_gguf_q8_0_f32_fused_glu),
+        (DType::F32, GgmlDType::Q2K) => Some(ffi::mrs_launch_mmvq_gguf_q2_k_f32_fused_glu),
+        (DType::F32, GgmlDType::Q3K) => Some(ffi::mrs_launch_mmvq_gguf_q3_k_f32_fused_glu),
+        (DType::F32, GgmlDType::Q4K) => Some(ffi::mrs_launch_mmvq_gguf_q4_k_f32_fused_glu),
+        (DType::F32, GgmlDType::Q5K) => Some(ffi::mrs_launch_mmvq_gguf_q5_k_f32_fused_glu),
+        (DType::F32, GgmlDType::Q6K) => Some(ffi::mrs_launch_mmvq_gguf_q6_k_f32_fused_glu),
         _ => None,
     }
 }
@@ -251,38 +251,38 @@ pub fn supports_fused_glu(input_ty: DType, dtype: GgmlDType) -> bool {
 
 fn fused_qkv_launcher(input_ty: DType, dtype: GgmlDType) -> Option<FusedQkvLauncher> {
     match (input_ty, dtype) {
-        (DType::BF16, GgmlDType::Q4_0) => Some(ffi::launch_mmvq_gguf_q4_0_bf16_fused_qkv),
-        (DType::BF16, GgmlDType::Q4_1) => Some(ffi::launch_mmvq_gguf_q4_1_bf16_fused_qkv),
-        (DType::BF16, GgmlDType::Q5_0) => Some(ffi::launch_mmvq_gguf_q5_0_bf16_fused_qkv),
-        (DType::BF16, GgmlDType::Q5_1) => Some(ffi::launch_mmvq_gguf_q5_1_bf16_fused_qkv),
-        (DType::BF16, GgmlDType::Q8_0) => Some(ffi::launch_mmvq_gguf_q8_0_bf16_fused_qkv),
-        (DType::BF16, GgmlDType::Q2K) => Some(ffi::launch_mmvq_gguf_q2_k_bf16_fused_qkv),
-        (DType::BF16, GgmlDType::Q3K) => Some(ffi::launch_mmvq_gguf_q3_k_bf16_fused_qkv),
-        (DType::BF16, GgmlDType::Q4K) => Some(ffi::launch_mmvq_gguf_q4_k_bf16_fused_qkv),
-        (DType::BF16, GgmlDType::Q5K) => Some(ffi::launch_mmvq_gguf_q5_k_bf16_fused_qkv),
-        (DType::BF16, GgmlDType::Q6K) => Some(ffi::launch_mmvq_gguf_q6_k_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::Q4_0) => Some(ffi::mrs_launch_mmvq_gguf_q4_0_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::Q4_1) => Some(ffi::mrs_launch_mmvq_gguf_q4_1_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::Q5_0) => Some(ffi::mrs_launch_mmvq_gguf_q5_0_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::Q5_1) => Some(ffi::mrs_launch_mmvq_gguf_q5_1_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::Q8_0) => Some(ffi::mrs_launch_mmvq_gguf_q8_0_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::Q2K) => Some(ffi::mrs_launch_mmvq_gguf_q2_k_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::Q3K) => Some(ffi::mrs_launch_mmvq_gguf_q3_k_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::Q4K) => Some(ffi::mrs_launch_mmvq_gguf_q4_k_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::Q5K) => Some(ffi::mrs_launch_mmvq_gguf_q5_k_bf16_fused_qkv),
+        (DType::BF16, GgmlDType::Q6K) => Some(ffi::mrs_launch_mmvq_gguf_q6_k_bf16_fused_qkv),
 
-        (DType::F16, GgmlDType::Q4_0) => Some(ffi::launch_mmvq_gguf_q4_0_f16_fused_qkv),
-        (DType::F16, GgmlDType::Q4_1) => Some(ffi::launch_mmvq_gguf_q4_1_f16_fused_qkv),
-        (DType::F16, GgmlDType::Q5_0) => Some(ffi::launch_mmvq_gguf_q5_0_f16_fused_qkv),
-        (DType::F16, GgmlDType::Q5_1) => Some(ffi::launch_mmvq_gguf_q5_1_f16_fused_qkv),
-        (DType::F16, GgmlDType::Q8_0) => Some(ffi::launch_mmvq_gguf_q8_0_f16_fused_qkv),
-        (DType::F16, GgmlDType::Q2K) => Some(ffi::launch_mmvq_gguf_q2_k_f16_fused_qkv),
-        (DType::F16, GgmlDType::Q3K) => Some(ffi::launch_mmvq_gguf_q3_k_f16_fused_qkv),
-        (DType::F16, GgmlDType::Q4K) => Some(ffi::launch_mmvq_gguf_q4_k_f16_fused_qkv),
-        (DType::F16, GgmlDType::Q5K) => Some(ffi::launch_mmvq_gguf_q5_k_f16_fused_qkv),
-        (DType::F16, GgmlDType::Q6K) => Some(ffi::launch_mmvq_gguf_q6_k_f16_fused_qkv),
+        (DType::F16, GgmlDType::Q4_0) => Some(ffi::mrs_launch_mmvq_gguf_q4_0_f16_fused_qkv),
+        (DType::F16, GgmlDType::Q4_1) => Some(ffi::mrs_launch_mmvq_gguf_q4_1_f16_fused_qkv),
+        (DType::F16, GgmlDType::Q5_0) => Some(ffi::mrs_launch_mmvq_gguf_q5_0_f16_fused_qkv),
+        (DType::F16, GgmlDType::Q5_1) => Some(ffi::mrs_launch_mmvq_gguf_q5_1_f16_fused_qkv),
+        (DType::F16, GgmlDType::Q8_0) => Some(ffi::mrs_launch_mmvq_gguf_q8_0_f16_fused_qkv),
+        (DType::F16, GgmlDType::Q2K) => Some(ffi::mrs_launch_mmvq_gguf_q2_k_f16_fused_qkv),
+        (DType::F16, GgmlDType::Q3K) => Some(ffi::mrs_launch_mmvq_gguf_q3_k_f16_fused_qkv),
+        (DType::F16, GgmlDType::Q4K) => Some(ffi::mrs_launch_mmvq_gguf_q4_k_f16_fused_qkv),
+        (DType::F16, GgmlDType::Q5K) => Some(ffi::mrs_launch_mmvq_gguf_q5_k_f16_fused_qkv),
+        (DType::F16, GgmlDType::Q6K) => Some(ffi::mrs_launch_mmvq_gguf_q6_k_f16_fused_qkv),
 
-        (DType::F32, GgmlDType::Q4_0) => Some(ffi::launch_mmvq_gguf_q4_0_f32_fused_qkv),
-        (DType::F32, GgmlDType::Q4_1) => Some(ffi::launch_mmvq_gguf_q4_1_f32_fused_qkv),
-        (DType::F32, GgmlDType::Q5_0) => Some(ffi::launch_mmvq_gguf_q5_0_f32_fused_qkv),
-        (DType::F32, GgmlDType::Q5_1) => Some(ffi::launch_mmvq_gguf_q5_1_f32_fused_qkv),
-        (DType::F32, GgmlDType::Q8_0) => Some(ffi::launch_mmvq_gguf_q8_0_f32_fused_qkv),
-        (DType::F32, GgmlDType::Q2K) => Some(ffi::launch_mmvq_gguf_q2_k_f32_fused_qkv),
-        (DType::F32, GgmlDType::Q3K) => Some(ffi::launch_mmvq_gguf_q3_k_f32_fused_qkv),
-        (DType::F32, GgmlDType::Q4K) => Some(ffi::launch_mmvq_gguf_q4_k_f32_fused_qkv),
-        (DType::F32, GgmlDType::Q5K) => Some(ffi::launch_mmvq_gguf_q5_k_f32_fused_qkv),
-        (DType::F32, GgmlDType::Q6K) => Some(ffi::launch_mmvq_gguf_q6_k_f32_fused_qkv),
+        (DType::F32, GgmlDType::Q4_0) => Some(ffi::mrs_launch_mmvq_gguf_q4_0_f32_fused_qkv),
+        (DType::F32, GgmlDType::Q4_1) => Some(ffi::mrs_launch_mmvq_gguf_q4_1_f32_fused_qkv),
+        (DType::F32, GgmlDType::Q5_0) => Some(ffi::mrs_launch_mmvq_gguf_q5_0_f32_fused_qkv),
+        (DType::F32, GgmlDType::Q5_1) => Some(ffi::mrs_launch_mmvq_gguf_q5_1_f32_fused_qkv),
+        (DType::F32, GgmlDType::Q8_0) => Some(ffi::mrs_launch_mmvq_gguf_q8_0_f32_fused_qkv),
+        (DType::F32, GgmlDType::Q2K) => Some(ffi::mrs_launch_mmvq_gguf_q2_k_f32_fused_qkv),
+        (DType::F32, GgmlDType::Q3K) => Some(ffi::mrs_launch_mmvq_gguf_q3_k_f32_fused_qkv),
+        (DType::F32, GgmlDType::Q4K) => Some(ffi::mrs_launch_mmvq_gguf_q4_k_f32_fused_qkv),
+        (DType::F32, GgmlDType::Q5K) => Some(ffi::mrs_launch_mmvq_gguf_q5_k_f32_fused_qkv),
+        (DType::F32, GgmlDType::Q6K) => Some(ffi::mrs_launch_mmvq_gguf_q6_k_f32_fused_qkv),
         _ => None,
     }
 }
@@ -360,7 +360,7 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
                 let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
 
                 unsafe {
-                    ffi::launch_mmvq_gguf_quantize_q8_1_bf16(
+                    ffi::mrs_launch_mmvq_gguf_quantize_q8_1_bf16(
                         xs_ptr as *const std::ffi::c_void,
                         scratch_ptr,
                         k as i32,
@@ -398,7 +398,7 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
                 let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
 
                 unsafe {
-                    ffi::launch_mmvq_gguf_quantize_q8_1_f16(
+                    ffi::mrs_launch_mmvq_gguf_quantize_q8_1_f16(
                         xs_ptr as *const std::ffi::c_void,
                         scratch_ptr,
                         k as i32,
@@ -436,7 +436,7 @@ pub fn plain(w: &QTensor, xs: &Tensor) -> Result<Tensor> {
                 let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
 
                 unsafe {
-                    ffi::launch_mmvq_gguf_quantize_q8_1_f32(
+                    ffi::mrs_launch_mmvq_gguf_quantize_q8_1_f32(
                         xs_ptr as *const std::ffi::c_void,
                         scratch_ptr,
                         k as i32,
@@ -564,7 +564,7 @@ pub fn fused_glu(
                 let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
 
                 unsafe {
-                    ffi::launch_mmvq_gguf_quantize_q8_1_bf16(
+                    ffi::mrs_launch_mmvq_gguf_quantize_q8_1_bf16(
                         xs_ptr as *const std::ffi::c_void,
                         scratch_ptr,
                         k as i32,
@@ -603,7 +603,7 @@ pub fn fused_glu(
                 let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
 
                 unsafe {
-                    ffi::launch_mmvq_gguf_quantize_q8_1_f16(
+                    ffi::mrs_launch_mmvq_gguf_quantize_q8_1_f16(
                         xs_ptr as *const std::ffi::c_void,
                         scratch_ptr,
                         k as i32,
@@ -642,7 +642,7 @@ pub fn fused_glu(
                 let (out_ptr, _out_guard) = slice_ptr_mut_on_stream(&mut out, 0, &stream);
 
                 unsafe {
-                    ffi::launch_mmvq_gguf_quantize_q8_1_f32(
+                    ffi::mrs_launch_mmvq_gguf_quantize_q8_1_f32(
                         xs_ptr as *const std::ffi::c_void,
                         scratch_ptr,
                         k as i32,
@@ -783,7 +783,7 @@ pub fn fused_qkv(
                 let (v_out_ptr, _v_out_guard) = slice_ptr_mut_on_stream(&mut v_out, 0, &stream);
 
                 unsafe {
-                    ffi::launch_mmvq_gguf_quantize_q8_1_bf16(
+                    ffi::mrs_launch_mmvq_gguf_quantize_q8_1_bf16(
                         xs_ptr as *const std::ffi::c_void,
                         scratch_ptr,
                         k as i32,
@@ -838,7 +838,7 @@ pub fn fused_qkv(
                 let (v_out_ptr, _v_out_guard) = slice_ptr_mut_on_stream(&mut v_out, 0, &stream);
 
                 unsafe {
-                    ffi::launch_mmvq_gguf_quantize_q8_1_f16(
+                    ffi::mrs_launch_mmvq_gguf_quantize_q8_1_f16(
                         xs_ptr as *const std::ffi::c_void,
                         scratch_ptr,
                         k as i32,
@@ -893,7 +893,7 @@ pub fn fused_qkv(
                 let (v_out_ptr, _v_out_guard) = slice_ptr_mut_on_stream(&mut v_out, 0, &stream);
 
                 unsafe {
-                    ffi::launch_mmvq_gguf_quantize_q8_1_f32(
+                    ffi::mrs_launch_mmvq_gguf_quantize_q8_1_f32(
                         xs_ptr as *const std::ffi::c_void,
                         scratch_ptr,
                         k as i32,
