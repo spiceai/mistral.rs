@@ -17,6 +17,7 @@ pub(crate) mod muse_glimmer_bindings;
 pub(crate) mod normal_bindings;
 pub(crate) mod normal_config;
 pub(crate) mod normal_registry;
+pub(crate) mod qwen4exp;
 pub(crate) mod qwen_multimodal_bindings;
 use strum::{EnumIter, EnumString, IntoEnumIterator};
 
@@ -62,12 +63,26 @@ pub enum GGUFArchitecture {
 /// the operator's next step is a different engine or a different quant repo, not
 /// a re-download. Each entry pairs the `general.architecture` value with the
 /// model family and the components a loader still has to grow.
-const RECOGNIZED_UNIMPLEMENTED: &[(&str, &str, &str)] = &[(
-    "deepseek4",
-    "DeepSeek-V4",
-    "an MLA output LoRA (`o_lora_rank`/`o_groups`), a sqrt-softplus router, \
+const RECOGNIZED_UNIMPLEMENTED: &[(&str, &str, &str)] = &[
+    (
+        "deepseek4",
+        "DeepSeek-V4",
+        "an MLA output LoRA (`o_lora_rank`/`o_groups`), a sqrt-softplus router, \
      hash layers, a sparse-attention indexer, and MXFP4 expert tensors",
-)];
+    ),
+    (
+        "deepseek41",
+        "DeepSeek-V4.1",
+        "the V4 graph plus Engram and the one-sublayer hyper-connection lag. \
+     It is not DeepSeek-V3 and is not loaded as `deepseekv3`",
+    ),
+    (
+        "glm5-next",
+        "GLM-5.3-Flash",
+        "Kimi Delta Attention, a DeepSeek sparse-attention indexer, and \
+     hyper-connections. It is not GLM-4 and is not loaded as `glm4`",
+    ),
+];
 
 impl GGUFArchitecture {
     pub fn from_value<T: AsRef<str> + std::fmt::Display>(value: T) -> Result<Self> {
@@ -132,6 +147,8 @@ impl GGUFArchitecture {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::GGUFArchitecture;
 
     /// A DeepSeek-V4 GGUF is a valid file this build cannot run yet. The error has to say
@@ -147,6 +164,29 @@ mod tests {
         assert!(!msg.contains("Unknown"), "{msg}");
         // The supported list is what tells the operator where to go instead.
         assert!(msg.contains("glm-dsa"), "{msg}");
+    }
+
+    #[test]
+    fn deepseek41_and_glm5_next_stay_off_the_older_graphs() {
+        for (arch, family, forbidden) in [
+            ("deepseek41", "DeepSeek-V4.1", "deepseekv3"),
+            ("glm5-next", "GLM-5.3-Flash", "glm4"),
+        ] {
+            let err = GGUFArchitecture::from_value(arch)
+                .expect_err("this checkpoint has no graph in this build");
+            let msg = err.to_string();
+            assert!(msg.contains(family), "{msg}");
+            assert!(msg.contains("not implemented"), "{msg}");
+            assert!(
+                msg.contains(&format!("not loaded as `{forbidden}`")),
+                "{msg}"
+            );
+            assert!(
+                !msg.contains("Unknown GGUF architecture"),
+                "must not look like a corrupt download: {msg}"
+            );
+            assert!(GGUFArchitecture::from_str(arch).is_err(), "{arch}");
+        }
     }
 
     #[test]

@@ -927,19 +927,6 @@ pub fn probe_hf_repo_files(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_hf_cache;
-    use hf_hub::Cache;
-
-    #[test]
-    fn explicit_cache_path_is_preserved() {
-        let path = std::env::temp_dir().join("mistralrs-explicit-hf-cache");
-        let cache = resolve_hf_cache(Some(Cache::new(path.clone())));
-        assert_eq!(cache.path(), &path);
-    }
-}
-
-#[cfg(test)]
-mod tests {
     use super::*;
 
     /// A termination signal that is already set before the "download" thread has any chance to
@@ -973,5 +960,12 @@ mod tests {
         let result = poll_until_finished_or_cancelled(handle, &should_terminate);
 
         assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn explicit_cache_path_is_preserved() {
+        let path = std::env::temp_dir().join("mistralrs-explicit-hf-cache");
+        let cache = resolve_hf_cache(Some(hf_hub::Cache::new(path.clone())));
+        assert_eq!(cache.path(), &path);
     }
 }

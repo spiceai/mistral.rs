@@ -103,8 +103,9 @@ pub fn get_global_tp_size_from_devices() -> Result<usize> {
         // whole model against a single node and reject a model that does fit once split.
         if let Ok(x) = std::env::var(MISTRALRS_MN_GLOBAL_WORLD_SIZE) {
             use std::str::FromStr;
-            return Ok(usize::from_str(&x)
-                .expect("Not a number for MISTRALRS_MN_GLOBAL_WORLD_SIZE!"));
+            return Ok(
+                usize::from_str(&x).expect("Not a number for MISTRALRS_MN_GLOBAL_WORLD_SIZE!")
+            );
         }
         // In case we have manual set of TP size
         if let Ok(x) = std::env::var(MISTRALRS_MN_LOCAL_WORLD_SIZE) {
@@ -597,8 +598,7 @@ mod nccl_ops {
                             // The global rank spans machines while a device ordinal is
                             // node-local, so compare this rank's position WITHIN its node.
                             // Single-node runs are unchanged (local world == whole world).
-                            let local_world_size =
-                                super::local_device_count().unwrap_or(1).max(1);
+                            let local_world_size = super::local_device_count().unwrap_or(1).max(1);
                             if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
@@ -633,8 +633,7 @@ mod nccl_ops {
                             // The global rank spans machines while a device ordinal is
                             // node-local, so compare this rank's position WITHIN its node.
                             // Single-node runs are unchanged (local world == whole world).
-                            let local_world_size =
-                                super::local_device_count().unwrap_or(1).max(1);
+                            let local_world_size = super::local_device_count().unwrap_or(1).max(1);
                             if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
@@ -669,8 +668,7 @@ mod nccl_ops {
                             // The global rank spans machines while a device ordinal is
                             // node-local, so compare this rank's position WITHIN its node.
                             // Single-node runs are unchanged (local world == whole world).
-                            let local_world_size =
-                                super::local_device_count().unwrap_or(1).max(1);
+                            let local_world_size = super::local_device_count().unwrap_or(1).max(1);
                             if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
@@ -761,8 +759,7 @@ mod nccl_ops {
                             // The global rank spans machines while a device ordinal is
                             // node-local, so compare this rank's position WITHIN its node.
                             // Single-node runs are unchanged (local world == whole world).
-                            let local_world_size =
-                                super::local_device_count().unwrap_or(1).max(1);
+                            let local_world_size = super::local_device_count().unwrap_or(1).max(1);
                             if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
@@ -797,8 +794,7 @@ mod nccl_ops {
                             // The global rank spans machines while a device ordinal is
                             // node-local, so compare this rank's position WITHIN its node.
                             // Single-node runs are unchanged (local world == whole world).
-                            let local_world_size =
-                                super::local_device_count().unwrap_or(1).max(1);
+                            let local_world_size = super::local_device_count().unwrap_or(1).max(1);
                             if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \
@@ -833,8 +829,7 @@ mod nccl_ops {
                             // The global rank spans machines while a device ordinal is
                             // node-local, so compare this rank's position WITHIN its node.
                             // Single-node runs are unchanged (local world == whole world).
-                            let local_world_size =
-                                super::local_device_count().unwrap_or(1).max(1);
+                            let local_world_size = super::local_device_count().unwrap_or(1).max(1);
                             if device_ordinal != nccl_comm.rank() % local_world_size {
                                 candle_core::bail!(
                                     "NCCL device mismatch: tensor on device {} but NCCL rank is {}. \

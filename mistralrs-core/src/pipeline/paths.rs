@@ -88,7 +88,7 @@ pub(crate) fn get_adapter_paths(
                 xlora_id.clone(),
                 RepoType::Model,
                 base_revision.clone(),
-            ));
+            )));
             let model_id = Path::new(&xlora_id);
             let dir_list = api_dir_list!(api, model_id, true, &base_revision).collect::<Vec<_>>();
             // Get the path for the xlora classifier
@@ -338,11 +338,11 @@ pub(crate) fn get_adapter_paths(
                 );
 
                 let api = build_api(token_source, true).map_err(candle_core::Error::msg)?;
-                let api = api.repo(Repo::with_revision(
+                let api = Arc::new(api.repo(Repo::with_revision(
                     source.to_string(),
                     RepoType::Model,
                     adapter.revision().to_string(),
-                ));
+                )));
 
                 let adapter_path_buf = std::path::Path::new(source);
                 let config_path = crate::pipeline::hf::get_file(

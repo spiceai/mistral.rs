@@ -869,7 +869,7 @@ impl ModelWeights {
         x: &Tensor,
         start_offsets: &[usize],
         context_lens: Vec<(usize, usize)>,
-        _metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
+        _metadata: Option<PagedAttentionInputMetadata>,
     ) -> Result<Tensor> {
         // The embedding table is stored at `dtype` (bf16) to halve its footprint, but the
         // residual stream is f32 — every `QRmsNorm` weight is a dequantized f32 tensor, and

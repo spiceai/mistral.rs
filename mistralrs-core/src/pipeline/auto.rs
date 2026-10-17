@@ -377,7 +377,11 @@ impl AutoLoader {
         }
     }
 
-    fn fetch_sentence_transformers_config(api: &ApiRepo, model_id: &Path, revision: &str) -> bool {
+    fn fetch_sentence_transformers_config(
+        api: &Arc<ApiRepo>,
+        model_id: &Path,
+        revision: &str,
+    ) -> bool {
         match crate::pipeline::hf::try_get_file(
             api,
             model_id,

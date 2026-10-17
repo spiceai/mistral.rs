@@ -12,8 +12,9 @@ use candle_core::{
     quantized::{
         gguf_file::Value,
         k_quants::{
-            BlockQ2K, BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1,
-            BlockQ6K, BlockQ8K, BlockQ8_0, BlockQ8_1,
+            BlockIQ1M, BlockIQ1S, BlockIQ2XXS, BlockIQ3XXS, BlockIQ4XS, BlockMxfp4, BlockQ2K,
+            BlockQ3K, BlockQ4K, BlockQ4_0, BlockQ4_1, BlockQ5K, BlockQ5_0, BlockQ5_1, BlockQ6K,
+            BlockQ8K, BlockQ8_0, BlockQ8_1,
         },
         GgmlDType, QStorage, QTensor,
     },
@@ -627,6 +628,12 @@ const fn ggml_dtype_alignment(dtype: GgmlDType) -> usize {
         GgmlDType::Q6K => align_of::<BlockQ6K>(),
         GgmlDType::Q8K => align_of::<BlockQ8K>(),
         GgmlDType::BF16 => align_of::<bf16>(),
+        GgmlDType::Iq1S => align_of::<BlockIQ1S>(),
+        GgmlDType::Iq1M => align_of::<BlockIQ1M>(),
+        GgmlDType::Iq2Xxs => align_of::<BlockIQ2XXS>(),
+        GgmlDType::Iq3Xxs => align_of::<BlockIQ3XXS>(),
+        GgmlDType::Iq4Xs => align_of::<BlockIQ4XS>(),
+        GgmlDType::Mxfp4 => align_of::<BlockMxfp4>(),
     }
 }
 

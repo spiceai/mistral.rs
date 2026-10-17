@@ -185,6 +185,32 @@ pub trait FromAdapterGGML {
     where
         Self: Sized;
 }
+pub trait FromGGUF {
+    fn from_gguf<R: std::io::Seek + std::io::Read>(
+        ct: Content<'_, R>,
+        device: &candle_core::Device,
+        mapper: Box<dyn DeviceMapper + Send + Sync>,
+        attention_mechanism: crate::paged_attention::AttentionImplementation,
+        dtype: DType,
+    ) -> Result<Self, candle_core::Error>
+    where
+        Self: Sized;
+}
+
+impl<R: std::io::Seek + std::io::Read> Config<ParamsGGUF<'_, R>, NoAdapter> {
+    pub fn try_into_model<T: FromGGUF>(self) -> Result<T, candle_core::Error> {
+        let ParamsGGUF(ct, Device { device, mapper }, dtype) = self.quant;
+        // glm-dsa is the only plain-GGUF model on this path, and it rejects paged attention.
+        T::from_gguf(
+            ct,
+            device,
+            mapper,
+            crate::paged_attention::AttentionImplementation::Eager,
+            dtype,
+        )
+    }
+}
+
 pub trait FromAdapterGGUF {
     #[allow(clippy::too_many_arguments)]
     fn from_gguf<R: std::io::Seek + std::io::Read>(
