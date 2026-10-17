@@ -50,7 +50,17 @@ impl AffineFormatSpec {
             GgmlDType::Q4K => (4, 32),
             GgmlDType::Q5K | GgmlDType::Q8K => (8, 32),
             GgmlDType::Q6K => (8, 16),
-            GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => return None,
+            // i-quants and MXFP4 have no packed-affine kernel. The indexed MoE
+            // path dequantizes those rows instead.
+            GgmlDType::F32
+            | GgmlDType::F16
+            | GgmlDType::BF16
+            | GgmlDType::Iq1S
+            | GgmlDType::Iq1M
+            | GgmlDType::Iq2Xxs
+            | GgmlDType::Iq3Xxs
+            | GgmlDType::Iq4Xs
+            | GgmlDType::Mxfp4 => return None,
         };
         Some(Self {
             source_dtype,
