@@ -85,16 +85,23 @@ const RECOGNIZED_UNIMPLEMENTED: &[(&str, &str, &str)] = &[
 ];
 
 impl GGUFArchitecture {
+    /// `Some` when `general.architecture` names a checkpoint this build can
+    /// identify and must not run on an older graph.
+    pub(crate) fn unimplemented_reason(value: &str) -> Option<anyhow::Error> {
+        let lowered = value.to_ascii_lowercase();
+        let (_, family, missing) = RECOGNIZED_UNIMPLEMENTED
+            .iter()
+            .find(|(arch, _, _)| *arch == lowered)?;
+        Some(anyhow::anyhow!(
+            "GGUF architecture `{value}` ({family}) is recognized but not implemented: it needs {missing}. Supported architectures: {}.",
+            Self::supported()
+        ))
+    }
+
     pub fn from_value<T: AsRef<str> + std::fmt::Display>(value: T) -> Result<Self> {
         let lowered = value.as_ref().to_ascii_lowercase();
-        if let Some((_, family, missing)) = RECOGNIZED_UNIMPLEMENTED
-            .iter()
-            .find(|(arch, _, _)| *arch == lowered)
-        {
-            anyhow::bail!(
-                "GGUF architecture `{value}` ({family}) is recognized but not implemented: it needs {missing}. Supported architectures: {}.",
-                Self::supported()
-            );
+        if let Some(error) = Self::unimplemented_reason(value.as_ref()) {
+            return Err(error);
         }
         Self::from_str(&lowered)
             .with_context(|| {
@@ -185,8 +192,14 @@ mod tests {
                 !msg.contains("Unknown GGUF architecture"),
                 "must not look like a corrupt download: {msg}"
             );
+            let reason = GGUFArchitecture::unimplemented_reason(arch)
+                .expect("native loader asks this before the normal registry");
+            assert_eq!(reason.to_string(), msg);
             assert!(GGUFArchitecture::from_str(arch).is_err(), "{arch}");
         }
+        assert!(GGUFArchitecture::unimplemented_reason("llama").is_none());
+        assert!(GGUFArchitecture::unimplemented_reason("glm4").is_none());
+        assert!(GGUFArchitecture::unimplemented_reason("qwen4exp").is_none());
     }
 
     #[test]

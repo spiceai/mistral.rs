@@ -617,6 +617,9 @@ impl GGUFLoader {
                 },
             );
         }
+        if let Some(error) = crate::gguf::GGUFArchitecture::unimplemented_reason(architecture) {
+            return Err(error);
+        }
         let metadata_keys = archive
             .metadata()
             .keys()
