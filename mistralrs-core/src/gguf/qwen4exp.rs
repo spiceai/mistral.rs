@@ -229,6 +229,48 @@ pub(crate) fn prepare_qwen4exp_config(
     Ok(config)
 }
 
+/// Layer schedule for a Qwen4-Exp GGUF.
+///
+/// A ratio above zero marks that layer as full attention, and the indexer
+/// compress ratio is the largest ratio. Some publishers write every ratio as
+/// zero and still set `full_attention_interval`. Those files use the interval
+/// schedule: layer `i` is full attention when `(i + 1)` is a multiple of the
+/// interval, and that interval is the compress ratio. An interval of zero
+/// leaves every layer linear so config validation rejects the file.
+fn attention_schedule(
+    compress_ratios: &[u64],
+    full_attention_interval: usize,
+) -> (Vec<&'static str>, u64) {
+    if compress_ratios.iter().any(|ratio| *ratio > 0) {
+        let layer_types = compress_ratios
+            .iter()
+            .map(|ratio| {
+                if *ratio > 0 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }
+            })
+            .collect();
+        let compress_ratio = compress_ratios.iter().copied().max().unwrap_or(0);
+        return (layer_types, compress_ratio);
+    }
+    if full_attention_interval == 0 {
+        return (vec!["linear_attention"; compress_ratios.len()], 0);
+    }
+    let layer_types = (0..compress_ratios.len())
+        .map(|index| {
+            if (index + 1).is_multiple_of(full_attention_interval) {
+                "full_attention"
+            } else {
+                "linear_attention"
+            }
+        })
+        .collect();
+    let compress_ratio = u64::try_from(full_attention_interval).unwrap_or(0);
+    (layer_types, compress_ratio)
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn synthesize_config(archive: &GgufArchive) -> Result<JsonValue> {
     let key = |suffix: &str| format!("{ARCHITECTURE}.{suffix}");
@@ -242,17 +284,9 @@ fn synthesize_config(archive: &GgufArchive) -> Result<JsonValue> {
             compress_ratios.len()
         );
     }
-    let layer_types = compress_ratios
-        .iter()
-        .map(|ratio| {
-            if *ratio > 0 {
-                "full_attention"
-            } else {
-                "linear_attention"
-            }
-        })
-        .collect::<Vec<_>>();
-    let compress_ratio = compress_ratios.iter().copied().max().unwrap_or(0);
+    let full_attention_interval = usize_at("full_attention_interval")?;
+    let (layer_types, compress_ratio) =
+        attention_schedule(&compress_ratios, full_attention_interval);
     let value_heads = usize_at("ssm.time_step_rank")?;
     let mrope_section = u64_array(archive, &key("rope.dimension_sections"))?
         .into_iter()
@@ -316,7 +350,7 @@ fn synthesize_config(archive: &GgufArchive) -> Result<JsonValue> {
         ),
         (
             "full_attention_interval".into(),
-            json!(usize_at("full_attention_interval")?),
+            json!(full_attention_interval),
         ),
         ("layer_types".into(), json!(layer_types)),
         (
@@ -515,6 +549,44 @@ fn token_id(archive: &GgufArchive, token: &str) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_compress_ratios_follow_full_attention_interval() {
+        let (layers, ratio) = attention_schedule(&[0, 0, 0, 0, 0, 0, 0, 0], 4);
+        assert_eq!(ratio, 4);
+        assert_eq!(layers[3], "full_attention");
+        assert_eq!(layers[7], "full_attention");
+        assert!(layers
+            .iter()
+            .enumerate()
+            .all(|(index, layer)| (*layer == "full_attention") == (index + 1).is_multiple_of(4)));
+    }
+
+    #[test]
+    fn positive_compress_ratios_stay_unchanged() {
+        let (layers, ratio) = attention_schedule(&[0, 0, 0, 4, 0, 0, 0, 8], 2);
+        assert_eq!(ratio, 8);
+        assert_eq!(
+            layers,
+            [
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+                "linear_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_interval_with_zero_ratios_stays_linear() {
+        let (layers, ratio) = attention_schedule(&[0, 0, 0, 0], 0);
+        assert_eq!(ratio, 0);
+        assert!(layers.iter().all(|layer| *layer == "linear_attention"));
+    }
 
     const GGUF_DIR_ENV: &str = "MISTRALRS_TEST_QWEN4EXP_GGUF_DIR";
     const PROJECTOR_ENV: &str = "MISTRALRS_TEST_QWEN4EXP_PROJECTOR";
