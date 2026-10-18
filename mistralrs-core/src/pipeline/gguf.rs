@@ -1538,8 +1538,16 @@ impl Loader for GGUFLoader {
         let internal_dtype = mapper.get_min_dtype(dtype)?;
 
         let quant = ModelConfig::ParamsGGUF(model, (device, mapper).into(), internal_dtype);
-        let adapter = ModelConfig::Adapter::try_new(paths, device, silent, is_xlora)?;
-        let model_config = ModelConfig::ModelParams::new(quant, Some(adapter));
+        // Plain GGUF has no adapter safetensors. `Adapter::try_new` only accepts an
+        // X-LoRA path set and panics otherwise, which is before the architecture match.
+        let adapter = if matches!(self.kind, ModelKind::GgufAdapter { .. }) {
+            Some(ModelConfig::Adapter::try_new(
+                paths, device, silent, is_xlora,
+            )?)
+        } else {
+            None
+        };
+        let model_config = ModelConfig::ModelParams::new(quant, adapter);
 
         let model = match self.kind {
             ModelKind::GgufQuantized { .. } => match arch {
