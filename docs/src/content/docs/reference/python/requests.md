@@ -34,8 +34,9 @@ for the shared CLI, HTTP, Python, and Rust behavior.
 
 `reasoning_effort` accepts `off`, `low`, `medium`, `high`, and `xhigh`; `none`
 aliases `off`. Values are trimmed and case-insensitive. If both reasoning controls
-are omitted, thinking is enabled with no selected effort. Contradictory
-`enable_thinking` and `reasoning_effort` values raise `ValueError`.
+are omitted, the model's chat template decides whether it thinks, with no
+selected effort. Contradictory `enable_thinking` and `reasoning_effort` values
+raise `ValueError`.
 
 | Field | Type | Default |
 | --- | --- | --- |

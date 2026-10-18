@@ -122,7 +122,7 @@ Request fields:
 | `container.skills` | Supports uploaded custom Skills with `{"type":"custom","skill_id":"...","version":"latest"}`. Anthropic-managed built-in Skills such as `pptx`, `xlsx`, `docx`, and `pdf` are not bundled. |
 | `thinking` | `enabled` and `adaptive` map to thinking on; `disabled` maps to thinking off. `display: "omitted"` suppresses reasoning text while preserving the thinking block lifecycle. The loaded chat template determines the effect. |
 | `output_config` | Native `effort` and JSON Schema `format` are supported. Effort accepts `low`, `medium`, `high`, `xhigh`, and `max`; `max` maps to local `xhigh`. Do not combine these fields with the equivalent mistral.rs extensions. |
-| `enable_thinking`, `reasoning_effort` | Supported as mistral.rs extensions. Effort also accepts `off`; `none` aliases `off`. If all controls are omitted, thinking defaults on with no selected effort. Contradictory native and extension controls return a validation error. |
+| `enable_thinking`, `reasoning_effort` | Supported as mistral.rs extensions. Effort also accepts `off`; `none` aliases `off`. If all controls are omitted, the model's chat template decides whether it thinks, with no selected effort. Contradictory native and extension controls return a validation error. |
 | `logit_bias`, `logprobs`, `top_logprobs` | Supported as mistral.rs extensions. |
 | `presence_penalty`, `frequency_penalty`, `repetition_penalty` | Supported as mistral.rs extensions. |
 | `response_format`, `grammar` | Supported as mistral.rs extensions. Do not set both in one request. |

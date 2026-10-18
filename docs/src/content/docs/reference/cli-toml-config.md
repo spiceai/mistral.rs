@@ -29,7 +29,7 @@ quant = "4"
 |---|---|---|---|
 | `command` | string | both | `"serve"` or `"run"`. |
 | `default_model_id` | string | serve | Model id treated as the default. Must match one of the `[[models]]` entries. |
-| `thinking` | bool | run | Legacy thinking toggle (alias: `enable_thinking`). If both reasoning controls are omitted, thinking defaults on. Maps to `--thinking` on `mistralrs run`. |
+| `thinking` | bool | run | Legacy thinking toggle (alias: `enable_thinking`). If both reasoning controls are omitted, the model's chat template decides whether it thinks. Maps to `--thinking` on `mistralrs run`. |
 | `reasoning_effort` | string | run | `off`, `low`, `medium`, `high`, or `xhigh`; `none` aliases `off`. Omit to leave effort unspecified. Maps to `--reasoning-effort`. |
 
 ## `[global]` section

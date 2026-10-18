@@ -49,7 +49,7 @@ Accepted alongside the base Chat Completions fields. Several are mistral.rs exte
 - `dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_sequence_breakers`: DRY sampling parameters.
 - `grammar`: llguidance constraints beyond JSON schemas.
 - `reasoning_effort`: `off`, `low`, `medium`, `high`, or `xhigh`. `none` is accepted as an alias for `off`. Values are trimmed and case-insensitive.
-- `enable_thinking`: legacy boolean toggle. If both controls are omitted, mistral.rs enables thinking and leaves the effort unspecified. An explicit positive effort enables thinking; `off` disables it. Contradictory pairs such as `reasoning_effort: "off"` with `enable_thinking: true` return a validation error.
+- `enable_thinking`: legacy boolean toggle. If both controls are omitted, `enable_thinking` stays undefined in the chat template and the effort unspecified, so the model's template decides: Qwen3 templates think, while DeepSeek-V4.1 and Gemma 4 answer directly. An explicit positive effort enables thinking; `off` disables it. Contradictory pairs such as `reasoning_effort: "off"` with `enable_thinking: true` return a validation error.
 
 The selected effort is passed to the chat template as both `reasoning_effort` and the compatibility name `reasoning_strength`. The template determines how each tier affects the model; it may treat positive tiers alike or ignore controls it does not use. The Python SDK uses the same values and defaults.
 - `web_search_options`: search tool configuration (de facto OpenAI field, not yet universal).

@@ -125,7 +125,7 @@ Variables available at render time:
 - `add_generation_prompt`: true when building a prompt for generation.
 - `bos_token`, `eos_token`, `unk_token`: model special tokens.
 - `date_string`: the current UTC date as a preformatted string (`DD, Month, YYYY`, e.g. `13, June, 2026`).
-- `enable_thinking`: resolved thinking toggle; defaults to true when the request specifies neither control.
+- `enable_thinking`: the request's thinking toggle. It is undefined when the request specifies neither control, so the template applies its own default; a positive effort sets it to true and `off` to false.
 - `reasoning_effort`, `reasoning_strength`: the same explicit `off`, `low`, `medium`, `high`, or `xhigh` value. Both are undefined when effort is omitted.
 - `tools` and `builtin_tools`: present only when the request carries tool schemas.
 

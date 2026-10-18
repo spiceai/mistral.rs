@@ -81,7 +81,7 @@ pub enum Command {
 
         /// Control thinking mode for models that support it.
         /// Use --thinking or --thinking true to force on, --thinking false to force off.
-        /// If both reasoning controls are omitted, effort is unspecified and thinking is enabled.
+        /// If both reasoning controls are omitted, effort is unspecified and the model's chat template decides whether it thinks.
         #[arg(long, num_args = 0..=1, default_missing_value = "true", value_parser = clap::value_parser!(bool))]
         thinking: Option<bool>,
 

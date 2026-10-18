@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     // ---------------------------------------------------------------
     // Thinking mode (Qwen3, DeepSeek-R1, and other reasoning models)
     //
-    // Thinking is enabled by default. You can toggle it with /think
+    // Their chat templates think by default. You can toggle it with /think
     // and /no_think tags in the user message, or via
     // `TextMessages::enable_thinking(bool)`.
     // ---------------------------------------------------------------
