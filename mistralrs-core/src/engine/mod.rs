@@ -2322,7 +2322,7 @@ impl Engine {
                     }
                 }
             }
-        } else if !distributed::is_daemon() && cfg!(feature = "ring") {
+        } else if !distributed::is_daemon() && mistralrs_quant::distributed::use_ring() {
             let num_workers =
                 mistralrs_quant::distributed::get_global_tp_size_from_devices().unwrap() - 1;
             let master_port = RingConfig::load().master_port;

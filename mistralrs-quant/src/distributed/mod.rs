@@ -85,15 +85,11 @@ pub fn local_device_count() -> Result<usize> {
 }
 
 pub fn get_global_tp_size_from_devices() -> Result<usize> {
-    #[cfg(all(feature = "cuda", feature = "ring"))]
-    {
-        let config = RingConfig::load();
-        Ok(config.world_size)
-    }
-    #[cfg(all(not(feature = "cuda"), feature = "ring"))]
-    {
-        let config = RingConfig::load();
-        Ok(config.world_size)
+    // A ring-enabled build still serves one node. `RING_CONFIG` is set only for
+    // an actual multi-node load; without it the tensor-parallel width is 1.
+    #[cfg(feature = "ring")]
+    if std::env::var("RING_CONFIG").is_ok() {
+        return Ok(RingConfig::load().world_size);
     }
 
     #[cfg(all(feature = "cuda", feature = "nccl"))]
@@ -116,7 +112,7 @@ pub fn get_global_tp_size_from_devices() -> Result<usize> {
         }
     }
 
-    #[cfg(all(not(feature = "ring"), not(feature = "nccl")))]
+    #[cfg(not(all(feature = "cuda", feature = "nccl")))]
     Ok(1)
 }
 
