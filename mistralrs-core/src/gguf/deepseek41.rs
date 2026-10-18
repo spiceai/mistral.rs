@@ -160,7 +160,14 @@ fn hyper_coeff(
     let flat = h.reshape((batch, flat_in))?.to_dtype(DType::F32)?;
     let variance = flat.sqr()?.mean_keepdim(D::Minus1)?;
     let scale = (variance + f64::from(rms_eps))?.sqrt()?.recip()?;
-    let projected = flat.matmul(&weights.fn_weight.to_dtype(DType::F32)?)?;
+    // GGUF stores this matrix as `[out, in]`. The mix is `x @ W.T`.
+    let weight = weights.fn_weight.to_dtype(DType::F32)?;
+    let weight = if weight.dim(1)? == flat_in {
+        weight.t()?.contiguous()?
+    } else {
+        weight
+    };
+    let projected = flat.matmul(&weight)?;
     let mixes = projected.broadcast_mul(&scale)?;
     let scale_w = weights.scale.to_dtype(DType::F32)?;
     let base = weights.base.to_dtype(DType::F32)?;
@@ -276,10 +283,16 @@ pub(crate) fn engram_apply(
     let hc = dims[dims.len() - 2];
     let lead: usize = dims[..dims.len() - 2].iter().product();
     let in_dim = *rows.dims().last().unwrap_or(&0);
+    let wkv = wkv.to_dtype(DType::F32)?;
+    let wkv = if wkv.dim(1)? == in_dim {
+        wkv.t()?.contiguous()?
+    } else {
+        wkv
+    };
     let kv = rows
         .reshape((lead, in_dim))?
         .to_dtype(DType::F32)?
-        .matmul(&wkv.to_dtype(DType::F32)?)?;
+        .matmul(&wkv)?;
     let key = kv
         .narrow(1, 0, hc * hidden)?
         .reshape((lead, hc, hidden))?;
@@ -393,9 +406,57 @@ mod tests {
     use crate::gguf::dsv4_hc::mix_streams;
 
     use super::{
-        compress_groups, engram_apply, engram_row_ids, lagged_block, missing_tensors, moe_route,
-        mqa_with_sink, swiglu_clamped, HyperWeights, REQUIRED_TENSORS,
+        compress_groups, engram_apply, engram_row_ids, hyper_coeff, lagged_block, missing_tensors,
+        moe_route, mqa_with_sink, swiglu_clamped, HyperWeights, REQUIRED_TENSORS,
     };
+
+    #[test]
+    fn hyper_coeff_accepts_the_gguf_out_in_matrix() {
+        let device = Device::Cpu;
+        let hc = 2usize;
+        let hidden = 5usize;
+        let flat_in = hc * hidden;
+        let out = (2 + hc) * hc;
+        let values: Vec<f32> = (0..flat_in * out)
+            .map(|index| ((index % 7) as f32) * 0.01)
+            .collect();
+        let inn = Tensor::from_vec(values.clone(), (flat_in, out), &device).expect("in-out");
+        let out_in = inn.t().expect("transpose").contiguous().expect("row major");
+        assert_eq!(out_in.dims(), &[out, flat_in]);
+        let scale = Tensor::from_vec(vec![1f32, 1.0, 1.0], (3,), &device).expect("scale");
+        let base = Tensor::zeros((out,), DType::F32, &device).expect("base");
+        let h = Tensor::ones((1, 1, hc, hidden), DType::F32, &device).expect("hidden");
+        let left = hyper_coeff(
+            &h,
+            &HyperWeights {
+                fn_weight: inn,
+                scale: scale.clone(),
+                base: base.clone(),
+            },
+            hc,
+            1,
+            1e-5,
+            1e-6,
+        )
+        .expect("in-out coeff");
+        let right = hyper_coeff(
+            &h,
+            &HyperWeights {
+                fn_weight: out_in,
+                scale,
+                base,
+            },
+            hc,
+            1,
+            1e-5,
+            1e-6,
+        )
+        .expect("out-in coeff");
+        assert_eq!(
+            left.pre.flatten_all().expect("flat").to_vec1::<f32>().expect("pre"),
+            right.pre.flatten_all().expect("flat").to_vec1::<f32>().expect("pre")
+        );
+    }
 
     fn close(lhs: &Tensor, rhs: &Tensor) {
         let lhs = lhs.flatten_all().unwrap().to_vec1::<f32>().unwrap();
