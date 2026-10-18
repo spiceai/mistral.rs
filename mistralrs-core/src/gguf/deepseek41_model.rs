@@ -861,9 +861,9 @@ impl Layer {
         let weight = (weight * scale)?;
         let t = keys.dim(1)?;
         let mut score = Tensor::zeros((batch, seq, t), DType::F32, x.device())?;
-        let keys_t = keys.transpose(1, 2)?;
+        let keys_t = keys.transpose(1, 2)?.contiguous()?;
         for head in 0..self.index_heads {
-            let qh = q.narrow(2, head, 1)?.squeeze(2)?;
+            let qh = q.narrow(2, head, 1)?.squeeze(2)?.contiguous()?;
             let mut dots = qh.matmul(&keys_t)?;
             dots = dots.relu()?;
             let wh = weight.narrow(2, head, 1)?;
@@ -998,9 +998,9 @@ fn attention_visible(
 fn sparse_mqa(q: &Tensor, k: &Tensor, sinks: &Tensor, visible: &Tensor) -> Result<Tensor> {
     let (batch, _seq, heads, dim) = q.dims4()?;
     let scale = 1.0 / (dim as f64).sqrt();
-    let q = q.transpose(1, 2)?;
-    let k = k.unsqueeze(1)?;
-    let scores = q.broadcast_matmul(&k.transpose(D::Minus1, D::Minus2)?)?;
+    let q = q.transpose(1, 2)?.contiguous()?;
+    let k = k.unsqueeze(1)?.contiguous()?;
+    let scores = q.broadcast_matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)?;
     let scores = (scores * scale)?;
     let blocked = (scores.zeros_like()? - f64::INFINITY)?;
     let scores = visible
@@ -1014,7 +1014,9 @@ fn sparse_mqa(q: &Tensor, k: &Tensor, sinks: &Tensor, visible: &Tensor) -> Resul
         .exp()?;
     let denom = (exp_scores.sum_keepdim(D::Minus1)? + sink)?;
     let probs = exp_scores.broadcast_div(&denom)?;
-    let out = probs.broadcast_matmul(&k.reshape((batch, 1, k.dim(2)?, dim))?)?;
+    let out = probs
+        .contiguous()?
+        .broadcast_matmul(&k.reshape((batch, 1, k.dim(2)?, dim))?.contiguous()?)?;
     out.transpose(1, 2)?.contiguous()
 }
 

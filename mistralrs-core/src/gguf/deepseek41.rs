@@ -376,9 +376,9 @@ pub(crate) fn swiglu_clamped(gate: &Tensor, up: &Tensor, limit: f64) -> Result<T
 pub(crate) fn mqa_with_sink(q: &Tensor, k: &Tensor, sinks: &Tensor) -> Result<Tensor> {
     let (batch, seq, heads, dim) = q.dims4()?;
     let scale = 1.0 / (dim as f64).sqrt();
-    let q = q.transpose(1, 2)?;
-    let k = k.unsqueeze(1)?;
-    let scores = q.matmul(&k.transpose(D::Minus1, D::Minus2)?)?;
+    let q = q.transpose(1, 2)?.contiguous()?;
+    let k = k.unsqueeze(1)?.contiguous()?;
+    let scores = q.matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)?;
     let scores = (scores * scale)?;
     let key_index = Tensor::arange(0u32, seq as u32, q.device())?;
     let query_index = key_index.unsqueeze(D::Minus1)?;
@@ -392,7 +392,9 @@ pub(crate) fn mqa_with_sink(q: &Tensor, k: &Tensor, sinks: &Tensor) -> Result<Te
     let sink = (sinks.reshape((1, heads, 1, 1))? - &row_max)?.exp()?;
     let denom = (exp_scores.sum_keepdim(D::Minus1)? + sink)?;
     let probs = exp_scores.broadcast_div(&denom)?;
-    let out = probs.matmul(&k.reshape((batch, 1, seq, dim))?)?;
+    let out = probs
+        .contiguous()?
+        .matmul(&k.reshape((batch, 1, seq, dim))?.contiguous()?)?;
     out.transpose(1, 2)?.contiguous()
 }
 
