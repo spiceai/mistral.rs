@@ -1,6 +1,9 @@
 #!/bin/sh
 set -e
 
+REMOTE_SIZE_CONNECT_TIMEOUT=3
+REMOTE_SIZE_MAX_TIME=5
+
 # mistral.rs Installation Script
 # Cross-platform installer for Linux and macOS with automatic hardware detection
 
@@ -36,6 +39,26 @@ info() { printf "${BLUE}info:${NC} %s\n" "$1" >&2; }
 success() { printf "${GREEN}success:${NC} %s\n" "$1" >&2; }
 warn() { printf "${YELLOW}warning:${NC} %s\n" "$1" >&2; }
 error() { printf "${RED}error:${NC} %s\n" "$1" >&2; exit 1; }
+# Echo a dependency-install command (rustup, brew, apt, ...) so the user sees it before confirming.
+show_cmd() { printf "${BOLD}  \$ %s${NC}\n" "$1" >&2; }
+
+# Format a byte count for humans (e.g. 1234567 -> 1.2 MiB).
+human_size() {
+    awk -v b="$1" 'BEGIN {
+        split("B KiB MiB GiB TiB", u, " ")
+        i = 1
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i]
+    }'
+}
+
+# Content-Length of a URL after redirects; empty if it cannot be determined.
+remote_download_size() {
+    curl --proto '=https' --tlsv1.2 -sfIL \
+        --connect-timeout "$REMOTE_SIZE_CONNECT_TIMEOUT" \
+        --max-time "$REMOTE_SIZE_MAX_TIME" "$1" 2>/dev/null \
+        | tr -d '\r' | awk 'tolower($1) == "content-length:" { len = $2 } END { if (len) print len }'
+}
 
 # Banner
 print_banner() {
@@ -67,6 +90,7 @@ detect_os() {
 
 # Minimum required Rust version
 REQUIRED_RUST_VERSION="1.94"
+RUSTUP_INSTALL_CMD="curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
 MISTRALRS_REPO_URL="https://github.com/EricLBuehler/mistral.rs"
 MISTRALRS_BRANCH="master"
 MISTRALRS_CLI_PACKAGE="mistralrs-cli"
@@ -99,7 +123,7 @@ version_gte() {
 # Install Rust via rustup
 install_rust() {
     info "Installing Rust via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    sh -c "$RUSTUP_INSTALL_CMD"
     . "$HOME/.cargo/env"
     success "Rust installed successfully"
 }
@@ -169,7 +193,7 @@ cutile_supported_for_cuda() {
     if [ "$cuda_cc" -eq 90 ] 2>/dev/null && [ "$cuda_ver_code" -ge 1303 ] 2>/dev/null; then
         return 0
     fi
-    if [ "$cuda_cc" -ge 100 ] 2>/dev/null && [ "$cuda_ver_code" -ge 1301 ] 2>/dev/null; then
+    if [ "$cuda_cc" -ge 100 ] 2>/dev/null && [ "$cuda_ver_code" -ge 1302 ] 2>/dev/null; then
         return 0
     fi
 
@@ -228,6 +252,7 @@ check_xcode_cli_tools() {
     if ! xcrun --version >/dev/null 2>&1; then
         warn "Xcode Command Line Tools are not installed"
         echo ""
+        show_cmd "xcode-select --install"
         printf "Would you like to install them now? [Y/n] "
         read_input
         case "$REPLY" in
@@ -239,6 +264,7 @@ check_xcode_cli_tools() {
         xcode-select --install
         echo "Please complete the installation in the dialog, then press Enter to continue..."
         read_input
+        show_cmd "sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer"
         sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
     fi
 }
@@ -248,6 +274,7 @@ check_metal_toolchain() {
     if ! xcrun metal --version >/dev/null 2>&1; then
         warn "Metal Toolchain is not installed"
         echo ""
+        show_cmd "xcodebuild -downloadComponent MetalToolchain"
         printf "Would you like to install it now? [Y/n] "
         read_input
         case "$REPLY" in
@@ -335,8 +362,8 @@ build_features() {
 
             # Add flash attention based on compute capability
             if [ "$cuda_cc" = "90" ]; then
-                features="$features flash-attn-v3"
-                info "Hopper GPU detected - enabling flash-attn-v3"
+                features="$features flash-attn-v3 flash-attn"
+                info "Hopper GPU detected - enabling flash-attn-v3 and flash-attn"
             elif [ "$cuda_cc" -ge 80 ] 2>/dev/null; then
                 features="$features flash-attn"
                 info "Ampere+ GPU detected - enabling flash-attn"
@@ -367,34 +394,38 @@ check_ffmpeg() {
     command -v ffmpeg >/dev/null 2>&1 && ffmpeg -version >/dev/null 2>&1
 }
 
-# Install ffmpeg using the system package manager
-install_ffmpeg() {
+# The package-manager command that would install FFmpeg on this system; empty if none was detected.
+ffmpeg_install_cmd() {
     os="$1"
     if [ "$os" = "macos" ]; then
         if command -v brew >/dev/null 2>&1; then
             if brew list ffmpeg >/dev/null 2>&1; then
-                info "Reinstalling FFmpeg via Homebrew..."
-                brew reinstall ffmpeg
+                echo "brew reinstall ffmpeg"
             else
-                info "Installing FFmpeg via Homebrew..."
-                brew install ffmpeg
+                echo "brew install ffmpeg"
             fi
-        else
-            warn "Homebrew not found. Install FFmpeg manually: https://ffmpeg.org/download.html"
-            return 1
         fi
-    else
-        if command -v apt-get >/dev/null 2>&1; then
-            info "Installing FFmpeg via apt..."
-            sudo apt-get update && sudo apt-get install -y ffmpeg
-        elif command -v dnf >/dev/null 2>&1; then
-            info "Installing FFmpeg via dnf..."
-            sudo dnf install -y ffmpeg
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo "sudo apt-get update && sudo apt-get install -y ffmpeg"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "sudo dnf install -y ffmpeg"
+    fi
+}
+
+# Install ffmpeg using the system package manager
+install_ffmpeg() {
+    os="$1"
+    cmd=$(ffmpeg_install_cmd "$os")
+    if [ -z "$cmd" ]; then
+        if [ "$os" = "macos" ]; then
+            warn "Homebrew not found. Install FFmpeg manually: https://ffmpeg.org/download.html"
         else
             warn "Could not detect package manager. Install FFmpeg manually: https://ffmpeg.org/download.html"
-            return 1
         fi
+        return 1
     fi
+    info "Installing FFmpeg..."
+    sh -c "$cmd"
 }
 
 # Install mistralrs-cli
@@ -421,16 +452,24 @@ install_mistralrs() {
     fi
 }
 
+remove_legacy_tileiras_link() {
+    legacy_tileiras_link="$BIN_DIR/tileiras"
+    legacy_tileiras_target="$PREBUILT_DIR/bin/tileiras"
+    if [ -L "$legacy_tileiras_link" ] && [ "$(readlink "$legacy_tileiras_link" 2>/dev/null)" = "$legacy_tileiras_target" ]; then
+        rm -f "$legacy_tileiras_link"
+    fi
+}
+
 install_source_from_staging() {
     if [ ! -f "$SOURCE_MISTRALRS" ]; then
         error "cargo install succeeded but $SOURCE_MISTRALRS was not found"
     fi
+    remove_legacy_tileiras_link
     rm -rf "$PREBUILT_DIR"
     mkdir -p "$PREBUILT_DIR" "$BIN_DIR"
     cp "$SOURCE_MISTRALRS" "$PREBUILT_DIR/mistralrs"
     chmod +x "$PREBUILT_DIR/mistralrs" 2>/dev/null || true
     ln -sf "$PREBUILT_DIR/mistralrs" "$BIN_DIR/mistralrs"
-    rm -f "$BIN_DIR/tileiras"
     rm -rf "$SOURCE_INSTALL_ROOT"
     if ! "$PREBUILT_DIR/mistralrs" --version >/dev/null 2>&1; then
         error "source-built binary did not run after installation"
@@ -470,7 +509,8 @@ cuda_sms_for_variant() {
         130:aarch64|130:arm64) echo "$PREBUILT_CUDA_SMS_AARCH64" ;;
         131:x86_64) echo "$PREBUILT_CUDA_SMS_X86" ;;
         131:aarch64|131:arm64) echo "$PREBUILT_CUDA_SMS_AARCH64" ;;
-        132:x86_64) echo "80 86 89" ;;
+        132:x86_64) echo "80 86 89 100 120" ;;
+        132:aarch64|132:arm64) echo "100 121" ;;
         133:x86_64) echo "90" ;;
         133:aarch64|133:arm64) echo "90" ;;
     esac
@@ -520,9 +560,10 @@ detect_prebuilt_asset() {
         return 0
     fi
     if [ "$triple" = "aarch64-unknown-linux-gnu" ]; then
-        # the default aarch64 asset assumes ARMv8.2 (dotprod); A72-class boards
-        # (Pi 4, Graviton1) get the compat build
-        if ! grep -qw asimddp /proc/cpuinfo 2>/dev/null; then
+        # the default aarch64 asset requires dotprod, fp16, and fhm
+        if ! grep -qw asimddp /proc/cpuinfo 2>/dev/null \
+            || ! grep -qw asimdhp /proc/cpuinfo 2>/dev/null \
+            || ! grep -qw asimdfhm /proc/cpuinfo 2>/dev/null; then
             echo "mistralrs-cpu-${triple}-v8_0.tar.gz"
             return 0
         fi
@@ -556,27 +597,30 @@ detect_legacy_cuda_prebuilt_asset() {
 install_prebuilt() {
     asset="$1"
     tmp=$(mktemp -d)
-    info "Downloading $asset"
-    if ! curl --proto '=https' --tlsv1.2 -fSL --progress-bar "$RELEASE_BASE/$asset" -o "$tmp/$asset"; then
+    asset_url="$RELEASE_BASE/$asset"
+    download_size=$(remote_download_size "$asset_url")
+    if [ -n "$download_size" ]; then
+        info "Downloading $asset ($(human_size "$download_size"))"
+    else
+        info "Downloading $asset"
+    fi
+    if ! curl --proto '=https' --tlsv1.2 -fSL --progress-bar "$asset_url" -o "$tmp/$asset"; then
         rm -rf "$tmp"
         return 1
     fi
+    remove_legacy_tileiras_link
     rm -rf "$PREBUILT_DIR"
     mkdir -p "$PREBUILT_DIR"
-    # CPU/Metal tarballs contain a bare `mistralrs`; CUDA tarballs add lib/ and bin/tileiras.
+    # CPU/Metal tarballs contain a bare `mistralrs`; CUDA tarballs add runtime libraries in lib/.
     if ! tar xzf "$tmp/$asset" -C "$PREBUILT_DIR"; then
         rm -rf "$tmp"
         return 1
     fi
     rm -rf "$tmp"
     chmod +x "$PREBUILT_DIR/mistralrs" 2>/dev/null || true
-    [ -f "$PREBUILT_DIR/bin/tileiras" ] && chmod +x "$PREBUILT_DIR/bin/tileiras" 2>/dev/null || true
     mkdir -p "$BIN_DIR"
-    # Symlink onto PATH; $ORIGIN/lib resolves through the symlink to the real lib dir, and a
-    # tileiras symlink lets cutile's PATH probe find the bundled assembler.
+    # Symlink onto PATH; $ORIGIN/lib resolves through the symlink to the real lib dir.
     ln -sf "$PREBUILT_DIR/mistralrs" "$BIN_DIR/mistralrs"
-    rm -f "$BIN_DIR/tileiras"
-    [ -f "$PREBUILT_DIR/bin/tileiras" ] && ln -sf "$PREBUILT_DIR/bin/tileiras" "$BIN_DIR/tileiras" || true
     if ! "$PREBUILT_DIR/mistralrs" --version >/dev/null 2>&1; then
         warn "Prebuilt binary did not run; falling back to source build."
         return 1
@@ -603,6 +647,7 @@ build_from_source() {
         if [ -n "$rust_version" ] && ! version_gte "$rust_version" "$REQUIRED_RUST_VERSION"; then
             warn "Rust $rust_version is below the required version $REQUIRED_RUST_VERSION"
             echo ""
+            show_cmd "rustup update stable"
             printf "Would you like to update Rust now? [Y/n] "
             read_input
             case "$REPLY" in
@@ -619,6 +664,7 @@ build_from_source() {
     else
         warn "Rust is not installed"
         echo ""
+        show_cmd "$RUSTUP_INSTALL_CMD"
         printf "Would you like to install Rust now? [Y/n] "
         read_input
         case "$REPLY" in
@@ -684,6 +730,8 @@ maybe_install_ffmpeg() {
     fi
     echo ""
     printf "${YELLOW}(Optional)${NC} FFmpeg is required for video input support.\n"
+    cmd=$(ffmpeg_install_cmd "$os")
+    [ -n "$cmd" ] && show_cmd "$cmd"
     printf "Would you like to install FFmpeg? [y/N] "
     read_input
     case "$REPLY" in
@@ -839,9 +887,6 @@ print_success() {
     echo "========="
     if [ "$method" = "prebuilt" ]; then
         printf "  binary      %s\n" "$(tildify "$PREBUILT_DIR/mistralrs")"
-        if [ -L "$BIN_DIR/tileiras" ]; then
-            printf "  cutile JIT  %s -> %s\n" "$(tildify "$BIN_DIR/tileiras")" "$(tildify "$PREBUILT_DIR/bin/tileiras")"
-        fi
     else
         printf "  binary      %s\n" "$(tildify "$PREBUILT_DIR/mistralrs")"
     fi
@@ -859,7 +904,7 @@ print_success() {
     echo "  # Run as a local agent (tools, web search, code execution)"
     echo "  mistralrs serve --agent -m google/gemma-4-E4B-it"
     echo ""
-    echo "Docs:     https://ericlbuehler.github.io/mistral.rs/"
+    echo "Docs:     https://docs.mistralrs.dev/"
     echo "Source:   https://github.com/EricLBuehler/mistral.rs"
     echo ""
     if [ -n "$FFMPEG_SKIPPED" ]; then

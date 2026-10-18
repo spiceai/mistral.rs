@@ -13,9 +13,7 @@ This file provides instructions for AI agents to understand the layout of the `m
 - `/mistralrs-pyo3/`      : Python bindings (PyO3)
 - `/mistralrs-cli/`       : Unified CLI binary (commands: run, serve, bench, from-config)
 - `/mistralrs-server-core/`: Shared server core logic
-- `/mistralrs-web-chat/`  : (Deprecated) Use `mistralrs serve --ui` instead
-- `/mistralrs-bench/`     : (Deprecated) Use `mistralrs bench` instead
-- `/docs/`                : Markdown documentation for models, features, and guides
+- `/docs/`             : Astro/Starlight documentation site (deployed at https://docs.mistralrs.dev)
 - `/examples/`            : Usage examples (Rust, Python, server samples, notebooks)
 - `/chat_templates/`      : Chat formatting templates (JSON/Jinja)
 - `/scripts/`             : Utility scripts (e.g., AWQ conversion)
@@ -104,8 +102,8 @@ Avoid returning TODOs.
   ```bash
   cargo doc --workspace
   ```
-- Preview at `target/doc/` or publish to GitHub Pages as configured.
-- Refer to `/docs/` for in-depth markdown guides (e.g., DEVICE_MAPPING.md, TOOL_CALLING.md).
+- Preview Rust API docs at `target/doc/`.
+- Refer to `/docs/src/content/docs/` for in-depth guides. The site builds with `cd docs && npm run build` and deploys to https://docs.mistralrs.dev via `.github/workflows/docs.yml`.
 
 ## Examples
 

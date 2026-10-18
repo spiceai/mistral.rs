@@ -174,6 +174,26 @@ impl<'a, R: std::io::Seek + std::io::Read> Content<'a, R> {
         self.arch
     }
 
+    /// Quantized on-disk bytes of tensors whose names `include` accepts.
+    ///
+    /// This is the storage size (`element_count / block_size * type_size`), not the
+    /// dequantized size. Device-map planning uses it so a Q2_K expert stack is not
+    /// counted as if it were F32.
+    pub fn quantized_storage_bytes(&self, mut include: impl FnMut(&str) -> bool) -> usize {
+        let mut total = 0usize;
+        for content in &self.contents {
+            for (name, info) in &content.tensor_infos {
+                if !include(name) {
+                    continue;
+                }
+                let bytes = info.shape.elem_count() / info.ggml_dtype.block_size()
+                    * info.ggml_dtype.type_size();
+                total = total.saturating_add(bytes);
+            }
+        }
+        total
+    }
+
     /// Retrieve a tensor info, searching through each content.
     pub fn tensor_info(&self, name: &str) -> Result<&TensorInfo> {
         for ct in &self.contents {

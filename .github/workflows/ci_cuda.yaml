@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test-cuda:
     name: CI / cuda (${{ matrix.name }})
@@ -19,6 +22,10 @@ jobs:
 
     runs-on: [self-hosted, Linux, ARM64, gpu, cuda]
 
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+
     strategy:
       fail-fast: false
       matrix:
@@ -27,7 +34,7 @@ jobs:
             features: cuda,nccl
             cuda: "13.0"
             test_args: ""
-          # cutile-compiler 0.1.0 emits Tile IR 13.2 bytecode, so tileiras (and thus the toolkit) must be >= 13.2.
+          # cuTile 0.3 selects bytecode for the active toolkit; 13.2 is the minimum lane for this runner's Ampere GPU.
           - name: cuda+cutile
             features: cuda,cutile
             cuda: "13.2"
@@ -42,10 +49,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl build-essential libssl-dev protobuf-compiler pkg-config
+          sudo apt-get install -y curl build-essential clang libclang-dev libssl-dev protobuf-compiler pkg-config
 
       - name: Install Rust Stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Pin CUDA toolkit to ${{ matrix.cuda }}
         run: |
@@ -73,7 +80,7 @@ jobs:
           nvcc --version || true
 
       - name: Clippy
-        run: cargo clippy --features ${{ matrix.features }}
+        run: cargo clippy ${{ matrix.test_args }} --features ${{ matrix.features }} --tests --examples -- -D warnings
 
       - name: Test
         run: cargo test ${{ matrix.test_args }} --features ${{ matrix.features }}

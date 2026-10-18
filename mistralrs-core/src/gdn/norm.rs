@@ -1,15 +1,32 @@
 use candle_core::{DType, Device, Result, Tensor, D};
+#[cfg(feature = "cuda")]
+use mistralrs_quant::QuantizedActivation;
 use mistralrs_quant::ShardedVarBuilder;
+
+use super::config::GdnGateActivation;
+#[cfg(feature = "cuda")]
+use crate::cuda::gdn::GdnFp8OutputSpec;
 
 pub struct RmsNormGated {
     pub weight: Tensor,
     eps: f64,
+    activation: GdnGateActivation,
 }
 
 impl RmsNormGated {
+    #[cfg(test)]
+    pub(crate) fn from_parts(weight: Tensor, eps: f64) -> Self {
+        Self {
+            weight,
+            eps,
+            activation: GdnGateActivation::Silu,
+        }
+    }
+
     pub fn new(
         size: usize,
         eps: f64,
+        activation: GdnGateActivation,
         vb: ShardedVarBuilder,
         isq_target_device: Option<&Device>,
     ) -> Result<Self> {
@@ -17,28 +34,75 @@ impl RmsNormGated {
         if let Some(target_dev) = isq_target_device {
             weight = weight.to_device(target_dev)?;
         }
-        Ok(Self { weight, eps })
+        Ok(Self {
+            weight,
+            eps,
+            activation,
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn eps(&self) -> f64 {
+        self.eps
+    }
+
+    pub(crate) fn activation(&self) -> GdnGateActivation {
+        self.activation
     }
 
     pub fn forward(&self, x: &Tensor, gate: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "cuda")]
         if x.device().is_cuda()
-            && x.rank() == 2
-            && gate.shape() == x.shape()
+            && (2..=4).contains(&x.rank())
+            && (2..=4).contains(&gate.rank())
+            && gate.elem_count() == x.elem_count()
+            && x.dim(D::Minus1)? == self.weight.elem_count()
+            && gate.dtype() == x.dtype()
             && self.weight.dtype() == x.dtype()
             && matches!(x.dtype(), DType::F16 | DType::BF16)
         {
-            return crate::cuda::gdn::rmsnorm_gated_cuda(x, gate, &self.weight, self.eps);
+            return crate::cuda::gdn::rmsnorm_gated_cuda(
+                x,
+                gate,
+                &self.weight,
+                self.eps,
+                self.activation,
+            );
         }
 
         let dtype = x.dtype();
         let x = x.to_dtype(DType::F32)?;
-        let gate = candle_nn::ops::silu(&gate.to_dtype(DType::F32)?)?;
+        let gate = gate.reshape(x.shape().clone())?.to_dtype(DType::F32)?;
+        let gate = match self.activation {
+            GdnGateActivation::Silu => candle_nn::ops::silu(&gate)?,
+            GdnGateActivation::Sigmoid => candle_nn::ops::sigmoid(&gate)?,
+        };
         let variance = x.sqr()?.mean_keepdim(D::Minus1)?;
         let normed = x.broadcast_div(&(variance + self.eps)?.sqrt()?)?;
         let out = normed
             .broadcast_mul(&self.weight.to_dtype(DType::F32)?)?
             .broadcast_mul(&gate)?;
         out.to_dtype(dtype)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn forward_quantized(
+        &self,
+        x: &Tensor,
+        gate: &Tensor,
+        spec: &GdnFp8OutputSpec,
+        num_v_heads: usize,
+        head_v_dim: usize,
+    ) -> Result<QuantizedActivation> {
+        crate::cuda::gdn::rmsnorm_gated_quantized_cuda(
+            x,
+            gate,
+            &self.weight,
+            self.eps,
+            self.activation,
+            spec,
+            num_v_heads,
+            head_v_dim,
+        )
     }
 }

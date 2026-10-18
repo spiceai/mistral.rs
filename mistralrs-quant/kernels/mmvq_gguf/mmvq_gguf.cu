@@ -45,7 +45,8 @@ enum GluActivation {
   GLU_SILU = 0,
   GLU_GELU = 1,
   GLU_RELU = 2,
-  GLU_GELU_ERF = 3
+  GLU_GELU_ERF = 3,
+  GLU_SIGMOID = 4
 };
 
 static __device__ __forceinline__ float glu_silu(float x) {
@@ -78,6 +79,8 @@ static __device__ __forceinline__ float apply_glu_activation(float x, int act) {
     return glu_relu(x);
   case GLU_GELU_ERF:
     return glu_gelu_erf(x);
+  case GLU_SIGMOID:
+    return 1.0f / (1.0f + expf(-x));
   default:
     return glu_silu(x);
   }
@@ -998,7 +1001,7 @@ static __device__ void mmvq_core_fused_qkv_impl(
 
 #define MMVQ_PLAIN_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot,     \
                          dst_tag, dst_c_type, ncols)                           \
-  extern "C" __global__ void __launch_bounds__(                                \
+  static __global__ void __launch_bounds__(                                \
       mmvq_nwarps_plain_for(ncols) * WARP_SIZE, 1)                             \
       mmvq_gguf_##tag##_##dst_tag##_plain_cuda##ncols(                         \
           const void *__restrict__ vx, const void *__restrict__ vy,            \
@@ -1011,7 +1014,7 @@ static __device__ void mmvq_core_fused_qkv_impl(
 
 #define MMVQ_FUSED_GLU_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, \
                              dst_tag, dst_c_type, ncols)                       \
-  extern "C" __global__ void __launch_bounds__(                                \
+  static __global__ void __launch_bounds__(                                \
       mmvq_nwarps_fused_glu_for(ncols) * WARP_SIZE, 1)                         \
       mmvq_gguf_##tag##_##dst_tag##_fused_glu_cuda##ncols(                     \
           const void *__restrict__ vx_gate, const void *__restrict__ vx_up,    \
@@ -1026,7 +1029,7 @@ static __device__ void mmvq_core_fused_qkv_impl(
 
 #define MMVQ_FUSED_QKV_ENTRY(tag, block_q_t, qk_val, qi_val, vdr_val, vec_dot, \
                              dst_tag, dst_c_type, ncols)                       \
-  extern "C" __global__ void __launch_bounds__(                                \
+  static __global__ void __launch_bounds__(                                \
       mmvq_nwarps_fused_qkv_for(ncols) * WARP_SIZE, 1)                         \
       mmvq_gguf_##tag##_##dst_tag##_fused_qkv_cuda##ncols(                     \
           const void *__restrict__ vx_q, const void *__restrict__ vx_k,        \
@@ -1214,7 +1217,7 @@ MMVQ_FUSED_QKV_TYPE_SET(q6_k, block_q6_K, QK_K, QI6_K, VDR_Q6_K_Q8_1_MMVQ,
 
 // Padding-aware BF16/F16/F32 -> Q8_1 quantize kernels.
 
-extern "C" __global__ void
+static __global__ void
 mmvq_gguf_quantize_q8_1_bf16(const __nv_bfloat16 *__restrict__ x,
                              void *__restrict__ vy, const int kx,
                              const int kx_padded) {
@@ -1248,7 +1251,7 @@ mmvq_gguf_quantize_q8_1_bf16(const __nv_bfloat16 *__restrict__ x,
   reinterpret_cast<half &>(y[ib].ds.y) = (half)sum;
 }
 
-extern "C" __global__ void
+static __global__ void
 mmvq_gguf_quantize_q8_1_f16(const half *__restrict__ x, void *__restrict__ vy,
                             const int kx, const int kx_padded) {
   const int ix = blockDim.x * blockIdx.x + threadIdx.x;
@@ -1281,7 +1284,7 @@ mmvq_gguf_quantize_q8_1_f16(const half *__restrict__ x, void *__restrict__ vy,
   reinterpret_cast<half &>(y[ib].ds.y) = (half)sum;
 }
 
-extern "C" __global__ void
+static __global__ void
 mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x, void *__restrict__ vy,
                             const int kx, const int kx_padded) {
   const int ix = blockDim.x * blockIdx.x + threadIdx.x;
@@ -1317,7 +1320,7 @@ mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x, void *__restrict__ vy,
 // Host-side launchers used by `mistralrs-quant/src/gguf/ffi.rs`.
 
 #define MMVQ_LAUNCHER_PLAIN(tag, dst_tag, dst_c_type)                          \
-  extern "C" void launch_mmvq_gguf_##tag##_##dst_tag##_plain(                  \
+  extern "C" void mrs_launch_mmvq_gguf_##tag##_##dst_tag##_plain(                  \
       const void *vx, const void *vy, void *dst, int ncols_x, int nrows_x,     \
       int stride_col_y, int stride_col_dst, int b_size, void *stream) {        \
     const unsigned int rows_per_block =                                        \
@@ -1382,7 +1385,7 @@ mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x, void *__restrict__ vy,
   }
 
 #define MMVQ_LAUNCHER_FUSED_GLU(tag, dst_tag, dst_c_type)                      \
-  extern "C" void launch_mmvq_gguf_##tag##_##dst_tag##_fused_glu(              \
+  extern "C" void mrs_launch_mmvq_gguf_##tag##_##dst_tag##_fused_glu(              \
       const void *vx_gate, const void *vx_up, const void *vy, void *dst,       \
       int ncols_x, int nrows_x, int stride_col_y, int stride_col_dst,          \
       int b_size, int activation, void *stream) {                              \
@@ -1447,7 +1450,7 @@ mmvq_gguf_quantize_q8_1_f32(const float *__restrict__ x, void *__restrict__ vy,
   }
 
 #define MMVQ_LAUNCHER_FUSED_QKV(tag, dst_tag, dst_c_type)                      \
-  extern "C" void launch_mmvq_gguf_##tag##_##dst_tag##_fused_qkv(              \
+  extern "C" void mrs_launch_mmvq_gguf_##tag##_##dst_tag##_fused_qkv(              \
       const void *vx_q, const void *vx_k, const void *vx_v, const void *vy,    \
       void *q_dst, void *k_dst, void *v_dst, int ncols_x, int nrows_q,         \
       int nrows_k, int nrows_v, int stride_col_y, int b_size, void *stream) {  \
@@ -1600,7 +1603,7 @@ MMVQ_LAUNCHER_FUSED_QKV_TYPE_SET(q6_k)
 
 // Quantize launchers.
 
-extern "C" void launch_mmvq_gguf_quantize_q8_1_bf16(const void *x, void *vy,
+extern "C" void mrs_launch_mmvq_gguf_quantize_q8_1_bf16(const void *x, void *vy,
                                                     int kx, int kx_padded,
                                                     int num_rows,
                                                     void *stream) {
@@ -1613,7 +1616,7 @@ extern "C" void launch_mmvq_gguf_quantize_q8_1_bf16(const void *x, void *vy,
                                                       vy, kx, kx_padded);
 }
 
-extern "C" void launch_mmvq_gguf_quantize_q8_1_f16(const void *x, void *vy,
+extern "C" void mrs_launch_mmvq_gguf_quantize_q8_1_f16(const void *x, void *vy,
                                                    int kx, int kx_padded,
                                                    int num_rows, void *stream) {
   const int num_blocks_x =
@@ -1625,7 +1628,7 @@ extern "C" void launch_mmvq_gguf_quantize_q8_1_f16(const void *x, void *vy,
                                                      kx_padded);
 }
 
-extern "C" void launch_mmvq_gguf_quantize_q8_1_f32(const void *x, void *vy,
+extern "C" void mrs_launch_mmvq_gguf_quantize_q8_1_f32(const void *x, void *vy,
                                                    int kx, int kx_padded,
                                                    int num_rows, void *stream) {
   const int num_blocks_x =

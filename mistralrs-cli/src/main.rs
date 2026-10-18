@@ -64,10 +64,12 @@ async fn main() -> Result<()> {
             agent_options,
             sandbox,
             thinking,
+            reasoning_effort,
             input,
             image,
             video,
             audio,
+            adapter,
         } => {
             let model_type = resolve_model_type(model_type, default_model)?;
             run_interactive(
@@ -77,10 +79,12 @@ async fn main() -> Result<()> {
                 sandbox,
                 cli.global,
                 thinking,
+                reasoning_effort,
                 input,
                 image,
                 video,
                 audio,
+                adapter,
             )
             .await?;
         }
@@ -143,6 +147,7 @@ async fn main() -> Result<()> {
             model_type,
             default_model,
             runtime,
+            adapter,
             prompt_len,
             gen_len,
             depth,
@@ -160,6 +165,7 @@ async fn main() -> Result<()> {
                     depths: depth,
                     iterations,
                     warmup,
+                    adapter,
                 },
             )
             .await?;

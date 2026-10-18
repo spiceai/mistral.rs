@@ -214,7 +214,7 @@ static void launch_mmq_case_q5_1(float *tmp_fixup, const mmq_args &args,
   }
 }
 
-extern "C" void launch_mmq_gguf_q5_1(void *tmp_fixup_ptr, const void *x,
+extern "C" void mrs_launch_mmq_gguf_q5_1(void *tmp_fixup_ptr, const void *x,
                                      const void *y_q8_1_mmq, void *dst,
                                      int64_t ncols_x, int64_t nrows_x,
                                      int64_t ncols_y, int64_t stride_row_x,

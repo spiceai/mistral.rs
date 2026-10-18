@@ -224,7 +224,7 @@ impl Loader for SpeechLoader {
             Ok(Box::new(SpeechModelPaths { weights, config }))
         };
         self.load_model_from_path(
-            &paths?,
+            paths?.as_ref(),
             dtype,
             device,
             silent,
@@ -237,7 +237,7 @@ impl Loader for SpeechLoader {
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn load_model_from_path(
         &self,
-        paths: &Box<dyn ModelPaths>,
+        paths: &dyn ModelPaths,
         dtype: &dyn TryIntoDType,
         device: &Device,
         silent: bool,
@@ -246,8 +246,7 @@ impl Loader for SpeechLoader {
         _paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
         let _progress_guard = ProgressScopeGuard::new(silent);
-        let paths = &paths
-            .as_ref()
+        let paths = paths
             .as_any()
             .downcast_ref::<SpeechModelPaths>()
             .expect("Path downcast failed.");
@@ -327,6 +326,7 @@ impl Loader for SpeechLoader {
                     input: vec![SupportedModality::Text],
                     output: vec![SupportedModality::Audio],
                 },
+                loaded_for_uqff_write: false,
             }),
             dummy_cache: EitherCache::Full(Cache::new(0, false)),
             cfg: self
@@ -363,7 +363,9 @@ impl IsqPipelineMixin for SpeechPipeline {
 }
 
 impl CacheManagerMixin for SpeechPipeline {
-    fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) {}
+    fn clone_in_cache(&self, _seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
+        Ok(())
+    }
     fn clone_out_cache(&self, _seqs: &mut [&mut Sequence]) {}
     fn set_none_cache(
         &self,
@@ -371,7 +373,8 @@ impl CacheManagerMixin for SpeechPipeline {
         _reset_non_granular: bool,
         _modify_draft_cache: bool,
         _load_preallocated_cache: bool,
-    ) {
+    ) -> candle_core::Result<()> {
+        Ok(())
     }
     fn cache(&self) -> &EitherCache {
         &self.dummy_cache

@@ -109,7 +109,22 @@ pub struct Gemma4TextConfig {
     pub keep_tied_lm_head_unquantized: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gemma4BidirectionalAttention {
+    Causal,
+    Vision,
+    All,
+}
+
 impl Gemma4TextConfig {
+    pub fn bidirectional_attention(&self) -> Gemma4BidirectionalAttention {
+        match self.use_bidirectional_attention.as_deref() {
+            Some("vision") => Gemma4BidirectionalAttention::Vision,
+            Some("all") => Gemma4BidirectionalAttention::All,
+            _ => Gemma4BidirectionalAttention::Causal,
+        }
+    }
+
     /// Returns layer types, computing from `sliding_window_pattern` when absent from config.
     /// Gemma 3 configs omit `layer_types` and use `sliding_window_pattern` instead.
     pub fn effective_layer_types(&self) -> Vec<String> {

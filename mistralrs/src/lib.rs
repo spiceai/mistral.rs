@@ -243,6 +243,12 @@ pub use messages::{
     MultimodalMessages, RequestBuilder, RequestLike, TextMessageRole, TextMessages,
 };
 pub use mistralrs_core::{
+    AdapterGenerationId, AdapterSelection, LoraAdapterError, LoraAdapterInfo,
+    LoraAdapterLoadPolicy, LoraAdapterRoute, LoraAdapterSpec, LoraResidentGenerationInfo,
+    LoraRuntimeConfig, LoraRuntimeStatus, DEFAULT_LORA_MAX_ADAPTERS, DEFAULT_LORA_MAX_BYTES,
+    DEFAULT_LORA_MAX_RANK, MAX_LORA_ALIAS_BYTES,
+};
+pub use mistralrs_core::{
     AgentPermission, AgentToolApproval, AgentToolApprovalAsyncCallback, AgentToolApprovalCallback,
     AgentToolApprovalDecision, AgentToolApprovalFuture, AgentToolApprovalHandler, AgentToolKind,
     AgentToolMetadata, AgentToolSource, CodeExecutionApproval, CodeExecutionApprovalCallback,
@@ -286,7 +292,9 @@ pub use mistralrs_core::{
 };
 
 // ========== Request Types ==========
-pub use mistralrs_core::{Constraint, LlguidanceGrammar, MessageContent, NormalRequest, Request};
+pub use mistralrs_core::{
+    Constraint, LlguidanceGrammar, MessageContent, NormalRequest, ReasoningEffort, Request,
+};
 
 // ========== Sampling ==========
 pub use mistralrs_core::{DrySamplingParams, ModelGenerationDefaults, SamplingParams, StopTokens};

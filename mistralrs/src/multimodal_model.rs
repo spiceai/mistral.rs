@@ -29,6 +29,8 @@ pub struct MultimodalModelBuilder {
     pub(crate) tokenizer_json: Option<String>,
     pub(crate) device_mapping: Option<DeviceMapSetting>,
     pub(crate) max_edge: Option<u32>,
+    pub(crate) max_model_len: Option<usize>,
+    pub(crate) hf_config_overrides: Option<HfConfigOverrides>,
     pub(crate) hf_cache_path: Option<PathBuf>,
     pub(crate) search_embedding_model: Option<SearchEmbeddingModel>,
     pub(crate) search_callback: Option<Arc<SearchCallback>>,
@@ -39,6 +41,7 @@ pub struct MultimodalModelBuilder {
     pub(crate) matformer_config_path: Option<PathBuf>,
     pub(crate) matformer_slice_name: Option<String>,
     pub(crate) organization: IsqOrganization,
+    pub(crate) encoder_cache_memory_bytes: Option<usize>,
 
     // Model running
     pub(crate) topology: Option<Topology>,
@@ -72,6 +75,8 @@ impl MultimodalModelBuilder {
             chat_template: None,
             tokenizer_json: None,
             max_edge: None,
+            max_model_len: None,
+            hf_config_overrides: None,
             loader_type: None,
             dtype: ModelDType::Auto,
             force_cpu: false,
@@ -96,6 +101,7 @@ impl MultimodalModelBuilder {
             matformer_config_path: None,
             matformer_slice_name: None,
             organization: IsqOrganization::Default,
+            encoder_cache_memory_bytes: None,
             prefix_cache_n: None,
         }
     }
@@ -135,6 +141,28 @@ impl MultimodalModelBuilder {
     /// This is only supported on the Qwen2-VL and Idefics 2 models. Others handle this internally.
     pub fn with_max_edge(mut self, max_edge: u32) -> Self {
         self.max_edge = Some(max_edge);
+        self
+    }
+
+    /// Set the runtime model context length.
+    pub fn with_max_model_len(mut self, max_model_len: usize) -> Self {
+        assert!(max_model_len > 0, "maximum model length must be nonzero");
+        self.max_model_len = Some(max_model_len);
+        self
+    }
+
+    /// Set recursively merged Hugging Face config.json overrides.
+    pub fn with_hf_config_overrides(mut self, overrides: HfConfigOverrides) -> Self {
+        self.hf_config_overrides = Some(overrides);
+        self
+    }
+
+    pub fn with_encoder_cache_memory_bytes(mut self, max_bytes: usize) -> Self {
+        assert!(
+            max_bytes > 0,
+            "encoder cache memory capacity must be nonzero"
+        );
+        self.encoder_cache_memory_bytes = Some(max_bytes);
         self
     }
 
@@ -194,5 +222,19 @@ impl DerefMut for UqffMultimodalModelBuilder {
 impl From<UqffMultimodalModelBuilder> for MultimodalModelBuilder {
     fn from(value: UqffMultimodalModelBuilder) -> Self {
         value.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MultimodalModelBuilder;
+
+    #[test]
+    fn max_model_len_is_configurable() {
+        let mut builder = MultimodalModelBuilder::new("model");
+        assert_eq!(builder.max_model_len, None);
+
+        builder = builder.with_max_model_len(8192);
+        assert_eq!(builder.max_model_len, Some(8192));
     }
 }

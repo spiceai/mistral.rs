@@ -3,9 +3,31 @@ use std::path::PathBuf;
 use either::Either;
 use mistralrs_core::{
     AutoDeviceMapParams, DiffusionLoaderType, EmbeddingLoaderType, ModelDType,
-    MultimodalLoaderType, NormalLoaderType,
+    MultimodalLoaderType, NormalLoaderType, DEFAULT_LORA_MAX_ADAPTERS, DEFAULT_LORA_MAX_BYTES,
+    DEFAULT_LORA_MAX_RANK,
 };
 use pyo3::{pyclass, pymethods};
+
+#[pyclass(get_all)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoraAdapter {
+    pub alias: String,
+    pub source: String,
+    pub revision: Option<String>,
+}
+
+#[pymethods]
+impl LoraAdapter {
+    #[new]
+    #[pyo3(signature = (alias, source, revision=None))]
+    fn new(alias: String, source: String, revision: Option<String>) -> Self {
+        Self {
+            alias,
+            source,
+            revision,
+        }
+    }
+}
 
 #[pyclass(eq, eq_int)]
 #[derive(Debug, Clone, PartialEq)]
@@ -107,8 +129,10 @@ pub enum MultimodalArchitecture {
     Qwen3VLMoE,
     Qwen3_5,
     Qwen3_5Moe,
+    Qwen4Exp,
     Voxtral,
     Gemma4,
+    MuseGlimmer,
     DiffusionGemma,
 }
 
@@ -134,8 +158,10 @@ impl From<MultimodalArchitecture> for MultimodalLoaderType {
             MultimodalArchitecture::Qwen3VLMoE => MultimodalLoaderType::Qwen3VLMoE,
             MultimodalArchitecture::Qwen3_5 => MultimodalLoaderType::Qwen3_5,
             MultimodalArchitecture::Qwen3_5Moe => MultimodalLoaderType::Qwen3_5Moe,
+            MultimodalArchitecture::Qwen4Exp => MultimodalLoaderType::Qwen4Exp,
             MultimodalArchitecture::Voxtral => MultimodalLoaderType::Voxtral,
             MultimodalArchitecture::Gemma4 => MultimodalLoaderType::Gemma4,
+            MultimodalArchitecture::MuseGlimmer => MultimodalLoaderType::MuseGlimmer,
             MultimodalArchitecture::DiffusionGemma => MultimodalLoaderType::DiffusionGemma,
         }
     }
@@ -335,9 +361,9 @@ pub enum Which {
     },
 
     #[pyo3(constructor = (
-        adapter_model_ids,
+        model_id,
+        adapters = None,
         arch = None,
-        model_id = None,
         tokenizer_json = None,
         topology = None,
         write_uqff = None,
@@ -345,11 +371,14 @@ pub enum Which {
         dtype = ModelDType::Auto,
         auto_map_params = None,
         hf_cache_path = None,
+        max_adapters = DEFAULT_LORA_MAX_ADAPTERS,
+        max_rank = DEFAULT_LORA_MAX_RANK,
+        max_bytes = DEFAULT_LORA_MAX_BYTES,
     ))]
     Lora {
-        adapter_model_ids: Vec<String>,
+        model_id: String,
+        adapters: Option<Vec<LoraAdapter>>,
         arch: Option<Architecture>,
-        model_id: Option<String>,
         tokenizer_json: Option<String>,
         topology: Option<String>,
         write_uqff: Option<PathBuf>,
@@ -357,6 +386,9 @@ pub enum Which {
         dtype: ModelDType,
         auto_map_params: Option<TextAutoMapParams>,
         hf_cache_path: Option<PathBuf>,
+        max_adapters: usize,
+        max_rank: usize,
+        max_bytes: u64,
     },
 
     #[pyo3(constructor = (
@@ -366,6 +398,23 @@ pub enum Which {
         topology = None,
         dtype = ModelDType::Auto,
         auto_map_params = None,
+        *,
+        tokenizer_json = None,
+        mmproj_filename = None,
+        organization = None,
+        write_uqff = None,
+        imatrix = None,
+        calibration_file = None,
+        max_edge = None,
+        multimodal_auto_map_params = None,
+        adapters = None,
+        max_adapters = DEFAULT_LORA_MAX_ADAPTERS,
+        max_rank = DEFAULT_LORA_MAX_RANK,
+        max_bytes = DEFAULT_LORA_MAX_BYTES,
+        hf_cache_path = None,
+        matformer_config_path = None,
+        matformer_slice_name = None,
+        encoder_cache_memory_bytes = None,
     ))]
     #[allow(clippy::upper_case_acronyms)]
     GGUF {
@@ -375,6 +424,22 @@ pub enum Which {
         topology: Option<String>,
         dtype: ModelDType,
         auto_map_params: Option<TextAutoMapParams>,
+        tokenizer_json: Option<String>,
+        mmproj_filename: Option<Either<String, Vec<String>>>,
+        organization: Option<IsqOrganization>,
+        write_uqff: Option<PathBuf>,
+        imatrix: Option<PathBuf>,
+        calibration_file: Option<PathBuf>,
+        max_edge: Option<u32>,
+        multimodal_auto_map_params: Option<MultimodalAutoMapParams>,
+        adapters: Option<Vec<LoraAdapter>>,
+        max_adapters: usize,
+        max_rank: usize,
+        max_bytes: u64,
+        hf_cache_path: Option<PathBuf>,
+        matformer_config_path: Option<PathBuf>,
+        matformer_slice_name: Option<String>,
+        encoder_cache_memory_bytes: Option<usize>,
     },
 
     #[pyo3(constructor = (
@@ -511,6 +576,7 @@ pub enum Which {
         matformer_config_path = None,
         matformer_slice_name = None,
         organization = None,
+        encoder_cache_memory_bytes = None,
     ))]
     MultimodalPlain {
         model_id: String,
@@ -528,6 +594,7 @@ pub enum Which {
         matformer_config_path: Option<PathBuf>,
         matformer_slice_name: Option<String>,
         organization: Option<IsqOrganization>,
+        encoder_cache_memory_bytes: Option<usize>,
     },
 
     #[pyo3(constructor = (
@@ -553,4 +620,24 @@ pub enum Which {
         dac_model_id: Option<String>,
         dtype: ModelDType,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Which_GGUF;
+    use pyo3::impl_::pyclass::{PyClassImplCollector, PyClassNewTextSignature};
+
+    #[test]
+    fn gguf_constructor_preserves_legacy_positional_prefix() {
+        let signature = PyClassImplCollector::<Which_GGUF>::new()
+            .new_text_signature()
+            .unwrap();
+
+        assert!(signature.starts_with(
+            "(quantized_model_id, quantized_filename, tok_model_id=None, topology=None, dtype=..., auto_map_params=None, *"
+        ));
+        assert!(signature.contains("tokenizer_json=None"));
+        assert!(signature.contains("mmproj_filename=None"));
+        assert!(signature.contains("encoder_cache_memory_bytes=None"));
+    }
 }

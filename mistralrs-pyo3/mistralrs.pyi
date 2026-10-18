@@ -1,6 +1,7 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterator, Mapping, Optional, Callable
+from os import PathLike
+from typing import Any, Callable, Iterator, Literal, Mapping, Optional
 
 class CalibrationStatus:
     collecting: bool
@@ -113,6 +114,17 @@ class AgentToolApprovalDecision:
     @staticmethod
     def deny(message: str | None = None) -> "AgentToolApprovalDecision": ...
 
+@dataclass(frozen=True)
+class LoraAdapterGeneration:
+    """Select one exact immutable LoRA adapter generation by its 64-character ID."""
+
+    generation: str
+
+class LoraAdapterError(ValueError):
+    """A dynamic LoRA lifecycle operation failed."""
+
+    code: str
+
 @dataclass
 class ChatCompletionRequest:
     """
@@ -130,8 +142,14 @@ class ChatCompletionRequest:
       `AgentToolApproval`. Return `True`, `False`, or
       `AgentToolApprovalDecision`.
 
-    See [agent permissions](/mistral.rs/guides/agents/permissions-and-approvals/)
+    See [agent permissions](/guides/agents/permissions-and-approvals/)
     for the shared CLI, HTTP, Python, and Rust behavior.
+
+    `reasoning_effort` accepts `off`, `low`, `medium`, `high`, and `xhigh`; `none`
+    aliases `off`. Values are trimmed and case-insensitive. If both reasoning controls
+    are omitted, the model's chat template decides whether it thinks, with no
+    selected effort. Contradictory `enable_thinking` and `reasoning_effort` values
+    raise `ValueError`.
     """
 
     messages: (
@@ -163,7 +181,9 @@ class ChatCompletionRequest:
     web_search_options: WebSearchOptions | None = None
     enable_thinking: bool | None = None
     truncate_sequence: bool = False
-    reasoning_effort: str | None = None
+    reasoning_effort: (
+        Literal["off", "none", "low", "medium", "high", "xhigh"] | None
+    ) = None
     max_tool_rounds: int | None = None
     tool_dispatch_url: str | None = None
     enable_code_execution: bool = False
@@ -177,6 +197,8 @@ class ChatCompletionRequest:
     session_id: str | None = None
     files: list[RequestedFile] | None = None
     input_files: list[InputFile] | None = None
+    ignore_eos: bool = False
+    adapter: str | LoraAdapterGeneration | None = field(default=None, kw_only=True)
 
 @dataclass
 class CompletionRequest:
@@ -210,6 +232,8 @@ class CompletionRequest:
     dry_allowed_length: int | None = None
     dry_sequence_breakers: list[str] | None = None
     truncate_sequence: bool = False
+    ignore_eos: bool = False
+    adapter: str | LoraAdapterGeneration | None = field(default=None, kw_only=True)
 
 @dataclass
 class EmbeddingRequest:
@@ -272,8 +296,10 @@ class MultimodalArchitecture(Enum):
     Qwen3VLMoE = "Qwen3VLMoE"
     Qwen3_5 = "Qwen3_5"
     Qwen3_5Moe = "Qwen3_5Moe"
+    Qwen4Exp = "Qwen4Exp"
     Voxtral = "Voxtral"
     Gemma4 = "Gemma4"
+    MuseGlimmer = "MuseGlimmer"
     DiffusionGemma = "DiffusionGemma"
 
 @dataclass
@@ -452,6 +478,12 @@ class ShellSkillMount:
         source_path: str,
     ) -> None: ...
 
+@dataclass
+class LoraAdapter:
+    alias: str
+    source: str
+    revision: str | None = None
+
 class Which(Enum):
     """
     Which model to select. See the docs for the `Which` enum in API.md for more details.
@@ -507,9 +539,9 @@ class Which(Enum):
 
     @dataclass
     class Lora:
-        adapter_model_ids: list[str]
+        model_id: str
+        adapters: list[LoraAdapter] | None = None
         arch: Architecture | None = None
-        model_id: str | None = None
         tokenizer_json: str | None = None
         topology: str | None = None
         write_uqff: str | None = None
@@ -517,18 +549,48 @@ class Which(Enum):
         dtype: ModelDType = ModelDType.Auto
         auto_map_params: TextAutoMapParams | None = None
         hf_cache_path: str | None = None
+        max_adapters: int = 16
+        max_rank: int = 256
+        max_bytes: int = 8589934592
 
     @dataclass
     class GGUF:
+        """Select a GGUF model.
+
+        Pass `adapters=[]` or set a non-default LoRA limit to enable an empty dynamic LoRA runtime.
+        With `mmproj_filename`, adapters apply to the language model.
+        Pass `in_situ_quant` to `Runner` to requantize compatible GGUF weights while loading.
+        """
+
         quantized_model_id: str
         quantized_filename: str | list[str]
         tok_model_id: str | None = None
         topology: str | None = None
         dtype: ModelDType = ModelDType.Auto
         auto_map_params: TextAutoMapParams | None = None
+        tokenizer_json: str | None = field(default=None, kw_only=True)
+        mmproj_filename: str | list[str] | None = field(default=None, kw_only=True)
+        organization: IsqOrganization | None = field(default=None, kw_only=True)
+        write_uqff: str | None = field(default=None, kw_only=True)
+        imatrix: str | None = field(default=None, kw_only=True)
+        calibration_file: str | None = field(default=None, kw_only=True)
+        max_edge: int | None = field(default=None, kw_only=True)
+        multimodal_auto_map_params: MultimodalAutoMapParams | None = field(
+            default=None, kw_only=True
+        )
+        adapters: list[LoraAdapter] | None = field(default=None, kw_only=True)
+        max_adapters: int = field(default=16, kw_only=True)
+        max_rank: int = field(default=256, kw_only=True)
+        max_bytes: int = field(default=8589934592, kw_only=True)
+        hf_cache_path: str | None = field(default=None, kw_only=True)
+        matformer_config_path: str | None = field(default=None, kw_only=True)
+        matformer_slice_name: str | None = field(default=None, kw_only=True)
+        encoder_cache_memory_bytes: int | None = field(default=None, kw_only=True)
 
     @dataclass
     class XLoraGGUF:
+        """Select X-LoRA for a Phi3 GGUF configuration."""
+
         quantized_model_id: str
         quantized_filename: str | list[str]
         xlora_model_id: str
@@ -541,6 +603,11 @@ class Which(Enum):
 
     @dataclass
     class LoraGGUF:
+        """Select legacy static LoRA for a Phi3 GGUF configuration.
+
+        For dynamic adapters on a supported GGUF, pass `adapters` to `Which.GGUF`.
+        """
+
         quantized_model_id: str
         quantized_filename: str | list[str]
         adapters_model_id: str
@@ -605,6 +672,7 @@ class Which(Enum):
         matformer_config_path: str | None = None
         matformer_slice_name: str | None = None
         organization: IsqOrganization | None = None
+        encoder_cache_memory_bytes: int | None = None
 
     @dataclass
     class DiffusionPlain:
@@ -622,6 +690,44 @@ class Which(Enum):
 class PagedCacheType(Enum):
     Auto: int = 0
     F8E4M3: int = 1
+
+@dataclass
+class LoraAdapterInfo:
+    """A loaded alias and the immutable generation it currently selects."""
+
+    alias: str
+    source: str
+    revision: str | None
+    generation: str
+    rank: int
+    bytes: int
+
+    def exact(self) -> LoraAdapterGeneration:
+        """Select this exact immutable generation in a request."""
+
+@dataclass
+class LoraResidentGenerationInfo:
+    """One device-resident generation, including retired generations still leased."""
+
+    generation: str
+    aliases: list[str]
+    rank: int
+    bytes: int
+    retired: bool
+    active_leases: int
+
+@dataclass
+class LoraRuntimeStatus:
+    """Loaded aliases, resident generations, active leases, and capacity limits."""
+
+    adapters: list[LoraAdapterInfo]
+    generations: list[LoraResidentGenerationInfo]
+    resident_generations: int
+    retired_generations: int
+    resident_bytes: int
+    max_adapters: int
+    max_rank: int
+    max_bytes: int
 
 class Runner:
     def __init__(
@@ -768,7 +874,7 @@ class Runner:
 
     def send_re_isq(self, dtype: str, model_id: str | None = None) -> None:
         """
-        Send a request to re-ISQ the model. If the model was loaded as GGUF or GGML then nothing will happen.
+        Re-ISQ a model that was loaded with `in_situ_quant`.
 
         Args:
             dtype: The ISQ dtype (e.g., "Q4K", "Q8_0").
@@ -817,7 +923,7 @@ class Runner:
         Args:
             text: The text to tokenize.
             add_special_tokens: Whether to add special tokens.
-            enable_thinking: Enables thinking for models that support this configuration.
+            enable_thinking: Compatibility argument; raw text tokenization does not render a chat template.
             model_id: Optional model ID to use for tokenization. If None, uses the default model.
         """
 
@@ -898,6 +1004,52 @@ class Runner:
 
         Args:
             model_id: The model ID to reload.
+        """
+
+    def load_lora_adapter(
+        self,
+        alias: str,
+        adapter_dir: str | PathLike[str],
+        model_id: str | None = None,
+        load_inplace: bool = False,
+        expected_generation: str | None = None,
+    ) -> LoraAdapterInfo:
+        """Load a local LoRA adapter, optionally replacing with generation CAS.
+
+        Raises:
+            LoraAdapterError: The operation failed; inspect `error.code` for recovery.
+        """
+
+    def unload_lora_adapter(
+        self,
+        alias: str,
+        model_id: str | None = None,
+        expected_generation: str | None = None,
+    ) -> LoraAdapterInfo:
+        """Unregister a LoRA alias while in-flight requests retain their generation.
+
+        Raises:
+            LoraAdapterError: The operation failed; inspect `error.code` for recovery.
+        """
+
+    def list_lora_adapters(
+        self,
+        model_id: str | None = None,
+    ) -> list[LoraAdapterInfo]:
+        """List loaded LoRA adapters for a model.
+
+        Raises:
+            LoraAdapterError: The operation failed; inspect `error.code` for recovery.
+        """
+
+    def lora_adapter_status(
+        self,
+        model_id: str | None = None,
+    ) -> LoraRuntimeStatus:
+        """Return loaded aliases and complete resident-generation capacity usage.
+
+        Raises:
+            LoraAdapterError: The operation failed; inspect `error.code` for recovery.
         """
 
     def list_models_with_status(self) -> list[tuple[str, str]]:
@@ -1110,6 +1262,7 @@ class ChatCompletionResponse:
     system_fingerprint: str
     object: str
     usage: Usage
+    adapter_generation: str | None = None
     agentic_tool_calls: list[AgenticToolCallRecord] | None = None
     files: list[File] | None = None
     session_id: str | None = None
@@ -1137,6 +1290,7 @@ class ChatCompletionChunkResponse:
     system_fingerprint: str
     object: str
     usage: Usage | None = None
+    adapter_generation: str | None = None
     session_id: str | None = None
 
 @dataclass
@@ -1155,6 +1309,7 @@ class CompletionResponse:
     system_fingerprint: str
     object: str
     usage: Usage
+    adapter_generation: str | None = None
 
 @dataclass
 class ImageChoice:
@@ -1205,14 +1360,12 @@ class InputFile:
         data: bytes,
         mime_type: str | None = None,
     ) -> None: ...
-
     @staticmethod
     def from_text(
         name: str,
         text: str,
         mime_type: str = "text/plain",
     ) -> "InputFile": ...
-
     @staticmethod
     def from_path(
         path: str,

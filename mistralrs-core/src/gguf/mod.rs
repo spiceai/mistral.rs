@@ -1,13 +1,38 @@
+pub(crate) mod base_model;
 mod chat_template;
 mod content;
+mod deepseek41;
+pub(crate) mod deepseek41_model;
+mod dsv4_hc;
+pub(crate) mod gemma3_bindings;
+pub(crate) mod gemma3_config;
+pub(crate) mod gemma3n_bindings;
 mod gguf_tokenizer;
+mod glm5next;
+pub(crate) mod glm5next_model;
 pub(crate) mod glm_moe;
+pub(crate) mod idefics3_bindings;
+mod lfm2_vl_bindings;
+pub(crate) mod llama4_bindings;
+mod mistral3_bindings;
+mod multimodal_binding_utils;
+pub(crate) mod multimodal_bindings;
+pub(crate) mod multimodal_vision_registry;
+pub(crate) mod muse_glimmer_bindings;
+pub(crate) mod normal_bindings;
+pub(crate) mod normal_config;
+pub(crate) mod normal_registry;
+pub(crate) mod qwen4exp;
+pub(crate) mod qwen_multimodal_bindings;
 use strum::{EnumIter, EnumString, IntoEnumIterator};
 
 use anyhow::{Context, Result};
-pub(crate) use chat_template::get_gguf_chat_template;
+pub(crate) use chat_template::{get_gguf_chat_template, get_gguf_chat_template_from_metadata};
 pub(crate) use content::Content;
-pub(crate) use gguf_tokenizer::{convert_gguf_to_hf_tokenizer, GgufTokenizerConversion};
+pub(crate) use gguf_tokenizer::{
+    convert_gguf_metadata_to_hf_tokenizer, validate_external_gguf_tokenizer,
+    GgufTokenizerConversion,
+};
 use std::str::FromStr;
 
 pub const GGUF_MULTI_FILE_DELIMITER: &str = ";";
@@ -33,6 +58,11 @@ pub enum GGUFArchitecture {
     Mistral3,
     #[strum(serialize = "glm-dsa")]
     GlmDsa,
+    /// DeepSeek-V4.1. Not DeepSeek-V3 and not `deepseekv3`.
+    DeepSeek41,
+    /// GLM-5.3-Flash. Not GLM-4 and not `glm4`.
+    #[strum(serialize = "glm5-next")]
+    Glm5Next,
 }
 
 // Wraps from_str() for some convenience:
@@ -51,16 +81,23 @@ const RECOGNIZED_UNIMPLEMENTED: &[(&str, &str, &str)] = &[(
 )];
 
 impl GGUFArchitecture {
+    /// `Some` when `general.architecture` names a checkpoint this build can
+    /// identify and must not run on an older graph.
+    pub(crate) fn unimplemented_reason(value: &str) -> Option<anyhow::Error> {
+        let lowered = value.to_ascii_lowercase();
+        let (_, family, missing) = RECOGNIZED_UNIMPLEMENTED
+            .iter()
+            .find(|(arch, _, _)| *arch == lowered)?;
+        Some(anyhow::anyhow!(
+            "GGUF architecture `{value}` ({family}) is recognized but not implemented: it needs {missing}. Supported architectures: {}.",
+            Self::supported()
+        ))
+    }
+
     pub fn from_value<T: AsRef<str> + std::fmt::Display>(value: T) -> Result<Self> {
         let lowered = value.as_ref().to_ascii_lowercase();
-        if let Some((_, family, missing)) = RECOGNIZED_UNIMPLEMENTED
-            .iter()
-            .find(|(arch, _, _)| *arch == lowered)
-        {
-            anyhow::bail!(
-                "GGUF architecture `{value}` ({family}) is recognized but not implemented: it needs {missing}. Supported architectures: {}.",
-                Self::supported()
-            );
+        if let Some(error) = Self::unimplemented_reason(value.as_ref()) {
+            return Err(error);
         }
         Self::from_str(&lowered)
             .with_context(|| {
@@ -83,6 +120,10 @@ impl GGUFArchitecture {
         match self {
             // MLA + sigmoid-gated MoE, run dense; see `gguf::glm_moe`.
             Self::GlmDsa => false,
+            // Compressed KV and a lagged hyper-connection. No paged kernel.
+            Self::DeepSeek41 => false,
+            // KDA recurrence and compressed DSA. No paged kernel.
+            Self::Glm5Next => false,
             Self::Llama
             | Self::Mpt
             | Self::Gptneox
@@ -113,6 +154,8 @@ impl GGUFArchitecture {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::GGUFArchitecture;
 
     /// A DeepSeek-V4 GGUF is a valid file this build cannot run yet. The error has to say
@@ -128,6 +171,39 @@ mod tests {
         assert!(!msg.contains("Unknown"), "{msg}");
         // The supported list is what tells the operator where to go instead.
         assert!(msg.contains("glm-dsa"), "{msg}");
+    }
+
+    #[test]
+    fn deepseek41_resolves_to_its_own_graph() {
+        let arch = GGUFArchitecture::from_value("deepseek41").expect("deepseek41 loads");
+        assert!(
+            matches!(arch, GGUFArchitecture::DeepSeek41),
+            "deepseek41 must not alias another graph: {arch}"
+        );
+        let name = arch.to_string();
+        assert_eq!(name, "deepseek41");
+        assert!(!name.contains("deepseekv3"), "{name}");
+        assert!(!arch.supports_paged_attention());
+        assert!(GGUFArchitecture::from_str("deepseek41").is_ok());
+        assert!(GGUFArchitecture::unimplemented_reason("deepseek41").is_none());
+    }
+
+    #[test]
+    fn glm5_next_resolves_to_its_own_graph() {
+        let arch = GGUFArchitecture::from_value("glm5-next").expect("glm5-next loads");
+        assert!(
+            matches!(arch, GGUFArchitecture::Glm5Next),
+            "glm5-next must not alias another graph: {arch}"
+        );
+        let name = arch.to_string();
+        assert_eq!(name, "glm5-next");
+        assert!(!name.contains("glm4"), "{name}");
+        assert!(!arch.supports_paged_attention());
+        assert!(GGUFArchitecture::from_str("glm5-next").is_ok());
+        assert!(GGUFArchitecture::unimplemented_reason("glm5-next").is_none());
+        assert!(GGUFArchitecture::unimplemented_reason("llama").is_none());
+        assert!(GGUFArchitecture::unimplemented_reason("glm4").is_none());
+        assert!(GGUFArchitecture::unimplemented_reason("qwen4exp").is_none());
     }
 
     #[test]
