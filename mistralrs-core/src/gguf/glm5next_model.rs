@@ -160,9 +160,10 @@ impl ModelWeights {
             meta_usize(&archive, &key("expert_feed_forward_length")).unwrap_or(hidden);
         let dense_ffn = meta_usize(&archive, &key("feed_forward_length")).unwrap_or(intermediate);
         let route_scale = meta_f32(&archive, &key("expert_weights_scale")).unwrap_or(1.0);
-        let route_normalize = meta_usize(&archive, &key("expert_weights_norm")).unwrap_or(0) != 0;
+        // The released GGUF stores this as a bool. Like llama.cpp, a file without it is refused.
+        let route_normalize = meta_flag(&archive, &key("expert_weights_norm"))?;
         // 2 is sigmoid, the only gating function the router below computes.
-        let gating = meta_usize(&archive, &key("expert_gating_func")).unwrap_or(2);
+        let gating = meta_usize(&archive, &key("expert_gating_func"))?;
         if gating != 2 {
             candle_core::bail!(
                 "glm5-next expert gating function {gating} is not supported; only sigmoid (2) is"
@@ -711,6 +712,13 @@ fn meta_usize(archive: &GgufArchive, name: &str) -> Result<usize> {
     value_usize(meta_value(archive, name)?, name)
 }
 
+fn meta_flag(archive: &GgufArchive, name: &str) -> Result<bool> {
+    match meta_value(archive, name)? {
+        candle_core::quantized::gguf_file::Value::Bool(value) => Ok(*value),
+        other => Ok(value_usize(other, name)? != 0),
+    }
+}
+
 fn meta_f32(archive: &GgufArchive, name: &str) -> Result<f32> {
     match meta_value(archive, name)? {
         candle_core::quantized::gguf_file::Value::F32(value) => Ok(*value),
@@ -824,6 +832,15 @@ mod tests {
         kv_heads: &[u32],
         expert: Option<Vec<u8>>,
     ) -> NamedTempFile {
+        write_model(tensors, kv_heads, expert, true)
+    }
+
+    fn write_model(
+        tensors: &[Weight],
+        kv_heads: &[u32],
+        expert: Option<Vec<u8>>,
+        normalize_experts: bool,
+    ) -> NamedTempFile {
         let mut meta: Vec<(String, Vec<u8>)> = Vec::new();
         let push_str = |meta: &mut Vec<(String, Vec<u8>)>, key: &str, value: &str| {
             let mut bytes = Vec::new();
@@ -840,6 +857,11 @@ mod tests {
         let push_f32 = |meta: &mut Vec<(String, Vec<u8>)>, key: &str, value: f32| {
             let mut bytes = 6u32.to_le_bytes().to_vec();
             bytes.extend_from_slice(&value.to_le_bytes());
+            push_meta(meta, key, bytes);
+        };
+        let push_bool = |meta: &mut Vec<(String, Vec<u8>)>, key: &str, value: bool| {
+            let mut bytes = 7u32.to_le_bytes().to_vec();
+            bytes.push(u8::from(value));
             push_meta(meta, key, bytes);
         };
         let push_u32s = |meta: &mut Vec<(String, Vec<u8>)>, key: &str, values: &[u32]| {
@@ -883,7 +905,12 @@ mod tests {
         push_f32(&mut meta, "glm5-next.hyper_connection.epsilon", 1e-6);
         push_u32(&mut meta, "glm5-next.leading_dense_block_count", 0);
         push_f32(&mut meta, "glm5-next.expert_weights_scale", 2.5);
-        push_u32(&mut meta, "glm5-next.expert_weights_norm", 1);
+        // The released GGUF stores this flag as a GGUF bool, not an integer.
+        push_bool(
+            &mut meta,
+            "glm5-next.expert_weights_norm",
+            normalize_experts,
+        );
         push_u32(&mut meta, "glm5-next.expert_gating_func", 2);
         push_u32(&mut meta, "glm5-next.attention.indexer.top_k", 8);
         push_u32s(
@@ -1143,6 +1170,22 @@ mod tests {
             err.to_string()
                 .contains("attends densely only up to 8 tokens and this sequence has 9"),
             "{err}"
+        );
+    }
+
+    /// Routed weights are renormalized only when `expert_weights_norm` says so, and the
+    /// flag is a GGUF bool. Reading it as an integer failed and silently skipped the
+    /// renormalization, which scaled GLM-5.3-Flash's routed experts by up to 6x.
+    #[test]
+    fn expert_weights_norm_is_read_from_a_gguf_bool() {
+        let weights = kda_weights(0.2);
+        let normalized = write_model(&weights, &[0], Some(q8(0.1)), true);
+        let raw = write_model(&weights, &[0], Some(q8(0.1)), false);
+        let with_norm = logits(&load(&normalized), &[1, 2]);
+        let without_norm = logits(&load(&raw), &[1, 2]);
+        assert_ne!(
+            with_norm, without_norm,
+            "`expert_weights_norm` must change how routed experts are weighted"
         );
     }
 
