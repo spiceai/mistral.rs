@@ -17,6 +17,7 @@ const LAYER_SEED_PRIME: u64 = 10007;
 const GATE_MAGNITUDE_FLOOR: f64 = 1e-6;
 const TABLE_SHARD_PREFIX: &str = "shard_";
 const GGUF_TABLE_NAME: &str = "per_layer_token_embd.weight";
+const GGML_TYPE_Q4_0: u32 = 2;
 const GGML_TYPE_IQ4_NL: u32 = 20;
 const IQ4_NL_BLOCK: usize = 32;
 const IQ4_NL_BLOCK_BYTES: usize = 18;
@@ -208,9 +209,10 @@ enum TableSource {
         starts: Vec<usize>,
         dtype: DType,
     },
-    /// One tensor in the GGUF memory map; `load_gguf` admits only IQ4_NL, which llama.cpp emits.
+    /// One tensor in the GGUF memory map. llama.cpp emits IQ4_NL; some K-quants store Q4_0.
     Gguf {
         archive: Arc<GgufArchive>,
+        kind: GgufPleKind,
         #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
         rows: usize,
     },
@@ -235,6 +237,26 @@ struct ResidentTable {
 
 fn iq4_nl_row_bytes(head_dim: usize) -> usize {
     head_dim / IQ4_NL_BLOCK * IQ4_NL_BLOCK_BYTES
+}
+
+#[derive(Clone, Copy)]
+enum GgufPleKind {
+    Iq4Nl,
+    Q4_0,
+}
+
+/// ggml `dequantize_row_q4_0` for one row. High nibbles occupy the second half.
+fn dequantize_q4_0_row(src: &[u8], out: &mut [f32]) {
+    let (blocks, _) = src.as_chunks::<IQ4_NL_BLOCK_BYTES>();
+    let (dsts, _) = out.as_chunks_mut::<IQ4_NL_BLOCK>();
+    for (block, dst) in blocks.iter().zip(dsts) {
+        let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let (lo, hi) = dst.split_at_mut(IQ4_NL_BLOCK / 2);
+        for (j, &byte) in block[2..].iter().enumerate() {
+            lo[j] = d * (f32::from(byte & 0xf) - 8.0);
+            hi[j] = d * (f32::from(byte >> 4) - 8.0);
+        }
+    }
 }
 
 /// ggml `dequantize_row_iq4_nl` for one row.
@@ -340,12 +362,14 @@ impl PleTable {
 
     fn load_gguf(archive: Arc<GgufArchive>, head_dim: usize) -> Result<Self> {
         let info = archive.tensor_info(GGUF_TABLE_NAME)?;
-        if info.dtype().raw() != GGML_TYPE_IQ4_NL {
-            candle_core::bail!(
-                "Qwen4-Exp GGUF n-gram table `{GGUF_TABLE_NAME}` is {}, only IQ4_NL is supported",
+        let kind = match info.dtype().raw() {
+            GGML_TYPE_IQ4_NL => GgufPleKind::Iq4Nl,
+            GGML_TYPE_Q4_0 => GgufPleKind::Q4_0,
+            _ => candle_core::bail!(
+                "Qwen4-Exp GGUF n-gram table `{GGUF_TABLE_NAME}` is {}, only IQ4_NL and Q4_0 are supported",
                 info.dtype().name()
-            );
-        }
+            ),
+        };
         let rows = match info.shape() {
             &[rows, dim] if dim == head_dim && head_dim.is_multiple_of(IQ4_NL_BLOCK) => rows,
             shape => candle_core::bail!(
@@ -357,7 +381,11 @@ impl PleTable {
             "Qwen4-Exp PLE n-gram table is memory-mapped from GGUF"
         );
         Ok(Self {
-            source: TableSource::Gguf { archive, rows },
+            source: TableSource::Gguf {
+                archive,
+                kind,
+                rows,
+            },
             head_dim,
             #[cfg(feature = "cuda")]
             device_index: None,
@@ -429,7 +457,10 @@ impl PleTable {
         };
         let start = std::time::Instant::now();
         let resident = match &self.source {
-            TableSource::Gguf { archive, .. } => self.copy_iq4_nl(archive, rows, device)?,
+            TableSource::Gguf { archive, kind, .. } => match kind {
+                GgufPleKind::Iq4Nl => self.copy_iq4_nl(archive, rows, device)?,
+                GgufPleKind::Q4_0 => self.quantize_q4_0(archive, rows, device)?,
+            },
             TableSource::Shards {
                 raw,
                 names,
@@ -477,6 +508,62 @@ impl PleTable {
             data,
             scales: None,
             format: crate::cuda::qwen4_exp::PleTableFormat::Iq4Nl,
+        })
+    }
+
+    /// Re-quantize a Q4_0 n-gram table into the resident 4-bit layout.
+    #[cfg(feature = "cuda")]
+    fn quantize_q4_0(
+        &self,
+        archive: &GgufArchive,
+        rows: usize,
+        device: &Device,
+    ) -> Result<ResidentTable> {
+        use rayon::prelude::*;
+        let bits = 4;
+        let groups = self.head_dim / RESIDENT_GROUP;
+        let row_bytes = self.head_dim * bits / 8;
+        let packed_row = iq4_nl_row_bytes(self.head_dim);
+        let data = unsafe { Tensor::empty((rows, row_bytes), DType::U8, device)? };
+        let scales = unsafe { Tensor::empty((rows, groups), DType::F16, device)? };
+        let bytes = archive.tensor_data(GGUF_TABLE_NAME)?.bytes();
+        let head_dim = self.head_dim;
+        let chunk_rows = 4096.min(rows.max(1));
+        for start in (0..rows).step_by(chunk_rows) {
+            let n = chunk_rows.min(rows - start);
+            let mut q = vec![0u8; n * row_bytes];
+            let mut sc = vec![half::f16::ZERO; n * groups];
+            q.par_chunks_mut(row_bytes)
+                .zip(sc.par_chunks_mut(groups))
+                .enumerate()
+                .for_each(|(row, (q_row, sc_row))| {
+                    let base = (start + row) * packed_row;
+                    let mut values = vec![0f32; head_dim];
+                    dequantize_q4_0_row(&bytes[base..base + packed_row], &mut values);
+                    let q_max = 7.0;
+                    for (g, scale) in sc_row.iter_mut().enumerate() {
+                        let range = g * RESIDENT_GROUP..(g + 1) * RESIDENT_GROUP;
+                        let amax = range.clone().map(|i| values[i].abs()).fold(0f32, f32::max);
+                        let s = half::f16::from_f32(amax / q_max);
+                        *scale = s;
+                        let inv = if s.to_f32() > 0.0 {
+                            1.0 / s.to_f32()
+                        } else {
+                            0.0
+                        };
+                        for i in range {
+                            let v = (values[i] * inv).round().clamp(-q_max, q_max) as i32;
+                            q_row[i / 2] |= ((v + 8) as u8) << (4 * (i % 2));
+                        }
+                    }
+                });
+            data.slice_set(&Tensor::from_vec(q, (n, row_bytes), device)?, 0, start)?;
+            scales.slice_set(&Tensor::from_vec(sc, (n, groups), device)?, 0, start)?;
+        }
+        Ok(ResidentTable {
+            data,
+            scales: Some(scales),
+            format: crate::cuda::qwen4_exp::PleTableFormat::Q4,
         })
     }
 
@@ -586,7 +673,7 @@ impl PleTable {
                 Tensor::from_raw_buffer(&data, *dtype, &[rows.len(), self.head_dim], &Device::Cpu)?
                     .to_device(device)
             }
-            TableSource::Gguf { archive, .. } => {
+            TableSource::Gguf { archive, kind, .. } => {
                 let row_bytes = iq4_nl_row_bytes(self.head_dim);
                 let bytes = archive.tensor_data(GGUF_TABLE_NAME)?.bytes();
                 let mut out = vec![0f32; rows.len() * self.head_dim];
@@ -595,7 +682,10 @@ impl PleTable {
                     let src = bytes
                         .get(offset..offset + row_bytes)
                         .ok_or_else(|| outside(row))?;
-                    dequantize_iq4_nl_row(src, dst);
+                    match kind {
+                        GgufPleKind::Iq4Nl => dequantize_iq4_nl_row(src, dst),
+                        GgufPleKind::Q4_0 => dequantize_q4_0_row(src, dst),
+                    }
                 }
                 Tensor::from_vec(out, (rows.len(), self.head_dim), device)
             }
@@ -1054,6 +1144,20 @@ fn verify_hash_buffers(raw: &MmapedSafetensors, prefix: &str, hash: &PleHash) ->
 mod tests {
     use super::*;
     use crate::vision_models::qwen4_exp::config::tests::flash_next_text_config;
+
+    #[test]
+    fn q4_0_row_dequant_centers_nibbles_around_zero() {
+        let mut block = [0u8; IQ4_NL_BLOCK_BYTES];
+        // f16 1.0
+        block[0] = 0x00;
+        block[1] = 0x3c;
+        // low nibble 8 -> 0 in the first half, high nibble 9 -> 1 in the second half
+        block[2] = 0x98;
+        let mut out = [0f32; IQ4_NL_BLOCK];
+        dequantize_q4_0_row(&block, &mut out);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[16], 1.0);
+    }
 
     #[cfg(feature = "cuda")]
     #[test]
