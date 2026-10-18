@@ -35,7 +35,7 @@ use crate::gguf::{
     validate_external_gguf_tokenizer, GgufTokenizerConversion,
 };
 use crate::gguf::{Content, GGUFArchitecture};
-use crate::kv_cache::FullCacheManager;
+use crate::kv_cache::{FullCacheManager, HybridCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
 use crate::pipeline::chat_template::{calculate_eos_tokens, BeginEndUnkPadTok, GenerationConfig};
 use crate::pipeline::hf::{build_api, get_file, list_repo_files};
@@ -1703,19 +1703,42 @@ impl IsqPipelineMixin for GGUFPipeline {
 
 impl CacheManagerMixin for GGUFPipeline {
     fn clone_in_cache(&self, seqs: &mut [&mut Sequence]) -> candle_core::Result<()> {
-        FullCacheManager.clone_in_cache(self, seqs, false)
+        match self.cache() {
+            EitherCache::Full(_) => FullCacheManager.clone_in_cache(self, seqs, false),
+            EitherCache::Normal(_) => NormalCacheManager.clone_in_cache(self, seqs, false),
+            EitherCache::Hybrid(_) => HybridCacheManager.clone_in_cache(self, seqs, false),
+        }
     }
     fn clone_out_cache(&self, seqs: &mut [&mut Sequence]) {
-        FullCacheManager.clone_out_cache(self, seqs, false)
+        match self.cache() {
+            EitherCache::Full(_) => FullCacheManager.clone_out_cache(self, seqs, false),
+            EitherCache::Normal(_) => NormalCacheManager.clone_out_cache(self, seqs, false),
+            EitherCache::Hybrid(_) => HybridCacheManager.clone_out_cache(self, seqs, false),
+        }
     }
     fn set_none_cache(
         &self,
         seqs: &mut [&mut Sequence],
         reset_non_granular: bool,
         modify_draft_cache: bool,
-        _load_preallocated_cache: bool,
+        load_preallocated_cache: bool,
     ) -> candle_core::Result<()> {
-        FullCacheManager.set_none_cache(self, seqs, modify_draft_cache, false)?;
+        match self.cache() {
+            EitherCache::Full(_) => {
+                FullCacheManager.set_none_cache(self, seqs, modify_draft_cache, false)?;
+            }
+            EitherCache::Normal(_) => {
+                NormalCacheManager.set_none_cache(
+                    self,
+                    seqs,
+                    modify_draft_cache,
+                    load_preallocated_cache,
+                )?;
+            }
+            EitherCache::Hybrid(_) => {
+                HybridCacheManager.set_none_cache(self, seqs, modify_draft_cache, false)?;
+            }
+        }
         if reset_non_granular {
             self.reset_non_granular_state()
         }
