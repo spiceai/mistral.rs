@@ -2139,6 +2139,12 @@ impl DeepSeekV2RotaryEmbedding {
     pub fn forward(&self, q: &Tensor, k: &Tensor, positions: &Tensor) -> Result<(Tensor, Tensor)> {
         apply_rotary_qk(q, k, &self.cos, &self.sin, positions, false)
     }
+
+    /// Undo [`forward`] on one tensor. `cos(-θ) = cos(θ)` and `sin(-θ) = -sin(θ)`.
+    pub fn inverse(&self, x: &Tensor, positions: &Tensor) -> Result<Tensor> {
+        let neg_sin = (&self.sin * -1.0)?;
+        apply_rotary_q(x, &self.cos, &neg_sin, positions, false)
+    }
 }
 
 #[derive(Debug, Clone)]

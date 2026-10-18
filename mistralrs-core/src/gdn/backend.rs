@@ -156,6 +156,113 @@ pub fn gated_delta_rule_recurrence(
         .to_dtype(dtype)
 }
 
+/// Per-channel gated delta net. `g` is `[batch, seq, heads, k_dim]`: state row `i`
+/// is scaled by `exp(g[i])` before the rank-1 update. A constant channel matches
+/// [`gated_delta_rule_recurrence`].
+pub fn kda_rule_recurrence(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state: &mut Tensor,
+) -> Result<Tensor> {
+    let dtype = q.dtype();
+    let k_head_dim = q.dim(D::Minus1)?;
+    let scale = 1.0 / (k_head_dim as f64).sqrt();
+
+    let q = (q.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)? * scale)?;
+    let k = k.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+    let v = v.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+    let g = g.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+    let beta = beta.transpose(1, 2)?.contiguous()?.to_dtype(DType::F32)?;
+
+    let seq_len = q.dim(2)?;
+    let (b_sz, n_heads) = (q.dim(0)?, q.dim(1)?);
+    let k_dim = q.dim(3)?;
+    let v_dim = v.dim(3)?;
+    let g_dim = g.dim(3)?;
+    if g_dim != k_dim {
+        candle_core::bail!("KDA gate last dim is {g_dim}, expected the key dim {k_dim}");
+    }
+
+    let qf = q.flatten_all()?.to_vec1::<f32>()?;
+    let kf = k.flatten_all()?.to_vec1::<f32>()?;
+    let vf = v.flatten_all()?.to_vec1::<f32>()?;
+    let gf = g.flatten_all()?.to_vec1::<f32>()?;
+    let betaf = beta.flatten_all()?.to_vec1::<f32>()?;
+    let mut sf = state
+        .to_dtype(DType::F32)?
+        .contiguous()?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+
+    let mut out = vec![0f32; b_sz * n_heads * seq_len * v_dim];
+    let out_ptr = out.as_mut_ptr() as usize;
+    let s_ptr = sf.as_mut_ptr() as usize;
+    let (qf, kf, vf, gf, betaf) = (
+        qf.as_slice(),
+        kf.as_slice(),
+        vf.as_slice(),
+        gf.as_slice(),
+        betaf.as_slice(),
+    );
+
+    candle_core::utils::barrier_pool().execute_chunked(b_sz * n_heads, |range| {
+        let out_ptr = out_ptr as *mut f32;
+        let s_ptr = s_ptr as *mut f32;
+        let mut kv_mem = vec![0f32; v_dim];
+        let mut delta = vec![0f32; v_dim];
+        for bh in range {
+            let s_head = unsafe {
+                std::slice::from_raw_parts_mut(s_ptr.add(bh * k_dim * v_dim), k_dim * v_dim)
+            };
+            for t in 0..seq_len {
+                let qk_base = (bh * seq_len + t) * k_dim;
+                let v_base = (bh * seq_len + t) * v_dim;
+                let g_base = qk_base;
+                let q_t = &qf[qk_base..qk_base + k_dim];
+                let k_t = &kf[qk_base..qk_base + k_dim];
+                let v_t = &vf[v_base..v_base + v_dim];
+                let beta_t = betaf[bh * seq_len + t];
+
+                kv_mem.iter_mut().for_each(|x| *x = 0.0);
+                for d in 0..k_dim {
+                    let decay = crate::attention::fast_exp(gf[g_base + d]);
+                    let row = &mut s_head[d * v_dim..(d + 1) * v_dim];
+                    let kd = k_t[d];
+                    for (rv, mem) in row.iter_mut().zip(kv_mem.iter_mut()) {
+                        *rv *= decay;
+                        *mem += *rv * kd;
+                    }
+                }
+                for ((dl, &vv), &mem) in delta.iter_mut().zip(v_t).zip(kv_mem.iter()) {
+                    *dl = (vv - mem) * beta_t;
+                }
+
+                let y = unsafe { std::slice::from_raw_parts_mut(out_ptr.add(v_base), v_dim) };
+                y.iter_mut().for_each(|x| *x = 0.0);
+                for d in 0..k_dim {
+                    let row = &mut s_head[d * v_dim..(d + 1) * v_dim];
+                    let kd = k_t[d];
+                    let qd = q_t[d];
+                    for ((rv, &dl), yv) in row.iter_mut().zip(delta.iter()).zip(y.iter_mut()) {
+                        *rv += kd * dl;
+                        *yv += *rv * qd;
+                    }
+                }
+            }
+        }
+    });
+
+    *state = Tensor::from_vec(sf, state.shape(), state.device())?.to_dtype(state.dtype())?;
+
+    Tensor::from_vec(out, (b_sz, n_heads, seq_len, v_dim), q.device())?
+        .transpose(1, 2)?
+        .contiguous()?
+        .to_dtype(dtype)
+}
+
 pub fn compute_beta_g(
     b: &Tensor,
     a: &Tensor,
@@ -1939,5 +2046,59 @@ mod tests {
         run_decode_case(dims(2, 4, 5, 3), 2)?;
         run_decode_case(dims(3, 3, 4, 2), 1)?;
         run_decode_case(dims_with_layout(2, 4, 5, 3, GdnVHeadLayout::Tiled), 2)
+    }
+
+    #[test]
+    fn kda_constant_gate_matches_scalar_recurrence() -> CandleResult<()> {
+        let dev = Device::Cpu;
+        let (batch, seq, heads, dim) = (1usize, 3usize, 2usize, 4usize);
+        let q = Tensor::from_vec(
+            patterned(batch * seq * heads * dim, 11, 0.3, 0.0),
+            (batch, seq, heads, dim),
+            &dev,
+        )?;
+        let k = Tensor::from_vec(
+            patterned(batch * seq * heads * dim, 12, 0.3, 0.0),
+            (batch, seq, heads, dim),
+            &dev,
+        )?;
+        let v = Tensor::from_vec(
+            patterned(batch * seq * heads * dim, 13, 0.3, 0.0),
+            (batch, seq, heads, dim),
+            &dev,
+        )?;
+        let beta = Tensor::from_vec(
+            patterned(batch * seq * heads, 14, 0.4, 0.5),
+            (batch, seq, heads),
+            &dev,
+        )?;
+        let g = Tensor::from_vec(
+            patterned(batch * seq * heads, 15, 0.2, -0.1),
+            (batch, seq, heads),
+            &dev,
+        )?;
+        let g_kda = g.unsqueeze(D::Minus1)?.broadcast_as((batch, seq, heads, dim))?;
+        let state0 = Tensor::from_vec(
+            patterned(batch * heads * dim * dim, 16, 0.05, 0.0),
+            (batch, heads, dim, dim),
+            &dev,
+        )?;
+        let mut scalar_state = state0.clone();
+        let mut kda_state = state0;
+        let scalar = gated_delta_rule_recurrence(&q, &k, &v, &g, &beta, &mut scalar_state)?;
+        let kda = kda_rule_recurrence(&q, &k, &v, &g_kda, &beta, &mut kda_state)?;
+        assert_close(&scalar, &kda)?;
+        assert_close(&scalar_state, &kda_state)?;
+
+        let mut varied = g_kda.flatten_all()?.to_vec1::<f32>()?;
+        let last = varied.len() - 1;
+        varied[last] += 1.5;
+        let g_varied = Tensor::from_vec(varied, (batch, seq, heads, dim), &dev)?;
+        let mut varied_state = scalar_state.clone();
+        let varied_out = kda_rule_recurrence(&q, &k, &v, &g_varied, &beta, &mut varied_state)?;
+        let same_out = varied_out.flatten_all()?.to_vec1::<f32>()?
+            == kda.flatten_all()?.to_vec1::<f32>()?;
+        assert!(!same_out, "a per-channel gate change left the KDA output unchanged");
+        Ok(())
     }
 }

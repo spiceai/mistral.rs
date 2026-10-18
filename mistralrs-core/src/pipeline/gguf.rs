@@ -131,6 +131,8 @@ enum Model {
     XLoraLlama(XLoraQLlama),
     XLoraPhi3(XLoraQPhi3),
     GlmDsa(QGlmDsa),
+    DeepSeek41(crate::gguf::deepseek41_model::ModelWeights),
+    Glm5Next(crate::gguf::glm5next_model::ModelWeights),
 }
 
 pub struct GGUFPipeline {
@@ -1307,8 +1309,12 @@ impl Loader for GGUFLoader {
                 Some(candle_core::quantized::gguf_file::Value::String(value)) => value.as_str(),
                 _ => "",
             };
-            // glm-dsa is not in the native registry. The legacy match below owns its graph.
-            if !architecture.eq_ignore_ascii_case("glm-dsa") {
+            // glm-dsa and deepseek41 are not in the native registry. The legacy match
+            // below owns their graphs. deepseek41 must not fall through to deepseekv3.
+            if !architecture.eq_ignore_ascii_case("glm-dsa")
+                && !architecture.eq_ignore_ascii_case("deepseek41")
+                && !architecture.eq_ignore_ascii_case("glm5-next")
+            {
                 return self.load_native_normal(NativeNormalLoadArgs {
                     paths,
                     dtype,
@@ -1529,6 +1535,24 @@ impl Loader for GGUFLoader {
         let model = match self.kind {
             ModelKind::GgufQuantized { .. } => match arch {
                 GGUFArchitecture::GlmDsa => Model::GlmDsa(QGlmDsa::try_from(model_config)?),
+                GGUFArchitecture::DeepSeek41 => {
+                    let comm = pipeline_mapper.get_comm_for(0)?;
+                    Model::DeepSeek41(crate::gguf::deepseek41_model::ModelWeights::load(
+                        paths.get_weight_filenames(),
+                        device,
+                        internal_dtype,
+                        comm,
+                    )?)
+                }
+                GGUFArchitecture::Glm5Next => {
+                    let comm = pipeline_mapper.get_comm_for(0)?;
+                    Model::Glm5Next(crate::gguf::glm5next_model::ModelWeights::load(
+                        paths.get_weight_filenames(),
+                        device,
+                        internal_dtype,
+                        comm,
+                    )?)
+                }
                 a => bail!(
                     "GGUF architecture `{a:?}` should have been loaded by the native registry"
                 ),
@@ -1562,12 +1586,16 @@ impl Loader for GGUFLoader {
             Model::XLoraLlama(ref xl) => xl.max_seq_len,
             Model::XLoraPhi3(ref p) => p.max_seq_len,
             Model::GlmDsa(ref p) => p.max_seq_len,
+            Model::DeepSeek41(ref p) => p.max_seq_len,
+            Model::Glm5Next(ref p) => p.max_seq_len,
         };
         let llg_factory = build_llg_factory(tokenizer.clone())?;
         let num_hidden_layers = match model {
             Model::XLoraLlama(ref model) => model.cache.full().lock().len(),
             Model::XLoraPhi3(ref model) => model.cache.full().lock().len(),
             Model::GlmDsa(ref model) => model.cache.normal().0.len(),
+            Model::DeepSeek41(ref model) => model.cache.normal().0.len(),
+            Model::Glm5Next(ref model) => model.cache.normal().0.len(),
         };
 
         if chat_template.bos_token.is_none() {
@@ -1681,6 +1709,8 @@ impl CacheManagerMixin for GGUFPipeline {
             Model::XLoraLlama(ref model) => &model.cache,
             Model::XLoraPhi3(ref model) => &model.cache,
             Model::GlmDsa(ref model) => &model.cache,
+            Model::DeepSeek41(ref model) => &model.cache,
+            Model::Glm5Next(ref model) => &model.cache,
         }
     }
 }
@@ -1691,6 +1721,8 @@ impl MetadataMixin for GGUFPipeline {
             Model::XLoraLlama(ref model) => model.device.clone(),
             Model::XLoraPhi3(ref model) => model.device.clone(),
             Model::GlmDsa(ref model) => model.device.clone(),
+            Model::DeepSeek41(ref model) => model.device.clone(),
+            Model::Glm5Next(ref model) => model.device.clone(),
         }
     }
     fn tokenizer(&self) -> Option<Arc<Tokenizer>> {
@@ -1768,6 +1800,12 @@ impl Pipeline for GGUFPipeline {
                 flash_meta_full.as_ref().unwrap_or(&flash_meta),
             )?,
             Model::GlmDsa(ref model) => {
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+            }
+            Model::DeepSeek41(ref model) => {
+                model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
+            }
+            Model::Glm5Next(ref model) => {
                 model.forward(&input_ids, &seqlen_offsets, context_lens, paged_attn_meta)?
             }
         };

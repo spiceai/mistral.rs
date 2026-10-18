@@ -3,6 +3,8 @@
 //! Shared Gated Delta Net (GDN) implementation for hybrid models.
 
 mod backend;
+
+pub(crate) use backend::kda_rule_recurrence;
 mod cache;
 mod config;
 mod layer;

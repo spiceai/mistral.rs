@@ -1,4 +1,9 @@
 pub(crate) mod base_model;
+mod deepseek41;
+pub(crate) mod deepseek41_model;
+mod dsv4_hc;
+mod glm5next;
+pub(crate) mod glm5next_model;
 mod chat_template;
 mod content;
 pub(crate) mod gemma3_bindings;
@@ -53,6 +58,11 @@ pub enum GGUFArchitecture {
     Mistral3,
     #[strum(serialize = "glm-dsa")]
     GlmDsa,
+    /// DeepSeek-V4.1. Not DeepSeek-V3 and not `deepseekv3`.
+    DeepSeek41,
+    /// GLM-5.3-Flash. Not GLM-4 and not `glm4`.
+    #[strum(serialize = "glm5-next")]
+    Glm5Next,
 }
 
 // Wraps from_str() for some convenience:
@@ -69,18 +79,6 @@ const RECOGNIZED_UNIMPLEMENTED: &[(&str, &str, &str)] = &[
         "DeepSeek-V4",
         "an MLA output LoRA (`o_lora_rank`/`o_groups`), a sqrt-softplus router, \
      hash layers, a sparse-attention indexer, and MXFP4 expert tensors",
-    ),
-    (
-        "deepseek41",
-        "DeepSeek-V4.1",
-        "the V4 graph plus Engram and the one-sublayer hyper-connection lag. \
-     It is not DeepSeek-V3 and is not loaded as `deepseekv3`",
-    ),
-    (
-        "glm5-next",
-        "GLM-5.3-Flash",
-        "Kimi Delta Attention, a DeepSeek sparse-attention indexer, and \
-     hyper-connections. It is not GLM-4 and is not loaded as `glm4`",
     ),
 ];
 
@@ -124,6 +122,10 @@ impl GGUFArchitecture {
         match self {
             // MLA + sigmoid-gated MoE, run dense; see `gguf::glm_moe`.
             Self::GlmDsa => false,
+            // Compressed KV and a lagged hyper-connection. No paged kernel.
+            Self::DeepSeek41 => false,
+            // KDA recurrence and compressed DSA. No paged kernel.
+            Self::Glm5Next => false,
             Self::Llama
             | Self::Mpt
             | Self::Gptneox
@@ -174,29 +176,33 @@ mod tests {
     }
 
     #[test]
-    fn deepseek41_and_glm5_next_stay_off_the_older_graphs() {
-        for (arch, family, forbidden) in [
-            ("deepseek41", "DeepSeek-V4.1", "deepseekv3"),
-            ("glm5-next", "GLM-5.3-Flash", "glm4"),
-        ] {
-            let err = GGUFArchitecture::from_value(arch)
-                .expect_err("this checkpoint has no graph in this build");
-            let msg = err.to_string();
-            assert!(msg.contains(family), "{msg}");
-            assert!(msg.contains("not implemented"), "{msg}");
-            assert!(
-                msg.contains(&format!("not loaded as `{forbidden}`")),
-                "{msg}"
-            );
-            assert!(
-                !msg.contains("Unknown GGUF architecture"),
-                "must not look like a corrupt download: {msg}"
-            );
-            let reason = GGUFArchitecture::unimplemented_reason(arch)
-                .expect("native loader asks this before the normal registry");
-            assert_eq!(reason.to_string(), msg);
-            assert!(GGUFArchitecture::from_str(arch).is_err(), "{arch}");
-        }
+    fn deepseek41_resolves_to_its_own_graph() {
+        let arch = GGUFArchitecture::from_value("deepseek41").expect("deepseek41 loads");
+        assert!(
+            matches!(arch, GGUFArchitecture::DeepSeek41),
+            "deepseek41 must not alias another graph: {arch}"
+        );
+        let name = arch.to_string();
+        assert_eq!(name, "deepseek41");
+        assert!(!name.contains("deepseekv3"), "{name}");
+        assert!(!arch.supports_paged_attention());
+        assert!(GGUFArchitecture::from_str("deepseek41").is_ok());
+        assert!(GGUFArchitecture::unimplemented_reason("deepseek41").is_none());
+    }
+
+    #[test]
+    fn glm5_next_resolves_to_its_own_graph() {
+        let arch = GGUFArchitecture::from_value("glm5-next").expect("glm5-next loads");
+        assert!(
+            matches!(arch, GGUFArchitecture::Glm5Next),
+            "glm5-next must not alias another graph: {arch}"
+        );
+        let name = arch.to_string();
+        assert_eq!(name, "glm5-next");
+        assert!(!name.contains("glm4"), "{name}");
+        assert!(!arch.supports_paged_attention());
+        assert!(GGUFArchitecture::from_str("glm5-next").is_ok());
+        assert!(GGUFArchitecture::unimplemented_reason("glm5-next").is_none());
         assert!(GGUFArchitecture::unimplemented_reason("llama").is_none());
         assert!(GGUFArchitecture::unimplemented_reason("glm4").is_none());
         assert!(GGUFArchitecture::unimplemented_reason("qwen4exp").is_none());
