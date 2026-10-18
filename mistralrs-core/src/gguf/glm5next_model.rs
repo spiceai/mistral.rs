@@ -2,9 +2,14 @@
 
 //! GGUF loader and forward for `general.architecture = glm5-next`.
 //!
-//! KDA layers call [`kda_rule_recurrence`]. Hyper-connections use the mix from
-//! the same sublayer. Routed experts stay quantized in [`MoEExperts`]. This is
-//! not GLM-4.
+//! KDA layers call [`kda_rule_recurrence`]. DSA layers attend over a cached
+//! compressed KV latent in the absorbed MLA form. Hyper-connections use the mix
+//! from the same sublayer. Routed experts stay quantized in [`MoEExperts`]. This
+//! is not GLM-4.
+//!
+//! The DSA lightning indexer is not implemented. Below its `top_k` the indexer
+//! selects every key, so dense attention is exact there; longer sequences are
+//! refused rather than attended differently from the model.
 
 use std::sync::{Arc, Mutex};
 
@@ -73,6 +78,7 @@ struct Kda {
     head_dim: usize,
     kernel: usize,
     lower_bound: f64,
+    eps: f64,
 }
 
 struct Dsa {
@@ -81,12 +87,15 @@ struct Dsa {
     q_b: Arc<dyn QuantMethod>,
     kv: Arc<dyn QuantMethod>,
     kv_norm: Tensor,
-    k_b: Tensor,
-    v_b: Tensor,
+    /// `attn_k_b` as `[heads, qk_head_dim, kv_lora_rank]`, so `q @ k_b_t` lands in latent space.
+    k_b_t: Tensor,
+    /// `attn_v_b` as `[heads, kv_lora_rank, v_head_dim]`.
+    v_b_t: Tensor,
     output: Arc<dyn QuantMethod>,
     heads: usize,
-    nope: usize,
-    rope: usize,
+    eps: f64,
+    /// Longest sequence for which dense attention matches the indexer's selection.
+    max_dense: usize,
 }
 
 enum Ffn {
@@ -105,6 +114,7 @@ enum Ffn {
         shared_down: Arc<dyn QuantMethod>,
         top_k: usize,
         scale: f64,
+        normalize: bool,
         limit: f64,
     },
 }
@@ -112,6 +122,8 @@ enum Ffn {
 struct RunState {
     kda: Vec<Option<Tensor>>,
     conv: Vec<Option<Tensor>>,
+    /// Normalized KV latent of every token so far, `[batch, tokens, kv_lora_rank]`, per DSA layer.
+    dsa: Vec<Option<Tensor>>,
 }
 
 impl ModelWeights {
@@ -127,6 +139,7 @@ impl ModelWeights {
             candle_core::bail!("Expected `{ARCH}` GGUF architecture, got `{arch}`.");
         }
         let blocks = meta_usize(&archive, &key("block_count"))?;
+        let context = meta_usize(&archive, &key("context_length")).unwrap_or(4096);
         let hidden = meta_usize(&archive, &key("embedding_length"))?;
         let heads = meta_usize(&archive, &key("attention.head_count"))?;
         let kv_heads = meta_usize_array(&archive, &key("attention.head_count_kv"))?;
@@ -143,15 +156,30 @@ impl ModelWeights {
         let leading = meta_usize(&archive, &key("leading_dense_block_count")).unwrap_or(0);
         let experts_n = meta_usize(&archive, &key("expert_count")).unwrap_or(0);
         let expert_k = meta_usize(&archive, &key("expert_used_count")).unwrap_or(1);
-        let intermediate = meta_usize(&archive, &key("expert_feed_forward_length")).unwrap_or(hidden);
+        let intermediate =
+            meta_usize(&archive, &key("expert_feed_forward_length")).unwrap_or(hidden);
         let dense_ffn = meta_usize(&archive, &key("feed_forward_length")).unwrap_or(intermediate);
         let route_scale = meta_f32(&archive, &key("expert_weights_scale")).unwrap_or(1.0);
+        let route_normalize = meta_usize(&archive, &key("expert_weights_norm")).unwrap_or(0) != 0;
+        // 2 is sigmoid, the only gating function the router below computes.
+        let gating = meta_usize(&archive, &key("expert_gating_func")).unwrap_or(2);
+        if gating != 2 {
+            candle_core::bail!(
+                "glm5-next expert gating function {gating} is not supported; only sigmoid (2) is"
+            );
+        }
+        let index_top_k = meta_usize(&archive, &key("attention.indexer.top_k")).unwrap_or(context);
         let q_lora = meta_usize(&archive, &key("attention.q_lora_rank")).unwrap_or(0);
         let kv_lora = meta_usize(&archive, &key("attention.kv_lora_rank")).unwrap_or(0);
         let nope = meta_usize(&archive, &key("attention.key_length_mla")).unwrap_or(0);
         let rope = meta_usize(&archive, &key("rope.dimension_count")).unwrap_or(0);
-        let context = meta_usize(&archive, &key("context_length")).unwrap_or(4096);
-        let clamps = meta_f32_array(&archive, &key("swiglu_clamp_exp")).unwrap_or_else(|_| vec![10.0]);
+        if rope != 0 {
+            candle_core::bail!(
+                "glm5-next DSA layers are NoPE; a rope dimension of {rope} is not supported"
+            );
+        }
+        let clamps =
+            meta_f32_array(&archive, &key("swiglu_clamp_exp")).unwrap_or_else(|_| vec![10.0]);
 
         let mut bindings = GgufBindingMap::new();
         for layer in leading..blocks {
@@ -168,7 +196,11 @@ impl ModelWeights {
                 }
             }
         }
-        let source = Arc::new(GgufWeightSource::new(archive.clone(), &bindings, DType::F32)?);
+        let source = Arc::new(GgufWeightSource::new(
+            archive.clone(),
+            &bindings,
+            DType::F32,
+        )?);
         let vb = source.sharded_var_builder(device.clone());
 
         let mut layers = Vec::with_capacity(blocks);
@@ -178,7 +210,8 @@ impl ModelWeights {
                 break;
             }
             let limit = f64::from(clamps.get(layer).copied().unwrap_or(10.0));
-            let ffn = if layer < leading || !archive.contains_tensor(&blk(layer, "ffn_gate_exps.weight"))
+            let ffn = if layer < leading
+                || !archive.contains_tensor(&blk(layer, "ffn_gate_exps.weight"))
             {
                 require(&archive, &blk(layer, "ffn_gate.weight"))?;
                 Ffn::Dense {
@@ -213,6 +246,7 @@ impl ModelWeights {
                     shared_down: linear(&archive, &blk(layer, "ffn_down_shexp.weight"), device)?,
                     top_k: expert_k,
                     scale: f64::from(route_scale),
+                    normalize: route_normalize,
                     limit,
                 }
             };
@@ -238,22 +272,25 @@ impl ModelWeights {
                     head_dim,
                     kernel,
                     lower_bound: lower,
+                    eps: f64::from(rms_eps),
                 })
             } else {
                 require(&archive, &blk(layer, "attn_q_a.weight"))?;
-                let _ = (q_lora, kv_lora, nope, rope, dense_ffn);
+                let _ = (q_lora, kv_lora, nope, dense_ffn);
+                let k_b = dense(&archive, &blk(layer, "attn_k_b.weight"), device)?;
+                let v_b = dense(&archive, &blk(layer, "attn_v_b.weight"), device)?;
                 LayerKind::Dsa(Dsa {
                     q_a: linear(&archive, &blk(layer, "attn_q_a.weight"), device)?,
                     q_norm: dense(&archive, &blk(layer, "attn_q_a_norm.weight"), device)?,
                     q_b: linear(&archive, &blk(layer, "attn_q_b.weight"), device)?,
                     kv: linear(&archive, &blk(layer, "attn_kv_a_mqa.weight"), device)?,
                     kv_norm: dense(&archive, &blk(layer, "attn_kv_a_norm.weight"), device)?,
-                    k_b: dense(&archive, &blk(layer, "attn_k_b.weight"), device)?,
-                    v_b: dense(&archive, &blk(layer, "attn_v_b.weight"), device)?,
+                    k_b_t: k_b.transpose(1, 2)?.contiguous()?,
+                    v_b_t: v_b.transpose(1, 2)?.contiguous()?,
                     output: linear(&archive, &blk(layer, "attn_output.weight"), device)?,
                     heads,
-                    nope,
-                    rope,
+                    eps: f64::from(rms_eps),
+                    max_dense: index_top_k,
                 })
             };
             layers.push(Layer {
@@ -287,6 +324,7 @@ impl ModelWeights {
             state: Mutex::new(RunState {
                 kda: (0..n).map(|_| None).collect(),
                 conv: (0..n).map(|_| None).collect(),
+                dsa: (0..n).map(|_| None).collect(),
             }),
         })
     }
@@ -316,6 +354,9 @@ impl ModelWeights {
                 *slot = None;
             }
             for slot in &mut state.conv {
+                *slot = None;
+            }
+            for slot in &mut state.dsa {
                 *slot = None;
             }
         }
@@ -377,13 +418,18 @@ impl Layer {
     fn attend(&self, x: &Tensor, index: usize, state: &mut RunState) -> Result<Tensor> {
         match &self.kind {
             LayerKind::Kda(kda) => kda.forward(x, &mut state.kda[index], &mut state.conv[index]),
-            LayerKind::Dsa(dsa) => dsa.forward(x),
+            LayerKind::Dsa(dsa) => dsa.forward(x, &mut state.dsa[index]),
         }
     }
 
     fn feed(&self, x: &Tensor) -> Result<Tensor> {
         match &self.ffn {
-            Ffn::Dense { gate, up, down, limit } => {
+            Ffn::Dense {
+                gate,
+                up,
+                down,
+                limit,
+            } => {
                 let mixed = swiglu_clamped(&gate.forward(x)?, &up.forward(x)?, *limit)?;
                 down.forward(&mixed)
             }
@@ -396,6 +442,7 @@ impl Layer {
                 shared_down,
                 top_k,
                 scale,
+                normalize,
                 limit,
             } => {
                 let (batch, seq, hidden) = x.dims3()?;
@@ -404,13 +451,15 @@ impl Layer {
                 let choice = scores.broadcast_add(bias)?;
                 let picked = crate::ops::TopKLastDimOp::topk(&choice, *top_k)?;
                 let weights = scores.gather(&picked.indices, D::Minus1)?;
+                let weights = if *normalize {
+                    weights.broadcast_div(&(weights.sum_keepdim(D::Minus1)? + 1e-20)?)?
+                } else {
+                    weights
+                };
                 let weights = (weights * *scale)?;
                 let routed = experts.forward(x, weights, &picked.indices)?;
-                let shared = swiglu_clamped(
-                    &shared_gate.forward(x)?,
-                    &shared_up.forward(x)?,
-                    *limit,
-                )?;
+                let shared =
+                    swiglu_clamped(&shared_gate.forward(x)?, &shared_up.forward(x)?, *limit)?;
                 routed + shared_down.forward(&shared)?
             }
         }
@@ -452,11 +501,13 @@ impl Kda {
         };
         let y = kda_rule_recurrence(&q, &k, &v, &g, &beta, &mut state)?;
         *recurrent = Some(state);
-        let y = y.reshape((batch, seq, self.heads * self.head_dim))?;
-        let y = rmsnorm(&y, &self.norm, 1e-6)?;
+        // The output norm weight is `[head_dim]`: each head is normalized on its own.
+        let y = y.reshape((batch, seq, self.heads, self.head_dim))?;
+        let y = rmsnorm(&y, &self.norm, self.eps)?;
         let gate = candle_nn::ops::sigmoid(&self.g_b.forward(&self.g_a.forward(x)?)?)?;
-        let gate = gate.reshape((batch, seq, self.heads * self.head_dim))?;
-        self.output.forward(&(y * gate)?)
+        let gate = gate.reshape((batch, seq, self.heads, self.head_dim))?;
+        let y = (y * gate)?.reshape((batch, seq, self.heads * self.head_dim))?;
+        self.output.forward(&y)
     }
 
     fn convolve(
@@ -480,7 +531,10 @@ impl Kda {
         }
         let weights = Tensor::cat(&[&self.conv_q, &self.conv_k, &self.conv_v], 0)?;
         let flat_h = history.flatten_all()?.to_vec1::<f32>()?;
-        let flat_w = weights.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
+        let flat_w = weights
+            .flatten_all()?
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()?;
         let hist_len = history.dim(1)?;
         let mut out = vec![0f32; batch * seq * channels];
         for b in 0..batch {
@@ -515,32 +569,53 @@ impl Kda {
 }
 
 impl Dsa {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    /// Absorbed MLA over the cached latent: scores are `(q @ k_b) . latent` and the
+    /// output is `(probs @ latent) @ v_b`. The latent is the only thing cached.
+    fn forward(&self, x: &Tensor, cache: &mut Option<Tensor>) -> Result<Tensor> {
         let (batch, seq, _) = x.dims3()?;
-        let q = rmsnorm(&self.q_a.forward(x)?, &self.q_norm, 1e-6)?;
-        let q = self.q_b.forward(&q)?.reshape((batch, seq, self.heads, ()))?;
-        let kv = rmsnorm(&self.kv.forward(x)?, &self.kv_norm, 1e-6)?;
-        let kv = kv.unsqueeze(1)?;
-        let k = kv.broadcast_matmul(&self.k_b.unsqueeze(0)?)?;
-        let v = kv.broadcast_matmul(&self.v_b.unsqueeze(0)?)?;
-        let dim = q.dim(D::Minus1)?;
-        let scale = 1.0 / (dim as f64).sqrt();
-        let scores = q
-            .transpose(1, 2)?
-            .broadcast_matmul(&k.transpose(D::Minus1, D::Minus2)?)?;
-        let scores = (scores * scale)?;
-        let key_index = Tensor::arange(0u32, seq as u32, x.device())?;
-        let causal = key_index
-            .unsqueeze(D::Minus1)?
-            .broadcast_ge(&key_index.unsqueeze(0)?)?;
-        let blocked = (scores.zeros_like()? - f64::INFINITY)?;
-        let scores = causal
-            .broadcast_as(scores.shape())?
-            .where_cond(&scores, &blocked)?;
-        let probs = candle_nn::ops::softmax(&scores, D::Minus1)?;
-        let y = probs.broadcast_matmul(&v.transpose(1, 2)?)?;
+        let past = match cache.as_ref() {
+            Some(prev) => prev.dim(1)?,
+            None => 0,
+        };
+        let total = past + seq;
+        if total > self.max_dense {
+            candle_core::bail!(
+                "glm5-next attends densely only up to {} tokens and this sequence has {total}; the sparse attention indexer that longer sequences need is not implemented",
+                self.max_dense
+            );
+        }
+        let q = rmsnorm(&self.q_a.forward(x)?, &self.q_norm, self.eps)?;
+        let q = self
+            .q_b
+            .forward(&q)?
+            .reshape((batch, seq, self.heads, ()))?;
+        let qk_dim = q.dim(D::Minus1)?;
+        let latent = rmsnorm(&self.kv.forward(x)?, &self.kv_norm, self.eps)?;
+        let latent = match cache.take() {
+            Some(prev) => Tensor::cat(&[&prev, &latent], 1)?,
+            None => latent,
+        };
+        *cache = Some(latent.clone());
+
+        let q = q.transpose(1, 2)?.contiguous()?;
+        let q_latent = q.broadcast_matmul(&self.k_b_t.unsqueeze(0)?)?;
+        let keys = latent.transpose(1, 2)?.contiguous()?.unsqueeze(1)?;
+        let scores = (q_latent.broadcast_matmul(&keys)? * (1.0 / (qk_dim as f64).sqrt()))?;
+        let scores = if seq > 1 {
+            let key_pos = Tensor::arange(0u32, total as u32, x.device())?.unsqueeze(0)?;
+            let query_pos = Tensor::arange(past as u32, total as u32, x.device())?.unsqueeze(1)?;
+            let visible = key_pos.broadcast_le(&query_pos)?;
+            let blocked = (scores.zeros_like()? - f64::INFINITY)?;
+            visible
+                .broadcast_as(scores.shape())?
+                .where_cond(&scores, &blocked)?
+        } else {
+            scores
+        };
+        let probs = candle_nn::ops::softmax_last_dim(&scores.contiguous()?)?;
+        let mixed = probs.broadcast_matmul(&latent.unsqueeze(1)?.contiguous()?)?;
+        let y = mixed.broadcast_matmul(&self.v_b_t.unsqueeze(0)?)?;
         let y = y.transpose(1, 2)?.reshape((batch, seq, ()))?;
-        let _ = (self.nope, self.rope);
         self.output.forward(&y)
     }
 }
@@ -550,11 +625,28 @@ fn l2_normalize(x: &Tensor) -> Result<Tensor> {
     x.broadcast_div(&denom)
 }
 
-fn hyper(archive: &GgufArchive, layer: usize, which: &str, device: &Device) -> Result<HyperWeights> {
+fn hyper(
+    archive: &GgufArchive,
+    layer: usize,
+    which: &str,
+    device: &Device,
+) -> Result<HyperWeights> {
     Ok(HyperWeights {
-        fn_weight: dense(archive, &blk(layer, &format!("hc_{which}_fn.weight")), device)?,
-        scale: dense(archive, &blk(layer, &format!("hc_{which}_scale.weight")), device)?,
-        base: dense(archive, &blk(layer, &format!("hc_{which}_base.weight")), device)?,
+        fn_weight: dense(
+            archive,
+            &blk(layer, &format!("hc_{which}_fn.weight")),
+            device,
+        )?,
+        scale: dense(
+            archive,
+            &blk(layer, &format!("hc_{which}_scale.weight")),
+            device,
+        )?,
+        base: dense(
+            archive,
+            &blk(layer, &format!("hc_{which}_base.weight")),
+            device,
+        )?,
     })
 }
 
@@ -631,7 +723,10 @@ fn meta_usize_array(archive: &GgufArchive, name: &str) -> Result<Vec<usize>> {
     let candle_core::quantized::gguf_file::Value::Array(values) = meta_value(archive, name)? else {
         candle_core::bail!("GGUF metadata `{name}` must be an array");
     };
-    values.iter().map(|value| value_usize(value, name)).collect()
+    values
+        .iter()
+        .map(|value| value_usize(value, name))
+        .collect()
 }
 
 fn meta_f32_array(archive: &GgufArchive, name: &str) -> Result<Vec<f32>> {
@@ -653,8 +748,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use candle_core::{DType, Device, Tensor};
     use candle_core::quantized::GgmlDType;
+    use candle_core::{DType, Device, Tensor};
     use mistralrs_quant::{Comm, Id};
     use tempfile::NamedTempFile;
 
@@ -667,21 +762,46 @@ mod tests {
             .collect()
     }
 
+    /// Seeded values in `[-scale, scale]`, so each token and channel differs.
+    fn noise(shape: &[u64], seed: u64, scale: f32) -> Vec<f32> {
+        let count: u64 = shape.iter().product();
+        let mut state = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * scale
+            })
+            .collect()
+    }
+
+    fn noisy(name: &str, shape: &[u64], seed: u64, scale: f32) -> Weight {
+        Weight {
+            name: name.to_string(),
+            shape: shape.to_vec(),
+            data: f32_bytes(&noise(shape, seed, scale)),
+            dtype: 0,
+        }
+    }
+
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
     #[derive(Clone)]
     struct Weight {
-        name: &'static str,
+        name: String,
         shape: Vec<u64>,
         data: Vec<u8>,
         dtype: u32,
     }
 
-    fn f32w(name: &'static str, shape: &[u64], salt: f32) -> Weight {
+    fn f32w(name: &str, shape: &[u64], salt: f32) -> Weight {
         Weight {
-            name,
+            name: name.to_string(),
             shape: shape.to_vec(),
             data: f32_bytes(&pattern(shape, salt)),
             dtype: 0,
@@ -693,6 +813,17 @@ mod tests {
     }
 
     fn write(tensors: &[Weight], expert_dtype: u32, expert: Vec<u8>) -> NamedTempFile {
+        let _ = expert_dtype;
+        write_layers(tensors, &[0], Some(expert))
+    }
+
+    /// One layer per entry of `kv_heads`: 0 is KDA, 1 is DSA. With `expert`, layer 0
+    /// has routed experts; every other layer uses the dense FFN.
+    fn write_layers(
+        tensors: &[Weight],
+        kv_heads: &[u32],
+        expert: Option<Vec<u8>>,
+    ) -> NamedTempFile {
         let mut meta: Vec<(String, Vec<u8>)> = Vec::new();
         let push_str = |meta: &mut Vec<(String, Vec<u8>)>, key: &str, value: &str| {
             let mut bytes = Vec::new();
@@ -722,16 +853,20 @@ mod tests {
         };
         push_str(&mut meta, "general.architecture", "glm5-next");
         push_u32(&mut meta, "general.alignment", 32);
-        push_u32(&mut meta, "glm5-next.block_count", 1);
+        push_u32(&mut meta, "glm5-next.block_count", kv_heads.len() as u32);
         push_u32(&mut meta, "glm5-next.context_length", 32);
         push_u32(&mut meta, "glm5-next.embedding_length", 32);
         push_u32(&mut meta, "glm5-next.feed_forward_length", 32);
         push_u32(&mut meta, "glm5-next.attention.head_count", 4);
-        push_f32(&mut meta, "glm5-next.attention.layer_norm_rms_epsilon", 1e-5);
+        push_f32(
+            &mut meta,
+            "glm5-next.attention.layer_norm_rms_epsilon",
+            1e-5,
+        );
         push_u32(&mut meta, "glm5-next.expert_count", 2);
         push_u32(&mut meta, "glm5-next.expert_used_count", 1);
         push_u32(&mut meta, "glm5-next.expert_feed_forward_length", 32);
-        push_u32s(&mut meta, "glm5-next.attention.head_count_kv", &[0]);
+        push_u32s(&mut meta, "glm5-next.attention.head_count_kv", kv_heads);
         push_u32(&mut meta, "glm5-next.attention.q_lora_rank", 16);
         push_u32(&mut meta, "glm5-next.attention.kv_lora_rank", 16);
         push_u32(&mut meta, "glm5-next.attention.key_length_mla", 8);
@@ -740,32 +875,37 @@ mod tests {
         push_u32(&mut meta, "glm5-next.kda.head_dim", 8);
         push_f32(&mut meta, "glm5-next.kda.gate_lower_bound", -5.0);
         push_u32(&mut meta, "glm5-next.hyper_connection.count", 2);
-        push_u32(&mut meta, "glm5-next.hyper_connection.sinkhorn_iterations", 1);
+        push_u32(
+            &mut meta,
+            "glm5-next.hyper_connection.sinkhorn_iterations",
+            1,
+        );
         push_f32(&mut meta, "glm5-next.hyper_connection.epsilon", 1e-6);
         push_u32(&mut meta, "glm5-next.leading_dense_block_count", 0);
         push_f32(&mut meta, "glm5-next.expert_weights_scale", 2.5);
         push_u32(&mut meta, "glm5-next.expert_weights_norm", 1);
-        push_u32s(&mut meta, "glm5-next.swiglu_clamp_exp", &[10]);
-        let _ = expert_dtype;
+        push_u32(&mut meta, "glm5-next.expert_gating_func", 2);
+        push_u32(&mut meta, "glm5-next.attention.indexer.top_k", 8);
+        push_u32s(
+            &mut meta,
+            "glm5-next.swiglu_clamp_exp",
+            &vec![10; kv_heads.len()],
+        );
         let mut all = tensors.to_vec();
-        all.push(Weight {
-            name: "blk.0.ffn_gate_exps.weight",
-            shape: vec![2, 32, 32],
-            data: expert,
-            dtype: 8,
-        });
-        all.push(Weight {
-            name: "blk.0.ffn_up_exps.weight",
-            shape: vec![2, 32, 32],
-            data: q8(0.4),
-            dtype: 8,
-        });
-        all.push(Weight {
-            name: "blk.0.ffn_down_exps.weight",
-            shape: vec![2, 32, 32],
-            data: q8(0.7),
-            dtype: 8,
-        });
+        if let Some(expert) = expert {
+            for (name, data) in [
+                ("blk.0.ffn_gate_exps.weight", expert),
+                ("blk.0.ffn_up_exps.weight", q8(0.4)),
+                ("blk.0.ffn_down_exps.weight", q8(0.7)),
+            ] {
+                all.push(Weight {
+                    name: name.to_string(),
+                    shape: vec![2, 32, 32],
+                    data,
+                    dtype: 8,
+                });
+            }
+        }
         // The rest of the writer mirrors the deepseek test file.
         let alignment = 32usize;
         let mut bytes = Vec::new();
@@ -824,14 +964,15 @@ mod tests {
             f32w("blk.0.ssm_conv1d_q.weight", &[32, 4], 0.2),
             f32w("blk.0.ssm_conv1d_k.weight", &[32, 4], 0.2),
             f32w("blk.0.ssm_conv1d_v.weight", &[32, 4], 0.2),
-            f32w("blk.0.ssm_f_a.weight", &[32, 32], 0.05),
-            f32w("blk.0.ssm_f_b.weight", &[32, 32], 0.05),
+            f32w("blk.0.ssm_f_a.weight", &[8, 32], 0.05),
+            f32w("blk.0.ssm_f_b.weight", &[32, 8], 0.05),
             f32w("blk.0.ssm_dt.bias", &[32], 0.0),
             f32w("blk.0.ssm_a", &[4], 0.1),
             f32w("blk.0.ssm_beta.weight", &[4, 32], 0.1),
-            f32w("blk.0.ssm_g_a.weight", &[32, 32], 0.05),
-            f32w("blk.0.ssm_g_b.weight", &[32, 32], 0.05),
-            f32w("blk.0.ssm_norm.weight", &[32], 1.0),
+            f32w("blk.0.ssm_g_a.weight", &[8, 32], 0.05),
+            f32w("blk.0.ssm_g_b.weight", &[32, 8], 0.05),
+            // Per-head output norm, as in the released GGUF: `[kda.head_dim]`.
+            f32w("blk.0.ssm_norm.weight", &[8], 1.0),
             f32w("blk.0.hc_attn_fn.weight", &[64, 8], 0.01),
             f32w("blk.0.hc_attn_scale.weight", &[3], 1.0),
             f32w("blk.0.hc_attn_base.weight", &[8], 0.0),
@@ -843,6 +984,46 @@ mod tests {
             f32w("blk.0.ffn_gate_shexp.weight", &[32, 32], 0.1),
             f32w("blk.0.ffn_up_shexp.weight", &[32, 32], 0.1),
             f32w("blk.0.ffn_down_shexp.weight", &[32, 32], 0.1),
+        ]
+    }
+
+    /// A DSA layer with a dense FFN. Shapes follow the released GGUF: `attn_k_b`
+    /// is `[heads, kv_lora, qk]` and `attn_v_b` is `[heads, v, kv_lora]`.
+    fn dsa_layer_weights(layer: usize) -> Vec<Weight> {
+        let w = |suffix: &str, shape: &[u64], salt: f32| {
+            f32w(&format!("blk.{layer}.{suffix}"), shape, salt)
+        };
+        let n = |suffix: &str, shape: &[u64], seed: u64| {
+            noisy(&format!("blk.{layer}.{suffix}"), shape, seed, 0.5)
+        };
+        vec![
+            w("attn_norm.weight", &[32], 1.0),
+            w("ffn_norm.weight", &[32], 1.0),
+            n("attn_q_a.weight", &[16, 32], 11),
+            w("attn_q_a_norm.weight", &[16], 1.0),
+            n("attn_q_b.weight", &[32, 16], 12),
+            n("attn_kv_a_mqa.weight", &[16, 32], 13),
+            w("attn_kv_a_norm.weight", &[16], 1.0),
+            n("attn_k_b.weight", &[4, 16, 8], 14),
+            n("attn_v_b.weight", &[4, 8, 16], 15),
+            n("attn_output.weight", &[32, 32], 16),
+            w("hc_attn_fn.weight", &[64, 8], 0.02),
+            w("hc_attn_scale.weight", &[3], 1.0),
+            w("hc_attn_base.weight", &[8], 0.0),
+            w("hc_ffn_fn.weight", &[64, 8], 0.02),
+            w("hc_ffn_scale.weight", &[3], 1.0),
+            w("hc_ffn_base.weight", &[8], 0.0),
+            w("ffn_gate.weight", &[32, 32], 0.1),
+            w("ffn_up.weight", &[32, 32], 0.2),
+            w("ffn_down.weight", &[32, 32], 0.3),
+        ]
+    }
+
+    fn embedding_weights() -> Vec<Weight> {
+        vec![
+            noisy("token_embd.weight", &[8, 32], 1, 1.0),
+            noisy("output.weight", &[8, 32], 2, 0.5),
+            f32w("output_norm.weight", &[32], 1.0),
         ]
     }
 
@@ -858,8 +1039,13 @@ mod tests {
 
     fn load(file: &NamedTempFile) -> ModelWeights {
         let comm = Arc::new(Comm::from_device(Id::new(), &Device::Cpu, 0, 1).expect("comm"));
-        ModelWeights::load(&[PathBuf::from(file.path())], &Device::Cpu, DType::F32, comm)
-            .expect("load glm5-next")
+        ModelWeights::load(
+            &[PathBuf::from(file.path())],
+            &Device::Cpu,
+            DType::F32,
+            comm,
+        )
+        .expect("load glm5-next")
     }
 
     fn logits(model: &ModelWeights, tokens: &[u32]) -> Vec<f32> {
@@ -873,13 +1059,103 @@ mod tests {
             .expect("f32")
     }
 
+    fn step(model: &ModelWeights, tokens: &[u32], start: usize) -> Vec<f32> {
+        let ids = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &Device::Cpu).expect("ids");
+        model
+            .forward(&ids, &[start], vec![(tokens.len() - 1, 1)], None)
+            .expect("forward")
+            .flatten_all()
+            .expect("flat")
+            .to_vec1()
+            .expect("f32")
+    }
+
+    /// Decoding a token after a prefill must give the logits of recomputing the
+    /// whole sequence: the KDA state and the DSA latent cache carry everything the
+    /// earlier tokens contribute.
+    #[test]
+    fn decode_after_prefill_matches_a_full_recompute() {
+        let mut weights = kda_weights(0.2);
+        weights.extend(dsa_layer_weights(1));
+        let file = write_layers(&weights, &[0, 1], Some(q8(0.1)));
+        let model = load(&file);
+
+        let full = step(&model, &[1, 2, 3, 4], 0);
+        let _ = step(&model, &[1, 2, 3], 0);
+        let decoded = step(&model, &[4], 3);
+        assert_eq!(full.len(), decoded.len());
+        let worst = full
+            .iter()
+            .zip(&decoded)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst < 1e-4,
+            "decode diverged from recompute by {worst}: {full:?} vs {decoded:?}"
+        );
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    }
+
+    /// With DSA as the only layer, attention is the only path between tokens, so a
+    /// decode step that loses the cached latent answers as if the prefix were absent.
+    #[test]
+    fn dsa_decode_attends_to_the_cached_prefix() {
+        let mut weights = embedding_weights();
+        weights.extend(dsa_layer_weights(0));
+        let file = write_layers(&weights, &[1], None);
+        let model = load(&file);
+
+        let full = step(&model, &[1, 2, 3, 4], 0);
+        let _ = step(&model, &[1, 2, 3], 0);
+        let decoded = step(&model, &[4], 3);
+        let alone = step(&model, &[4], 0);
+
+        let drift = max_abs_diff(&full, &decoded);
+        assert!(
+            drift < 1e-5,
+            "decode diverged from recompute by {drift}: {full:?} vs {decoded:?}"
+        );
+        let prefix_effect = max_abs_diff(&decoded, &alone);
+        assert!(
+            prefix_effect > 1e-3,
+            "the prefix moved the decoded logits by only {prefix_effect}; the test cannot see a lost cache"
+        );
+    }
+
+    #[test]
+    fn dsa_refuses_sequences_past_the_indexer_top_k() {
+        let mut weights = embedding_weights();
+        weights.extend(dsa_layer_weights(0));
+        let file = write_layers(&weights, &[1], None);
+        let model = load(&file);
+        let ids = Tensor::from_vec((0u32..9).map(|t| t % 8).collect(), (1, 9), &Device::Cpu)
+            .expect("ids");
+        let err = model
+            .forward(&ids, &[0], vec![(8, 1)], None)
+            .expect_err("9 tokens exceed the indexer top_k of 8");
+        assert!(
+            err.to_string()
+                .contains("attends densely only up to 8 tokens and this sequence has 9"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn kda_and_quantized_experts_change_the_logits() {
         let file = write(&kda_weights(0.2), 8, q8(0.1));
         let model = load(&file);
         let first = logits(&model, &[1, 2]);
         let second = logits(&model, &[3, 4]);
-        assert_ne!(first, second, "different tokens must change glm5-next logits");
+        assert_ne!(
+            first, second,
+            "different tokens must change glm5-next logits"
+        );
         let other = write(&kda_weights(1.4), 8, q8(0.1));
         let changed = logits(&load(&other), &[1, 2]);
         assert_ne!(first, changed, "KDA query weights must change logits");
@@ -900,10 +1176,6 @@ mod tests {
             Ok(_) => panic!("missing KDA query must fail closed"),
             Err(err) => err,
         };
-        assert!(
-            err.to_string().contains("attn_q.weight"),
-            "{}",
-            err
-        );
+        assert!(err.to_string().contains("attn_q.weight"), "{}", err);
     }
 }
