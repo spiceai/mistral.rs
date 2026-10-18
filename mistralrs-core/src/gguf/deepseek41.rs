@@ -1,9 +1,12 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+
 //! DeepSeek-V4.1 pieces that are not DeepSeek-V3.
 //!
 //! The lagged hyper-connection block, Engram, compressed-KV pooling, and the
 //! sqrt-softplus router live here. `deepseek41_model` is what loads a GGUF and
 //! calls them. This is not the DeepSeek-V3 graph.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
 use candle_core::{DType, Result, Tensor, D};
@@ -13,6 +16,7 @@ use crate::ops::TopKLastDimOp;
 use super::dsv4_hc::{combine_streams, mix_streams, sinkhorn};
 
 /// Tensor suffixes a `deepseek41` GGUF has to contain.
+#[cfg(test)]
 pub(crate) const REQUIRED_TENSORS: &[&str] = &[
     "attn_compressor_gate.weight",
     "attn_compressor_kv.weight",
@@ -55,6 +59,7 @@ pub(crate) const REQUIRED_TENSORS: &[&str] = &[
     "token_embd.weight",
 ];
 
+#[cfg(test)]
 pub(crate) fn missing_tensors<'a>(present: &HashSet<&str>) -> Vec<&'a str> {
     REQUIRED_TENSORS
         .iter()
@@ -88,9 +93,11 @@ pub(crate) fn engram_row_ids(
     {
         candle_core::bail!("Engram hash tables do not match the layer, head, and n-gram counts");
     }
-    let pad = u64::from(*token_map.get(pad_token as usize).ok_or_else(|| {
-        candle_core::Error::msg("Engram pad token is outside the token map")
-    })?);
+    let pad = u64::from(
+        *token_map
+            .get(pad_token as usize)
+            .ok_or_else(|| candle_core::Error::msg("Engram pad token is outside the token map"))?,
+    );
     let mut ids = vec![0u64; tokens.len() * n_layers * n_cols];
     for (pos, _) in tokens.iter().enumerate() {
         let mut gram = vec![0u64; max_ngram];
@@ -194,7 +201,9 @@ fn hyper_coeff(
         .transpose(0, 1)?
         .contiguous()?;
     let comb = comb.transpose(1, 2)?.contiguous()?;
-    let comb = comb.broadcast_mul(&scale_w.get(2)?)?.broadcast_add(&comb_base)?;
+    let comb = comb
+        .broadcast_mul(&scale_w.get(2)?)?
+        .broadcast_add(&comb_base)?;
     let comb = sinkhorn(&comb, iters, hc_eps)?;
     let mut stream_dims = dims[..dims.len() - 2].to_vec();
     stream_dims.push(hc);
@@ -298,9 +307,7 @@ pub(crate) fn engram_apply(
         .reshape((lead, in_dim))?
         .to_dtype(DType::F32)?
         .matmul(&wkv)?;
-    let key = kv
-        .narrow(1, 0, hc * hidden)?
-        .reshape((lead, hc, hidden))?;
+    let key = kv.narrow(1, 0, hc * hidden)?.reshape((lead, hc, hidden))?;
     let value = kv.narrow(1, hc * hidden, hidden)?;
     let hf = h.reshape((lead, hc, hidden))?.to_dtype(DType::F32)?;
     // GGUF stores these as `[hc, hidden]`, which broadcasts onto `hf`.
@@ -374,15 +381,19 @@ pub(crate) fn swiglu_clamped(gate: &Tensor, up: &Tensor, limit: f64) -> Result<T
     let gate = gate.to_dtype(DType::F32)?;
     let up = up.to_dtype(DType::F32)?;
     let (gate, up) = if limit > 0.0 {
-        (gate.clamp(f64::NEG_INFINITY, limit)?, up.clamp(-limit, limit)?)
+        (
+            gate.clamp(f64::NEG_INFINITY, limit)?,
+            up.clamp(-limit, limit)?,
+        )
     } else {
         (gate, up)
     };
-    Ok((candle_nn::ops::silu(&gate)? * up)?)
+    candle_nn::ops::silu(&gate)? * up
 }
 
 /// Causal multi-query attention. `k` is the single KV head `[batch, seq, dim]`.
 /// `sinks` is one logit per head that takes probability mass and adds nothing.
+#[cfg(test)]
 pub(crate) fn mqa_with_sink(q: &Tensor, k: &Tensor, sinks: &Tensor) -> Result<Tensor> {
     let (batch, seq, heads, dim) = q.dims4()?;
     let scale = 1.0 / (dim as f64).sqrt();
@@ -465,8 +476,17 @@ mod tests {
         )
         .expect("out-in coeff");
         assert_eq!(
-            left.pre.flatten_all().expect("flat").to_vec1::<f32>().expect("pre"),
-            right.pre.flatten_all().expect("flat").to_vec1::<f32>().expect("pre")
+            left.pre
+                .flatten_all()
+                .expect("flat")
+                .to_vec1::<f32>()
+                .expect("pre"),
+            right
+                .pre
+                .flatten_all()
+                .expect("flat")
+                .to_vec1::<f32>()
+                .expect("pre")
         );
     }
 
@@ -499,17 +519,48 @@ mod tests {
         let multipliers = [3u64, 5];
         let primes = [11u64, 13];
         let offsets = [100u64, 200];
-        let first = engram_row_ids(&[4, 1], &token_map, 0, 1, 2, 2, &multipliers, &primes, &offsets)
-            .unwrap();
-        let second = engram_row_ids(&[5, 1], &token_map, 0, 1, 2, 2, &multipliers, &primes, &offsets)
-            .unwrap();
+        let first = engram_row_ids(
+            &[4, 1],
+            &token_map,
+            0,
+            1,
+            2,
+            2,
+            &multipliers,
+            &primes,
+            &offsets,
+        )
+        .unwrap();
+        let second = engram_row_ids(
+            &[5, 1],
+            &token_map,
+            0,
+            1,
+            2,
+            2,
+            &multipliers,
+            &primes,
+            &offsets,
+        )
+        .unwrap();
         assert_eq!(first.len(), 4);
         assert_ne!(
-            first[2..], second[2..],
+            first[2..],
+            second[2..],
             "position 1 must read the token before it"
         );
-        let same_start =
-            engram_row_ids(&[4], &token_map, 0, 1, 2, 2, &multipliers, &primes, &offsets).unwrap();
+        let same_start = engram_row_ids(
+            &[4],
+            &token_map,
+            0,
+            1,
+            2,
+            2,
+            &multipliers,
+            &primes,
+            &offsets,
+        )
+        .unwrap();
         assert_eq!(first[..2], same_start[..]);
     }
 
@@ -560,8 +611,12 @@ mod tests {
         .unwrap();
         let incoming = Tensor::from_vec(vec![1f32, 0.0], (1, 1, hc), &device).unwrap();
         let mix_len = (2 + hc) * hc;
-        let weight = Tensor::from_vec(vec![0.1f32; (hc * hidden) * mix_len], (hc * hidden, mix_len), &device)
-            .unwrap();
+        let weight = Tensor::from_vec(
+            vec![0.1f32; (hc * hidden) * mix_len],
+            (hc * hidden, mix_len),
+            &device,
+        )
+        .unwrap();
         let scale = Tensor::from_vec(vec![1f32, 1.0, 1.0], (3,), &device).unwrap();
         let base = Tensor::zeros((mix_len,), DType::F32, &device).unwrap();
         let attn_mix = HyperWeights {
@@ -582,29 +637,15 @@ mod tests {
         };
         let ffn = |x: &Tensor| Ok(x.clone());
         let (_h, next_pre) = lagged_block(
-            &h,
-            &incoming,
-            &attn_mix,
-            &ffn_mix,
-            &norm,
-            &norm,
-            hc,
-            1,
-            1e-6,
-            1e-6,
-            attn,
-            ffn,
+            &h, &incoming, &attn_mix, &ffn_mix, &norm, &norm, hc, 1, 1e-6, 1e-6, attn, ffn,
         )
         .unwrap();
         let expected = mix_streams(&h, &incoming).unwrap();
         let expected = super::rmsnorm(&expected, &norm, 1e-6).unwrap();
         close(seen.borrow().as_ref().unwrap(), &expected);
-        let own_pre_would_match_incoming = next_pre
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap()
-            == incoming.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let own_pre_would_match_incoming =
+            next_pre.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                == incoming.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(!own_pre_would_match_incoming);
     }
 
@@ -641,12 +682,32 @@ mod tests {
         let device = Device::Cpu;
         let q = Tensor::from_vec(vec![1f32, 0.0], (1, 1, 1, 2), &device).unwrap();
         let k = Tensor::from_vec(vec![1f32, 0.0], (1, 1, 2), &device).unwrap();
-        let quiet = mqa_with_sink(&q, &k, &Tensor::from_vec(vec![-20f32], (1,), &device).unwrap())
+        let quiet = mqa_with_sink(
+            &q,
+            &k,
+            &Tensor::from_vec(vec![-20f32], (1,), &device).unwrap(),
+        )
+        .unwrap();
+        let loud = mqa_with_sink(
+            &q,
+            &k,
+            &Tensor::from_vec(vec![20f32], (1,), &device).unwrap(),
+        )
+        .unwrap();
+        let quiet = quiet
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
             .unwrap();
-        let loud = mqa_with_sink(&q, &k, &Tensor::from_vec(vec![20f32], (1,), &device).unwrap())
+        let loud = loud
+            .sqr()
+            .unwrap()
+            .sum_all()
+            .unwrap()
+            .to_scalar::<f32>()
             .unwrap();
-        let quiet = quiet.sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
-        let loud = loud.sqr().unwrap().sum_all().unwrap().to_scalar::<f32>().unwrap();
         assert!(quiet > loud, "quiet {quiet} loud {loud}");
     }
 

@@ -4,6 +4,9 @@ on:
   workflow_dispatch:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test-cuda:
     name: CI / cuda (${{ matrix.name }})
@@ -49,7 +52,7 @@ jobs:
           sudo apt-get install -y curl build-essential clang libclang-dev libssl-dev protobuf-compiler pkg-config
 
       - name: Install Rust Stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
       - name: Pin CUDA toolkit to ${{ matrix.cuda }}
         run: |

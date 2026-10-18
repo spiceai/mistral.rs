@@ -205,7 +205,7 @@ impl ModelWeights {
         let vb = source.sharded_var_builder(device.clone());
 
         let mut layers = Vec::with_capacity(blocks);
-        for layer in 0..blocks {
+        for (layer, &kv_head_count) in kv_heads.iter().enumerate().take(blocks) {
             if !archive.contains_tensor(&blk(layer, "hc_attn_fn.weight")) {
                 // The last block is the MTP head. It has no hyper-connection mix.
                 break;
@@ -251,7 +251,7 @@ impl ModelWeights {
                     limit,
                 }
             };
-            let kind = if kv_heads[layer] == 0 {
+            let kind = if kv_head_count == 0 {
                 require(&archive, &blk(layer, "attn_q.weight"))?;
                 LayerKind::Kda(Kda {
                     q: linear(&archive, &blk(layer, "attn_q.weight"), device)?,

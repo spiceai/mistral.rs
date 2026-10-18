@@ -196,7 +196,9 @@ impl ModelWeights {
             candle_core::bail!("deepseek41 expert weights must be renormalized");
         }
         if rope_dim == 0 || !rope_dim.is_multiple_of(2) || rope_dim > head_dim {
-            candle_core::bail!("deepseek41 rope dimension {rope_dim} does not fit head dim {head_dim}");
+            candle_core::bail!(
+                "deepseek41 rope dimension {rope_dim} does not fit head dim {head_dim}"
+            );
         }
         if !heads.is_multiple_of(groups) || groups == 0 || hc < 2 {
             candle_core::bail!("deepseek41 head, group, or hyper-connection counts are unusable");
@@ -216,7 +218,7 @@ impl ModelWeights {
         let beta_fast = meta_f32(&archive, &key("rope.scaling.yarn_beta_fast"))?;
         let beta_slow = meta_f32(&archive, &key("rope.scaling.yarn_beta_slow"))?;
         let context = meta_usize(&archive, &key("context_length")).unwrap_or(ROPE_TABLE);
-        let rope_len = context.min(ROPE_TABLE).max(8);
+        let rope_len = context.clamp(8, ROPE_TABLE);
         let rope = Arc::new(build_rope(freq_base, rope_dim, rope_len, None, device)?);
         let compress_rope = Arc::new(build_rope(
             compress_base,
@@ -233,7 +235,8 @@ impl ModelWeights {
         let index_heads = meta_usize(&archive, &key("attention.indexer.head_count"))?;
         let index_dim = meta_usize(&archive, &key("attention.indexer.key_length"))?;
         let index_topk = meta_usize(&archive, &key("attention.indexer.top_k"))?;
-        let engram_layers = meta_usize_array(&archive, &key("engram.layer_ids")).unwrap_or_default();
+        let engram_layers =
+            meta_usize_array(&archive, &key("engram.layer_ids")).unwrap_or_default();
         let engram = load_engram_hash(&archive, &engram_layers)?;
 
         let mut bindings = GgufBindingMap::new();
@@ -251,7 +254,11 @@ impl ModelWeights {
                 );
             }
         }
-        let source = Arc::new(GgufWeightSource::new(archive.clone(), &bindings, DType::F32)?);
+        let source = Arc::new(GgufWeightSource::new(
+            archive.clone(),
+            &bindings,
+            DType::F32,
+        )?);
         let vb = source.sharded_var_builder(device.clone());
 
         let embed = linear(&archive, "token_embd.weight", device)?;
@@ -335,12 +342,20 @@ impl ModelWeights {
                     q_b: linear(&archive, &blk(layer, "indexer.attn_q_b.weight"), device)?,
                     proj: linear(&archive, &blk(layer, "indexer.proj.weight"), device)?,
                     k_norm: if owns_k {
-                        Some(dense(&archive, &blk(layer, "indexer.k_norm.weight"), device)?)
+                        Some(dense(
+                            &archive,
+                            &blk(layer, "indexer.k_norm.weight"),
+                            device,
+                        )?)
                     } else {
                         None
                     },
                     k: if owns_k {
-                        Some(linear(&archive, &blk(layer, "indexer.attn_k.weight"), device)?)
+                        Some(linear(
+                            &archive,
+                            &blk(layer, "indexer.attn_k.weight"),
+                            device,
+                        )?)
                     } else {
                         None
                     },
@@ -425,9 +440,7 @@ impl ModelWeights {
                 indexer,
                 engram: engram_weights,
             });
-            let q_shape = archive
-                .tensor_info(&blk(layer, "attn_q_a.weight"))?
-                .shape();
+            let q_shape = archive.tensor_info(&blk(layer, "attn_q_a.weight"))?.shape();
             if q_shape != [q_lora, hidden] && q_shape != [hidden, q_lora] {
                 candle_core::bail!(
                     "deepseek41 `{}.attn_q_a.weight` shape {q_shape:?} does not match q_lora {q_lora} and hidden {hidden}",
@@ -526,11 +539,14 @@ impl ModelWeights {
             Tensor::cat(&[&ones, &zeros], 2)?
         };
         let positions = crate::pipeline::text_positions_tensor(&[start], seq, &self.device)?;
-        if start + seq > self.layers.first().map(|layer| layer.rope_len()).unwrap_or(ROPE_TABLE) {
-            candle_core::bail!(
-                "deepseek41 position {} is past the rope table",
-                start + seq
-            );
+        if start + seq
+            > self
+                .layers
+                .first()
+                .map(|layer| layer.rope_len())
+                .unwrap_or(ROPE_TABLE)
+        {
+            candle_core::bail!("deepseek41 position {} is past the rope table", start + seq);
         }
         let mut incoming = pre;
         for layer in &self.layers {
@@ -553,7 +569,8 @@ impl ModelWeights {
             };
             // `lagged_block` takes Fn. The step's state is exclusively borrowed for this layer.
             let (next, next_pre) = {
-                let layer_attn = |x: &Tensor| layer.attend(x, step.start, step.positions, step.state);
+                let layer_attn =
+                    |x: &Tensor| layer.attend(x, step.start, step.positions, step.state);
                 let layer_ffn = |x: &Tensor| layer.feed_forward(x);
                 lagged_block(
                     &hidden,
@@ -661,7 +678,11 @@ impl Layer {
         let q = q.reshape((batch, seq, self.heads, self.head_dim))?;
         let q = q.transpose(1, 2)?;
         let q = rotate_tail(&self.rope, &q, positions, self.rope_dim)?;
-        let kv = rmsnorm(&self.kv.forward(x)?, &self.kv_norm, f64::from(self.rms_eps()))?;
+        let kv = rmsnorm(
+            &self.kv.forward(x)?,
+            &self.kv_norm,
+            f64::from(self.rms_eps()),
+        )?;
         let kv = kv.unsqueeze(1)?;
         let kv = rotate_tail(&self.rope, &kv, positions, self.rope_dim)?;
         let kv = kv.squeeze(1)?;
@@ -713,7 +734,10 @@ impl Layer {
         } else if let Some(prev) = &state.window {
             Tensor::cat(&[prev, kv], 1)?
         } else {
-            candle_core::bail!("deepseek41 layer {} is missing its window cache", self.index)
+            candle_core::bail!(
+                "deepseek41 layer {} is missing its window cache",
+                self.index
+            )
         };
         let keep = history.dim(1)?.min(self.window);
         let start_keep = history.dim(1)? - keep;
@@ -824,14 +848,15 @@ impl Layer {
         let first = start - (start % self.ratio);
         let mut positions = Vec::with_capacity(groups);
         for group in 0..groups {
-            positions.push(u32::try_from(first + group * self.ratio).map_err(candle_core::Error::wrap)?);
+            positions
+                .push(u32::try_from(first + group * self.ratio).map_err(candle_core::Error::wrap)?);
         }
         let positions = Tensor::from_vec(positions, (groups,), rows.device())?;
         let rows = rows.unsqueeze(1)?;
         let roped = rotate_tail(
-            self.compress_rope.as_ref().ok_or_else(|| {
-                candle_core::Error::msg("deepseek41 compressed rope is missing")
-            })?,
+            self.compress_rope
+                .as_ref()
+                .ok_or_else(|| candle_core::Error::msg("deepseek41 compressed rope is missing"))?,
             &rows,
             &positions,
             self.rope_dim,
@@ -891,7 +916,8 @@ impl Layer {
         let (batch, seq, hidden) = x.dims3()?;
         let flat = x.reshape((batch * seq, hidden))?;
         let logits = self.router.forward(&flat)?;
-        let (ids, weights) = moe_route(&logits, &self.router_bias, self.expert_k, self.route_scale)?;
+        let (ids, weights) =
+            moe_route(&logits, &self.router_bias, self.expert_k, self.route_scale)?;
         let routed = self.experts.forward(x, weights, &ids)?;
         let gate = self.shared_gate.forward(x)?;
         let up = self.shared_up.forward(x)?;
@@ -909,7 +935,8 @@ fn apply_engram(
     eps: f32,
     device: &Device,
 ) -> Result<Tensor> {
-    let hash = hash.ok_or_else(|| candle_core::Error::msg("deepseek41 Engram hash tables are missing"))?;
+    let hash =
+        hash.ok_or_else(|| candle_core::Error::msg("deepseek41 Engram hash tables are missing"))?;
     let ids = engram_row_ids(
         tokens,
         &hash.token_map,
@@ -977,7 +1004,7 @@ fn attention_visible(
     for query in 0..seq {
         let abs = start + query;
         let oldest = abs.saturating_sub(window.saturating_sub(1));
-        let groups = if ratio == 0 { 0 } else { (abs + 1) / ratio };
+        let groups = (abs + 1).checked_div(ratio).unwrap_or(0);
         for key in 0..keys {
             let allowed = if key < window_len {
                 let key_abs = if start == 0 {
@@ -1041,11 +1068,28 @@ fn load_engram_hash(archive: &GgufArchive, layers: &[usize]) -> Result<Option<En
     }))
 }
 
-fn hyper(archive: &GgufArchive, layer: usize, which: &str, device: &Device) -> Result<HyperWeights> {
+fn hyper(
+    archive: &GgufArchive,
+    layer: usize,
+    which: &str,
+    device: &Device,
+) -> Result<HyperWeights> {
     Ok(HyperWeights {
-        fn_weight: dense(archive, &blk(layer, &format!("hc_{which}_fn.weight")), device)?,
-        scale: dense(archive, &blk(layer, &format!("hc_{which}_scale.weight")), device)?,
-        base: dense(archive, &blk(layer, &format!("hc_{which}_base.weight")), device)?,
+        fn_weight: dense(
+            archive,
+            &blk(layer, &format!("hc_{which}_fn.weight")),
+            device,
+        )?,
+        scale: dense(
+            archive,
+            &blk(layer, &format!("hc_{which}_scale.weight")),
+            device,
+        )?,
+        base: dense(
+            archive,
+            &blk(layer, &format!("hc_{which}_base.weight")),
+            device,
+        )?,
     })
 }
 
@@ -1090,7 +1134,10 @@ fn blk(layer: usize, suffix: &str) -> String {
     format!("blk.{layer}.{suffix}")
 }
 
-fn meta_value<'a>(archive: &'a GgufArchive, name: &str) -> Result<&'a candle_core::quantized::gguf_file::Value> {
+fn meta_value<'a>(
+    archive: &'a GgufArchive,
+    name: &str,
+) -> Result<&'a candle_core::quantized::gguf_file::Value> {
     archive.metadata_value(name).ok_or_else(|| {
         candle_core::Error::msg(format!("GGUF deepseek41 is missing metadata `{name}`"))
     })
@@ -1126,7 +1173,10 @@ fn meta_usize_array(archive: &GgufArchive, name: &str) -> Result<Vec<usize>> {
     let candle_core::quantized::gguf_file::Value::Array(values) = meta_value(archive, name)? else {
         candle_core::bail!("GGUF metadata `{name}` must be an array");
     };
-    values.iter().map(|value| value_usize(value, name)).collect()
+    values
+        .iter()
+        .map(|value| value_usize(value, name))
+        .collect()
 }
 
 fn meta_f32_array(archive: &GgufArchive, name: &str) -> Result<Vec<f32>> {
@@ -1176,8 +1226,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use candle_core::{DType, Device, Tensor};
     use candle_core::quantized::GgmlDType;
+    use candle_core::{DType, Device, Tensor};
     use mistralrs_quant::{Comm, Id};
     use tempfile::NamedTempFile;
 
@@ -1211,15 +1261,18 @@ mod tests {
     }
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
     }
 
     fn q2k(shape: &[u64], salt: f32) -> Vec<u8> {
         let values = pattern(shape, salt);
         let dims: Vec<usize> = shape.iter().map(|dim| *dim as usize).collect();
         let tensor = Tensor::from_vec(values, dims.as_slice(), &Device::Cpu).expect("pattern");
-        let quantized = candle_core::quantized::QTensor::quantize(&tensor, GgmlDType::Q2K)
-            .expect("q2k");
+        let quantized =
+            candle_core::quantized::QTensor::quantize(&tensor, GgmlDType::Q2K).expect("q2k");
         quantized.data().expect("q2k bytes").to_vec()
     }
 
@@ -1302,42 +1355,150 @@ mod tests {
 
     fn base_meta(ratio: u32) -> Vec<Meta> {
         vec![
-            Meta { key: "general.architecture", value: MetaValue::Str("deepseek41") },
-            Meta { key: "general.alignment", value: MetaValue::U32(32) },
-            Meta { key: "deepseek41.block_count", value: MetaValue::U32(1) },
-            Meta { key: "deepseek41.context_length", value: MetaValue::U32(32) },
-            Meta { key: "deepseek41.embedding_length", value: MetaValue::U32(256) },
-            Meta { key: "deepseek41.attention.head_count", value: MetaValue::U32(2) },
-            Meta { key: "deepseek41.attention.head_count_kv", value: MetaValue::U32(1) },
-            Meta { key: "deepseek41.attention.key_length", value: MetaValue::U32(64) },
-            Meta { key: "deepseek41.attention.value_length", value: MetaValue::U32(64) },
-            Meta { key: "deepseek41.rope.dimension_count", value: MetaValue::U32(4) },
-            Meta { key: "deepseek41.rope.freq_base", value: MetaValue::F32(10_000.0) },
-            Meta { key: "deepseek41.attention.compress_rope_freq_base", value: MetaValue::F32(160_000.0) },
-            Meta { key: "deepseek41.rope.scaling.factor", value: MetaValue::F32(16.0) },
-            Meta { key: "deepseek41.rope.scaling.original_context_length", value: MetaValue::U32(64) },
-            Meta { key: "deepseek41.rope.scaling.yarn_beta_fast", value: MetaValue::F32(32.0) },
-            Meta { key: "deepseek41.rope.scaling.yarn_beta_slow", value: MetaValue::F32(1.0) },
-            Meta { key: "deepseek41.attention.layer_norm_rms_epsilon", value: MetaValue::F32(1e-5) },
-            Meta { key: "deepseek41.attention.q_lora_rank", value: MetaValue::U32(32) },
-            Meta { key: "deepseek41.attention.sliding_window", value: MetaValue::U32(8) },
-            Meta { key: "deepseek41.expert_count", value: MetaValue::U32(2) },
-            Meta { key: "deepseek41.expert_used_count", value: MetaValue::U32(1) },
-            Meta { key: "deepseek41.expert_feed_forward_length", value: MetaValue::U32(256) },
-            Meta { key: "deepseek41.expert_gating_func", value: MetaValue::U32(4) },
-            Meta { key: "deepseek41.expert_weights_scale", value: MetaValue::F32(1.5) },
-            Meta { key: "deepseek41.expert_weights_norm", value: MetaValue::U32(1) },
-            Meta { key: "deepseek41.attention.output_group_count", value: MetaValue::U32(2) },
-            Meta { key: "deepseek41.attention.output_lora_rank", value: MetaValue::U32(8) },
-            Meta { key: "deepseek41.hyper_connection.count", value: MetaValue::U32(2) },
-            Meta { key: "deepseek41.hyper_connection.sinkhorn_iterations", value: MetaValue::U32(1) },
-            Meta { key: "deepseek41.hyper_connection.epsilon", value: MetaValue::F32(1e-6) },
-            Meta { key: "deepseek41.attention.indexer.head_count", value: MetaValue::U32(2) },
-            Meta { key: "deepseek41.attention.indexer.key_length", value: MetaValue::U32(8) },
-            Meta { key: "deepseek41.attention.indexer.top_k", value: MetaValue::U32(4) },
-            Meta { key: "deepseek41.attention.compress_ratios", value: MetaValue::U32s(vec![ratio]) },
-            Meta { key: "deepseek41.swiglu_clamp_exp", value: MetaValue::F32s(vec![10.0]) },
-            Meta { key: "deepseek41.engram.layer_ids", value: MetaValue::U32s(vec![]) },
+            Meta {
+                key: "general.architecture",
+                value: MetaValue::Str("deepseek41"),
+            },
+            Meta {
+                key: "general.alignment",
+                value: MetaValue::U32(32),
+            },
+            Meta {
+                key: "deepseek41.block_count",
+                value: MetaValue::U32(1),
+            },
+            Meta {
+                key: "deepseek41.context_length",
+                value: MetaValue::U32(32),
+            },
+            Meta {
+                key: "deepseek41.embedding_length",
+                value: MetaValue::U32(256),
+            },
+            Meta {
+                key: "deepseek41.attention.head_count",
+                value: MetaValue::U32(2),
+            },
+            Meta {
+                key: "deepseek41.attention.head_count_kv",
+                value: MetaValue::U32(1),
+            },
+            Meta {
+                key: "deepseek41.attention.key_length",
+                value: MetaValue::U32(64),
+            },
+            Meta {
+                key: "deepseek41.attention.value_length",
+                value: MetaValue::U32(64),
+            },
+            Meta {
+                key: "deepseek41.rope.dimension_count",
+                value: MetaValue::U32(4),
+            },
+            Meta {
+                key: "deepseek41.rope.freq_base",
+                value: MetaValue::F32(10_000.0),
+            },
+            Meta {
+                key: "deepseek41.attention.compress_rope_freq_base",
+                value: MetaValue::F32(160_000.0),
+            },
+            Meta {
+                key: "deepseek41.rope.scaling.factor",
+                value: MetaValue::F32(16.0),
+            },
+            Meta {
+                key: "deepseek41.rope.scaling.original_context_length",
+                value: MetaValue::U32(64),
+            },
+            Meta {
+                key: "deepseek41.rope.scaling.yarn_beta_fast",
+                value: MetaValue::F32(32.0),
+            },
+            Meta {
+                key: "deepseek41.rope.scaling.yarn_beta_slow",
+                value: MetaValue::F32(1.0),
+            },
+            Meta {
+                key: "deepseek41.attention.layer_norm_rms_epsilon",
+                value: MetaValue::F32(1e-5),
+            },
+            Meta {
+                key: "deepseek41.attention.q_lora_rank",
+                value: MetaValue::U32(32),
+            },
+            Meta {
+                key: "deepseek41.attention.sliding_window",
+                value: MetaValue::U32(8),
+            },
+            Meta {
+                key: "deepseek41.expert_count",
+                value: MetaValue::U32(2),
+            },
+            Meta {
+                key: "deepseek41.expert_used_count",
+                value: MetaValue::U32(1),
+            },
+            Meta {
+                key: "deepseek41.expert_feed_forward_length",
+                value: MetaValue::U32(256),
+            },
+            Meta {
+                key: "deepseek41.expert_gating_func",
+                value: MetaValue::U32(4),
+            },
+            Meta {
+                key: "deepseek41.expert_weights_scale",
+                value: MetaValue::F32(1.5),
+            },
+            Meta {
+                key: "deepseek41.expert_weights_norm",
+                value: MetaValue::U32(1),
+            },
+            Meta {
+                key: "deepseek41.attention.output_group_count",
+                value: MetaValue::U32(2),
+            },
+            Meta {
+                key: "deepseek41.attention.output_lora_rank",
+                value: MetaValue::U32(8),
+            },
+            Meta {
+                key: "deepseek41.hyper_connection.count",
+                value: MetaValue::U32(2),
+            },
+            Meta {
+                key: "deepseek41.hyper_connection.sinkhorn_iterations",
+                value: MetaValue::U32(1),
+            },
+            Meta {
+                key: "deepseek41.hyper_connection.epsilon",
+                value: MetaValue::F32(1e-6),
+            },
+            Meta {
+                key: "deepseek41.attention.indexer.head_count",
+                value: MetaValue::U32(2),
+            },
+            Meta {
+                key: "deepseek41.attention.indexer.key_length",
+                value: MetaValue::U32(8),
+            },
+            Meta {
+                key: "deepseek41.attention.indexer.top_k",
+                value: MetaValue::U32(4),
+            },
+            Meta {
+                key: "deepseek41.attention.compress_ratios",
+                value: MetaValue::U32s(vec![ratio]),
+            },
+            Meta {
+                key: "deepseek41.swiglu_clamp_exp",
+                value: MetaValue::F32s(vec![10.0]),
+            },
+            Meta {
+                key: "deepseek41.engram.layer_ids",
+                value: MetaValue::U32s(vec![]),
+            },
         ]
     }
 
@@ -1412,9 +1573,7 @@ mod tests {
 
     fn load(file: &NamedTempFile) -> ModelWeights {
         let path = PathBuf::from(file.path());
-        let comm = Arc::new(
-            Comm::from_device(Id::new(), &Device::Cpu, 0, 1).expect("comm"),
-        );
+        let comm = Arc::new(Comm::from_device(Id::new(), &Device::Cpu, 0, 1).expect("comm"));
         ModelWeights::load(&[path], &Device::Cpu, DType::F32, comm).expect("load deepseek41")
     }
 
@@ -1432,7 +1591,7 @@ mod tests {
     #[test]
     fn device_map_sizing_returns_the_stored_bytes() {
         let file = write_gguf(&base_meta(0), &tiny_weights(0.1, false));
-        let mut opened = vec![std::fs::File::open(file.path()).expect("open tiny gguf")];
+        let mut opened = [std::fs::File::open(file.path()).expect("open tiny gguf")];
         let mut readers: Vec<&mut std::fs::File> = opened.iter_mut().collect();
         let model = crate::gguf::Content::from_readers(&mut readers).expect("read tiny gguf");
         let loader = crate::utils::gguf_metadata::GgufDeviceMapLoaderInner {
@@ -1471,7 +1630,10 @@ mod tests {
         let model = load(&file);
         let first = logits(&model, &[1, 2]);
         let second = logits(&model, &[4, 5]);
-        assert_ne!(first, second, "different tokens must change deepseek41 logits");
+        assert_ne!(
+            first, second,
+            "different tokens must change deepseek41 logits"
+        );
         assert!(first.iter().any(|value| value.is_finite()));
 
         let other = write_gguf(&base_meta(0), &tiny_weights(1.7, false));

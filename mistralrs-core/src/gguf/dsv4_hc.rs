@@ -41,8 +41,10 @@ pub(crate) fn combine_streams(
     post: &Tensor,
     comb: &Tensor,
 ) -> Result<Tensor> {
-    let injected = x.unsqueeze(D::Minus2)?.broadcast_mul(&post.unsqueeze(D::Minus1)?)?;
-    let mixed = comb.matmul(&residual)?;
+    let injected = x
+        .unsqueeze(D::Minus2)?
+        .broadcast_mul(&post.unsqueeze(D::Minus1)?)?;
+    let mixed = comb.matmul(residual)?;
     injected.broadcast_add(&mixed)
 }
 
@@ -65,8 +67,8 @@ mod tests {
     #[test]
     fn sinkhorn_one_iteration_matches_the_reference_matrix() {
         let device = Device::Cpu;
-        let logits = Tensor::from_vec(vec![1f32, 0.0, 0.0, 3.0], (1, 2, 2), &device)
-            .expect("logits");
+        let logits =
+            Tensor::from_vec(vec![1f32, 0.0, 0.0, 3.0], (1, 2, 2), &device).expect("logits");
         let got = sinkhorn(&logits, 1, 1e-6)
             .expect("sinkhorn")
             .flatten_all()
@@ -75,15 +77,15 @@ mod tests {
             .expect("values");
         close(
             &got,
-            &[0.939_076_89, 0.060_921_82, 0.220_170_56, 0.779_828_62],
+            &[0.939_076_9, 0.060_921_82, 0.220_170_56, 0.779_828_6],
         );
     }
 
     #[test]
     fn sinkhorn_second_iteration_renormalizes_both_axes() {
         let device = Device::Cpu;
-        let logits = Tensor::from_vec(vec![1f32, 0.0, 0.0, 3.0], (1, 2, 2), &device)
-            .expect("logits");
+        let logits =
+            Tensor::from_vec(vec![1f32, 0.0, 0.0, 3.0], (1, 2, 2), &device).expect("logits");
         let got = sinkhorn(&logits, 2, 1e-6)
             .expect("sinkhorn")
             .flatten_all()

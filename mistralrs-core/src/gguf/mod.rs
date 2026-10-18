@@ -1,15 +1,15 @@
 pub(crate) mod base_model;
+mod chat_template;
+mod content;
 mod deepseek41;
 pub(crate) mod deepseek41_model;
 mod dsv4_hc;
-mod glm5next;
-pub(crate) mod glm5next_model;
-mod chat_template;
-mod content;
 pub(crate) mod gemma3_bindings;
 pub(crate) mod gemma3_config;
 pub(crate) mod gemma3n_bindings;
 mod gguf_tokenizer;
+mod glm5next;
+pub(crate) mod glm5next_model;
 pub(crate) mod glm_moe;
 pub(crate) mod idefics3_bindings;
 mod lfm2_vl_bindings;
@@ -73,14 +73,12 @@ pub enum GGUFArchitecture {
 /// the operator's next step is a different engine or a different quant repo, not
 /// a re-download. Each entry pairs the `general.architecture` value with the
 /// model family and the components a loader still has to grow.
-const RECOGNIZED_UNIMPLEMENTED: &[(&str, &str, &str)] = &[
-    (
-        "deepseek4",
-        "DeepSeek-V4",
-        "an MLA output LoRA (`o_lora_rank`/`o_groups`), a sqrt-softplus router, \
+const RECOGNIZED_UNIMPLEMENTED: &[(&str, &str, &str)] = &[(
+    "deepseek4",
+    "DeepSeek-V4",
+    "an MLA output LoRA (`o_lora_rank`/`o_groups`), a sqrt-softplus router, \
      hash layers, a sparse-attention indexer, and MXFP4 expert tensors",
-    ),
-];
+)];
 
 impl GGUFArchitecture {
     /// `Some` when `general.architecture` names a checkpoint this build can

@@ -2077,7 +2077,9 @@ mod tests {
             (batch, seq, heads),
             &dev,
         )?;
-        let g_kda = g.unsqueeze(D::Minus1)?.broadcast_as((batch, seq, heads, dim))?;
+        let g_kda = g
+            .unsqueeze(D::Minus1)?
+            .broadcast_as((batch, seq, heads, dim))?;
         let state0 = Tensor::from_vec(
             patterned(batch * heads * dim * dim, 16, 0.05, 0.0),
             (batch, heads, dim, dim),
@@ -2096,9 +2098,12 @@ mod tests {
         let g_varied = Tensor::from_vec(varied, (batch, seq, heads, dim), &dev)?;
         let mut varied_state = scalar_state.clone();
         let varied_out = kda_rule_recurrence(&q, &k, &v, &g_varied, &beta, &mut varied_state)?;
-        let same_out = varied_out.flatten_all()?.to_vec1::<f32>()?
-            == kda.flatten_all()?.to_vec1::<f32>()?;
-        assert!(!same_out, "a per-channel gate change left the KDA output unchanged");
+        let same_out =
+            varied_out.flatten_all()?.to_vec1::<f32>()? == kda.flatten_all()?.to_vec1::<f32>()?;
+        assert!(
+            !same_out,
+            "a per-channel gate change left the KDA output unchanged"
+        );
         Ok(())
     }
 }

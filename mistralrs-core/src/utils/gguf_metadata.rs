@@ -963,10 +963,7 @@ mod split_kv_heads_tests {
             Value::I32(1),
         ]);
         assert_eq!(super::metadata_count(&array).expect("array"), 1);
-        assert_eq!(
-            super::metadata_count(&Value::U32(64)).expect("scalar"),
-            64
-        );
+        assert_eq!(super::metadata_count(&Value::U32(64)).expect("scalar"), 64);
         assert!(super::metadata_count(&Value::Array(vec![])).is_err());
     }
 

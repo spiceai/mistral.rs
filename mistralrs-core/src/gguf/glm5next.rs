@@ -1,10 +1,12 @@
-//! GLM-5.3-Flash tensor families. The forward is not registered: KDA, the
-//! indexer pool, and absorbed sparse attention still have to consume these.
+//! GLM-5.3-Flash tensor families, checked by the tests below. `glm5next_model`
+//! loads them and runs the forward.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
 /// Tensor suffixes a `glm5-next` GGUF has to contain. The last block is the
 /// draft head and does not carry `hc_*`.
+#[cfg(test)]
 pub(crate) const REQUIRED_TENSORS: &[&str] = &[
     "attn_k.weight",
     "attn_k_b.weight",
@@ -63,6 +65,7 @@ pub(crate) const REQUIRED_TENSORS: &[&str] = &[
     "token_embd.weight",
 ];
 
+#[cfg(test)]
 pub(crate) fn missing_tensors<'a>(present: &HashSet<&str>) -> Vec<&'a str> {
     REQUIRED_TENSORS
         .iter()

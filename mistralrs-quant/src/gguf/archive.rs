@@ -1529,7 +1529,9 @@ mod tests {
 
     #[test]
     fn dequantize_rows_reads_only_the_selected_q2k_rows() -> Result<()> {
-        let values: Vec<f32> = (0..4 * 256).map(|index| (index as f32) * 0.01 - 5.0).collect();
+        let values: Vec<f32> = (0..4 * 256)
+            .map(|index| (index as f32) * 0.01 - 5.0)
+            .collect();
         let source = Tensor::from_vec(values, (4, 256), &Device::Cpu)?;
         let quantized = candle_core::quantized::QTensor::quantize(&source, GgmlDType::Q2K)?;
         let file = write_test_gguf(
