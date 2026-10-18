@@ -62,6 +62,9 @@ pub(crate) struct GgufTokenizerConversion {
     pub bos: Option<String>,
     pub eos: Option<String>,
     pub unk: Option<String>,
+    /// Tokens the GGUF declares as ending a turn besides `eos`: `eot_token_id` and
+    /// `eom_token_id`. Generation stops on them too, as llama.cpp does.
+    pub end_of_turn: Vec<String>,
 }
 
 struct GgufTokenizerMetadata {
@@ -69,6 +72,7 @@ struct GgufTokenizerMetadata {
     bos: Option<u32>,
     eos: Option<u32>,
     unk: Option<u32>,
+    end_of_turn: Vec<u32>,
 }
 
 impl GgufTokenizerMetadata {
@@ -88,12 +92,23 @@ impl GgufTokenizerMetadata {
             bos: metadata.get_option_value("bos_token_id")?,
             eos: metadata.get_option_value("eos_token_id")?,
             unk: metadata.get_option_value("unknown_token_id")?,
+            end_of_turn: end_of_turn_ids(
+                metadata.get_option_value("eot_token_id")?,
+                metadata.get_option_value("eom_token_id")?,
+            ),
         };
+        let end_of_turn = result
+            .end_of_turn
+            .iter()
+            .map(|id| ("end-of-turn", Some(*id)));
         for (name, id) in [
             ("bos", result.bos),
             ("eos", result.eos),
             ("unknown", result.unk),
-        ] {
+        ]
+        .into_iter()
+        .chain(end_of_turn)
+        {
             if let Some(id) = id {
                 anyhow::ensure!(
                     (id as usize) < result.tokens.len(),
@@ -103,6 +118,13 @@ impl GgufTokenizerMetadata {
             }
         }
         Ok(result)
+    }
+
+    fn end_of_turn_tokens(&self) -> Vec<String> {
+        self.end_of_turn
+            .iter()
+            .map(|id| self.tokens[*id as usize].clone())
+            .collect()
     }
 
     fn token(&self, id: Option<u32>) -> Option<String> {
@@ -134,7 +156,15 @@ pub(crate) fn validate_external_gguf_tokenizer(
         bos: metadata.token(metadata.bos),
         eos: metadata.token(metadata.eos),
         unk: metadata.token(metadata.unk),
+        end_of_turn: metadata.end_of_turn_tokens(),
     })
+}
+
+/// `eot_token_id` and `eom_token_id`, without duplicates.
+fn end_of_turn_ids(eot: Option<u32>, eom: Option<u32>) -> Vec<u32> {
+    let mut ids: Vec<u32> = eot.into_iter().chain(eom).collect();
+    ids.dedup();
+    ids
 }
 
 struct PropsGGUF {
@@ -147,6 +177,7 @@ struct PropsGGUF {
     unk: Option<u32>,
     bos: Option<u32>,
     eos: u32,
+    end_of_turn: Vec<u32>,
     add_bos: bool,
     add_space_prefix: bool,
 }
@@ -168,6 +199,10 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             unk: c.get_value("unknown_token_id").ok(),
             eos: c.get_value("eos_token_id")?,
             bos: c.get_value("bos_token_id").ok(),
+            end_of_turn: end_of_turn_ids(
+                c.get_option_value("eot_token_id")?,
+                c.get_option_value("eom_token_id")?,
+            ),
             add_bos: c.get_option_value("add_bos_token")?.unwrap_or(false),
             add_space_prefix: c.get_option_value("add_space_prefix")?.unwrap_or(false),
         };
@@ -188,6 +223,9 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
         }
         if let Some(unk) = props.unk {
             check("unk", unk)?;
+        }
+        for id in &props.end_of_turn {
+            check("end-of-turn", *id)?;
         }
 
         Ok(props)
@@ -271,6 +309,11 @@ pub(crate) fn convert_gguf_metadata_to_hf_tokenizer(
         bos,
         eos: Some(props.tokens[props.eos as usize].clone()),
         unk,
+        end_of_turn: props
+            .end_of_turn
+            .iter()
+            .map(|id| props.tokens[*id as usize].clone())
+            .collect(),
     })
 }
 
@@ -848,6 +891,7 @@ mod tests {
             unk: None,
             bos: None,
             eos: 0,
+            end_of_turn: Vec::new(),
             add_bos: false,
             add_space_prefix: false,
         }
@@ -888,6 +932,37 @@ mod tests {
         assert_eq!(conversion.bos.as_deref(), Some("a"));
         assert_eq!(conversion.eos.as_deref(), Some("<eos>"));
         assert_eq!(conversion.unk.as_deref(), Some("b"));
+    }
+
+    /// GLM-5.3-Flash declares `<|user|>` as `eot_token_id` and `<|observation|>` as
+    /// `eom_token_id`. Both end a turn, and an id outside the vocabulary is refused.
+    #[test]
+    fn end_of_turn_tokens_come_from_eot_and_eom_ids() {
+        let tokens = ["<eos>", "a", "b", "<|user|>", "<|observation|>"];
+        let mut metadata = tokenizer_metadata(&tokens);
+        metadata.insert("tokenizer.ggml.eot_token_id".to_string(), Value::U32(3));
+        metadata.insert("tokenizer.ggml.eom_token_id".to_string(), Value::U32(4));
+        let conversion =
+            validate_external_gguf_tokenizer(tokenizer_with_tokens(&tokens), &metadata).unwrap();
+        assert_eq!(conversion.end_of_turn, ["<|user|>", "<|observation|>"]);
+
+        let plain = validate_external_gguf_tokenizer(
+            tokenizer_with_tokens(&tokens),
+            &tokenizer_metadata(&tokens),
+        )
+        .unwrap();
+        assert!(plain.end_of_turn.is_empty(), "{:?}", plain.end_of_turn);
+
+        metadata.insert("tokenizer.ggml.eot_token_id".to_string(), Value::U32(9));
+        let error = validate_external_gguf_tokenizer(tokenizer_with_tokens(&tokens), &metadata)
+            .err()
+            .expect("an out-of-range end-of-turn id must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("`end-of-turn` token id 9 is out of bounds for vocab size 5"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -984,6 +1059,7 @@ mod tests {
             unk: Some(3),
             bos: Some(2),
             eos: 1,
+            end_of_turn: Vec::new(),
             add_bos,
             add_space_prefix,
         }

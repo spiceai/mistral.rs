@@ -1505,6 +1505,7 @@ impl Loader for GGUFLoader {
             bos,
             eos,
             unk,
+            end_of_turn,
         } = tokenizer.conversion;
 
         // Only load gguf chat template if there is nothing else
@@ -1634,7 +1635,16 @@ impl Loader for GGUFLoader {
         let generation_defaults = gen_conf
             .as_ref()
             .and_then(GenerationConfig::generation_defaults);
-        let eos = calculate_eos_tokens(&chat_template, gen_conf.as_ref(), &tokenizer);
+        let mut eos = calculate_eos_tokens(&chat_template, gen_conf.as_ref(), &tokenizer);
+        // GLM ends a turn with `<|user|>`, its `eot_token_id`; without it the reply ran on
+        // into an invented next turn.
+        for token in &end_of_turn {
+            if let Some(id) = tokenizer.token_to_id(token) {
+                if !eos.contains(&id) {
+                    eos.push(id);
+                }
+            }
+        }
         Ok(Arc::new(Mutex::new(GGUFPipeline {
             model,
             tokenizer: tokenizer.into(),
@@ -1910,6 +1920,7 @@ mod tests {
             bos: None,
             eos: Some(marker.to_string()),
             unk: None,
+            end_of_turn: Vec::new(),
         }
     }
 
