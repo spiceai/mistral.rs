@@ -220,6 +220,9 @@ pub struct Engine {
     pub(crate) file_store: crate::files::FileStore,
     // Re-runs the decode graph precapture after the recurrent pool grows and drops every graph
     pub(crate) graph_precapture_ctx: Option<DecodeGraphPrecaptureCtx>,
+    /// Captured at construction, while `RING_CONFIG` is set. A later load may
+    /// clear the variable; the ring sockets still exist.
+    ring_configured: bool,
     #[cfg(feature = "cuda")]
     cuda_decode_enabled: bool,
 }
@@ -738,6 +741,7 @@ impl Engine {
             session_store,
             file_store,
             graph_precapture_ctx,
+            ring_configured: mistralrs_quant::distributed::use_ring(),
             #[cfg(feature = "cuda")]
             cuda_decode_enabled,
         })
@@ -1221,6 +1225,13 @@ impl Engine {
                     let scheduler = get_mut_arcmutex!(self.scheduler);
                     scheduler.waiting_len() + scheduler.running_len()
                 };
+                // Replication waits until every worker connects. Workers connect
+                // only after the request they are already running finishes, so
+                // admitting another one here blocks the head inside `accept`
+                // and the workers deadlock on the next ring all-reduce.
+                if ring_defers_new_workload(self.ring_configured, active_sequences) {
+                    break;
+                }
                 let request = if decode_batch_leased {
                     pending.pop_admissible_workload(active_sequences)
                 } else {
@@ -2336,5 +2347,27 @@ impl Engine {
                 writer.write_all(req.as_bytes()).unwrap();
             }
         }
+    }
+}
+
+/// True when a new workload must stay queued.
+///
+/// Ring workers dial the head for the next request only after they finish the
+/// one they are running. Dispatching during that window blocks the head in
+/// `accept` and stops the forward those workers are still inside.
+pub(crate) fn ring_defers_new_workload(ring_configured: bool, active_sequences: usize) -> bool {
+    ring_configured && active_sequences > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ring_defers_new_workload;
+
+    #[test]
+    fn ring_keeps_a_second_request_queued_while_one_is_active() {
+        assert!(!ring_defers_new_workload(true, 0));
+        assert!(ring_defers_new_workload(true, 1));
+        assert!(ring_defers_new_workload(true, 4));
+        assert!(!ring_defers_new_workload(false, 3));
     }
 }
