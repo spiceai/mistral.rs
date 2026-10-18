@@ -33,12 +33,13 @@ rust-version = "1.94"
 [workspace.dependencies]
 # spiceai/candle lock-step with huggingface/candle 66a8cf18 (mistral.rs v0.9.4),
 # plus the i-quant and MXFP4 dequant patches.
-# 2a6ec204 is 4fc320cf (row dequant) plus the fp8 unary `#if __CUDA_ARCH__ >= 890` guard.
-candle-core = { git = "https://github.com/spiceai/candle.git", rev = "2a6ec204bfad5933332b5b053738e55bd61875be" }
-candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "2a6ec204bfad5933332b5b053738e55bd61875be" }
-candle-flash-attn-v3 = { git = "https://github.com/spiceai/candle.git", rev = "2a6ec204bfad5933332b5b053738e55bd61875be" }
-candle-flash-attn = { git = "https://github.com/spiceai/candle.git", rev = "2a6ec204bfad5933332b5b053738e55bd61875be" }
-candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "2a6ec204bfad5933332b5b053738e55bd61875be" }
+# 3af9fcd7 is the merge of spiceai/candle#18 into `spiceai`: 4fc320cf (row dequant) plus the
+# fp8 unary `#if __CUDA_ARCH__ >= 890` guard.
+candle-core = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" }
+candle-nn = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" }
+candle-flash-attn-v3 = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" }
+candle-flash-attn = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" }
+candle-metal-kernels = { git = "https://github.com/spiceai/candle.git", rev = "3af9fcd7c5feaad2ea30218a3872cd7c446d9dfb" }
 
 axum = "0.8.8"
 http-body-util = "0.1.3"
