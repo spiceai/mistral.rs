@@ -143,6 +143,9 @@ impl<'de> Deserialize<'de> for ReasoningEffort {
 }
 
 /// Default thinking toggle when neither reasoning control is provided.
+///
+/// Chat templates do not receive it: an unspecified toggle stays undefined there, so each
+/// template applies its own default.
 pub const DEFAULT_ENABLE_THINKING: bool = true;
 
 /// Effective reasoning controls after validating their relationship.

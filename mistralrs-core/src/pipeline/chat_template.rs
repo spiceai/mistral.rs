@@ -830,6 +830,14 @@ pub fn apply_chat_template_to(
         .reasoning_effort
         .map(|effort| Value::from(effort.as_str()))
         .unwrap_or(Value::UNDEFINED);
+    // A request that sets neither control leaves `enable_thinking` undefined, so the
+    // template applies its own default, as Hugging Face transformers renders it. Qwen3
+    // templates then think and DeepSeek-V4.1's answers directly.
+    let enable_thinking_value = if enable_thinking.is_none() && reasoning_effort.is_none() {
+        Value::UNDEFINED
+    } else {
+        Value::from(reasoning_controls.enable_thinking)
+    };
 
     // Detect builtin tools from the tools list
     // Known builtin tools for GPT-OSS/Harmony format: "browser", "python"
@@ -865,7 +873,7 @@ pub fn apply_chat_template_to(
             eos_token => eos_tok,
             unk_token => unk_tok,
             date_string => date_string,
-            enable_thinking => reasoning_controls.enable_thinking,
+            enable_thinking => &enable_thinking_value,
             reasoning_effort => &reasoning_effort_value,
             reasoning_strength => &reasoning_effort_value,
         })?
@@ -883,7 +891,7 @@ pub fn apply_chat_template_to(
             tools => tools,
             builtin_tools => builtin_tools,
             date_string => date_string,
-            enable_thinking => reasoning_controls.enable_thinking,
+            enable_thinking => &enable_thinking_value,
             reasoning_effort => &reasoning_effort_value,
             reasoning_strength => &reasoning_effort_value,
         })?
@@ -918,9 +926,7 @@ mod tests {
         template_tool_call_format, ChatTemplate, ChatTemplateValue, GenerationConfig,
         ReasoningEffort,
     };
-    use crate::{
-        tools::ToolCallFormat, Function, MessageContent, Tool, ToolType, DEFAULT_ENABLE_THINKING,
-    };
+    use crate::{tools::ToolCallFormat, Function, MessageContent, Tool, ToolType};
     use tokenizers::Tokenizer;
 
     fn user_text_message(text: &str) -> IndexMap<String, MessageContent> {
@@ -1162,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn unspecified_thinking_enables_template_thinking() {
+    fn unspecified_thinking_leaves_the_template_default() {
         let template = ChatTemplateValue(Either::Left(
             "{% if enable_thinking is defined and enable_thinking %}<|think|>{% endif %}{{ bos_token }}{{ messages[0]['content'] }}".to_string(),
         ));
@@ -1193,9 +1199,35 @@ mod tests {
         )
         .unwrap();
 
-        const { assert!(DEFAULT_ENABLE_THINKING) };
-        assert_eq!(rendered, "<|think|><bos>hello");
-        assert_eq!(rendered, enabled);
+        assert_eq!(rendered, "<bos>hello");
+        assert_eq!(enabled, "<|think|><bos>hello");
+    }
+
+    /// Templates disagree on their default. Qwen3 thinks unless told not to; DeepSeek-V4.1
+    /// answers directly unless told to think. Leaving the flag unset keeps each one's.
+    #[test]
+    fn unspecified_thinking_keeps_each_template_default() {
+        let render = |template: &str, enable_thinking: Option<bool>| {
+            apply_chat_template_to(
+                vec![user_text_message("hello")],
+                true,
+                enable_thinking,
+                None,
+                &ChatTemplateValue(Either::Left(template.to_string())),
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .unwrap()
+        };
+        let qwen = "{{ messages[0]['content'] }}|{% if enable_thinking is defined and enable_thinking is false %}<think></think>{% endif %}";
+        let deepseek = "{{ messages[0]['content'] }}|{% if enable_thinking is defined and enable_thinking %}<think>{% else %}</think>{% endif %}";
+
+        assert_eq!(render(qwen, None), "hello|");
+        assert_eq!(render(qwen, Some(false)), "hello|<think></think>");
+        assert_eq!(render(deepseek, None), "hello|</think>");
+        assert_eq!(render(deepseek, Some(true)), "hello|<think>");
     }
 
     #[test]
@@ -1218,7 +1250,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(rendered, "no-effort:no-strength:enabled");
+        assert_eq!(rendered, "no-effort:no-strength:disabled");
     }
 
     #[test]
