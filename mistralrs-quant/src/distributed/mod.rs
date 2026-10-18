@@ -181,7 +181,7 @@ impl Comm {
         }
 
         #[cfg(feature = "ring")]
-        {
+        if use_ring() {
             return Ok(Self::Ring(ring::RingComm::from_device(
                 id, dev, rank, world_size,
             )?));
