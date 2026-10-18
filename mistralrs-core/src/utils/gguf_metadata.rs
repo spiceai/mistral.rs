@@ -19,6 +19,44 @@ use crate::GGUFArchitecture;
 /// Matches the default in [`crate::gguf::glm_moe`].
 const GLM_DSA_DEFAULT_MLA_HEAD_DIM: usize = 256;
 
+/// One GGUF integer, or the widest entry of a per-layer integer array.
+///
+/// `head_count_kv` is a scalar on most architectures and an array of signed
+/// layer counts on `glm5-next` (KDA layers are 0, DSA layers are 1). The
+/// device map needs a single head count; the model itself still reads the array.
+fn metadata_count(value: &gguf_file::Value) -> candle_core::Result<usize> {
+    match value {
+        gguf_file::Value::Array(items) => {
+            if items.is_empty() {
+                candle_core::bail!("GGUF integer array is empty");
+            }
+            let mut widest = 0usize;
+            for item in items {
+                widest = widest.max(metadata_scalar(item)?);
+            }
+            Ok(widest)
+        }
+        other => metadata_scalar(other),
+    }
+}
+
+fn metadata_scalar(value: &gguf_file::Value) -> candle_core::Result<usize> {
+    use gguf_file::Value;
+    let number = match value {
+        Value::U8(number) => u64::from(*number),
+        Value::U16(number) => u64::from(*number),
+        Value::U32(number) => u64::from(*number),
+        Value::U64(number) => *number,
+        Value::I8(number) if *number >= 0 => u64::from(*number as u8),
+        Value::I16(number) if *number >= 0 => u64::from(*number as u16),
+        Value::I32(number) if *number >= 0 => u64::from(*number as u32),
+        Value::I64(number) if *number >= 0 => *number as u64,
+        Value::Bool(number) => u64::from(*number),
+        other => candle_core::bail!("not a nonnegative GGUF integer {other:?}"),
+    };
+    usize::try_from(number).map_err(candle_core::Error::wrap)
+}
+
 #[derive(Debug)]
 pub struct ContentConfig {
     max_seq_len: usize,
@@ -38,9 +76,8 @@ impl<'a, R: std::io::Seek + std::io::Read> From<&Content<'a, R>> for ContentConf
         let num_attn_heads = metadata[&format!("{arch}.attention.head_count")]
             .to_u64()
             .unwrap() as usize;
-        let mut num_kv_heads = metadata[&format!("{arch}.attention.head_count_kv")]
-            .to_u64()
-            .unwrap() as usize;
+        let mut num_kv_heads =
+            metadata_count(&metadata[&format!("{arch}.attention.head_count_kv")]).unwrap();
         let mut key_length = metadata
             .get(&format!("{arch}.attention.key_length"))
             .map(|x| x.to_u64().unwrap() as usize);
@@ -914,6 +951,23 @@ mod split_kv_heads_tests {
         let mut cfg = config(2);
         cfg.split_kv_heads(0, 3);
         assert_eq!(cfg.num_kv_heads, 2);
+    }
+
+    #[test]
+    fn per_layer_kv_head_array_uses_the_widest_layer() {
+        use candle_core::quantized::gguf_file::Value;
+        let array = Value::Array(vec![
+            Value::I32(0),
+            Value::I32(0),
+            Value::I32(0),
+            Value::I32(1),
+        ]);
+        assert_eq!(super::metadata_count(&array).expect("array"), 1);
+        assert_eq!(
+            super::metadata_count(&Value::U32(64)).expect("scalar"),
+            64
+        );
+        assert!(super::metadata_count(&Value::Array(vec![])).is_err());
     }
 
     #[test]
