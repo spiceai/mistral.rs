@@ -298,7 +298,12 @@ pub(crate) fn engram_apply(
         .reshape((lead, hc, hidden))?;
     let value = kv.narrow(1, hc * hidden, hidden)?;
     let hf = h.reshape((lead, hc, hidden))?.to_dtype(DType::F32)?;
-    let qk = (q_weight.to_dtype(DType::F32)? * k_weight.to_dtype(DType::F32)?)?.transpose(0, 1)?;
+    // GGUF stores these as `[hc, hidden]`, which broadcasts onto `hf`.
+    // `[hidden, hc]` is the other orientation and is transposed into place.
+    let mut qk = (q_weight.to_dtype(DType::F32)? * k_weight.to_dtype(DType::F32)?)?;
+    if qk.dims() == [hidden, hc] {
+        qk = qk.t()?.contiguous()?;
+    }
     let h_var = hf.sqr()?.mean_keepdim(D::Minus1)?;
     let k_var = key.sqr()?.mean_keepdim(D::Minus1)?;
     let rstd = (h_var + eps)?.sqrt()?.recip()?;
