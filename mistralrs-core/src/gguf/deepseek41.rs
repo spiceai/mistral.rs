@@ -126,6 +126,11 @@ pub(crate) fn engram_row_ids(
 }
 
 pub(crate) fn rmsnorm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    // A warmup step can hand this a zero-length sequence. CUDA's reduction
+    // divides by the output size and panics when that size is zero.
+    if x.dims().contains(&0) {
+        return Ok(x.clone());
+    }
     let xf = x.to_dtype(DType::F32)?;
     let variance = xf.sqr()?.mean_keepdim(D::Minus1)?;
     let normed = xf.broadcast_div(&(variance + eps)?.sqrt()?)?;
@@ -506,6 +511,15 @@ mod tests {
         let same_start =
             engram_row_ids(&[4], &token_map, 0, 1, 2, 2, &multipliers, &primes, &offsets).unwrap();
         assert_eq!(first[..2], same_start[..]);
+    }
+
+    #[test]
+    fn rmsnorm_of_an_empty_sequence_does_not_reduce() {
+        let device = Device::Cpu;
+        let x = Tensor::zeros((1, 0, 4), DType::F32, &device).unwrap();
+        let weight = Tensor::ones((4,), DType::F32, &device).unwrap();
+        let out = super::rmsnorm(&x, &weight, 1e-6).unwrap();
+        assert_eq!(out.dims(), &[1, 0, 4]);
     }
 
     #[test]
