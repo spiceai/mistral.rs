@@ -1351,38 +1351,47 @@ impl Loader for GGUFLoader {
         let arch = model.arch();
         validate_legacy_gguf_adapter_qk_layout(arch)?;
 
-        // If auto, convert to Map
+        // If auto, convert to Map. A ring load replaces this mapper with the
+        // tensor-parallel communicator below, so sizing the whole file against
+        // one device would reject a model that fits only when sharded.
         let num_layers = model.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
 
-        if let DeviceMapSetting::Auto(params) = mapper.clone() {
-            let devices = device_map::get_all_similar_devices(device)?;
-            // Initial dtype
-            let dtype = dtype.try_into_dtype(&devices.iter().collect::<Vec<_>>())?;
+        if !mistralrs_quant::distributed::use_ring() {
+            if let DeviceMapSetting::Auto(params) = mapper.clone() {
+                let devices = device_map::get_all_similar_devices(device)?;
+                // Initial dtype
+                let dtype = dtype.try_into_dtype(&devices.iter().collect::<Vec<_>>())?;
 
-            let model = GgufDeviceMapLoaderInner {
-                model: &model,
-                arch,
-            };
+                let model = GgufDeviceMapLoaderInner {
+                    model: &model,
+                    arch,
+                };
 
-            let layer_sizes_in_bytes =
-                model.layer_sizes_in_bytes("this is a dummy config!", dtype, 1, None)?;
-            let non_mapped_size_in_bytes =
-                model.non_mapped_size_in_bytes("this is a dummy config!", dtype, 1, None, None)?;
-            let total_model_size_in_bytes =
-                layer_sizes_in_bytes.iter().sum::<usize>() + non_mapped_size_in_bytes;
+                let layer_sizes_in_bytes =
+                    model.layer_sizes_in_bytes("this is a dummy config!", dtype, 1, None)?;
+                let non_mapped_size_in_bytes = model.non_mapped_size_in_bytes(
+                    "this is a dummy config!",
+                    dtype,
+                    1,
+                    None,
+                    None,
+                )?;
+                let total_model_size_in_bytes =
+                    layer_sizes_in_bytes.iter().sum::<usize>() + non_mapped_size_in_bytes;
 
-            let new = model.get_device_layers(
-                "this is a dummy config!",
-                num_layers,
-                layer_sizes_in_bytes,
-                non_mapped_size_in_bytes,
-                total_model_size_in_bytes,
-                &devices,
-                dtype,
-                &params,
-                None,
-            )?;
-            mapper = DeviceMapSetting::Map(new);
+                let new = model.get_device_layers(
+                    "this is a dummy config!",
+                    num_layers,
+                    layer_sizes_in_bytes,
+                    non_mapped_size_in_bytes,
+                    total_model_size_in_bytes,
+                    &devices,
+                    dtype,
+                    &params,
+                    None,
+                )?;
+                mapper = DeviceMapSetting::Map(new);
+            }
         }
 
         #[cfg(feature = "cuda")]

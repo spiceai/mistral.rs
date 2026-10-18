@@ -1402,6 +1402,42 @@ mod tests {
     }
 
     #[test]
+    fn device_map_sizing_returns_the_stored_bytes() {
+        let file = write_gguf(&base_meta(0), &tiny_weights(0.1, false));
+        let mut opened = vec![std::fs::File::open(file.path()).expect("open tiny gguf")];
+        let mut readers: Vec<&mut std::fs::File> = opened.iter_mut().collect();
+        let model = crate::gguf::Content::from_readers(&mut readers).expect("read tiny gguf");
+        let loader = crate::utils::gguf_metadata::GgufDeviceMapLoaderInner {
+            model: &model,
+            arch: model.arch(),
+        };
+        let layers = crate::pipeline::DeviceMappedModelLoader::layer_sizes_in_bytes(
+            &loader,
+            "cfg",
+            DType::F32,
+            1,
+            None,
+        )
+        .expect("deepseek41 layer sizes");
+        assert_eq!(layers.len(), 1);
+        let non_mapped = crate::pipeline::DeviceMappedModelLoader::non_mapped_size_in_bytes(
+            &loader,
+            "cfg",
+            DType::F32,
+            1,
+            None,
+            None,
+        )
+        .expect("deepseek41 non-mapped size");
+        let layered = model.quantized_storage_bytes(|name| name.starts_with("blk."));
+        let global = model.quantized_storage_bytes(|name| !name.starts_with("blk."));
+        assert_eq!(layers[0], layered);
+        assert_eq!(non_mapped, global);
+        assert!(layers[0] > 0);
+        assert!(non_mapped > 0);
+    }
+
+    #[test]
     fn quantized_experts_change_the_logits_and_a_missing_stack_fails() {
         let file = write_gguf(&base_meta(0), &tiny_weights(0.1, false));
         let model = load(&file);

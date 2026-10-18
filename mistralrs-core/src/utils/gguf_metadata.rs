@@ -432,6 +432,11 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 };
                 token_embd + output_norm + output
             }
+            // Embeddings, the final norm, and the LM head sit outside `blk.*`.
+            // Everything else in these graphs is a layer tensor.
+            GGUFArchitecture::DeepSeek41 | GGUFArchitecture::Glm5Next => self
+                .model
+                .quantized_storage_bytes(|name| !name.starts_with("blk.")),
             _ => unimplemented!(),
         };
         Ok(size_in_bytes)
@@ -836,6 +841,20 @@ impl DeviceMappedModelLoader for GgufDeviceMapLoaderInner<'_, '_> {
                 let world_size =
                     mistralrs_quant::distributed::get_global_tp_size_from_devices().unwrap_or(1);
                 (attn + indexer + ffn) / world_size.max(1)
+            }
+
+            // One average layer, then the same world-size split `GlmDsa` uses.
+            // Expert stacks dominate; attention that stays replicated is a small
+            // over-divide. The sum across `num_layers` is the `blk.*` storage
+            // divided by the tensor-parallel world size.
+            GGUFArchitecture::DeepSeek41 | GGUFArchitecture::Glm5Next => {
+                let layers = self.num_layers(config)?.max(1);
+                let layered = self
+                    .model
+                    .quantized_storage_bytes(|name| name.starts_with("blk."));
+                let world_size =
+                    mistralrs_quant::distributed::get_global_tp_size_from_devices().unwrap_or(1);
+                layered / layers / world_size.max(1)
             }
 
             _ => unimplemented!(),
