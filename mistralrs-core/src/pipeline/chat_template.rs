@@ -947,6 +947,35 @@ mod tests {
         assert!(invalid.validate_token_ids(4).is_err());
     }
 
+    /// Hugging Face renders chat templates with Jinja's `loopcontrols` extension, and
+    /// released templates rely on it (GLM-5.3-Flash uses `{% break %}` seven times).
+    #[test]
+    fn templates_may_break_and_continue_loops() {
+        let template = ChatTemplateValue(Either::Left(
+            "{% for m in messages %}{% if loop.index == 2 %}{% continue %}{% endif %}\
+             {{ m['content'] }};{% if loop.index == 3 %}{% break %}{% endif %}{% endfor %}"
+                .to_string(),
+        ));
+        let rendered = apply_chat_template_to(
+            vec![
+                user_text_message("one"),
+                user_text_message("two"),
+                user_text_message("three"),
+                user_text_message("four"),
+            ],
+            false,
+            None,
+            None,
+            &template,
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("a template with loop controls renders");
+        assert_eq!(rendered, "one;three;");
+    }
+
     #[test]
     fn intentional_template_rejections_keep_validation_identity() {
         let template = ChatTemplateValue(Either::Left(
