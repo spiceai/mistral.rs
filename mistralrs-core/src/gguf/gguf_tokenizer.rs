@@ -366,7 +366,8 @@ fn bpe_pre_tokenizer_spec(pre: Option<&str>) -> Result<BpePreTokenizerSpec> {
             ignore_merges: false,
             normalize_nfc: false,
         },
-        "deepseek-v3" | "hunyuan-dense" => BpePreTokenizerSpec {
+        // llama.cpp's JOYAI_LLM pre-type uses the DeepSeek-V3 regex set.
+        "deepseek-v3" | "hunyuan-dense" | "joyai-llm" => BpePreTokenizerSpec {
             kind: BpePreTokenizerKind::DeepSeekV3,
             regexes: DEEPSEEK_V3_REGEXES,
             ignore_merges: false,
@@ -1174,6 +1175,13 @@ mod tests {
                 false,
                 3,
             ),
+            (
+                "joyai-llm",
+                BpePreTokenizerKind::DeepSeekV3,
+                false,
+                false,
+                3,
+            ),
             ("hunyuan", BpePreTokenizerKind::Qwen2, false, false, 1),
             ("gpt-4o", BpePreTokenizerKind::Gpt4O, false, false, 1),
             ("tekken", BpePreTokenizerKind::Tekken, true, false, 1),
@@ -1187,6 +1195,9 @@ mod tests {
             assert_eq!(spec.regexes.len(), regex_count, "{pre}");
             bpe_tokenizer(&test_bpe_props(Some(pre)))?;
         }
+        let joyai = bpe_pre_tokenizer_spec(Some("joyai-llm"))?;
+        let deepseek_v3 = bpe_pre_tokenizer_spec(Some("deepseek-v3"))?;
+        assert_eq!(joyai.regexes, deepseek_v3.regexes);
         Ok(())
     }
 
