@@ -113,8 +113,31 @@ struct Indexer {
     k_norm: Option<Tensor>,
 }
 
+/// The Engram table stays in the GGUF map. A token reads a few rows; copying the
+/// whole table (tens of GiB, once per rank) does not fit next to the expert shard.
+struct EngramTable {
+    archive: Arc<GgufArchive>,
+    name: String,
+}
+
+impl EngramTable {
+    fn gather(&self, ids: &Tensor) -> Result<Tensor> {
+        let flat = ids
+            .flatten_all()?
+            .to_dtype(DType::U32)?
+            .to_device(&Device::Cpu)?
+            .to_vec1::<u32>()?;
+        let rows = self
+            .archive
+            .dequantize_rows(&self.name, &flat, ids.device())?;
+        let mut shape = ids.dims().to_vec();
+        shape.push(rows.dim(D::Minus1)?);
+        rows.reshape(shape)
+    }
+}
+
 struct EngramLayer {
-    table: Arc<dyn QuantMethod>,
+    table: EngramTable,
     wkv: Tensor,
     q: Tensor,
     k: Tensor,
@@ -335,7 +358,10 @@ impl ModelWeights {
                 require(&archive, &blk(layer, "engram_q.weight"))?;
                 require(&archive, &blk(layer, "engram_k.weight"))?;
                 Some(EngramLayer {
-                    table: linear(&archive, &blk(layer, "engram_embd.weight"), device)?,
+                    table: EngramTable {
+                        archive: archive.clone(),
+                        name: blk(layer, "engram_embd.weight"),
+                    },
                     wkv: dense(&archive, &blk(layer, "engram_wkv.weight"), device)?,
                     q: dense(&archive, &blk(layer, "engram_q.weight"), device)?,
                     k: dense(&archive, &blk(layer, "engram_k.weight"), device)?,
@@ -906,7 +932,7 @@ fn apply_engram(
         }
     }
     let flat = Tensor::from_vec(flat, (h.dim(0)?, seq, cols), device)?;
-    let rows = layer.table.embedding_forward(&flat, DType::F32)?;
+    let rows = layer.table.gather(&flat)?;
     let rows = rows.reshape((h.dim(0)?, seq, cols * hash.key_length))?;
     engram_apply(h, &rows, &layer.wkv, &layer.q, &layer.k, f64::from(eps))
 }

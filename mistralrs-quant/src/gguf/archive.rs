@@ -18,7 +18,7 @@ use candle_core::{
         },
         GgmlDType, QStorage, QTensor,
     },
-    Device, Error, Result,
+    Device, Error, Result, Tensor,
 };
 use half::{bf16, f16};
 use memmap2::{Mmap, MmapOptions};
@@ -571,6 +571,61 @@ impl GgufArchive {
             info.shape.clone(),
             device,
         )
+    }
+
+    /// Dequantize selected rows of a packed matrix without copying the other rows.
+    ///
+    /// `shape` is `[row_count, ...]`, and the trailing dimensions are one contiguous
+    /// packed row. The returned tensor is `[rows.len(), ...]` on `device`.
+    pub fn dequantize_rows(&self, name: &str, rows: &[u32], device: &Device) -> Result<Tensor> {
+        let info = self.tensor_info(name)?;
+        let shape = info.shape();
+        if shape.len() < 2 {
+            candle_core::bail!("GGUF tensor `{name}` has no row dimension to gather");
+        }
+        let row_count = shape[0];
+        let row_elems: usize = shape[1..].iter().try_fold(1usize, |count, dim| {
+            count
+                .checked_mul(*dim)
+                .ok_or_else(|| Error::msg(format!("GGUF tensor `{name}` row size overflow")))
+        })?;
+        let dtype = info.dtype().candle_dtype()?;
+        let block = dtype.block_size();
+        if block == 0 || !row_elems.is_multiple_of(block) {
+            candle_core::bail!(
+                "GGUF tensor `{name}` row of {row_elems} elements is not a whole {dtype:?} block"
+            );
+        }
+        let row_bytes = (row_elems / block)
+            .checked_mul(dtype.type_size())
+            .ok_or_else(|| Error::msg(format!("GGUF tensor `{name}` row byte size overflow")))?;
+        if self.shards[info.shard_index()].endian() != GgufEndian::Little {
+            candle_core::bail!("big-endian GGUF tensor loading is not supported");
+        }
+        let data = self.tensor_data(name)?;
+        let bytes = data.bytes();
+        let mut packed = Vec::with_capacity(rows.len().saturating_mul(row_bytes));
+        for &row in rows {
+            let row = usize::try_from(row).map_err(Error::wrap)?;
+            if row >= row_count {
+                candle_core::bail!("GGUF tensor `{name}` row {row} is outside {row_count}");
+            }
+            let start = row
+                .checked_mul(row_bytes)
+                .ok_or_else(|| Error::msg(format!("GGUF tensor `{name}` row offset overflow")))?;
+            let end = start + row_bytes;
+            if end > bytes.len() {
+                candle_core::bail!(
+                    "GGUF tensor `{name}` row {row} needs bytes {start}..{end}, but only {} are mapped",
+                    bytes.len()
+                );
+            }
+            packed.extend_from_slice(&bytes[start..end]);
+        }
+        let mut dims = shape.to_vec();
+        dims[0] = rows.len();
+        let gathered = qtensor_from_gguf_data(dtype, &packed, dims, &Device::Cpu)?;
+        gathered.dequantize(&Device::Cpu)?.to_device(device)
     }
 }
 
@@ -1312,6 +1367,7 @@ mod tests {
 
     use byteorder::{LittleEndian, WriteBytesExt};
     use candle_core::quantized::GgmlDType;
+    use candle_core::Tensor;
     use tempfile::NamedTempFile;
 
     use super::*;
@@ -1469,6 +1525,32 @@ mod tests {
             assert_eq!(catalog.block_size(), Some(dtype.block_size()), "{dtype:?}");
             assert_eq!(catalog.type_size(), Some(dtype.type_size()), "{dtype:?}");
         }
+    }
+
+    #[test]
+    fn dequantize_rows_reads_only_the_selected_q2k_rows() -> Result<()> {
+        let values: Vec<f32> = (0..4 * 256).map(|index| (index as f32) * 0.01 - 5.0).collect();
+        let source = Tensor::from_vec(values, (4, 256), &Device::Cpu)?;
+        let quantized = candle_core::quantized::QTensor::quantize(&source, GgmlDType::Q2K)?;
+        let file = write_test_gguf(
+            &base_metadata(),
+            &[TestTensor {
+                name: "blk.1.engram_embd.weight",
+                shape: vec![4, 256],
+                dtype: 10,
+                data: quantized.data()?.to_vec(),
+                offset: None,
+            }],
+            DEFAULT_ALIGNMENT,
+        );
+        let archive = GgufArchive::open_file(file.path())?;
+        let got = archive.dequantize_rows("blk.1.engram_embd.weight", &[3, 1], &Device::Cpu)?;
+        let full = quantized.dequantize(&Device::Cpu)?;
+        let index = Tensor::from_vec(vec![3u32, 1], (2,), &Device::Cpu)?;
+        let expected = full.index_select(&index, 0)?;
+        assert_eq!(got.dims(), &[2, 256]);
+        assert_eq!(got.to_vec2::<f32>()?, expected.to_vec2::<f32>()?);
+        Ok(())
     }
 
     #[test]
