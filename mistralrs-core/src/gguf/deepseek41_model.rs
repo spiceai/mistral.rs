@@ -155,10 +155,7 @@ struct LayerState {
 
 struct RunState {
     tokens: Vec<u32>,
-    last_pre: Option<Tensor>,
     layers: Vec<LayerState>,
-    /// Compressed-row indices from the most recent indexer, into that owner's rows.
-    index_ids: Option<(usize, Tensor)>,
 }
 
 impl ModelWeights {
@@ -481,9 +478,7 @@ impl ModelWeights {
             max_seq_len: context,
             state: Mutex::new(RunState {
                 tokens: Vec::new(),
-                last_pre: None,
                 layers: layer_states,
-                index_ids: None,
             }),
         })
     }
@@ -516,8 +511,6 @@ impl ModelWeights {
             .map_err(|_| candle_core::Error::msg("deepseek41 state lock was poisoned"))?;
         if start == 0 {
             state.tokens.clear();
-            state.last_pre = None;
-            state.index_ids = None;
             for layer in &mut state.layers {
                 *layer = LayerState {
                     window: None,
@@ -538,9 +531,9 @@ impl ModelWeights {
         }
         let refs: Vec<&Tensor> = parts.iter().collect();
         let mut hidden = Tensor::cat(&refs, 2)?;
-        let pre = if let Some(prev) = &state.last_pre {
-            prev.clone()
-        } else {
+        // Layer 0 has no earlier sublayer to take a mix from: every token starts from the
+        // one-hot mix that selects the first copy.
+        let pre = {
             let ones = Tensor::ones((batch, seq, 1), DType::F32, &self.device)?;
             let zeros = Tensor::zeros((batch, seq, self.hc - 1), DType::F32, &self.device)?;
             Tensor::cat(&[&ones, &zeros], 2)?
@@ -598,7 +591,6 @@ impl ModelWeights {
             incoming = next_pre;
         }
         let mixed = crate::gguf::dsv4_hc::mix_streams(&hidden, &incoming)?;
-        state.last_pre = Some(incoming.narrow(1, seq - 1, 1)?);
         drop(state);
         let normed = rmsnorm(&mixed, &self.norm, f64::from(self.rms_eps))?;
         let logits = self.output.forward(&normed)?;
@@ -684,26 +676,35 @@ impl Layer {
         let q = self.q_b.forward(&q_low)?;
         let q = q.reshape((batch, seq, self.heads, self.head_dim))?;
         let q = q.transpose(1, 2)?;
-        let q = rotate_tail(&self.rope, &q, positions, self.rope_dim)?;
+        // A layer that reads a compressed stream rotates its queries, window and output with
+        // the compressor's base and YaRN; a plain sliding-window layer uses the model's.
+        let attn_rope = self.compress_rope.as_deref().unwrap_or(self.rope.as_ref());
+        let q = rotate_tail(attn_rope, &q, positions, self.rope_dim)?;
         let kv = rmsnorm(
             &self.kv.forward(x)?,
             &self.kv_norm,
             f64::from(self.rms_eps()),
         )?;
         let kv = kv.unsqueeze(1)?;
-        let kv = rotate_tail(&self.rope, &kv, positions, self.rope_dim)?;
+        let kv = rotate_tail(attn_rope, &kv, positions, self.rope_dim)?;
         let kv = kv.squeeze(1)?;
         let window = self.push_window(&kv, start, &mut state.layers[self.index])?;
         let window_len = window.dim(1)?;
         let mut keys = window;
         let mut compressed_len = 0;
+        let mut picked = None;
         if self.ratio > 0 {
-            let compressed = self.compress(x, &q_low, start, state)?;
+            let (compressed, ids) = self.compress(x, &q_low, positions, start, state)?;
             compressed_len = compressed.dim(1)?;
             if compressed_len > 0 {
                 keys = Tensor::cat(&[&keys, &compressed], 1)?;
+                picked = ids;
             }
         }
+        let picked = match picked {
+            Some(ids) if ids.dim(D::Minus1)? > 0 => Some(ids.flatten_all()?.to_vec1::<u32>()?),
+            _ => None,
+        };
         let visible = attention_visible(
             seq,
             window_len,
@@ -711,11 +712,12 @@ impl Layer {
             start,
             self.window,
             self.ratio,
+            picked.as_deref(),
             x.device(),
         )?;
         let mixed = sparse_mqa(&q.transpose(1, 2)?, &keys, &self.sinks, &visible)?;
         let mixed = mixed.transpose(1, 2)?;
-        let mixed = inverse_rotate_tail(&self.rope, &mixed, positions, self.rope_dim)?;
+        let mixed = inverse_rotate_tail(attn_rope, &mixed, positions, self.rope_dim)?;
         let mixed = mixed.transpose(1, 2)?.contiguous()?;
         let group_in = self.heads / self.groups * self.head_dim;
         let grouped = mixed.reshape((batch, seq, self.groups, group_in))?;
@@ -753,13 +755,16 @@ impl Layer {
         Ok(history)
     }
 
+    /// This layer's compressed rows, and, at an index source, the rows its indexer picked for
+    /// each query, `[batch, seq, top_k]`.
     fn compress(
         &self,
         x: &Tensor,
         q_low: &Tensor,
+        positions: &Tensor,
         start: usize,
         state: &mut RunState,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let owner = self.kv_owner.ok_or_else(|| {
             candle_core::Error::msg(format!(
                 "deepseek41 layer {} has no compressed-kv owner",
@@ -798,11 +803,13 @@ impl Layer {
             Some(rows) => rows,
             None => Tensor::zeros((1, 0, self.head_dim), DType::F32, x.device())?,
         };
-        if let Some(indexer) = &self.indexer {
-            let ids = self.index_rows(indexer, q_low, x, owner, start, state)?;
-            state.index_ids = Some((owner, ids));
-        }
-        Ok(compressed)
+        let picked = match &self.indexer {
+            Some(indexer) => {
+                Some(self.index_rows(indexer, q_low, x, owner, positions, start, state)?)
+            }
+            None => None,
+        };
+        Ok((compressed, picked))
     }
 
     fn pool(&self, x: &Tensor, start: usize, state: &mut LayerState) -> Result<Tensor> {
@@ -871,12 +878,14 @@ impl Layer {
         roped.squeeze(1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn index_rows(
         &self,
         indexer: &Indexer,
         q_low: &Tensor,
         x: &Tensor,
         owner: usize,
+        positions: &Tensor,
         start: usize,
         state: &RunState,
     ) -> Result<Tensor> {
@@ -887,6 +896,15 @@ impl Layer {
         let (batch, seq, _) = x.dims3()?;
         let q = indexer.q_b.forward(q_low)?;
         let q = q.reshape((batch, seq, self.index_heads, self.index_dim))?;
+        // The index queries rotate like the compressed rows they score.
+        let compress_rope = self.compress_rope.as_ref().ok_or_else(|| {
+            candle_core::Error::msg(format!(
+                "deepseek41 layer {} indexes compressed rows but has no compressed rope",
+                self.index
+            ))
+        })?;
+        let q = rotate_tail(compress_rope, &q.transpose(1, 2)?, positions, self.rope_dim)?
+            .transpose(1, 2)?;
         let weight = indexer.proj.forward(x)?;
         let weight = weight.reshape((batch, seq, self.index_heads))?;
         let scale = (self.index_dim as f64).sqrt().recip() / (self.index_heads as f64).sqrt();
@@ -999,6 +1017,10 @@ fn inverse_rotate_tail(
     Tensor::cat(&[&nope, &tail], D::Minus1)
 }
 
+/// Which keys each query sees: the window keys inside its sliding window, and the compressed
+/// rows its position has completed. `picked`, an index source's `top_k` rows per query, further
+/// restricts the compressed rows to those.
+#[allow(clippy::too_many_arguments)]
 fn attention_visible(
     seq: usize,
     window_len: usize,
@@ -1006,14 +1028,25 @@ fn attention_visible(
     start: usize,
     window: usize,
     ratio: usize,
+    picked: Option<&[u32]>,
     device: &Device,
 ) -> Result<Tensor> {
     let keys = window_len + compressed_len;
+    let top_k = picked.map_or(0, |ids| ids.len() / seq.max(1));
+    let mut chosen = vec![false; compressed_len];
     let mut visible = Vec::with_capacity(seq * keys);
     for query in 0..seq {
         let abs = start + query;
         let oldest = abs.saturating_sub(window.saturating_sub(1));
         let groups = (abs + 1).checked_div(ratio).unwrap_or(0);
+        if let Some(ids) = picked {
+            chosen.fill(false);
+            for &row in &ids[query * top_k..(query + 1) * top_k] {
+                if let Some(slot) = chosen.get_mut(row as usize) {
+                    *slot = true;
+                }
+            }
+        }
         for key in 0..keys {
             let allowed = if key < window_len {
                 // The window keys are the `window_len` most recent positions, ending at the
@@ -1021,7 +1054,8 @@ fn attention_visible(
                 let key_abs = start + seq - window_len + key;
                 key_abs <= abs && key_abs >= oldest
             } else {
-                key - window_len < groups
+                let row = key - window_len;
+                row < groups && (picked.is_none() || chosen[row])
             };
             visible.push(u8::from(allowed));
         }
@@ -1600,8 +1634,10 @@ mod tests {
             assert_eq!(weight.dtype, 0, "{} starts as f32", weight.name);
             let values: Vec<f32> = weight
                 .data
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect();
             let dims: Vec<usize> = weight.shape.iter().map(|dim| *dim as usize).collect();
             let tensor = Tensor::from_vec(values, dims.as_slice(), &Device::Cpu).expect("weight");
@@ -1742,6 +1778,108 @@ mod tests {
             failures.is_empty(),
             "decoding differs from prefilling through the same tokens at: {}",
             failures.join(", ")
+        );
+    }
+
+    fn with_meta(mut meta: Vec<Meta>, key: &str, value: MetaValue) -> Vec<Meta> {
+        let entry = meta
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .unwrap_or_else(|| panic!("fixture metadata has no `{key}`"));
+        entry.value = value;
+        meta
+    }
+
+    fn logits_with(meta: Vec<Meta>, compressor: bool, tokens: &[u32]) -> Vec<f32> {
+        let file = write_gguf(&meta, &tiny_weights(0.1, compressor));
+        logits(&load(&file), tokens)
+    }
+
+    // A layer that reads a compressed stream rotates its queries and window with the
+    // compressor's base and YaRN, as the reference does; a sliding-window layer uses the
+    // model's base.
+    #[test]
+    fn a_compressed_layer_rotates_with_the_compressor_base() {
+        let tokens = [1u32, 6, 11, 0, 5, 10];
+        let main = |ratio, base| {
+            with_meta(
+                base_meta(ratio),
+                "deepseek41.rope.freq_base",
+                MetaValue::F32(base),
+            )
+        };
+        let compress = |ratio, base| {
+            with_meta(
+                base_meta(ratio),
+                "deepseek41.attention.compress_rope_freq_base",
+                MetaValue::F32(base),
+            )
+        };
+        for ratio in [1, 2] {
+            assert_eq!(
+                logits_with(main(ratio, 10_000.0), true, &tokens),
+                logits_with(main(ratio, 777.0), true, &tokens),
+                "ratio {ratio}: the model's rope base must not reach a compressed layer"
+            );
+            assert_ne!(
+                logits_with(compress(ratio, 160_000.0), true, &tokens),
+                logits_with(compress(ratio, 4_000.0), true, &tokens),
+                "ratio {ratio}: the compressor's rope base must reach a compressed layer"
+            );
+        }
+        assert_eq!(
+            logits_with(compress(0, 160_000.0), false, &tokens),
+            logits_with(compress(0, 4_000.0), false, &tokens),
+            "the compressor's rope base must not reach a sliding-window layer"
+        );
+        assert_ne!(
+            logits_with(main(0, 10_000.0), false, &tokens),
+            logits_with(main(0, 777.0), false, &tokens),
+            "the model's rope base must reach a sliding-window layer"
+        );
+    }
+
+    #[test]
+    fn an_index_source_attends_to_only_the_compressed_rows_it_picked() {
+        let top_k = |k| {
+            with_meta(
+                base_meta(1),
+                "deepseek41.attention.indexer.top_k",
+                MetaValue::U32(k),
+            )
+        };
+        // Ratio 1 compresses every token, so 14 tokens make 14 rows, more than a top_k of 4.
+        let long: Vec<u32> = (0..14u32).map(|i| (i * 5 + 1) % 16).collect();
+        assert_ne!(
+            logits_with(top_k(4), true, &long),
+            logits_with(top_k(64), true, &long),
+            "with more rows than top_k, the selection must change what attention reads"
+        );
+        // Four tokens make four rows: a top_k of 4 picks them all.
+        let short = &long[..4];
+        assert_eq!(
+            logits_with(top_k(4), true, short),
+            logits_with(top_k(64), true, short),
+            "picking every row must read what full attention reads"
+        );
+    }
+
+    #[test]
+    fn the_picked_rows_restrict_the_compressed_keys_and_not_the_window() {
+        // Two queries at positions 4 and 5 of a ratio-1 stream: a 3-key window, then five
+        // compressed rows. Each query picked two rows; position 4 has completed rows 0..=4.
+        let picked = [0u32, 3, 1, 4];
+        let visible = super::attention_visible(2, 3, 5, 4, 3, 1, Some(&picked), &Device::Cpu)
+            .expect("visible")
+            .to_vec2::<u8>()
+            .expect("values");
+        assert_eq!(
+            visible,
+            vec![
+                // window: positions 3, 4, 5      compressed rows 0..5
+                vec![1, 1, 0, 1, 0, 0, 1, 0],
+                vec![1, 1, 1, 0, 1, 0, 0, 1],
+            ]
         );
     }
 
