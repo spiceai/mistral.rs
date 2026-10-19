@@ -73,7 +73,7 @@ struct Layer {
     index_topk: usize,
     expert_k: usize,
     route_scale: f64,
-    swiglu_limit: f64,
+    shared_swiglu_limit: f64,
     kv_owner: Option<usize>,
     q_a: Arc<dyn QuantMethod>,
     q_a_norm: Tensor,
@@ -211,6 +211,12 @@ impl ModelWeights {
             );
         }
         let clamps = meta_f32_array(&archive, &key("swiglu_clamp_exp"))?;
+        // The shared expert has its own limits; a checkpoint without them reuses the routed
+        // experts', as the reference does.
+        let shared_clamps = match meta_f32_array(&archive, &key("swiglu_clamp_shexp")) {
+            Ok(values) => values,
+            Err(_) => clamps.clone(),
+        };
         let freq_base = meta_f32(&archive, &key("rope.freq_base"))?;
         let compress_base = meta_f32(&archive, &key("attention.compress_rope_freq_base"))?;
         let yarn_factor = meta_f32(&archive, &key("rope.scaling.factor"))?;
@@ -313,7 +319,8 @@ impl ModelWeights {
                 false,
                 &None,
                 Activation::Silu,
-            )?;
+            )?
+            .with_swiglu_limit(f64::from(clamps.get(layer).copied().unwrap_or(10.0)))?;
             let compressor = if archive.contains_tensor(&blk(layer, "attn_compressor_kv.weight")) {
                 Some(Compressor {
                     kv: linear(&archive, &blk(layer, "attn_compressor_kv.weight"), device)?,
@@ -400,7 +407,7 @@ impl ModelWeights {
                     })?;
                 out_a.push(loaded);
             }
-            let clamp = clamps.get(layer).copied().unwrap_or(10.0);
+            let clamp = shared_clamps.get(layer).copied().unwrap_or(10.0);
             layers.push(Layer {
                 index: layer,
                 ratio,
@@ -414,7 +421,7 @@ impl ModelWeights {
                 index_topk,
                 expert_k,
                 route_scale,
-                swiglu_limit: f64::from(clamp),
+                shared_swiglu_limit: f64::from(clamp),
                 kv_owner: owners[layer],
                 q_a: linear(&archive, &blk(layer, "attn_q_a.weight"), device)?,
                 q_a_norm: dense(&archive, &blk(layer, "attn_q_a_norm.weight"), device)?,
@@ -921,7 +928,7 @@ impl Layer {
         let routed = self.experts.forward(x, weights, &ids)?;
         let gate = self.shared_gate.forward(x)?;
         let up = self.shared_up.forward(x)?;
-        let mixed = swiglu_clamped(&gate, &up, self.swiglu_limit)?;
+        let mixed = swiglu_clamped(&gate, &up, self.shared_swiglu_limit)?;
         let shared = self.shared_down.forward(&mixed)?;
         routed + shared
     }
