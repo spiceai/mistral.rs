@@ -973,7 +973,9 @@ fn rotate_tail(
     let dim = x.dim(D::Minus1)?;
     let nope = x.narrow(D::Minus1, 0, dim - rope_dim)?;
     let tail = x.narrow(D::Minus1, dim - rope_dim, rope_dim)?;
-    let (tail, _) = rope.forward(&tail.contiguous()?, &tail.contiguous()?, positions)?;
+    // The CUDA rotary kernels rotate in place. The narrow of a one-token, one-head tensor is
+    // already contiguous and shares `x`'s buffer, so hand the kernel a copy of its own.
+    let tail = rope.rotate(&tail.copy()?, positions)?;
     Tensor::cat(&[&nope, &tail], D::Minus1)
 }
 
@@ -986,7 +988,7 @@ fn inverse_rotate_tail(
     let dim = x.dim(D::Minus1)?;
     let nope = x.narrow(D::Minus1, 0, dim - rope_dim)?;
     let tail = x.narrow(D::Minus1, dim - rope_dim, rope_dim)?;
-    let tail = rope.inverse(&tail.contiguous()?, positions)?;
+    let tail = rope.inverse(&tail.copy()?, positions)?;
     Tensor::cat(&[&nope, &tail], D::Minus1)
 }
 
@@ -1007,11 +1009,9 @@ fn attention_visible(
         let groups = (abs + 1).checked_div(ratio).unwrap_or(0);
         for key in 0..keys {
             let allowed = if key < window_len {
-                let key_abs = if start == 0 {
-                    key
-                } else {
-                    start.saturating_sub(window.saturating_sub(1)) + key
-                };
+                // The window keys are the `window_len` most recent positions, ending at the
+                // last query.
+                let key_abs = start + seq - window_len + key;
                 key_abs <= abs && key_abs >= oldest
             } else {
                 key - window_len < groups
@@ -1571,14 +1571,53 @@ mod tests {
         weights
     }
 
+    /// `tiny_weights` with its 256-wide dense matrices stored in the real checkpoint's types:
+    /// Q2_K for the embedding, attention, compressor, indexer and shared gate/up, Q3_K for the
+    /// shared down projection, and Q6_K for the output.
+    fn tiny_weights_quantized_dense(expert_salt: f32, compressor: bool) -> Vec<Weight> {
+        let mut weights = tiny_weights(expert_salt, compressor);
+        for weight in &mut weights {
+            let quant = match weight.name.as_str() {
+                "output.weight" => (GgmlDType::Q6K, 14),
+                "blk.0.ffn_down_shexp.weight" => (GgmlDType::Q3K, 11),
+                "token_embd.weight"
+                | "blk.0.attn_q_a.weight"
+                | "blk.0.attn_kv.weight"
+                | "blk.0.ffn_gate_shexp.weight"
+                | "blk.0.ffn_up_shexp.weight"
+                | "blk.0.attn_compressor_kv.weight"
+                | "blk.0.attn_compressor_gate.weight"
+                | "blk.0.indexer.proj.weight" => (GgmlDType::Q2K, 10),
+                _ => continue,
+            };
+            assert_eq!(weight.dtype, 0, "{} starts as f32", weight.name);
+            let values: Vec<f32> = weight
+                .data
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .collect();
+            let dims: Vec<usize> = weight.shape.iter().map(|dim| *dim as usize).collect();
+            let tensor = Tensor::from_vec(values, dims.as_slice(), &Device::Cpu).expect("weight");
+            let quantized =
+                candle_core::quantized::QTensor::quantize(&tensor, quant.0).expect("quantize");
+            weight.data = quantized.data().expect("quantized bytes").to_vec();
+            weight.dtype = quant.1;
+        }
+        weights
+    }
+
     fn load(file: &NamedTempFile) -> ModelWeights {
+        load_on(file, &Device::Cpu)
+    }
+
+    fn load_on(file: &NamedTempFile, device: &Device) -> ModelWeights {
         let path = PathBuf::from(file.path());
-        let comm = Arc::new(Comm::from_device(Id::new(), &Device::Cpu, 0, 1).expect("comm"));
-        ModelWeights::load(&[path], &Device::Cpu, DType::F32, comm).expect("load deepseek41")
+        let comm = Arc::new(Comm::from_device(Id::new(), device, 0, 1).expect("comm"));
+        ModelWeights::load(&[path], device, DType::F32, comm).expect("load deepseek41")
     }
 
     fn logits(model: &ModelWeights, tokens: &[u32]) -> Vec<f32> {
-        let ids = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &Device::Cpu).expect("ids");
+        let ids = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &model.device).expect("ids");
         model
             .forward(&ids, &[0], vec![(tokens.len() - 1, 1)], None)
             .expect("forward")
@@ -1586,6 +1625,117 @@ mod tests {
             .expect("flat")
             .to_vec1::<f32>()
             .expect("values")
+    }
+
+    /// The logits for each of `tokens[prefill - 1..]`: a prefill of the first `prefill`
+    /// tokens, then one decode step per remaining token.
+    fn decoded_logits(model: &ModelWeights, tokens: &[u32], prefill: usize) -> Vec<Vec<f32>> {
+        let values = |logits: Tensor| {
+            logits
+                .flatten_all()
+                .expect("flat")
+                .to_vec1::<f32>()
+                .expect("values")
+        };
+        let ids =
+            Tensor::from_vec(tokens[..prefill].to_vec(), (1, prefill), &model.device).expect("ids");
+        let mut out = vec![values(
+            model
+                .forward(&ids, &[0], vec![(prefill - 1, 1)], None)
+                .expect("prefill"),
+        )];
+        for (offset, &token) in tokens.iter().enumerate().skip(prefill) {
+            let ids = Tensor::from_vec(vec![token], (1, 1), &model.device).expect("ids");
+            out.push(values(
+                model
+                    .forward(&ids, &[offset], vec![(0, 1)], None)
+                    .expect("decode"),
+            ));
+        }
+        out
+    }
+
+    // Regression test: a served DeepSeek-V4.1-Flash-1017 answered its first token
+    // correctly and then degenerated ("1, 2, 2, 2 2 2…"), because decoding did not compute
+    // what a prefill of the same tokens computes.
+    /// Each decode step whose logits differ from a prefill through the same tokens.
+    fn decode_prefill_mismatches(device: &Device, quantized_dense: bool) -> Vec<String> {
+        // Longer than the 8-token window, and long enough for the indexer to choose among
+        // more compressed rows than its top-k of 4.
+        let tokens: Vec<u32> = (0..14u32).map(|i| (i * 5 + 1) % 16).collect();
+        let prefill = 3;
+        let mut failures = Vec::new();
+        for ratio in [0, 1, 2] {
+            let mut weights = if quantized_dense {
+                tiny_weights_quantized_dense(0.1, ratio > 0)
+            } else {
+                tiny_weights(0.1, ratio > 0)
+            };
+            // A decisive router bias, so that the two paths' rounding cannot flip a near-tie
+            // between the fixture's two experts.
+            for weight in &mut weights {
+                if weight.name == "blk.0.exp_probs_b.bias" {
+                    weight.data = f32_bytes(&[3.0, -3.0]);
+                }
+            }
+            let file = write_gguf(&base_meta(ratio), &weights);
+            let model = load_on(&file, device);
+            let decoded = decoded_logits(&model, &tokens, prefill);
+            for (step, got) in decoded.iter().enumerate() {
+                let end = prefill + step;
+                let want = logits(&model, &tokens[..end]);
+                assert_eq!(got.len(), want.len());
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(got, want)| (got - want).abs())
+                    .fold(0f32, f32::max);
+                let scale = want.iter().map(|value| value.abs()).fold(0f32, f32::max);
+                eprintln!(
+                    "{device:?} quantized_dense={quantized_dense} ratio {ratio} token {}: max |decode - prefill| = {worst:e} of max |prefill| {scale:e}",
+                    end - 1
+                );
+                // Float32 rounding across the two paths stays under 1e-4. With quantized dense
+                // weights, CUDA's one-row matmul quantizes its input to Q8_1 and prefill's does
+                // not, which moves the logits by up to 0.04% of their size.
+                let bound = if quantized_dense {
+                    1e-3 * scale
+                } else {
+                    1.5e-4
+                };
+                if worst > bound {
+                    failures.push(format!("ratio {ratio} token {} ({worst:e})", end - 1));
+                }
+            }
+        }
+        failures
+    }
+
+    #[test]
+    fn decoding_a_token_matches_prefilling_through_it() {
+        let failures = decode_prefill_mismatches(&Device::Cpu, false);
+        assert!(
+            failures.is_empty(),
+            "decoding differs from prefilling through the same tokens at: {}",
+            failures.join(", ")
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn decoding_a_token_matches_prefilling_through_it_on_cuda() {
+        let device = Device::new_cuda(0).expect("cuda device");
+        let mut failures = decode_prefill_mismatches(&device, false);
+        failures.extend(
+            decode_prefill_mismatches(&device, true)
+                .into_iter()
+                .map(|failure| format!("quantized dense: {failure}")),
+        );
+        assert!(
+            failures.is_empty(),
+            "decoding differs from prefilling through the same tokens at: {}",
+            failures.join(", ")
+        );
     }
 
     #[test]
