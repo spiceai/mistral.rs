@@ -701,10 +701,6 @@ impl Layer {
                 picked = ids;
             }
         }
-        let picked = match picked {
-            Some(ids) if ids.dim(D::Minus1)? > 0 => Some(ids.flatten_all()?.to_vec1::<u32>()?),
-            _ => None,
-        };
         let visible = attention_visible(
             seq,
             window_len,
@@ -712,9 +708,15 @@ impl Layer {
             start,
             self.window,
             self.ratio,
-            picked.as_deref(),
             x.device(),
         )?;
+        // A top_k that covers every row picks them all, so only a longer stream is restricted.
+        let visible = match picked {
+            Some(ids) if (1..compressed_len).contains(&ids.dim(D::Minus1)?) => {
+                restrict_to_picked(&visible, window_len, &ids)?
+            }
+            _ => visible,
+        };
         let mixed = sparse_mqa(&q.transpose(1, 2)?, &keys, &self.sinks, &visible)?;
         let mixed = mixed.transpose(1, 2)?;
         let mixed = inverse_rotate_tail(attn_rope, &mixed, positions, self.rope_dim)?;
@@ -1018,9 +1020,7 @@ fn inverse_rotate_tail(
 }
 
 /// Which keys each query sees: the window keys inside its sliding window, and the compressed
-/// rows its position has completed. `picked`, an index source's `top_k` rows per query, further
-/// restricts the compressed rows to those.
-#[allow(clippy::too_many_arguments)]
+/// rows its position has completed.
 fn attention_visible(
     seq: usize,
     window_len: usize,
@@ -1028,25 +1028,14 @@ fn attention_visible(
     start: usize,
     window: usize,
     ratio: usize,
-    picked: Option<&[u32]>,
     device: &Device,
 ) -> Result<Tensor> {
     let keys = window_len + compressed_len;
-    let top_k = picked.map_or(0, |ids| ids.len() / seq.max(1));
-    let mut chosen = vec![false; compressed_len];
     let mut visible = Vec::with_capacity(seq * keys);
     for query in 0..seq {
         let abs = start + query;
         let oldest = abs.saturating_sub(window.saturating_sub(1));
         let groups = (abs + 1).checked_div(ratio).unwrap_or(0);
-        if let Some(ids) = picked {
-            chosen.fill(false);
-            for &row in &ids[query * top_k..(query + 1) * top_k] {
-                if let Some(slot) = chosen.get_mut(row as usize) {
-                    *slot = true;
-                }
-            }
-        }
         for key in 0..keys {
             let allowed = if key < window_len {
                 // The window keys are the `window_len` most recent positions, ending at the
@@ -1054,13 +1043,27 @@ fn attention_visible(
                 let key_abs = start + seq - window_len + key;
                 key_abs <= abs && key_abs >= oldest
             } else {
-                let row = key - window_len;
-                row < groups && (picked.is_none() || chosen[row])
+                key - window_len < groups
             };
             visible.push(u8::from(allowed));
         }
     }
     Tensor::from_vec(visible, (seq, keys), device)
+}
+
+/// Restrict `visible`'s compressed keys, the ones after the first `window_len`, to the rows an
+/// index source picked for each query (`[batch, seq, top_k]`). The mask is built where the picks
+/// are, so reading them never waits on the device.
+fn restrict_to_picked(visible: &Tensor, window_len: usize, picked: &Tensor) -> Result<Tensor> {
+    let (seq, keys) = visible.dims2()?;
+    let rows = keys - window_len;
+    let picked = picked.reshape((seq, ()))?.contiguous()?;
+    let ones = Tensor::ones(picked.shape(), DType::F32, visible.device())?;
+    let chosen = Tensor::zeros((seq, rows), DType::F32, visible.device())?
+        .scatter_add(&picked, &ones, 1)?
+        .gt(0.0)?;
+    let compressed = (visible.narrow(1, window_len, rows)? * chosen)?;
+    Tensor::cat(&[&visible.narrow(1, 0, window_len)?, &compressed], 1)
 }
 
 fn sparse_mqa(q: &Tensor, k: &Tensor, sinks: &Tensor, visible: &Tensor) -> Result<Tensor> {
@@ -1868,9 +1871,10 @@ mod tests {
     fn the_picked_rows_restrict_the_compressed_keys_and_not_the_window() {
         // Two queries at positions 4 and 5 of a ratio-1 stream: a 3-key window, then five
         // compressed rows. Each query picked two rows; position 4 has completed rows 0..=4.
-        let picked = [0u32, 3, 1, 4];
-        let visible = super::attention_visible(2, 3, 5, 4, 3, 1, Some(&picked), &Device::Cpu)
-            .expect("visible")
+        let picked = Tensor::from_vec(vec![0u32, 3, 1, 4], (1, 2, 2), &Device::Cpu).expect("ids");
+        let causal = super::attention_visible(2, 3, 5, 4, 3, 1, &Device::Cpu).expect("visible");
+        let visible = super::restrict_to_picked(&causal, 3, &picked)
+            .expect("restricted")
             .to_vec2::<u8>()
             .expect("values");
         assert_eq!(
