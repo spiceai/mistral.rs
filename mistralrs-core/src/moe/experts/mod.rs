@@ -46,6 +46,7 @@ pub struct MoEExperts {
     num_experts_per_tok: usize,
     all_reduce: SumAllReduce,
     world_size: usize,
+    swiglu_limit: Option<f64>,
 }
 
 enum MoEExpertsBackendImpl {
@@ -275,7 +276,20 @@ impl MoEExperts {
             num_experts_per_tok: cfg.num_experts_per_tok,
             all_reduce: SumAllReduce::new(comm),
             world_size: comm.world_size(),
+            swiglu_limit: None,
         }
+    }
+
+    /// Clamp the experts' SwiGLU inputs: `gate` to at most `limit` and `up` to within
+    /// `±limit`. Only gather-based experts can apply it; the fused kernels have no clamp.
+    pub fn with_swiglu_limit(mut self, limit: f64) -> Result<Self> {
+        if !matches!(self.backend, MoEExpertsBackendImpl::Fast(_)) {
+            candle_core::bail!(
+                "a clamped SwiGLU needs gather-based experts, and these experts use a fused backend"
+            );
+        }
+        self.swiglu_limit = (limit > 0.0).then_some(limit);
+        Ok(self)
     }
 
     fn register_lora_site(
@@ -373,6 +387,7 @@ impl MoEExperts {
             num_experts: self.num_experts,
             num_experts_per_tok: self.num_experts_per_tok,
             act: self.act,
+            swiglu_limit: self.swiglu_limit,
         }
     }
 }

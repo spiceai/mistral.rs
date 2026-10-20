@@ -68,6 +68,9 @@ pub(super) struct MoEForwardConfig {
     pub num_experts: usize,
     pub num_experts_per_tok: usize,
     pub act: Activation,
+    /// Clamp the SwiGLU inputs, `gate` to at most this and `up` to within plus or minus it,
+    /// as DeepSeek-V4.1 does. Only the gather path applies it.
+    pub swiglu_limit: Option<f64>,
 }
 
 #[cfg(feature = "cuda")]

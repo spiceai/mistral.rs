@@ -73,7 +73,7 @@ struct Layer {
     index_topk: usize,
     expert_k: usize,
     route_scale: f64,
-    swiglu_limit: f64,
+    shared_swiglu_limit: f64,
     kv_owner: Option<usize>,
     q_a: Arc<dyn QuantMethod>,
     q_a_norm: Tensor,
@@ -155,10 +155,7 @@ struct LayerState {
 
 struct RunState {
     tokens: Vec<u32>,
-    last_pre: Option<Tensor>,
     layers: Vec<LayerState>,
-    /// Compressed-row indices from the most recent indexer, into that owner's rows.
-    index_ids: Option<(usize, Tensor)>,
 }
 
 impl ModelWeights {
@@ -210,7 +207,17 @@ impl ModelWeights {
                 ratios.len()
             );
         }
-        let clamps = meta_f32_array(&archive, &key("swiglu_clamp_exp"))?;
+        let clamps =
+            meta_f32_per_layer(&archive, &key("swiglu_clamp_exp"), blocks)?.ok_or_else(|| {
+                candle_core::Error::msg(format!(
+                    "GGUF deepseek41 is missing metadata `{}`",
+                    key("swiglu_clamp_exp")
+                ))
+            })?;
+        // The shared expert has its own limits; a checkpoint without them reuses the routed
+        // experts', as the reference does.
+        let shared_clamps = meta_f32_per_layer(&archive, &key("swiglu_clamp_shexp"), blocks)?
+            .unwrap_or_else(|| clamps.clone());
         let freq_base = meta_f32(&archive, &key("rope.freq_base"))?;
         let compress_base = meta_f32(&archive, &key("attention.compress_rope_freq_base"))?;
         let yarn_factor = meta_f32(&archive, &key("rope.scaling.factor"))?;
@@ -313,7 +320,8 @@ impl ModelWeights {
                 false,
                 &None,
                 Activation::Silu,
-            )?;
+            )?
+            .with_swiglu_limit(f64::from(clamps[layer]))?;
             let compressor = if archive.contains_tensor(&blk(layer, "attn_compressor_kv.weight")) {
                 Some(Compressor {
                     kv: linear(&archive, &blk(layer, "attn_compressor_kv.weight"), device)?,
@@ -400,7 +408,6 @@ impl ModelWeights {
                     })?;
                 out_a.push(loaded);
             }
-            let clamp = clamps.get(layer).copied().unwrap_or(10.0);
             layers.push(Layer {
                 index: layer,
                 ratio,
@@ -414,7 +421,7 @@ impl ModelWeights {
                 index_topk,
                 expert_k,
                 route_scale,
-                swiglu_limit: f64::from(clamp),
+                shared_swiglu_limit: f64::from(shared_clamps[layer]),
                 kv_owner: owners[layer],
                 q_a: linear(&archive, &blk(layer, "attn_q_a.weight"), device)?,
                 q_a_norm: dense(&archive, &blk(layer, "attn_q_a_norm.weight"), device)?,
@@ -474,9 +481,7 @@ impl ModelWeights {
             max_seq_len: context,
             state: Mutex::new(RunState {
                 tokens: Vec::new(),
-                last_pre: None,
                 layers: layer_states,
-                index_ids: None,
             }),
         })
     }
@@ -509,8 +514,6 @@ impl ModelWeights {
             .map_err(|_| candle_core::Error::msg("deepseek41 state lock was poisoned"))?;
         if start == 0 {
             state.tokens.clear();
-            state.last_pre = None;
-            state.index_ids = None;
             for layer in &mut state.layers {
                 *layer = LayerState {
                     window: None,
@@ -531,9 +534,9 @@ impl ModelWeights {
         }
         let refs: Vec<&Tensor> = parts.iter().collect();
         let mut hidden = Tensor::cat(&refs, 2)?;
-        let pre = if let Some(prev) = &state.last_pre {
-            prev.clone()
-        } else {
+        // Layer 0 has no earlier sublayer to take a mix from: every token starts from the
+        // one-hot mix that selects the first copy.
+        let pre = {
             let ones = Tensor::ones((batch, seq, 1), DType::F32, &self.device)?;
             let zeros = Tensor::zeros((batch, seq, self.hc - 1), DType::F32, &self.device)?;
             Tensor::cat(&[&ones, &zeros], 2)?
@@ -591,7 +594,6 @@ impl ModelWeights {
             incoming = next_pre;
         }
         let mixed = crate::gguf::dsv4_hc::mix_streams(&hidden, &incoming)?;
-        state.last_pre = Some(incoming.narrow(1, seq - 1, 1)?);
         drop(state);
         let normed = rmsnorm(&mixed, &self.norm, f64::from(self.rms_eps))?;
         let logits = self.output.forward(&normed)?;
@@ -677,24 +679,29 @@ impl Layer {
         let q = self.q_b.forward(&q_low)?;
         let q = q.reshape((batch, seq, self.heads, self.head_dim))?;
         let q = q.transpose(1, 2)?;
-        let q = rotate_tail(&self.rope, &q, positions, self.rope_dim)?;
+        // A layer that reads a compressed stream rotates its queries, window and output with
+        // the compressor's base and YaRN; a plain sliding-window layer uses the model's.
+        let attn_rope = self.compress_rope.as_deref().unwrap_or(self.rope.as_ref());
+        let q = rotate_tail(attn_rope, &q, positions, self.rope_dim)?;
         let kv = rmsnorm(
             &self.kv.forward(x)?,
             &self.kv_norm,
             f64::from(self.rms_eps()),
         )?;
         let kv = kv.unsqueeze(1)?;
-        let kv = rotate_tail(&self.rope, &kv, positions, self.rope_dim)?;
+        let kv = rotate_tail(attn_rope, &kv, positions, self.rope_dim)?;
         let kv = kv.squeeze(1)?;
         let window = self.push_window(&kv, start, &mut state.layers[self.index])?;
         let window_len = window.dim(1)?;
         let mut keys = window;
         let mut compressed_len = 0;
+        let mut picked = None;
         if self.ratio > 0 {
-            let compressed = self.compress(x, &q_low, start, state)?;
+            let (compressed, ids) = self.compress(x, &q_low, positions, start, state)?;
             compressed_len = compressed.dim(1)?;
             if compressed_len > 0 {
                 keys = Tensor::cat(&[&keys, &compressed], 1)?;
+                picked = ids;
             }
         }
         let visible = attention_visible(
@@ -706,9 +713,16 @@ impl Layer {
             self.ratio,
             x.device(),
         )?;
+        // A top_k that covers every row picks them all, so only a longer stream is restricted.
+        let visible = match picked {
+            Some(ids) if (1..compressed_len).contains(&ids.dim(D::Minus1)?) => {
+                restrict_to_picked(&visible, window_len, &ids)?
+            }
+            _ => visible,
+        };
         let mixed = sparse_mqa(&q.transpose(1, 2)?, &keys, &self.sinks, &visible)?;
         let mixed = mixed.transpose(1, 2)?;
-        let mixed = inverse_rotate_tail(&self.rope, &mixed, positions, self.rope_dim)?;
+        let mixed = inverse_rotate_tail(attn_rope, &mixed, positions, self.rope_dim)?;
         let mixed = mixed.transpose(1, 2)?.contiguous()?;
         let group_in = self.heads / self.groups * self.head_dim;
         let grouped = mixed.reshape((batch, seq, self.groups, group_in))?;
@@ -746,13 +760,16 @@ impl Layer {
         Ok(history)
     }
 
+    /// This layer's compressed rows, and, at an index source, the rows its indexer picked for
+    /// each query, `[batch, seq, top_k]`.
     fn compress(
         &self,
         x: &Tensor,
         q_low: &Tensor,
+        positions: &Tensor,
         start: usize,
         state: &mut RunState,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<Tensor>)> {
         let owner = self.kv_owner.ok_or_else(|| {
             candle_core::Error::msg(format!(
                 "deepseek41 layer {} has no compressed-kv owner",
@@ -791,11 +808,13 @@ impl Layer {
             Some(rows) => rows,
             None => Tensor::zeros((1, 0, self.head_dim), DType::F32, x.device())?,
         };
-        if let Some(indexer) = &self.indexer {
-            let ids = self.index_rows(indexer, q_low, x, owner, start, state)?;
-            state.index_ids = Some((owner, ids));
-        }
-        Ok(compressed)
+        let picked = match &self.indexer {
+            Some(indexer) => {
+                Some(self.index_rows(indexer, q_low, x, owner, positions, start, state)?)
+            }
+            None => None,
+        };
+        Ok((compressed, picked))
     }
 
     fn pool(&self, x: &Tensor, start: usize, state: &mut LayerState) -> Result<Tensor> {
@@ -864,12 +883,14 @@ impl Layer {
         roped.squeeze(1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn index_rows(
         &self,
         indexer: &Indexer,
         q_low: &Tensor,
         x: &Tensor,
         owner: usize,
+        positions: &Tensor,
         start: usize,
         state: &RunState,
     ) -> Result<Tensor> {
@@ -880,6 +901,15 @@ impl Layer {
         let (batch, seq, _) = x.dims3()?;
         let q = indexer.q_b.forward(q_low)?;
         let q = q.reshape((batch, seq, self.index_heads, self.index_dim))?;
+        // The index queries rotate like the compressed rows they score.
+        let compress_rope = self.compress_rope.as_ref().ok_or_else(|| {
+            candle_core::Error::msg(format!(
+                "deepseek41 layer {} indexes compressed rows but has no compressed rope",
+                self.index
+            ))
+        })?;
+        let q = rotate_tail(compress_rope, &q.transpose(1, 2)?, positions, self.rope_dim)?
+            .transpose(1, 2)?;
         let weight = indexer.proj.forward(x)?;
         let weight = weight.reshape((batch, seq, self.index_heads))?;
         let scale = (self.index_dim as f64).sqrt().recip() / (self.index_heads as f64).sqrt();
@@ -921,7 +951,7 @@ impl Layer {
         let routed = self.experts.forward(x, weights, &ids)?;
         let gate = self.shared_gate.forward(x)?;
         let up = self.shared_up.forward(x)?;
-        let mixed = swiglu_clamped(&gate, &up, self.swiglu_limit)?;
+        let mixed = swiglu_clamped(&gate, &up, self.shared_swiglu_limit)?;
         let shared = self.shared_down.forward(&mixed)?;
         routed + shared
     }
@@ -973,7 +1003,9 @@ fn rotate_tail(
     let dim = x.dim(D::Minus1)?;
     let nope = x.narrow(D::Minus1, 0, dim - rope_dim)?;
     let tail = x.narrow(D::Minus1, dim - rope_dim, rope_dim)?;
-    let (tail, _) = rope.forward(&tail.contiguous()?, &tail.contiguous()?, positions)?;
+    // The CUDA rotary kernels rotate in place. The narrow of a one-token, one-head tensor is
+    // already contiguous and shares `x`'s buffer, so hand the kernel a copy of its own.
+    let tail = rope.rotate(&tail.copy()?, positions)?;
     Tensor::cat(&[&nope, &tail], D::Minus1)
 }
 
@@ -986,10 +1018,12 @@ fn inverse_rotate_tail(
     let dim = x.dim(D::Minus1)?;
     let nope = x.narrow(D::Minus1, 0, dim - rope_dim)?;
     let tail = x.narrow(D::Minus1, dim - rope_dim, rope_dim)?;
-    let tail = rope.inverse(&tail.contiguous()?, positions)?;
+    let tail = rope.inverse(&tail.copy()?, positions)?;
     Tensor::cat(&[&nope, &tail], D::Minus1)
 }
 
+/// Which keys each query sees: the window keys inside its sliding window, and the compressed
+/// rows its position has completed.
 fn attention_visible(
     seq: usize,
     window_len: usize,
@@ -1007,11 +1041,9 @@ fn attention_visible(
         let groups = (abs + 1).checked_div(ratio).unwrap_or(0);
         for key in 0..keys {
             let allowed = if key < window_len {
-                let key_abs = if start == 0 {
-                    key
-                } else {
-                    start.saturating_sub(window.saturating_sub(1)) + key
-                };
+                // The window keys are the `window_len` most recent positions, ending at the
+                // last query.
+                let key_abs = start + seq - window_len + key;
                 key_abs <= abs && key_abs >= oldest
             } else {
                 key - window_len < groups
@@ -1020,6 +1052,21 @@ fn attention_visible(
         }
     }
     Tensor::from_vec(visible, (seq, keys), device)
+}
+
+/// Restrict `visible`'s compressed keys, the ones after the first `window_len`, to the rows an
+/// index source picked for each query (`[batch, seq, top_k]`). The mask is built where the picks
+/// are, so reading them never waits on the device.
+fn restrict_to_picked(visible: &Tensor, window_len: usize, picked: &Tensor) -> Result<Tensor> {
+    let (seq, keys) = visible.dims2()?;
+    let rows = keys - window_len;
+    let picked = picked.reshape((seq, ()))?.contiguous()?;
+    let ones = Tensor::ones(picked.shape(), DType::F32, visible.device())?;
+    let chosen = Tensor::zeros((seq, rows), DType::F32, visible.device())?
+        .scatter_add(&picked, &ones, 1)?
+        .gt(0.0)?;
+    let compressed = (visible.narrow(1, window_len, rows)? * chosen)?;
+    Tensor::cat(&[&visible.narrow(1, 0, window_len)?, &compressed], 1)
 }
 
 fn sparse_mqa(q: &Tensor, k: &Tensor, sinks: &Tensor, visible: &Tensor) -> Result<Tensor> {
@@ -1191,6 +1238,29 @@ fn meta_f32_array(archive: &GgufArchive, name: &str) -> Result<Vec<f32>> {
             other => value_usize(other, name).map(|inner| inner as f32),
         })
         .collect()
+}
+
+/// A per-layer value that the GGUF stores either once, for every layer, or as an array with one
+/// entry per layer, as the reference's `get_key_or_arr` reads it. `None` when the key is absent.
+fn meta_f32_per_layer(
+    archive: &GgufArchive,
+    name: &str,
+    layers: usize,
+) -> Result<Option<Vec<f32>>> {
+    let Some(value) = archive.metadata_value(name) else {
+        return Ok(None);
+    };
+    let values = match value {
+        candle_core::quantized::gguf_file::Value::Array(_) => meta_f32_array(archive, name)?,
+        _ => vec![meta_f32(archive, name)?; layers],
+    };
+    if values.len() != layers {
+        candle_core::bail!(
+            "GGUF metadata `{name}` has {} entries for {layers} blocks",
+            values.len()
+        );
+    }
+    Ok(Some(values))
 }
 
 fn meta_u32_array(archive: &GgufArchive, name: &str) -> Result<Vec<u32>> {
@@ -1571,14 +1641,55 @@ mod tests {
         weights
     }
 
+    /// `tiny_weights` with its 256-wide dense matrices stored in the real checkpoint's types:
+    /// Q2_K for the embedding, attention, compressor, indexer and shared gate/up, Q3_K for the
+    /// shared down projection, and Q6_K for the output.
+    fn tiny_weights_quantized_dense(expert_salt: f32, compressor: bool) -> Vec<Weight> {
+        let mut weights = tiny_weights(expert_salt, compressor);
+        for weight in &mut weights {
+            let quant = match weight.name.as_str() {
+                "output.weight" => (GgmlDType::Q6K, 14),
+                "blk.0.ffn_down_shexp.weight" => (GgmlDType::Q3K, 11),
+                "token_embd.weight"
+                | "blk.0.attn_q_a.weight"
+                | "blk.0.attn_kv.weight"
+                | "blk.0.ffn_gate_shexp.weight"
+                | "blk.0.ffn_up_shexp.weight"
+                | "blk.0.attn_compressor_kv.weight"
+                | "blk.0.attn_compressor_gate.weight"
+                | "blk.0.indexer.proj.weight" => (GgmlDType::Q2K, 10),
+                _ => continue,
+            };
+            assert_eq!(weight.dtype, 0, "{} starts as f32", weight.name);
+            let values: Vec<f32> = weight
+                .data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
+                .collect();
+            let dims: Vec<usize> = weight.shape.iter().map(|dim| *dim as usize).collect();
+            let tensor = Tensor::from_vec(values, dims.as_slice(), &Device::Cpu).expect("weight");
+            let quantized =
+                candle_core::quantized::QTensor::quantize(&tensor, quant.0).expect("quantize");
+            weight.data = quantized.data().expect("quantized bytes").to_vec();
+            weight.dtype = quant.1;
+        }
+        weights
+    }
+
     fn load(file: &NamedTempFile) -> ModelWeights {
+        load_on(file, &Device::Cpu)
+    }
+
+    fn load_on(file: &NamedTempFile, device: &Device) -> ModelWeights {
         let path = PathBuf::from(file.path());
-        let comm = Arc::new(Comm::from_device(Id::new(), &Device::Cpu, 0, 1).expect("comm"));
-        ModelWeights::load(&[path], &Device::Cpu, DType::F32, comm).expect("load deepseek41")
+        let comm = Arc::new(Comm::from_device(Id::new(), device, 0, 1).expect("comm"));
+        ModelWeights::load(&[path], device, DType::F32, comm).expect("load deepseek41")
     }
 
     fn logits(model: &ModelWeights, tokens: &[u32]) -> Vec<f32> {
-        let ids = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &Device::Cpu).expect("ids");
+        let ids = Tensor::from_vec(tokens.to_vec(), (1, tokens.len()), &model.device).expect("ids");
         model
             .forward(&ids, &[0], vec![(tokens.len() - 1, 1)], None)
             .expect("forward")
@@ -1586,6 +1697,266 @@ mod tests {
             .expect("flat")
             .to_vec1::<f32>()
             .expect("values")
+    }
+
+    /// The logits for each of `tokens[prefill - 1..]`: a prefill of the first `prefill`
+    /// tokens, then one decode step per remaining token.
+    fn decoded_logits(model: &ModelWeights, tokens: &[u32], prefill: usize) -> Vec<Vec<f32>> {
+        let values = |logits: Tensor| {
+            logits
+                .flatten_all()
+                .expect("flat")
+                .to_vec1::<f32>()
+                .expect("values")
+        };
+        let ids =
+            Tensor::from_vec(tokens[..prefill].to_vec(), (1, prefill), &model.device).expect("ids");
+        let mut out = vec![values(
+            model
+                .forward(&ids, &[0], vec![(prefill - 1, 1)], None)
+                .expect("prefill"),
+        )];
+        for (offset, &token) in tokens.iter().enumerate().skip(prefill) {
+            let ids = Tensor::from_vec(vec![token], (1, 1), &model.device).expect("ids");
+            out.push(values(
+                model
+                    .forward(&ids, &[offset], vec![(0, 1)], None)
+                    .expect("decode"),
+            ));
+        }
+        out
+    }
+
+    // Regression test: a served DeepSeek-V4.1-Flash-1017 answered its first token
+    // correctly and then degenerated ("1, 2, 2, 2 2 2…"), because decoding did not compute
+    // what a prefill of the same tokens computes.
+    /// Each decode step whose logits differ from a prefill through the same tokens.
+    fn decode_prefill_mismatches(device: &Device, quantized_dense: bool) -> Vec<String> {
+        // Longer than the 8-token window, and long enough for the indexer to choose among
+        // more compressed rows than its top-k of 4.
+        let tokens: Vec<u32> = (0..14u32).map(|i| (i * 5 + 1) % 16).collect();
+        let prefill = 3;
+        let mut failures = Vec::new();
+        for ratio in [0, 1, 2] {
+            let mut weights = if quantized_dense {
+                tiny_weights_quantized_dense(0.1, ratio > 0)
+            } else {
+                tiny_weights(0.1, ratio > 0)
+            };
+            // A decisive router bias, so that the two paths' rounding cannot flip a near-tie
+            // between the fixture's two experts.
+            for weight in &mut weights {
+                if weight.name == "blk.0.exp_probs_b.bias" {
+                    weight.data = f32_bytes(&[3.0, -3.0]);
+                }
+            }
+            let file = write_gguf(&base_meta(ratio), &weights);
+            let model = load_on(&file, device);
+            let decoded = decoded_logits(&model, &tokens, prefill);
+            for (step, got) in decoded.iter().enumerate() {
+                let end = prefill + step;
+                let want = logits(&model, &tokens[..end]);
+                assert_eq!(got.len(), want.len());
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(got, want)| (got - want).abs())
+                    .fold(0f32, f32::max);
+                let scale = want.iter().map(|value| value.abs()).fold(0f32, f32::max);
+                eprintln!(
+                    "{device:?} quantized_dense={quantized_dense} ratio {ratio} token {}: max |decode - prefill| = {worst:e} of max |prefill| {scale:e}",
+                    end - 1
+                );
+                // Float32 rounding across the two paths stays under 1e-4. With quantized dense
+                // weights, CUDA's one-row matmul quantizes its input to Q8_1 and prefill's does
+                // not, which moves the logits by up to 0.04% of their size.
+                let bound = if quantized_dense {
+                    1e-3 * scale
+                } else {
+                    1.5e-4
+                };
+                if worst > bound {
+                    failures.push(format!("ratio {ratio} token {} ({worst:e})", end - 1));
+                }
+            }
+        }
+        failures
+    }
+
+    #[test]
+    fn decoding_a_token_matches_prefilling_through_it() {
+        let failures = decode_prefill_mismatches(&Device::Cpu, false);
+        assert!(
+            failures.is_empty(),
+            "decoding differs from prefilling through the same tokens at: {}",
+            failures.join(", ")
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn decoding_a_token_matches_prefilling_through_it_on_cuda() {
+        let device = Device::new_cuda(0).expect("cuda device");
+        let mut failures = decode_prefill_mismatches(&device, false);
+        failures.extend(
+            decode_prefill_mismatches(&device, true)
+                .into_iter()
+                .map(|failure| format!("quantized dense: {failure}")),
+        );
+        assert!(
+            failures.is_empty(),
+            "decoding differs from prefilling through the same tokens at: {}",
+            failures.join(", ")
+        );
+    }
+
+    fn with_meta(mut meta: Vec<Meta>, key: &str, value: MetaValue) -> Vec<Meta> {
+        let entry = meta
+            .iter_mut()
+            .find(|entry| entry.key == key)
+            .unwrap_or_else(|| panic!("fixture metadata has no `{key}`"));
+        entry.value = value;
+        meta
+    }
+
+    fn logits_with(meta: Vec<Meta>, compressor: bool, tokens: &[u32]) -> Vec<f32> {
+        let file = write_gguf(&meta, &tiny_weights(0.1, compressor));
+        logits(&load(&file), tokens)
+    }
+
+    // A layer that reads a compressed stream rotates its queries and window with the
+    // compressor's base and YaRN, as the reference does; a sliding-window layer uses the
+    // model's base.
+    #[test]
+    fn a_compressed_layer_rotates_with_the_compressor_base() {
+        let tokens = [1u32, 6, 11, 0, 5, 10];
+        let main = |ratio, base| {
+            with_meta(
+                base_meta(ratio),
+                "deepseek41.rope.freq_base",
+                MetaValue::F32(base),
+            )
+        };
+        let compress = |ratio, base| {
+            with_meta(
+                base_meta(ratio),
+                "deepseek41.attention.compress_rope_freq_base",
+                MetaValue::F32(base),
+            )
+        };
+        for ratio in [1, 2] {
+            assert_eq!(
+                logits_with(main(ratio, 10_000.0), true, &tokens),
+                logits_with(main(ratio, 777.0), true, &tokens),
+                "ratio {ratio}: the model's rope base must not reach a compressed layer"
+            );
+            assert_ne!(
+                logits_with(compress(ratio, 160_000.0), true, &tokens),
+                logits_with(compress(ratio, 4_000.0), true, &tokens),
+                "ratio {ratio}: the compressor's rope base must reach a compressed layer"
+            );
+        }
+        assert_eq!(
+            logits_with(compress(0, 160_000.0), false, &tokens),
+            logits_with(compress(0, 4_000.0), false, &tokens),
+            "the compressor's rope base must not reach a sliding-window layer"
+        );
+        assert_ne!(
+            logits_with(main(0, 10_000.0), false, &tokens),
+            logits_with(main(0, 777.0), false, &tokens),
+            "the model's rope base must reach a sliding-window layer"
+        );
+    }
+
+    #[test]
+    fn an_index_source_attends_to_only_the_compressed_rows_it_picked() {
+        let top_k = |k| {
+            with_meta(
+                base_meta(1),
+                "deepseek41.attention.indexer.top_k",
+                MetaValue::U32(k),
+            )
+        };
+        // Ratio 1 compresses every token, so 14 tokens make 14 rows, more than a top_k of 4.
+        let long: Vec<u32> = (0..14u32).map(|i| (i * 5 + 1) % 16).collect();
+        assert_ne!(
+            logits_with(top_k(4), true, &long),
+            logits_with(top_k(64), true, &long),
+            "with more rows than top_k, the selection must change what attention reads"
+        );
+        // Four tokens make four rows: a top_k of 4 picks them all.
+        let short = &long[..4];
+        assert_eq!(
+            logits_with(top_k(4), true, short),
+            logits_with(top_k(64), true, short),
+            "picking every row must read what full attention reads"
+        );
+    }
+
+    #[test]
+    fn the_picked_rows_restrict_the_compressed_keys_and_not_the_window() {
+        // Two queries at positions 4 and 5 of a ratio-1 stream: a 3-key window, then five
+        // compressed rows. Each query picked two rows; position 4 has completed rows 0..=4.
+        let picked = Tensor::from_vec(vec![0u32, 3, 1, 4], (1, 2, 2), &Device::Cpu).expect("ids");
+        let causal = super::attention_visible(2, 3, 5, 4, 3, 1, &Device::Cpu).expect("visible");
+        let visible = super::restrict_to_picked(&causal, 3, &picked)
+            .expect("restricted")
+            .to_vec2::<u8>()
+            .expect("values");
+        assert_eq!(
+            visible,
+            vec![
+                // window: positions 3, 4, 5      compressed rows 0..5
+                vec![1, 1, 0, 1, 0, 0, 1, 0],
+                vec![1, 1, 1, 0, 1, 0, 0, 1],
+            ]
+        );
+    }
+
+    #[test]
+    fn the_swiglu_limits_load_as_one_value_or_one_per_layer() {
+        // The reference reads both limits with `get_key_or_arr`: one value covers every layer,
+        // an array has one entry per layer, and only an absent shared limit reuses the routed.
+        const EXP: &str = "deepseek41.swiglu_clamp_exp";
+        const SHEXP: &str = "deepseek41.swiglu_clamp_shexp";
+        let with_shared = |value: MetaValue| {
+            let mut meta = base_meta(0);
+            meta.push(Meta { key: SHEXP, value });
+            meta
+        };
+        let shared_limit = |meta: Vec<Meta>| {
+            let file = write_gguf(&meta, &tiny_weights(0.1, false));
+            load(&file).layers[0].shared_swiglu_limit
+        };
+        let load_error = |meta: Vec<Meta>| {
+            let file = write_gguf(&meta, &tiny_weights(0.1, false));
+            let path = PathBuf::from(file.path());
+            let comm = Arc::new(Comm::from_device(Id::new(), &Device::Cpu, 0, 1).expect("comm"));
+            match ModelWeights::load(&[path], &Device::Cpu, DType::F32, comm) {
+                Ok(_) => panic!("malformed limits must fail the load"),
+                Err(err) => err.to_string(),
+            }
+        };
+
+        assert_eq!(shared_limit(base_meta(0)), 10.0);
+        assert_eq!(
+            shared_limit(with_meta(base_meta(0), EXP, MetaValue::F32(7.0))),
+            7.0
+        );
+        assert_eq!(shared_limit(with_shared(MetaValue::F32(3.0))), 3.0);
+        assert_eq!(shared_limit(with_shared(MetaValue::F32s(vec![4.0]))), 4.0);
+        assert_eq!(
+            load_error(with_shared(MetaValue::Str("ten"))),
+            format!("GGUF metadata `{SHEXP}` must be a nonnegative integer")
+        );
+        assert_eq!(
+            load_error(with_meta(
+                base_meta(0),
+                EXP,
+                MetaValue::F32s(vec![10.0, 10.0])
+            )),
+            format!("GGUF metadata `{EXP}` has 2 entries for 1 blocks")
+        );
     }
 
     #[test]

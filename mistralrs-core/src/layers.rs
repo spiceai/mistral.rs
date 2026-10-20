@@ -2140,6 +2140,13 @@ impl DeepSeekV2RotaryEmbedding {
         apply_rotary_qk(q, k, &self.cos, &self.sin, positions, false)
     }
 
+    /// [`forward`] on one tensor. Pass one tensor here rather than the same one as both `q`
+    /// and `k`: on CUDA the rotation runs in place, and two handles on one buffer rotate it
+    /// twice.
+    pub fn rotate(&self, x: &Tensor, positions: &Tensor) -> Result<Tensor> {
+        apply_rotary_q(x, &self.cos, &self.sin, positions, false)
+    }
+
     /// Undo [`forward`] on one tensor. `cos(-θ) = cos(θ)` and `sin(-θ) = -sin(θ)`.
     pub fn inverse(&self, x: &Tensor, positions: &Tensor) -> Result<Tensor> {
         let neg_sin = (&self.sin * -1.0)?;
