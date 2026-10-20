@@ -526,7 +526,7 @@ extern "C" {
 
     // Fused gate+up+activation+multiply launchers
     // All share the same signature: (gate_weights, up_weights, inputs_q8_1,
-    //   indices, outputs, n, k, batch, topk, k_padded, act_type, swiglu_limit, stream)
+    //   indices, outputs, n, k, batch, topk, k_padded, act_type, stream)
 
     pub fn launch_moe_gemv_fused_gate_up_q8_0_q8_1(
         gate_weights: *const c_void,
@@ -540,7 +540,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_q4_0_q8_1(
@@ -555,7 +554,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_q4_1_q8_1(
@@ -570,7 +568,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_q5_0_q8_1(
@@ -585,7 +582,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_q5_1_q8_1(
@@ -600,7 +596,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_q8_1_q8_1(
@@ -615,7 +610,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_q2k_q8_1(
@@ -630,7 +624,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_q3k_q8_1(
@@ -645,7 +638,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_q4k_q8_1(
@@ -660,7 +652,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_q5k_q8_1(
@@ -675,7 +666,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
     pub fn launch_moe_gemv_fused_gate_up_q6k_q8_1(
@@ -690,7 +680,6 @@ extern "C" {
         topk: i32,
         k_padded: i32,
         act_type: i32,
-        swiglu_limit: f32,
         stream: *mut c_void,
     );
 

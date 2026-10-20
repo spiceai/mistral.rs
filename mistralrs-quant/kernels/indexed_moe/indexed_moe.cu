@@ -1347,10 +1347,7 @@ __device__ void moe_gemv_fused_gate_up_impl(
     const unsigned int *__restrict__ indices, float *__restrict__ all_outputs,
     const int n, const int k, const int batch, const int topk,
     const int k_padded,
-    const int act_type, // 0=gelu_pytorch_tanh, 1=silu
-    // > 0 clamps the activation's inputs first: gate to at most the limit,
-    // up to within plus or minus it (DeepSeek-V4.1's clamped SwiGLU).
-    const float swiglu_limit) {
+    const int act_type) { // 0=gelu_pytorch_tanh, 1=silu
 
   constexpr int ROWS_PER_WARP = 2;
   constexpr int NWARPS = 4;
@@ -1408,10 +1405,6 @@ __device__ void moe_gemv_fused_gate_up_impl(
     u_sum = warp_reduce_sum(u_sum);
 
     if (threadIdx.x == 0) {
-      if (swiglu_limit > 0.0f) {
-        g_sum = fminf(g_sum, swiglu_limit);
-        u_sum = fminf(fmaxf(u_sum, -swiglu_limit), swiglu_limit);
-      }
       float activated =
           (act_type == 0) ? gelu_pytorch_tanh(g_sum) : silu(g_sum);
       out[row] = u_sum * activated;
@@ -1503,10 +1496,10 @@ __device__ void moe_gemv_down_aggregate_impl(
       const unsigned int *__restrict__ indices,                                \
       float *__restrict__ all_outputs, const int n, const int k,               \
       const int batch, const int topk, const int k_padded,                     \
-      const int act_type, const float swiglu_limit) {                          \
+      const int act_type) {                                                    \
     moe_gemv_fused_gate_up_impl<qk_val, qi_val, block_type, vdr_val, vd_fn>(   \
         gate_weights, up_weights, all_inputs, indices, all_outputs, n, k,      \
-        batch, topk, k_padded, act_type, swiglu_limit);                        \
+        batch, topk, k_padded, act_type);                                      \
   }
 
 FUSED_GATE_UP_KERNEL(q8_0_q8_1, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ,
@@ -1627,7 +1620,7 @@ DOWN_AGGREGATE_KERNEL(q6k_q8_1, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ,
       const void *gate_weights, const void *up_weights,                        \
       const void *all_inputs, const unsigned int *indices, float *all_outputs, \
       int n, int k, int batch, int topk, int k_padded, int act_type,           \
-      float swiglu_limit, void *stream) {                                      \
+      void *stream) {                                                          \
     const int NWARPS = 4;                                                      \
     const int ROWS_PER_WARP = 2;                                               \
     const int ROWS_PER_BLOCK = NWARPS * ROWS_PER_WARP;                         \
@@ -1636,7 +1629,7 @@ DOWN_AGGREGATE_KERNEL(q6k_q8_1, QK_K, QI6_K, block_q6_K, VDR_Q6_K_Q8_1_MMVQ,
     cudaStream_t s = static_cast<cudaStream_t>(stream);                        \
     moe_gemv_fused_gate_up_##suffix<<<grid, block, 0, s>>>(                    \
         gate_weights, up_weights, all_inputs, indices, all_outputs, n, k,      \
-        batch, topk, k_padded, act_type, swiglu_limit);                        \
+        batch, topk, k_padded, act_type);                                      \
   }
 
 LAUNCH_FUSED_GATE_UP(q8_0_q8_1)

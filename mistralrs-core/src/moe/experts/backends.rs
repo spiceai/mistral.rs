@@ -437,6 +437,8 @@ mod swiglu_limit_tests {
     use mistralrs_quant::GgufMatMul;
 
     const EXPERTS: usize = 3;
+    const HIDDEN: usize = 64;
+    const INTERMEDIATE: usize = 96;
     const TOPK: usize = 2;
     const LIMIT: f64 = 0.05;
 
@@ -451,13 +453,8 @@ mod swiglu_limit_tests {
         Tensor::from_vec(values, shape, &Device::Cpu)
     }
 
-    /// The quantized projection on `device`, and its dequantized weights on the CPU.
-    fn quantized(
-        weight: &Tensor,
-        dtype: GgmlDType,
-        device: &Device,
-    ) -> Result<(Arc<dyn QuantMethod>, Tensor)> {
-        let q = QTensor::quantize_onto(weight, dtype, device)?;
+    fn quantized(weight: &Tensor) -> Result<(Arc<dyn QuantMethod>, Tensor)> {
+        let q = QTensor::quantize(weight, GgmlDType::Q8_0)?;
         let dequantized = q.dequantize(&Device::Cpu)?;
         let method: Arc<dyn QuantMethod> = Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
             q_weight: Arc::new(q),
@@ -466,152 +463,81 @@ mod swiglu_limit_tests {
         Ok((method, dequantized))
     }
 
-    struct Experts {
-        fast: FastExpertsWeights,
-        gate: Tensor,
-        up: Tensor,
-        down: Tensor,
-    }
-
-    fn experts(
-        hidden: usize,
-        intermediate: usize,
-        gate_up: GgmlDType,
-        down: GgmlDType,
-        device: &Device,
-    ) -> Result<Experts> {
-        let (gate_proj, gate) = quantized(
-            &weights((EXPERTS, intermediate, hidden), 0.1)?,
-            gate_up,
-            device,
-        )?;
-        let (up_proj, up) = quantized(
-            &weights((EXPERTS, intermediate, hidden), 0.7)?,
-            gate_up,
-            device,
-        )?;
-        let (down_proj, down_w) = quantized(
-            &weights((EXPERTS, hidden, intermediate), 1.3)?,
-            down,
-            device,
-        )?;
-        Ok(Experts {
-            fast: FastExpertsWeights {
-                fused_gate_proj: gate_proj,
-                fused_up_proj: up_proj,
-                fused_down_proj: down_proj,
-                sharded: false,
-            },
-            gate,
-            up,
-            down: down_w,
-        })
-    }
-
-    /// The routed SwiGLU written out on dequantized weights, token by token: clamp `gate`
-    /// above and `up` on both sides, then `silu(gate) * up` through `down`, weighted by the
-    /// router.
-    fn reference(xs: &Tensor, ids: &[u32], route: &[f32], experts: &Experts) -> Result<Tensor> {
-        let (tokens, hidden) = xs.dims2()?;
-        let mut rows = Vec::with_capacity(tokens);
-        for token in 0..tokens {
-            let x = xs.narrow(0, token, 1)?;
-            let mut out = Tensor::zeros((1, hidden), DType::F32, &Device::Cpu)?;
-            for slot in 0..TOPK {
-                let id = ids[token * TOPK + slot] as usize;
-                let g = x
-                    .matmul(&experts.gate.get(id)?.t()?)?
-                    .clamp(f64::NEG_INFINITY, LIMIT)?;
-                let u = x.matmul(&experts.up.get(id)?.t()?)?.clamp(-LIMIT, LIMIT)?;
-                let mixed = (candle_nn::ops::silu(&g)? * u)?;
-                let y = mixed.matmul(&experts.down.get(id)?.t()?)?;
-                out = (out + (y * f64::from(route[token * TOPK + slot]))?)?;
-            }
-            rows.push(out);
+    /// The routed SwiGLU written out on dequantized weights: clamp `gate` above and `up` on
+    /// both sides, then `silu(gate) * up` through `down`, weighted by the router.
+    fn reference(
+        xs: &Tensor,
+        ids: &[u32],
+        route: &[f32],
+        gate: &Tensor,
+        up: &Tensor,
+        down: &Tensor,
+    ) -> Result<Tensor> {
+        let mut out = Tensor::zeros((1, HIDDEN), DType::F32, &Device::Cpu)?;
+        for (&id, &weight) in ids.iter().zip(route) {
+            let id = id as usize;
+            let g = xs
+                .matmul(&gate.get(id)?.t()?)?
+                .clamp(f64::NEG_INFINITY, LIMIT)?;
+            let u = xs.matmul(&up.get(id)?.t()?)?.clamp(-LIMIT, LIMIT)?;
+            let mixed = (candle_nn::ops::silu(&g)? * u)?;
+            let y = mixed.matmul(&down.get(id)?.t()?)?;
+            out = (out + (y * f64::from(weight))?)?;
         }
-        Tensor::cat(&rows, 0)
+        Ok(out)
     }
 
     fn relative(a: &Tensor, b: &Tensor) -> Result<f32> {
-        let a = a.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let diff = (&a - b)?.abs()?.max_all()?.to_scalar::<f32>()?;
+        let diff = (a - b)?.abs()?.max_all()?.to_scalar::<f32>()?;
         let scale = b.abs()?.max_all()?.to_scalar::<f32>()?;
         Ok(diff / scale)
-    }
-
-    struct Routed {
-        xs: Tensor,
-        xs_flat: Tensor,
-        ids: Vec<u32>,
-        route: Vec<f32>,
-        topk_ids: Tensor,
-        topk_weights: Tensor,
-    }
-
-    fn routed(tokens: usize, hidden: usize, device: &Device) -> Result<Routed> {
-        // Large enough inputs that gate and up pass the limit.
-        let xs_flat = (weights((1, tokens, hidden), 3.1)? * 25.0)?.reshape((tokens, hidden))?;
-        let ids: Vec<u32> = (0..tokens * TOPK)
-            .map(|slot| u32::try_from((slot * 2 + slot / TOPK) % EXPERTS).expect("small id"))
-            .collect();
-        let route: Vec<f32> = (0..tokens * TOPK)
-            .map(|slot| if slot % TOPK == 0 { 0.65 } else { 0.35 })
-            .collect();
-        Ok(Routed {
-            xs: xs_flat.reshape((1, tokens, hidden))?.to_device(device)?,
-            topk_ids: Tensor::from_slice(&ids, (tokens, TOPK), device)?,
-            topk_weights: Tensor::from_slice(&route, (tokens, TOPK), device)?,
-            xs_flat,
-            ids,
-            route,
-        })
-    }
-
-    fn forward<'a>(
-        routed: &'a Routed,
-        xs_flat: &'a Tensor,
-        phase: MoEForwardPhase,
-    ) -> MoEForward<'a> {
-        let (tokens, hidden) = routed.xs_flat.dims2().expect("dims");
-        MoEForward {
-            xs: &routed.xs,
-            xs_flat,
-            topk_weights: &routed.topk_weights,
-            topk_ids: &routed.topk_ids,
-            original_dtype: DType::F32,
-            shape: MoEForwardShape {
-                batch_size: 1,
-                seq_len: tokens,
-                hidden_dim: hidden,
-                num_tokens: tokens,
-                phase,
-            },
-            lora: None,
-        }
-    }
-
-    fn config(swiglu_limit: Option<f64>) -> MoEForwardConfig {
-        MoEForwardConfig {
-            num_experts: EXPERTS,
-            num_experts_per_tok: TOPK,
-            act: Activation::Silu,
-            swiglu_limit,
-        }
     }
 
     // Regression test: DeepSeek-V4.1's routed experts clamp their SwiGLU
     // (`swiglu_clamp_exp`), and the graph served them unclamped.
     #[test]
     fn the_gather_path_clamps_swiglu_inputs_to_the_limit() -> Result<()> {
-        let experts = experts(64, 96, GgmlDType::Q8_0, GgmlDType::Q8_0, &Device::Cpu)?;
-        let routed = routed(1, 64, &Device::Cpu)?;
-        let forward = forward(&routed, &routed.xs_flat, MoEForwardPhase::Decode);
-        let want = reference(&routed.xs_flat, &routed.ids, &routed.route, &experts)?;
-        let clamped_error = relative(
-            &experts.fast.forward_impl(&forward, config(Some(LIMIT)))?,
-            &want,
-        )?;
-        let unclamped_error = relative(&experts.fast.forward_impl(&forward, config(None))?, &want)?;
+        let (gate, gate_w) = quantized(&weights((EXPERTS, INTERMEDIATE, HIDDEN), 0.1)?)?;
+        let (up, up_w) = quantized(&weights((EXPERTS, INTERMEDIATE, HIDDEN), 0.7)?)?;
+        let (down, down_w) = quantized(&weights((EXPERTS, HIDDEN, INTERMEDIATE), 1.3)?)?;
+        let fast = FastExpertsWeights {
+            fused_gate_proj: gate,
+            fused_up_proj: up,
+            fused_down_proj: down,
+            sharded: false,
+        };
+        let xs = (weights((1, 1, HIDDEN), 3.1)? * 25.0)?;
+        let xs_flat = xs.reshape((1, HIDDEN))?;
+        let ids = [2u32, 0];
+        let route = [0.65f32, 0.35];
+        let topk_ids = Tensor::from_slice(&ids, (1, TOPK), &Device::Cpu)?;
+        let topk_weights = Tensor::from_slice(&route, (1, TOPK), &Device::Cpu)?;
+        let forward = MoEForward {
+            xs: &xs,
+            xs_flat: &xs_flat,
+            topk_weights: &topk_weights,
+            topk_ids: &topk_ids,
+            original_dtype: DType::F32,
+            shape: MoEForwardShape {
+                batch_size: 1,
+                seq_len: 1,
+                hidden_dim: HIDDEN,
+                num_tokens: 1,
+                phase: MoEForwardPhase::Decode,
+            },
+            lora: None,
+        };
+        let config = |swiglu_limit| MoEForwardConfig {
+            num_experts: EXPERTS,
+            num_experts_per_tok: TOPK,
+            act: Activation::Silu,
+            swiglu_limit,
+        };
+        let want = reference(&xs_flat, &ids, &route, &gate_w, &up_w, &down_w)?;
+        let clamped = fast.forward_impl(&forward, config(Some(LIMIT)))?;
+        let unclamped = fast.forward_impl(&forward, config(None))?;
+        let clamped_error = relative(&clamped, &want)?;
+        let unclamped_error = relative(&unclamped, &want)?;
         assert!(
             clamped_error < 0.02,
             "the clamped gather path is {clamped_error} from the clamped reference"
@@ -619,60 +545,6 @@ mod swiglu_limit_tests {
         assert!(
             unclamped_error > 0.2,
             "the inputs never reach the limit, so this test checks nothing ({unclamped_error})"
-        );
-        Ok(())
-    }
-
-    // The fused decode kernel and the grouped prefill clamp too, so a clamped model keeps the
-    // fast CUDA paths. DeepSeek-V4.1 stores its routed experts as Q2_K gate/up and Q3_K down.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn the_cuda_fast_paths_clamp_swiglu_inputs_to_the_limit() -> Result<()> {
-        const HIDDEN: usize = 256;
-        const INTERMEDIATE: usize = 768;
-        let device = Device::new_cuda(0)?;
-        let mut failures = Vec::new();
-        for (gate_up, down) in [
-            (GgmlDType::Q2K, GgmlDType::Q3K),
-            (GgmlDType::Q8_0, GgmlDType::Q8_0),
-        ] {
-            let experts = experts(HIDDEN, INTERMEDIATE, gate_up, down, &device)?;
-            for (path, tokens) in [
-                ("decode", 1),
-                ("grouped prefill", GROUPED_PREFILL_MIN_TOKENS + 8),
-            ] {
-                let routed = routed(tokens, HIDDEN, &device)?;
-                let xs_flat = routed.xs_flat.to_device(&device)?;
-                let phase = if tokens == 1 {
-                    MoEForwardPhase::Decode
-                } else {
-                    MoEForwardPhase::Prefill
-                };
-                let forward = forward(&routed, &xs_flat, phase);
-                let want = reference(&routed.xs_flat, &routed.ids, &routed.route, &experts)?;
-                let run = |limit| -> Result<Tensor> {
-                    let out = if tokens == 1 {
-                        experts.fast.forward_decode(&forward, config(limit))?
-                    } else {
-                        experts.fast.forward_grouped(&forward, config(limit))?
-                    };
-                    out.ok_or_else(|| {
-                        candle_core::Error::msg(format!("{path} declined {gate_up:?}/{down:?}"))
-                    })
-                };
-                let clamped = relative(&run(Some(LIMIT))?, &want)?;
-                let unclamped = relative(&run(None)?, &want)?;
-                eprintln!("{path} {gate_up:?}/{down:?}: clamped {clamped:e}, unclamped {unclamped:e} of the clamped reference");
-                // Both paths quantize the activations to Q8_1 on the way in and on the way down.
-                if clamped > 0.05 || unclamped < 0.2 {
-                    failures.push(format!("{path} {gate_up:?}/{down:?} (clamped {clamped:e}, unclamped {unclamped:e})"));
-                }
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "the CUDA fast paths ignore the SwiGLU limit: {}",
-            failures.join(", ")
         );
         Ok(())
     }
@@ -1363,8 +1235,12 @@ impl FastExpertsWeights {
         forward: &MoEForward,
         config: MoEForwardConfig,
     ) -> Result<Tensor> {
-        if config.swiglu_limit.is_some() && forward.lora.is_some() {
-            candle_core::bail!("a clamped SwiGLU is not supported with expert LoRA");
+        if config.swiglu_limit.is_some() {
+            // The fused and grouped kernels have no clamp.
+            if forward.lora.is_some() {
+                candle_core::bail!("a clamped SwiGLU is not supported with expert LoRA");
+            }
+            return self.forward_gather(forward, config);
         }
         if forward.lora.is_some() {
             #[cfg(feature = "cuda")]
@@ -1812,7 +1688,6 @@ impl FastExpertsWeights {
                 forward.shape.num_tokens,
                 config.num_experts_per_tok,
                 act_type,
-                config.swiglu_limit.map_or(0.0, |limit| limit as f32),
                 dev,
             )?
         };
@@ -1985,9 +1860,6 @@ impl FastExpertsWeights {
             _ => None,
         };
 
-        // The down kernels that fuse the activation cannot clamp it, so a clamped SwiGLU takes the
-        // branch that activates before the down projection.
-        let glu_activation = glu_activation.filter(|_| config.swiglu_limit.is_none());
         let down = if let (true, Some(glu_activation)) = (
             mistralrs_quant::supports_mmq(down_qt.dtype()),
             glu_activation,
@@ -2088,12 +1960,6 @@ impl FastExpertsWeights {
                     2,
                 ),
                 None => match &gate_up {
-                    GroupedGateUp::Packed(gate_up) if config.swiglu_limit.is_some() => {
-                        let intermediate = gate_up.dim(D::Minus1)? / 2;
-                        let gate = gate_up.narrow(D::Minus1, 0, intermediate)?;
-                        let up = gate_up.narrow(D::Minus1, intermediate, intermediate)?;
-                        (gated(&gate, &up, config)?, 2)
-                    }
                     GroupedGateUp::Packed(gate_up) => (
                         crate::ops::split_mul_and_act(
                             gate_up,
@@ -2102,9 +1968,6 @@ impl FastExpertsWeights {
                         )?,
                         2,
                     ),
-                    GroupedGateUp::SortedPair { gate, up } if config.swiglu_limit.is_some() => {
-                        (gated(gate, up, config)?, 0)
-                    }
                     GroupedGateUp::SortedPair { gate, up } => {
                         (crate::ops::mul_and_act(gate, up, config.act)?, 0)
                     }
