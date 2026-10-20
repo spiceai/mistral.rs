@@ -1515,6 +1515,9 @@ pub const ACT_SILU: i32 = 1;
 ///   4. fused down+topk_weights+atomicAdd aggregation
 ///
 /// Returns the aggregated output tensor of shape [batch, hidden_size].
+///
+/// `swiglu_limit` > 0 clamps the activation's inputs (gate to at most the limit, up to within
+/// plus or minus it) before the activation; 0 leaves them as computed.
 #[allow(clippy::too_many_arguments)]
 /// # Safety
 /// `topk_weights_ptr` must be a valid device pointer to `batch * topk` f32 values.
@@ -1528,6 +1531,7 @@ pub unsafe fn indexed_moe_fused_decode(
     batch: usize,
     topk: usize,
     act_type: i32,
+    swiglu_limit: f32,
     dev: &CudaDevice,
 ) -> Result<Tensor> {
     let gate_up_dtype = gate_qt.dtype();
@@ -1587,6 +1591,7 @@ pub unsafe fn indexed_moe_fused_decode(
             i32,
             i32,
             i32,
+            f32,
             *mut std::ffi::c_void,
         );
 
@@ -1618,6 +1623,7 @@ pub unsafe fn indexed_moe_fused_decode(
                 topk as i32,
                 k_padded as i32,
                 act_type,
+                swiglu_limit,
                 stream,
             );
         }
