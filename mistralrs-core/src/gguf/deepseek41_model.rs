@@ -207,13 +207,17 @@ impl ModelWeights {
                 ratios.len()
             );
         }
-        let clamps = meta_f32_array(&archive, &key("swiglu_clamp_exp"))?;
+        let clamps =
+            meta_f32_per_layer(&archive, &key("swiglu_clamp_exp"), blocks)?.ok_or_else(|| {
+                candle_core::Error::msg(format!(
+                    "GGUF deepseek41 is missing metadata `{}`",
+                    key("swiglu_clamp_exp")
+                ))
+            })?;
         // The shared expert has its own limits; a checkpoint without them reuses the routed
         // experts', as the reference does.
-        let shared_clamps = match meta_f32_array(&archive, &key("swiglu_clamp_shexp")) {
-            Ok(values) => values,
-            Err(_) => clamps.clone(),
-        };
+        let shared_clamps = meta_f32_per_layer(&archive, &key("swiglu_clamp_shexp"), blocks)?
+            .unwrap_or_else(|| clamps.clone());
         let freq_base = meta_f32(&archive, &key("rope.freq_base"))?;
         let compress_base = meta_f32(&archive, &key("attention.compress_rope_freq_base"))?;
         let yarn_factor = meta_f32(&archive, &key("rope.scaling.factor"))?;
@@ -317,7 +321,7 @@ impl ModelWeights {
                 &None,
                 Activation::Silu,
             )?
-            .with_swiglu_limit(f64::from(clamps.get(layer).copied().unwrap_or(10.0)))?;
+            .with_swiglu_limit(f64::from(clamps[layer]))?;
             let compressor = if archive.contains_tensor(&blk(layer, "attn_compressor_kv.weight")) {
                 Some(Compressor {
                     kv: linear(&archive, &blk(layer, "attn_compressor_kv.weight"), device)?,
@@ -404,7 +408,6 @@ impl ModelWeights {
                     })?;
                 out_a.push(loaded);
             }
-            let clamp = shared_clamps.get(layer).copied().unwrap_or(10.0);
             layers.push(Layer {
                 index: layer,
                 ratio,
@@ -418,7 +421,7 @@ impl ModelWeights {
                 index_topk,
                 expert_k,
                 route_scale,
-                shared_swiglu_limit: f64::from(clamp),
+                shared_swiglu_limit: f64::from(shared_clamps[layer]),
                 kv_owner: owners[layer],
                 q_a: linear(&archive, &blk(layer, "attn_q_a.weight"), device)?,
                 q_a_norm: dense(&archive, &blk(layer, "attn_q_a_norm.weight"), device)?,
@@ -1237,6 +1240,29 @@ fn meta_f32_array(archive: &GgufArchive, name: &str) -> Result<Vec<f32>> {
         .collect()
 }
 
+/// A per-layer value that the GGUF stores either once, for every layer, or as an array with one
+/// entry per layer, as the reference's `get_key_or_arr` reads it. `None` when the key is absent.
+fn meta_f32_per_layer(
+    archive: &GgufArchive,
+    name: &str,
+    layers: usize,
+) -> Result<Option<Vec<f32>>> {
+    let Some(value) = archive.metadata_value(name) else {
+        return Ok(None);
+    };
+    let values = match value {
+        candle_core::quantized::gguf_file::Value::Array(_) => meta_f32_array(archive, name)?,
+        _ => vec![meta_f32(archive, name)?; layers],
+    };
+    if values.len() != layers {
+        candle_core::bail!(
+            "GGUF metadata `{name}` has {} entries for {layers} blocks",
+            values.len()
+        );
+    }
+    Ok(Some(values))
+}
+
 fn meta_u32_array(archive: &GgufArchive, name: &str) -> Result<Vec<u32>> {
     meta_usize_array(archive, name)?
         .into_iter()
@@ -1884,6 +1910,52 @@ mod tests {
                 vec![1, 1, 0, 1, 0, 0, 1, 0],
                 vec![1, 1, 1, 0, 1, 0, 0, 1],
             ]
+        );
+    }
+
+    #[test]
+    fn the_swiglu_limits_load_as_one_value_or_one_per_layer() {
+        // The reference reads both limits with `get_key_or_arr`: one value covers every layer,
+        // an array has one entry per layer, and only an absent shared limit reuses the routed.
+        const EXP: &str = "deepseek41.swiglu_clamp_exp";
+        const SHEXP: &str = "deepseek41.swiglu_clamp_shexp";
+        let with_shared = |value: MetaValue| {
+            let mut meta = base_meta(0);
+            meta.push(Meta { key: SHEXP, value });
+            meta
+        };
+        let shared_limit = |meta: Vec<Meta>| {
+            let file = write_gguf(&meta, &tiny_weights(0.1, false));
+            load(&file).layers[0].shared_swiglu_limit
+        };
+        let load_error = |meta: Vec<Meta>| {
+            let file = write_gguf(&meta, &tiny_weights(0.1, false));
+            let path = PathBuf::from(file.path());
+            let comm = Arc::new(Comm::from_device(Id::new(), &Device::Cpu, 0, 1).expect("comm"));
+            match ModelWeights::load(&[path], &Device::Cpu, DType::F32, comm) {
+                Ok(_) => panic!("malformed limits must fail the load"),
+                Err(err) => err.to_string(),
+            }
+        };
+
+        assert_eq!(shared_limit(base_meta(0)), 10.0);
+        assert_eq!(
+            shared_limit(with_meta(base_meta(0), EXP, MetaValue::F32(7.0))),
+            7.0
+        );
+        assert_eq!(shared_limit(with_shared(MetaValue::F32(3.0))), 3.0);
+        assert_eq!(shared_limit(with_shared(MetaValue::F32s(vec![4.0]))), 4.0);
+        assert_eq!(
+            load_error(with_shared(MetaValue::Str("ten"))),
+            format!("GGUF metadata `{SHEXP}` must be a nonnegative integer")
+        );
+        assert_eq!(
+            load_error(with_meta(
+                base_meta(0),
+                EXP,
+                MetaValue::F32s(vec![10.0, 10.0])
+            )),
+            format!("GGUF metadata `{EXP}` has 2 entries for 1 blocks")
         );
     }
 
