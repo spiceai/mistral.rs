@@ -602,8 +602,15 @@ impl Dsa {
 
         let q = q.transpose(1, 2)?.contiguous()?;
         let q_latent = q.broadcast_matmul(&self.k_b_t.unsqueeze(0)?)?;
-        let keys = latent.transpose(1, 2)?.contiguous()?.unsqueeze(1)?;
-        let scores = (q_latent.broadcast_matmul(&keys)? * (1.0 / (qk_dim as f64).sqrt()))?;
+        // Every head scores against the same latent, so the heads fold into the query rows
+        // of one matmul; broadcasting the latent across them copies it once per head.
+        let lora = q_latent.dim(D::Minus1)?;
+        let keys = latent.transpose(1, 2)?.contiguous()?;
+        let scores = q_latent
+            .reshape((batch, self.heads * seq, lora))?
+            .matmul(&keys)?
+            .reshape((batch, self.heads, seq, total))?;
+        let scores = (scores * (1.0 / (qk_dim as f64).sqrt()))?;
         let scores = if seq > 1 {
             let key_pos = Tensor::arange(0u32, total as u32, x.device())?.unsqueeze(0)?;
             let query_pos = Tensor::arange(past as u32, total as u32, x.device())?.unsqueeze(1)?;
@@ -616,7 +623,10 @@ impl Dsa {
             scores
         };
         let probs = candle_nn::ops::softmax_last_dim(&scores.contiguous()?)?;
-        let mixed = probs.broadcast_matmul(&latent.unsqueeze(1)?.contiguous()?)?;
+        let mixed = probs
+            .reshape((batch, self.heads * seq, total))?
+            .matmul(&latent.contiguous()?)?
+            .reshape((batch, self.heads, seq, lora))?;
         let y = mixed.broadcast_matmul(&self.v_b_t.unsqueeze(0)?)?;
         let y = y.transpose(1, 2)?.reshape((batch, seq, ()))?;
         self.output.forward(&y)
