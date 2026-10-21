@@ -15,8 +15,8 @@ use mistralrs_quant::{
 };
 
 use crate::gguf::deepseek41::{
-    compress_groups, engram_apply, engram_row_ids, lagged_block, moe_route, rmsnorm,
-    swiglu_clamped, HyperWeights,
+    compress_groups, engram_apply, engram_projection, engram_row_ids, hyper_mix_projection,
+    lagged_block, moe_route, rmsnorm, swiglu_clamped, HyperWeights,
 };
 use crate::kv_cache::{EitherCache, NormalCache};
 use crate::layers::{
@@ -385,7 +385,14 @@ impl ModelWeights {
                         archive: archive.clone(),
                         name: blk(layer, "engram_embd.weight"),
                     },
-                    wkv: dense(&archive, &blk(layer, "engram_wkv.weight"), device)?,
+                    wkv: engram_projection(
+                        dense(&archive, &blk(layer, "engram_wkv.weight"), device)?,
+                        *archive
+                            .tensor_info(&blk(layer, "engram_embd.weight"))?
+                            .shape()
+                            .last()
+                            .unwrap_or(&0),
+                    )?,
                     q: dense(&archive, &blk(layer, "engram_q.weight"), device)?,
                     k: dense(&archive, &blk(layer, "engram_k.weight"), device)?,
                     hash_index,
@@ -435,8 +442,8 @@ impl ModelWeights {
                 compress_rope: (ratio > 0).then(|| compress_rope.clone()),
                 attn_norm: dense(&archive, &blk(layer, "attn_norm.weight"), device)?,
                 ffn_norm: dense(&archive, &blk(layer, "ffn_norm.weight"), device)?,
-                hc_attn: hyper(&archive, layer, "attn", device)?,
-                hc_ffn: hyper(&archive, layer, "ffn", device)?,
+                hc_attn: hyper(&archive, layer, "attn", hc * hidden, device)?,
+                hc_ffn: hyper(&archive, layer, "ffn", hc * hidden, device)?,
                 experts: experts_layer,
                 router: linear(&archive, &blk(layer, "ffn_gate_inp.weight"), device)?,
                 router_bias: dense(&archive, &blk(layer, "exp_probs_b.bias"), device)?,
@@ -1119,13 +1126,17 @@ fn hyper(
     archive: &GgufArchive,
     layer: usize,
     which: &str,
+    flat_in: usize,
     device: &Device,
 ) -> Result<HyperWeights> {
     Ok(HyperWeights {
-        fn_weight: dense(
-            archive,
-            &blk(layer, &format!("hc_{which}_fn.weight")),
-            device,
+        fn_weight: hyper_mix_projection(
+            dense(
+                archive,
+                &blk(layer, &format!("hc_{which}_fn.weight")),
+                device,
+            )?,
+            flat_in,
         )?,
         scale: dense(
             archive,

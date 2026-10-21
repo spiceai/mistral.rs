@@ -157,6 +157,16 @@ struct HyperCoeff {
     comb: Tensor,
 }
 
+/// Orients a GGUF `hc_*_fn` mix as the `[in, out]` matrix [`hyper_coeff`] multiplies the
+/// flattened streams by. GGUF stores it `[out, in]`, and the mix is `x @ W.T`.
+pub(crate) fn hyper_mix_projection(fn_weight: Tensor, flat_in: usize) -> Result<Tensor> {
+    if fn_weight.dim(1)? == flat_in {
+        fn_weight.t()?.contiguous()
+    } else {
+        Ok(fn_weight)
+    }
+}
+
 fn hyper_coeff(
     h: &Tensor,
     weights: &HyperWeights,
@@ -172,13 +182,15 @@ fn hyper_coeff(
     let flat = h.reshape((batch, flat_in))?.to_dtype(DType::F32)?;
     let variance = flat.sqr()?.mean_keepdim(D::Minus1)?;
     let scale = (variance + f64::from(rms_eps))?.sqrt()?.recip()?;
-    // GGUF stores this matrix as `[out, in]`. The mix is `x @ W.T`.
+    // `fn_weight` arrives as `[in, out]`, oriented once at load by `hyper_mix_projection`;
+    // transposing it here would copy the whole matrix on every token.
+    if weights.fn_weight.dim(0)? != flat_in {
+        candle_core::bail!(
+            "deepseek41 hyper-connection mix is {:?}, but the streams flatten to {flat_in} values",
+            weights.fn_weight.dims()
+        );
+    }
     let weight = weights.fn_weight.to_dtype(DType::F32)?;
-    let weight = if weight.dim(1)? == flat_in {
-        weight.t()?.contiguous()?
-    } else {
-        weight
-    };
     let projected = flat.matmul(&weight)?;
     let mixes = projected.broadcast_mul(&scale)?;
     let scale_w = weights.scale.to_dtype(DType::F32)?;
@@ -284,6 +296,16 @@ where
 
 /// Gated write of gathered Engram rows into the residual streams.
 /// `wkv` is `[cols * head_dim, hc * hidden + hidden]`. A zero row leaves `h` unchanged.
+/// Orients a GGUF `engram_wkv` as the `[in_dim, out]` matrix [`engram_apply`] multiplies
+/// the gathered rows by, transposing it when it is stored `[out, in_dim]`.
+pub(crate) fn engram_projection(wkv: Tensor, in_dim: usize) -> Result<Tensor> {
+    if wkv.dim(1)? == in_dim {
+        wkv.t()?.contiguous()
+    } else {
+        Ok(wkv)
+    }
+}
+
 pub(crate) fn engram_apply(
     h: &Tensor,
     rows: &Tensor,
@@ -297,12 +319,15 @@ pub(crate) fn engram_apply(
     let hc = dims[dims.len() - 2];
     let lead: usize = dims[..dims.len() - 2].iter().product();
     let in_dim = *rows.dims().last().unwrap_or(&0);
+    // `wkv` arrives as `[in_dim, out]`, oriented once at load by `engram_projection`;
+    // transposing it here would copy the whole matrix on every token.
+    if wkv.dim(0)? != in_dim {
+        candle_core::bail!(
+            "deepseek41 engram projection is {:?}, but the gathered rows have {in_dim} columns",
+            wkv.dims()
+        );
+    }
     let wkv = wkv.to_dtype(DType::F32)?;
-    let wkv = if wkv.dim(1)? == in_dim {
-        wkv.t()?.contiguous()?
-    } else {
-        wkv
-    };
     let kv = rows
         .reshape((lead, in_dim))?
         .to_dtype(DType::F32)?
@@ -429,12 +454,13 @@ mod tests {
     use crate::gguf::dsv4_hc::mix_streams;
 
     use super::{
-        compress_groups, engram_apply, engram_row_ids, hyper_coeff, lagged_block, missing_tensors,
-        moe_route, mqa_with_sink, swiglu_clamped, HyperWeights, REQUIRED_TENSORS,
+        compress_groups, engram_apply, engram_projection, engram_row_ids, hyper_coeff,
+        hyper_mix_projection, lagged_block, missing_tensors, moe_route, mqa_with_sink,
+        swiglu_clamped, HyperWeights, REQUIRED_TENSORS,
     };
 
     #[test]
-    fn hyper_coeff_accepts_the_gguf_out_in_matrix() {
+    fn hyper_coeff_takes_the_gguf_out_in_matrix_oriented_at_load() {
         let device = Device::Cpu;
         let hc = 2usize;
         let hidden = 5usize;
@@ -465,9 +491,9 @@ mod tests {
         let right = hyper_coeff(
             &h,
             &HyperWeights {
-                fn_weight: out_in,
-                scale,
-                base,
+                fn_weight: hyper_mix_projection(out_in.clone(), flat_in).expect("oriented"),
+                scale: scale.clone(),
+                base: base.clone(),
             },
             hc,
             1,
@@ -487,6 +513,25 @@ mod tests {
                 .expect("flat")
                 .to_vec1::<f32>()
                 .expect("pre")
+        );
+        let unoriented = hyper_coeff(
+            &h,
+            &HyperWeights {
+                fn_weight: out_in,
+                scale,
+                base,
+            },
+            hc,
+            1,
+            1e-5,
+            1e-6,
+        )
+        .err()
+        .expect("an unoriented mix is refused")
+        .to_string();
+        assert_eq!(
+            unoriented,
+            "deepseek41 hyper-connection mix is [8, 10], but the streams flatten to 10 values"
         );
     }
 
@@ -595,6 +640,50 @@ mod tests {
         assert_ne!(
             changed.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             h.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+        );
+    }
+
+    #[test]
+    fn an_engram_projection_stored_out_by_in_is_oriented_once_at_load() {
+        let device = Device::Cpu;
+        let h = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &device).unwrap();
+        let rows = Tensor::from_vec(vec![1f32, -1.0], (1, 1, 2), &device).unwrap();
+        let in_by_out = Tensor::from_vec(
+            vec![
+                0.5f32, -0.25, 0.125, 1.0, -1.0, 0.5, 0.25, 0.5, -0.125, 0.75, 0.25, -0.5,
+            ],
+            (2, 6),
+            &device,
+        )
+        .unwrap();
+        let q = Tensor::from_vec(vec![0.2f32, -0.3, 0.4, -0.1], (2, 2), &device).unwrap();
+        let k = Tensor::from_vec(vec![0.5f32, 0.25, -0.5, 1.0], (2, 2), &device).unwrap();
+        // GGUF stores the projection `[out, in_dim]`.
+        let stored = in_by_out.t().unwrap().contiguous().unwrap();
+
+        let oriented = engram_projection(stored.clone(), 2).unwrap();
+        assert_eq!(oriented.dims(), &[2, 6]);
+        assert_eq!(
+            engram_apply(&h, &rows, &oriented, &q, &k, 1e-6)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            engram_apply(&h, &rows, &in_by_out, &q, &k, 1e-6)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        );
+        let unoriented = engram_apply(&h, &rows, &stored, &q, &k, 1e-6)
+            .err()
+            .expect("an unoriented projection is refused")
+            .to_string();
+        assert_eq!(
+            unoriented,
+            "deepseek41 engram projection is [6, 2], but the gathered rows have 2 columns"
         );
     }
 

@@ -20,7 +20,9 @@ use mistralrs_quant::{
 };
 
 use crate::gdn::kda_rule_recurrence;
-use crate::gguf::deepseek41::{rmsnorm, swiglu_clamped, unlagged_block, HyperWeights};
+use crate::gguf::deepseek41::{
+    hyper_mix_projection, rmsnorm, swiglu_clamped, unlagged_block, HyperWeights,
+};
 use crate::kv_cache::{EitherCache, NormalCache};
 use crate::layers::Activation;
 use crate::moe::{ExpertProjNames, MoEExperts, MoEExpertsConfig};
@@ -298,8 +300,8 @@ impl ModelWeights {
                 kind,
                 attn_norm: dense(&archive, &blk(layer, "attn_norm.weight"), device)?,
                 ffn_norm: dense(&archive, &blk(layer, "ffn_norm.weight"), device)?,
-                hc_attn: hyper(&archive, layer, "attn", device)?,
-                hc_ffn: hyper(&archive, layer, "ffn", device)?,
+                hc_attn: hyper(&archive, layer, "attn", hc * hidden, device)?,
+                hc_ffn: hyper(&archive, layer, "ffn", hc * hidden, device)?,
                 ffn,
             });
         }
@@ -630,13 +632,17 @@ fn hyper(
     archive: &GgufArchive,
     layer: usize,
     which: &str,
+    flat_in: usize,
     device: &Device,
 ) -> Result<HyperWeights> {
     Ok(HyperWeights {
-        fn_weight: dense(
-            archive,
-            &blk(layer, &format!("hc_{which}_fn.weight")),
-            device,
+        fn_weight: hyper_mix_projection(
+            dense(
+                archive,
+                &blk(layer, &format!("hc_{which}_fn.weight")),
+                device,
+            )?,
+            flat_in,
         )?,
         scale: dense(
             archive,
