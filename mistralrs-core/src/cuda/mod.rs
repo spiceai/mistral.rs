@@ -19,5 +19,7 @@ pub(crate) mod preload;
 #[cfg(feature = "cuda")]
 pub(crate) mod qwen4_exp;
 #[cfg(feature = "cuda")]
+pub(crate) mod sinkhorn;
+#[cfg(feature = "cuda")]
 pub(crate) mod speculative_rejection;
 pub mod ssm;
