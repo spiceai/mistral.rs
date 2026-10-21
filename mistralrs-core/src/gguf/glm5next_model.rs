@@ -64,9 +64,8 @@ struct Kda {
     q: Arc<dyn QuantMethod>,
     k: Arc<dyn QuantMethod>,
     v: Arc<dyn QuantMethod>,
-    conv_q: Tensor,
-    conv_k: Tensor,
-    conv_v: Tensor,
+    /// The q, k and v depthwise convolutions joined as one `[channels, kernel]` f32 matrix.
+    conv: Tensor,
     f_a: Arc<dyn QuantMethod>,
     f_b: Arc<dyn QuantMethod>,
     dt_bias: Tensor,
@@ -259,9 +258,14 @@ impl ModelWeights {
                     q: linear(&archive, &blk(layer, "attn_q.weight"), device)?,
                     k: linear(&archive, &blk(layer, "attn_k.weight"), device)?,
                     v: linear(&archive, &blk(layer, "attn_v.weight"), device)?,
-                    conv_q: dense(&archive, &blk(layer, "ssm_conv1d_q.weight"), device)?,
-                    conv_k: dense(&archive, &blk(layer, "ssm_conv1d_k.weight"), device)?,
-                    conv_v: dense(&archive, &blk(layer, "ssm_conv1d_v.weight"), device)?,
+                    conv: conv_weights(
+                        &[
+                            dense(&archive, &blk(layer, "ssm_conv1d_q.weight"), device)?,
+                            dense(&archive, &blk(layer, "ssm_conv1d_k.weight"), device)?,
+                            dense(&archive, &blk(layer, "ssm_conv1d_v.weight"), device)?,
+                        ],
+                        kernel,
+                    )?,
                     f_a: linear(&archive, &blk(layer, "ssm_f_a.weight"), device)?,
                     f_b: linear(&archive, &blk(layer, "ssm_f_b.weight"), device)?,
                     dt_bias: dense(&archive, &blk(layer, "ssm_dt.bias"), device)?,
@@ -521,7 +525,7 @@ impl Kda {
         state: &mut Option<Tensor>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let joined = Tensor::cat(&[q, k, v], D::Minus1)?;
-        let (batch, seq, channels) = joined.dims3()?;
+        let (_, seq, channels) = joined.dims3()?;
         let width = channels / 3;
         let history = match state {
             Some(prev) => Tensor::cat(&[prev, &joined], 1)?,
@@ -532,43 +536,53 @@ impl Kda {
             let start = history.dim(1)? - keep;
             *state = Some(history.narrow(1, start, keep)?);
         }
-        let weights = Tensor::cat(&[&self.conv_q, &self.conv_k, &self.conv_v], 0)?;
-        let flat_h = history.flatten_all()?.to_vec1::<f32>()?;
-        let flat_w = weights
-            .flatten_all()?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()?;
-        let hist_len = history.dim(1)?;
-        let mut out = vec![0f32; batch * seq * channels];
-        for b in 0..batch {
-            for t in 0..seq {
-                let abs = hist_len - seq + t;
-                for c in 0..channels {
-                    let mut acc = 0f32;
-                    for lag in 0..self.kernel {
-                        if abs + 1 + lag < self.kernel {
-                            continue;
-                        }
-                        let src = abs + 1 + lag - self.kernel;
-                        if src >= hist_len {
-                            continue;
-                        }
-                        let x = flat_h[(b * hist_len + src) * channels + c];
-                        let w = flat_w[c * self.kernel + lag];
-                        acc += x * w;
-                    }
-                    out[(b * seq + t) * channels + c] = acc;
-                }
-            }
-        }
-        let _ = width;
-        let mixed = Tensor::from_vec(out, (batch, seq, channels), q.device())?;
+        let mixed = causal_depthwise_conv(&history, &self.conv, seq)?;
         let mixed = candle_nn::ops::silu(&mixed)?;
         let q = mixed.narrow(D::Minus1, 0, width)?;
         let k = mixed.narrow(D::Minus1, width, width)?;
         let v = mixed.narrow(D::Minus1, width * 2, width)?;
         Ok((q, k, v))
     }
+}
+
+/// Joins the q, k and v depthwise convolutions into one `[channels, kernel]` f32 matrix, in
+/// the order the joined channels run, once at load.
+fn conv_weights(parts: &[Tensor], kernel: usize) -> Result<Tensor> {
+    let joined = Tensor::cat(parts, 0)?.to_dtype(DType::F32)?.flatten_all()?;
+    let values = joined.elem_count();
+    if kernel == 0 || !values.is_multiple_of(kernel) {
+        candle_core::bail!(
+            "glm5-next convolution weights hold {values} values, which is not a whole number of {kernel}-tap kernels"
+        );
+    }
+    joined.reshape((values / kernel, kernel))
+}
+
+/// Causal depthwise convolution of the last `seq` positions of `history`
+/// (`[batch, hist_len, channels]`) with `weights` (`[channels, kernel]`). Output `t` sums
+/// `history[abs + 1 + lag - kernel] * weights[c, lag]` over the lags that land inside the
+/// history, where `abs = hist_len - seq + t`. It runs as `kernel` tensor ops on the history's
+/// device: reading the history and weights back to the host would stall the GPU every layer.
+fn causal_depthwise_conv(history: &Tensor, weights: &Tensor, seq: usize) -> Result<Tensor> {
+    let (batch, hist_len, channels) = history.dims3()?;
+    let kernel = weights.dim(1)?;
+    let history = history.to_dtype(DType::F32)?;
+    let padded = if kernel > 1 {
+        let zeros = Tensor::zeros((batch, kernel - 1, channels), DType::F32, history.device())?;
+        Tensor::cat(&[&zeros, &history], 1)?
+    } else {
+        history
+    };
+    let mut acc: Option<Tensor> = None;
+    for lag in 0..kernel {
+        let rows = padded.narrow(1, hist_len - seq + lag, seq)?;
+        let term = rows.broadcast_mul(&weights.narrow(1, lag, 1)?.squeeze(1)?)?;
+        acc = Some(match acc {
+            Some(sum) => (sum + term)?,
+            None => term,
+        });
+    }
+    acc.ok_or_else(|| candle_core::Error::msg("glm5-next convolution has no taps"))
 }
 
 impl Dsa {
@@ -1116,6 +1130,76 @@ mod tests {
     /// Decoding a token after a prefill must give the logits of recomputing the
     /// whole sequence: the KDA state and the DSA latent cache carry everything the
     /// earlier tokens contribute.
+    /// The host loop `causal_depthwise_conv` replaced, as the reference it is checked against.
+    fn conv_on_the_host(
+        history: &[f32],
+        batch: usize,
+        hist_len: usize,
+        channels: usize,
+        weights: &[f32],
+        kernel: usize,
+        seq: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0f32; batch * seq * channels];
+        for b in 0..batch {
+            for t in 0..seq {
+                let abs = hist_len - seq + t;
+                for c in 0..channels {
+                    let mut acc = 0f32;
+                    for lag in 0..kernel {
+                        if abs + 1 + lag < kernel {
+                            continue;
+                        }
+                        let src = abs + 1 + lag - kernel;
+                        acc += history[(b * hist_len + src) * channels + c]
+                            * weights[c * kernel + lag];
+                    }
+                    out[(b * seq + t) * channels + c] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_device_convolution_matches_the_host_loop() {
+        let device = Device::Cpu;
+        let kernel = 4;
+        for (batch, hist_len, seq, channels) in [
+            (1, 1, 1, 6),
+            (1, 2, 1, 6),
+            (1, 6, 1, 9),
+            (2, 5, 3, 6),
+            (1, 3, 3, 3),
+        ] {
+            let history: Vec<f32> = (0..batch * hist_len * channels)
+                .map(|i| ((i * 29 % 23) as f32 - 11.0) * 0.05)
+                .collect();
+            let weights: Vec<f32> = (0..channels * kernel)
+                .map(|i| ((i * 13 % 17) as f32 - 8.0) * 0.03)
+                .collect();
+            let got = super::causal_depthwise_conv(
+                &Tensor::from_vec(history.clone(), (batch, hist_len, channels), &device).unwrap(),
+                &Tensor::from_vec(weights.clone(), (channels, kernel), &device).unwrap(),
+                seq,
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            let expect =
+                conv_on_the_host(&history, batch, hist_len, channels, &weights, kernel, seq);
+            assert_eq!(got.len(), expect.len());
+            for (index, (g, e)) in got.iter().zip(&expect).enumerate() {
+                assert!(
+                    (g - e).abs() <= 1e-6,
+                    "batch={batch} hist_len={hist_len} seq={seq} index={index}: device {g}, host {e}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn decode_after_prefill_matches_a_full_recompute() {
         let mut weights = kda_weights(0.2);
