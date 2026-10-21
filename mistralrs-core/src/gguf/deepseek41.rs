@@ -686,16 +686,14 @@ mod tests {
                 .unwrap()
         );
         let unoriented = engram_apply(&h, &rows, &stored, &q, &k, 1e-6)
-            .err()
-            .expect("an unoriented projection is refused")
+            .expect_err("an unoriented projection is refused")
             .to_string();
         assert_eq!(
             unoriented,
             "deepseek41 engram projection is [6, 2], but the gathered rows have 2 columns"
         );
         let misshapen = engram_projection(Tensor::zeros((3, 2), DType::F32, &device).unwrap(), 6)
-            .err()
-            .expect("a projection that produces the wrong width is refused at load")
+            .expect_err("a projection that produces the wrong width is refused at load")
             .to_string();
         assert_eq!(
             misshapen,
