@@ -15,8 +15,8 @@ use mistralrs_quant::{
 };
 
 use crate::gguf::deepseek41::{
-    compress_groups, engram_apply, engram_projection, engram_row_ids, hyper_mix_projection,
-    lagged_block, moe_route, rmsnorm, swiglu_clamped, HyperWeights,
+    compress_groups, engram_apply, engram_row_ids, hyper_mix_projection, lagged_block, moe_route,
+    rmsnorm, swiglu_clamped, HyperWeights,
 };
 use crate::kv_cache::{EitherCache, NormalCache};
 use crate::layers::{
@@ -138,7 +138,7 @@ impl EngramTable {
 
 struct EngramLayer {
     table: EngramTable,
-    wkv: Tensor,
+    wkv: Arc<dyn QuantMethod>,
     q: Tensor,
     k: Tensor,
     hash_index: usize,
@@ -385,10 +385,7 @@ impl ModelWeights {
                         archive: archive.clone(),
                         name: blk(layer, "engram_embd.weight"),
                     },
-                    wkv: engram_projection(
-                        dense(&archive, &blk(layer, "engram_wkv.weight"), device)?,
-                        (hc + 1) * hidden,
-                    )?,
+                    wkv: linear(&archive, &blk(layer, "engram_wkv.weight"), device)?,
                     q: dense(&archive, &blk(layer, "engram_q.weight"), device)?,
                     k: dense(&archive, &blk(layer, "engram_k.weight"), device)?,
                     hash_index,
@@ -993,8 +990,9 @@ fn apply_engram(
     }
     let flat = Tensor::from_vec(flat, (h.dim(0)?, seq, cols), device)?;
     let rows = layer.table.gather(&flat)?;
-    let rows = rows.reshape((h.dim(0)?, seq, cols * hash.key_length))?;
-    engram_apply(h, &rows, &layer.wkv, &layer.q, &layer.k, f64::from(eps))
+    let rows = rows.reshape((h.dim(0)? * seq, cols * hash.key_length))?;
+    let kv = layer.wkv.forward(&rows.to_dtype(DType::F32)?)?;
+    engram_apply(h, &kv, &layer.q, &layer.k, f64::from(eps))
 }
 
 fn rotate_tail(
@@ -1072,29 +1070,36 @@ fn restrict_to_picked(visible: &Tensor, window_len: usize, picked: &Tensor) -> R
     Tensor::cat(&[&visible.narrow(1, 0, window_len)?, &compressed], 1)
 }
 
+/// Attention with one shared key/value head and a per-head sink. `q` is
+/// `[batch, seq, heads, dim]`, `k` is `[batch, keys, dim]`, `visible` is `[seq, keys]`, and
+/// the result is `[batch, seq, heads, dim]`. Every query head reads the same rows, so the
+/// heads fold into the query rows of one matmul; broadcasting `k` across the heads instead
+/// copies it once per head on every token.
 fn sparse_mqa(q: &Tensor, k: &Tensor, sinks: &Tensor, visible: &Tensor) -> Result<Tensor> {
-    let (batch, _seq, heads, dim) = q.dims4()?;
+    let (batch, seq, heads, dim) = q.dims4()?;
+    let keys = k.dim(1)?;
     let scale = 1.0 / (dim as f64).sqrt();
-    let q = q.transpose(1, 2)?.contiguous()?;
-    let k = k.unsqueeze(1)?.contiguous()?;
-    let scores = q.broadcast_matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)?;
-    let scores = (scores * scale)?;
+    let q = q.contiguous()?.reshape((batch, seq * heads, dim))?;
+    let k = k.contiguous()?;
+    let scores = q.matmul(&k.transpose(1, 2)?.contiguous()?)?;
+    let scores = (scores * scale)?.reshape((batch, seq, heads, keys))?;
     let blocked = (scores.zeros_like()? - f64::INFINITY)?;
     let scores = visible
+        .reshape((1, seq, 1, keys))?
         .broadcast_as(scores.shape())?
         .where_cond(&scores, &blocked)?;
     let row_max = scores.max_keepdim(D::Minus1)?;
     let exp_scores = scores.broadcast_sub(&row_max)?.exp()?;
     let sink = sinks
-        .reshape((1, heads, 1, 1))?
+        .reshape((1, 1, heads, 1))?
         .broadcast_sub(&row_max)?
         .exp()?;
     let denom = (exp_scores.sum_keepdim(D::Minus1)? + sink)?;
     let probs = exp_scores.broadcast_div(&denom)?;
-    let out = probs
-        .contiguous()?
-        .broadcast_matmul(&k.reshape((batch, 1, k.dim(2)?, dim))?.contiguous()?)?;
-    out.transpose(1, 2)?.contiguous()
+    probs
+        .reshape((batch, seq * heads, keys))?
+        .matmul(&k)?
+        .reshape((batch, seq, heads, dim))
 }
 
 fn load_engram_hash(archive: &GgufArchive, layers: &[usize]) -> Result<Option<EngramHash>> {
@@ -1788,6 +1793,91 @@ mod tests {
             }
         }
         failures
+    }
+
+    /// The broadcast form `sparse_mqa` replaced: `k` broadcast across the heads.
+    fn sparse_mqa_broadcast(q: &Tensor, k: &Tensor, sinks: &Tensor, visible: &Tensor) -> Tensor {
+        let (batch, _seq, heads, dim) = q.dims4().expect("q dims");
+        let scale = 1.0 / (dim as f64).sqrt();
+        let q = q.transpose(1, 2).unwrap().contiguous().unwrap();
+        let k = k.unsqueeze(1).unwrap().contiguous().unwrap();
+        let scores = q
+            .broadcast_matmul(&k.transpose(3, 2).unwrap().contiguous().unwrap())
+            .unwrap();
+        let scores = (scores * scale).unwrap();
+        let blocked = (scores.zeros_like().unwrap() - f64::INFINITY).unwrap();
+        let scores = visible
+            .broadcast_as(scores.shape())
+            .unwrap()
+            .where_cond(&scores, &blocked)
+            .unwrap();
+        let row_max = scores.max_keepdim(3).unwrap();
+        let exp_scores = scores.broadcast_sub(&row_max).unwrap().exp().unwrap();
+        let sink = sinks
+            .reshape((1, heads, 1, 1))
+            .unwrap()
+            .broadcast_sub(&row_max)
+            .unwrap()
+            .exp()
+            .unwrap();
+        let denom = (exp_scores.sum_keepdim(3).unwrap() + sink).unwrap();
+        let probs = exp_scores.broadcast_div(&denom).unwrap();
+        let out = probs
+            .contiguous()
+            .unwrap()
+            .broadcast_matmul(
+                &k.reshape((batch, 1, k.dim(2).unwrap(), dim))
+                    .unwrap()
+                    .contiguous()
+                    .unwrap(),
+            )
+            .unwrap();
+        out.transpose(1, 2).unwrap().contiguous().unwrap()
+    }
+
+    #[test]
+    fn folding_the_heads_into_one_matmul_matches_broadcasting_the_keys() {
+        let device = Device::Cpu;
+        for (batch, seq, heads, keys, dim) in [(1, 1, 4, 7, 8), (1, 3, 2, 5, 4), (2, 2, 3, 6, 4)] {
+            let q = Tensor::new(
+                pattern(&[batch as u64, seq as u64, heads as u64, dim as u64], 0.3),
+                &device,
+            )
+            .unwrap()
+            .reshape((batch, seq, heads, dim))
+            .unwrap();
+            let k = Tensor::new(
+                pattern(&[batch as u64, keys as u64, dim as u64], -0.2),
+                &device,
+            )
+            .unwrap()
+            .reshape((batch, keys, dim))
+            .unwrap();
+            let sinks = Tensor::new(pattern(&[heads as u64], 0.1), &device).unwrap();
+            // Every query sees the first key; the rest alternate, so some rows are masked.
+            let mask: Vec<u8> = (0..seq * keys)
+                .map(|index| u8::from(index % keys == 0 || (index / keys + index) % 2 == 0))
+                .collect();
+            let visible = Tensor::from_vec(mask, (seq, keys), &device).unwrap();
+            let folded = super::sparse_mqa(&q, &k, &sinks, &visible)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let broadcast = sparse_mqa_broadcast(&q, &k, &sinks, &visible)
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(folded.len(), broadcast.len());
+            for (index, (got, expect)) in folded.iter().zip(&broadcast).enumerate() {
+                assert!(
+                    (got - expect).abs() <= 1e-6,
+                    "batch={batch} seq={seq} heads={heads} keys={keys} dim={dim} index={index}: folded {got}, broadcast {expect}"
+                );
+            }
+        }
     }
 
     #[test]

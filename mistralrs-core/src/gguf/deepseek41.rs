@@ -296,27 +296,12 @@ where
 
 /// Gated write of gathered Engram rows into the residual streams.
 /// `wkv` is `[cols * head_dim, hc * hidden + hidden]`. A zero row leaves `h` unchanged.
-/// Orients a GGUF `engram_wkv` as the `[in_dim, out]` matrix [`engram_apply`] multiplies
-/// the gathered rows by, transposing it when it is stored `[out, in_dim]`. `out` is
-/// `(hc + 1) * hidden`: `hc` keys and one value. The input width is not the table's row
-/// width, since a token's gathered rows are concatenated, so orientation goes by `out`.
-pub(crate) fn engram_projection(wkv: Tensor, out: usize) -> Result<Tensor> {
-    let (rows, cols) = wkv.dims2()?;
-    if rows == out {
-        wkv.t()?.contiguous()
-    } else if cols == out {
-        Ok(wkv)
-    } else {
-        candle_core::bail!(
-            "deepseek41 engram projection is [{rows}, {cols}], and neither dimension is the {out} keys and value it produces"
-        )
-    }
-}
-
+/// Mixes an engram layer's projected rows into the streams. `kv` is the gathered rows
+/// projected by `engram_wkv`, `(hc + 1) * hidden` wide per token: `hc` keys, then one value.
+/// The caller projects with the quantized weight, so the dense matrix is never built.
 pub(crate) fn engram_apply(
     h: &Tensor,
-    rows: &Tensor,
-    wkv: &Tensor,
+    kv: &Tensor,
     q_weight: &Tensor,
     k_weight: &Tensor,
     eps: f64,
@@ -325,20 +310,14 @@ pub(crate) fn engram_apply(
     let hidden = *dims.last().unwrap_or(&0);
     let hc = dims[dims.len() - 2];
     let lead: usize = dims[..dims.len() - 2].iter().product();
-    let in_dim = *rows.dims().last().unwrap_or(&0);
-    // `wkv` arrives as `[in_dim, out]`, oriented once at load by `engram_projection`;
-    // transposing it here would copy the whole matrix on every token.
-    if wkv.dim(0)? != in_dim {
+    let width = (hc + 1) * hidden;
+    if kv.elem_count() != lead * width {
         candle_core::bail!(
-            "deepseek41 engram projection is {:?}, but the gathered rows have {in_dim} columns",
-            wkv.dims()
+            "deepseek41 engram projection gave {:?}, but the streams need {width} keys and value for each of {lead} tokens",
+            kv.dims()
         );
     }
-    let wkv = wkv.to_dtype(DType::F32)?;
-    let kv = rows
-        .reshape((lead, in_dim))?
-        .to_dtype(DType::F32)?
-        .matmul(&wkv)?;
+    let kv = kv.reshape((lead, width))?.to_dtype(DType::F32)?;
     let key = kv.narrow(1, 0, hc * hidden)?.reshape((lead, hc, hidden))?;
     let value = kv.narrow(1, hc * hidden, hidden)?;
     let hf = h.reshape((lead, hc, hidden))?.to_dtype(DType::F32)?;
@@ -461,9 +440,9 @@ mod tests {
     use crate::gguf::dsv4_hc::mix_streams;
 
     use super::{
-        compress_groups, engram_apply, engram_projection, engram_row_ids, hyper_coeff,
-        hyper_mix_projection, lagged_block, missing_tensors, moe_route, mqa_with_sink,
-        swiglu_clamped, HyperWeights, REQUIRED_TENSORS,
+        compress_groups, engram_apply, engram_row_ids, hyper_coeff, hyper_mix_projection,
+        lagged_block, missing_tensors, moe_route, mqa_with_sink, swiglu_clamped, HyperWeights,
+        REQUIRED_TENSORS,
     };
 
     #[test]
@@ -640,64 +619,27 @@ mod tests {
         .unwrap();
         let q = Tensor::from_vec(vec![0.2f32, -0.3, 0.4, -0.1], (2, 2), &device).unwrap();
         let k = Tensor::from_vec(vec![0.5f32, 0.25, -0.5, 1.0], (2, 2), &device).unwrap();
-        let out = engram_apply(&h, &rows, &wkv, &q, &k, 1e-6).unwrap();
+        let out = engram_apply(
+            &h,
+            &rows.reshape((1, 2)).unwrap().matmul(&wkv).unwrap(),
+            &q,
+            &k,
+            1e-6,
+        )
+        .unwrap();
         close(&out, &h);
         let rows = Tensor::from_vec(vec![1f32, -1.0], (1, 1, 2), &device).unwrap();
-        let changed = engram_apply(&h, &rows, &wkv, &q, &k, 1e-6).unwrap();
+        let changed = engram_apply(
+            &h,
+            &rows.reshape((1, 2)).unwrap().matmul(&wkv).unwrap(),
+            &q,
+            &k,
+            1e-6,
+        )
+        .unwrap();
         assert_ne!(
             changed.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             h.flatten_all().unwrap().to_vec1::<f32>().unwrap()
-        );
-    }
-
-    #[test]
-    fn an_engram_projection_stored_out_by_in_is_oriented_once_at_load() {
-        let device = Device::Cpu;
-        let h = Tensor::from_vec(vec![1f32, 2.0, 3.0, 4.0], (1, 1, 2, 2), &device).unwrap();
-        let rows = Tensor::from_vec(vec![1f32, -1.0], (1, 1, 2), &device).unwrap();
-        let in_by_out = Tensor::from_vec(
-            vec![
-                0.5f32, -0.25, 0.125, 1.0, -1.0, 0.5, 0.25, 0.5, -0.125, 0.75, 0.25, -0.5,
-            ],
-            (2, 6),
-            &device,
-        )
-        .unwrap();
-        let q = Tensor::from_vec(vec![0.2f32, -0.3, 0.4, -0.1], (2, 2), &device).unwrap();
-        let k = Tensor::from_vec(vec![0.5f32, 0.25, -0.5, 1.0], (2, 2), &device).unwrap();
-        // GGUF stores the projection `[out, in_dim]`.
-        let stored = in_by_out.t().unwrap().contiguous().unwrap();
-
-        // `hc` and `hidden` are both 2, so the projection produces `(hc + 1) * hidden = 6`.
-        let oriented = engram_projection(stored.clone(), 6).unwrap();
-        assert_eq!(oriented.dims(), &[2, 6]);
-        assert_eq!(
-            engram_apply(&h, &rows, &oriented, &q, &k, 1e-6)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap(),
-            engram_apply(&h, &rows, &in_by_out, &q, &k, 1e-6)
-                .unwrap()
-                .flatten_all()
-                .unwrap()
-                .to_vec1::<f32>()
-                .unwrap()
-        );
-        let unoriented = engram_apply(&h, &rows, &stored, &q, &k, 1e-6)
-            .expect_err("an unoriented projection is refused")
-            .to_string();
-        assert_eq!(
-            unoriented,
-            "deepseek41 engram projection is [6, 2], but the gathered rows have 2 columns"
-        );
-        let misshapen = engram_projection(Tensor::zeros((3, 2), DType::F32, &device).unwrap(), 6)
-            .expect_err("a projection that produces the wrong width is refused at load")
-            .to_string();
-        assert_eq!(
-            misshapen,
-            "deepseek41 engram projection is [3, 2], and neither dimension is the 6 keys and value it produces"
         );
     }
 
