@@ -15,8 +15,8 @@ use mistralrs_quant::{
 };
 
 use crate::gguf::deepseek41::{
-    compress_groups, engram_apply, engram_row_ids, lagged_block, moe_route, rmsnorm,
-    swiglu_clamped, HyperWeights,
+    compress_groups, engram_apply, engram_row_ids, hyper_mix_projection, lagged_block, moe_route,
+    rmsnorm, swiglu_clamped, HyperWeights,
 };
 use crate::kv_cache::{EitherCache, NormalCache};
 use crate::layers::{
@@ -138,7 +138,7 @@ impl EngramTable {
 
 struct EngramLayer {
     table: EngramTable,
-    wkv: Tensor,
+    wkv: Arc<dyn QuantMethod>,
     q: Tensor,
     k: Tensor,
     hash_index: usize,
@@ -385,7 +385,7 @@ impl ModelWeights {
                         archive: archive.clone(),
                         name: blk(layer, "engram_embd.weight"),
                     },
-                    wkv: dense(&archive, &blk(layer, "engram_wkv.weight"), device)?,
+                    wkv: linear(&archive, &blk(layer, "engram_wkv.weight"), device)?,
                     q: dense(&archive, &blk(layer, "engram_q.weight"), device)?,
                     k: dense(&archive, &blk(layer, "engram_k.weight"), device)?,
                     hash_index,
@@ -435,8 +435,8 @@ impl ModelWeights {
                 compress_rope: (ratio > 0).then(|| compress_rope.clone()),
                 attn_norm: dense(&archive, &blk(layer, "attn_norm.weight"), device)?,
                 ffn_norm: dense(&archive, &blk(layer, "ffn_norm.weight"), device)?,
-                hc_attn: hyper(&archive, layer, "attn", device)?,
-                hc_ffn: hyper(&archive, layer, "ffn", device)?,
+                hc_attn: hyper(&archive, layer, "attn", hc * hidden, device)?,
+                hc_ffn: hyper(&archive, layer, "ffn", hc * hidden, device)?,
                 experts: experts_layer,
                 router: linear(&archive, &blk(layer, "ffn_gate_inp.weight"), device)?,
                 router_bias: dense(&archive, &blk(layer, "exp_probs_b.bias"), device)?,
@@ -990,8 +990,9 @@ fn apply_engram(
     }
     let flat = Tensor::from_vec(flat, (h.dim(0)?, seq, cols), device)?;
     let rows = layer.table.gather(&flat)?;
-    let rows = rows.reshape((h.dim(0)?, seq, cols * hash.key_length))?;
-    engram_apply(h, &rows, &layer.wkv, &layer.q, &layer.k, f64::from(eps))
+    let rows = rows.reshape((h.dim(0)? * seq, cols * hash.key_length))?;
+    let kv = layer.wkv.forward(&rows.to_dtype(DType::F32)?)?;
+    engram_apply(h, &kv, &layer.q, &layer.k, f64::from(eps))
 }
 
 fn rotate_tail(
@@ -1069,29 +1070,36 @@ fn restrict_to_picked(visible: &Tensor, window_len: usize, picked: &Tensor) -> R
     Tensor::cat(&[&visible.narrow(1, 0, window_len)?, &compressed], 1)
 }
 
+/// Attention with one shared key/value head and a per-head sink. `q` is
+/// `[batch, seq, heads, dim]`, `k` is `[batch, keys, dim]`, `visible` is `[seq, keys]`, and
+/// the result is `[batch, seq, heads, dim]`. Every query head reads the same rows, so the
+/// heads fold into the query rows of one matmul; broadcasting `k` across the heads instead
+/// copies it once per head on every token.
 fn sparse_mqa(q: &Tensor, k: &Tensor, sinks: &Tensor, visible: &Tensor) -> Result<Tensor> {
-    let (batch, _seq, heads, dim) = q.dims4()?;
+    let (batch, seq, heads, dim) = q.dims4()?;
+    let keys = k.dim(1)?;
     let scale = 1.0 / (dim as f64).sqrt();
-    let q = q.transpose(1, 2)?.contiguous()?;
-    let k = k.unsqueeze(1)?.contiguous()?;
-    let scores = q.broadcast_matmul(&k.transpose(D::Minus1, D::Minus2)?.contiguous()?)?;
-    let scores = (scores * scale)?;
+    let q = q.contiguous()?.reshape((batch, seq * heads, dim))?;
+    let k = k.contiguous()?;
+    let scores = q.matmul(&k.transpose(1, 2)?.contiguous()?)?;
+    let scores = (scores * scale)?.reshape((batch, seq, heads, keys))?;
     let blocked = (scores.zeros_like()? - f64::INFINITY)?;
     let scores = visible
+        .reshape((1, seq, 1, keys))?
         .broadcast_as(scores.shape())?
         .where_cond(&scores, &blocked)?;
     let row_max = scores.max_keepdim(D::Minus1)?;
     let exp_scores = scores.broadcast_sub(&row_max)?.exp()?;
     let sink = sinks
-        .reshape((1, heads, 1, 1))?
+        .reshape((1, 1, heads, 1))?
         .broadcast_sub(&row_max)?
         .exp()?;
     let denom = (exp_scores.sum_keepdim(D::Minus1)? + sink)?;
     let probs = exp_scores.broadcast_div(&denom)?;
-    let out = probs
-        .contiguous()?
-        .broadcast_matmul(&k.reshape((batch, 1, k.dim(2)?, dim))?.contiguous()?)?;
-    out.transpose(1, 2)?.contiguous()
+    probs
+        .reshape((batch, seq * heads, keys))?
+        .matmul(&k)?
+        .reshape((batch, seq, heads, dim))
 }
 
 fn load_engram_hash(archive: &GgufArchive, layers: &[usize]) -> Result<Option<EngramHash>> {
@@ -1119,13 +1127,17 @@ fn hyper(
     archive: &GgufArchive,
     layer: usize,
     which: &str,
+    flat_in: usize,
     device: &Device,
 ) -> Result<HyperWeights> {
     Ok(HyperWeights {
-        fn_weight: dense(
-            archive,
-            &blk(layer, &format!("hc_{which}_fn.weight")),
-            device,
+        fn_weight: hyper_mix_projection(
+            dense(
+                archive,
+                &blk(layer, &format!("hc_{which}_fn.weight")),
+                device,
+            )?,
+            flat_in,
         )?,
         scale: dense(
             archive,
@@ -1781,6 +1793,191 @@ mod tests {
             }
         }
         failures
+    }
+
+    /// `base_meta` with one engram layer on block 0: two hash heads over 2-grams, so a token's
+    /// gathered rows are `2 * key_length` wide rather than one table row.
+    fn engram_meta(ratio: u32) -> Vec<Meta> {
+        let mut meta = with_meta(
+            base_meta(ratio),
+            "deepseek41.engram.layer_ids",
+            MetaValue::U32s(vec![0]),
+        );
+        meta.extend([
+            Meta {
+                key: "deepseek41.engram.head_count",
+                value: MetaValue::U32(2),
+            },
+            Meta {
+                key: "deepseek41.engram.key_length",
+                value: MetaValue::U32(8),
+            },
+            Meta {
+                key: "deepseek41.engram.max_ngram_size",
+                value: MetaValue::U32(2),
+            },
+            Meta {
+                key: "deepseek41.engram.pad_id",
+                value: MetaValue::U32(0),
+            },
+            Meta {
+                key: "deepseek41.engram.token_map",
+                value: MetaValue::U32s((0..16).collect()),
+            },
+            Meta {
+                key: "deepseek41.engram.multipliers",
+                value: MetaValue::U32s(vec![3, 5]),
+            },
+            Meta {
+                key: "deepseek41.engram.primes",
+                value: MetaValue::U32s(vec![5, 7]),
+            },
+            Meta {
+                key: "deepseek41.engram.offsets",
+                value: MetaValue::U32s(vec![0, 5]),
+            },
+        ]);
+        meta
+    }
+
+    /// The engram tensors for `engram_meta`. The table has 12 rows: head 0's buckets are
+    /// 0..5 and head 1's are offset to 5..12. `wkv` is `[(hc + 1) * hidden, 2 * key_length]`;
+    /// `None` makes it all zeros.
+    fn engram_weights(wkv_salt: Option<f32>) -> Vec<Weight> {
+        let wkv_shape = [768u64, 16];
+        let wkv = match wkv_salt {
+            Some(salt) => f32_weight("blk.0.engram_wkv.weight", &wkv_shape, salt),
+            None => Weight {
+                name: "blk.0.engram_wkv.weight".to_string(),
+                shape: wkv_shape.to_vec(),
+                dtype: 0,
+                data: f32_bytes(&vec![0.0; 768 * 16]),
+            },
+        };
+        vec![
+            f32_weight("blk.0.engram_embd.weight", &[12, 8], 0.3),
+            wkv,
+            f32_weight("blk.0.engram_q.weight", &[2, 256], 0.2),
+            f32_weight("blk.0.engram_k.weight", &[2, 256], 0.25),
+        ]
+    }
+
+    #[test]
+    fn an_engram_layer_runs_through_its_quantized_projection() {
+        let tokens: Vec<u32> = (0..10u32).map(|i| (i * 7 + 2) % 16).collect();
+        let load_with = |wkv_salt: Option<f32>| {
+            let mut weights = tiny_weights(0.1, false);
+            weights.extend(engram_weights(wkv_salt));
+            load(&write_gguf(&engram_meta(0), &weights))
+        };
+        let model = load_with(Some(0.1));
+        let engram = logits(&model, &tokens);
+        let silent = logits(&load_with(None), &tokens);
+        let plain = logits(
+            &load(&write_gguf(&base_meta(0), &tiny_weights(0.1, false))),
+            &tokens,
+        );
+        // A zero projection gives a zero key and value, which leaves the streams unchanged.
+        assert_eq!(silent, plain);
+        assert_ne!(engram, plain, "the engram projection reaches the logits");
+        for (step, got) in decoded_logits(&model, &tokens, 3).iter().enumerate() {
+            let want = logits(&model, &tokens[..3 + step]);
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 1.5e-4,
+                "token {}: max |decode - prefill| = {worst:e}",
+                2 + step
+            );
+        }
+    }
+
+    /// The broadcast form `sparse_mqa` replaced: `k` broadcast across the heads.
+    fn sparse_mqa_broadcast(q: &Tensor, k: &Tensor, sinks: &Tensor, visible: &Tensor) -> Tensor {
+        let (batch, _seq, heads, dim) = q.dims4().expect("q dims");
+        let scale = 1.0 / (dim as f64).sqrt();
+        let q = q.transpose(1, 2).unwrap().contiguous().unwrap();
+        let k = k.unsqueeze(1).unwrap().contiguous().unwrap();
+        let scores = q
+            .broadcast_matmul(&k.transpose(3, 2).unwrap().contiguous().unwrap())
+            .unwrap();
+        let scores = (scores * scale).unwrap();
+        let blocked = (scores.zeros_like().unwrap() - f64::INFINITY).unwrap();
+        let scores = visible
+            .broadcast_as(scores.shape())
+            .unwrap()
+            .where_cond(&scores, &blocked)
+            .unwrap();
+        let row_max = scores.max_keepdim(3).unwrap();
+        let exp_scores = scores.broadcast_sub(&row_max).unwrap().exp().unwrap();
+        let sink = sinks
+            .reshape((1, heads, 1, 1))
+            .unwrap()
+            .broadcast_sub(&row_max)
+            .unwrap()
+            .exp()
+            .unwrap();
+        let denom = (exp_scores.sum_keepdim(3).unwrap() + sink).unwrap();
+        let probs = exp_scores.broadcast_div(&denom).unwrap();
+        let out = probs
+            .contiguous()
+            .unwrap()
+            .broadcast_matmul(
+                &k.reshape((batch, 1, k.dim(2).unwrap(), dim))
+                    .unwrap()
+                    .contiguous()
+                    .unwrap(),
+            )
+            .unwrap();
+        out.transpose(1, 2).unwrap().contiguous().unwrap()
+    }
+
+    #[test]
+    fn folding_the_heads_into_one_matmul_matches_broadcasting_the_keys() {
+        let device = Device::Cpu;
+        for (batch, seq, heads, keys, dim) in [(1, 1, 4, 7, 8), (1, 3, 2, 5, 4), (2, 2, 3, 6, 4)] {
+            let q = Tensor::new(
+                pattern(&[batch as u64, seq as u64, heads as u64, dim as u64], 0.3),
+                &device,
+            )
+            .unwrap()
+            .reshape((batch, seq, heads, dim))
+            .unwrap();
+            let k = Tensor::new(
+                pattern(&[batch as u64, keys as u64, dim as u64], -0.2),
+                &device,
+            )
+            .unwrap()
+            .reshape((batch, keys, dim))
+            .unwrap();
+            let sinks = Tensor::new(pattern(&[heads as u64], 0.1), &device).unwrap();
+            // Every query sees the first key; the rest alternate, so some rows are masked.
+            let mask: Vec<u8> = (0..seq * keys)
+                .map(|index| u8::from(index % keys == 0 || (index / keys + index) % 2 == 0))
+                .collect();
+            let visible = Tensor::from_vec(mask, (seq, keys), &device).unwrap();
+            let folded = super::sparse_mqa(&q, &k, &sinks, &visible)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let broadcast = sparse_mqa_broadcast(&q, &k, &sinks, &visible)
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(folded.len(), broadcast.len());
+            for (index, (got, expect)) in folded.iter().zip(&broadcast).enumerate() {
+                assert!(
+                    (got - expect).abs() <= 1e-6,
+                    "batch={batch} seq={seq} heads={heads} keys={keys} dim={dim} index={index}: folded {got}, broadcast {expect}"
+                );
+            }
+        }
     }
 
     #[test]

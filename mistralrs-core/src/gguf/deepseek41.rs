@@ -157,6 +157,16 @@ struct HyperCoeff {
     comb: Tensor,
 }
 
+/// Orients a GGUF `hc_*_fn` mix as the `[in, out]` matrix [`hyper_coeff`] multiplies the
+/// flattened streams by. GGUF stores it `[out, in]`, and the mix is `x @ W.T`.
+pub(crate) fn hyper_mix_projection(fn_weight: Tensor, flat_in: usize) -> Result<Tensor> {
+    if fn_weight.dim(1)? == flat_in {
+        fn_weight.t()?.contiguous()
+    } else {
+        Ok(fn_weight)
+    }
+}
+
 fn hyper_coeff(
     h: &Tensor,
     weights: &HyperWeights,
@@ -172,13 +182,15 @@ fn hyper_coeff(
     let flat = h.reshape((batch, flat_in))?.to_dtype(DType::F32)?;
     let variance = flat.sqr()?.mean_keepdim(D::Minus1)?;
     let scale = (variance + f64::from(rms_eps))?.sqrt()?.recip()?;
-    // GGUF stores this matrix as `[out, in]`. The mix is `x @ W.T`.
+    // `fn_weight` arrives as `[in, out]`, oriented once at load by `hyper_mix_projection`;
+    // transposing it here would copy the whole matrix on every token.
+    if weights.fn_weight.dim(0)? != flat_in {
+        candle_core::bail!(
+            "deepseek41 hyper-connection mix is {:?}, but the streams flatten to {flat_in} values",
+            weights.fn_weight.dims()
+        );
+    }
     let weight = weights.fn_weight.to_dtype(DType::F32)?;
-    let weight = if weight.dim(1)? == flat_in {
-        weight.t()?.contiguous()?
-    } else {
-        weight
-    };
     let projected = flat.matmul(&weight)?;
     let mixes = projected.broadcast_mul(&scale)?;
     let scale_w = weights.scale.to_dtype(DType::F32)?;
@@ -284,10 +296,12 @@ where
 
 /// Gated write of gathered Engram rows into the residual streams.
 /// `wkv` is `[cols * head_dim, hc * hidden + hidden]`. A zero row leaves `h` unchanged.
+/// Mixes an engram layer's projected rows into the streams. `kv` is the gathered rows
+/// projected by `engram_wkv`, `(hc + 1) * hidden` wide per token: `hc` keys, then one value.
+/// The caller projects with the quantized weight, so the dense matrix is never built.
 pub(crate) fn engram_apply(
     h: &Tensor,
-    rows: &Tensor,
-    wkv: &Tensor,
+    kv: &Tensor,
     q_weight: &Tensor,
     k_weight: &Tensor,
     eps: f64,
@@ -296,17 +310,14 @@ pub(crate) fn engram_apply(
     let hidden = *dims.last().unwrap_or(&0);
     let hc = dims[dims.len() - 2];
     let lead: usize = dims[..dims.len() - 2].iter().product();
-    let in_dim = *rows.dims().last().unwrap_or(&0);
-    let wkv = wkv.to_dtype(DType::F32)?;
-    let wkv = if wkv.dim(1)? == in_dim {
-        wkv.t()?.contiguous()?
-    } else {
-        wkv
-    };
-    let kv = rows
-        .reshape((lead, in_dim))?
-        .to_dtype(DType::F32)?
-        .matmul(&wkv)?;
+    let width = (hc + 1) * hidden;
+    if kv.elem_count() != lead * width {
+        candle_core::bail!(
+            "deepseek41 engram projection gave {:?}, but the streams need {width} keys and value for each of {lead} tokens",
+            kv.dims()
+        );
+    }
+    let kv = kv.reshape((lead, width))?.to_dtype(DType::F32)?;
     let key = kv.narrow(1, 0, hc * hidden)?.reshape((lead, hc, hidden))?;
     let value = kv.narrow(1, hc * hidden, hidden)?;
     let hf = h.reshape((lead, hc, hidden))?.to_dtype(DType::F32)?;
@@ -429,12 +440,13 @@ mod tests {
     use crate::gguf::dsv4_hc::mix_streams;
 
     use super::{
-        compress_groups, engram_apply, engram_row_ids, hyper_coeff, lagged_block, missing_tensors,
-        moe_route, mqa_with_sink, swiglu_clamped, HyperWeights, REQUIRED_TENSORS,
+        compress_groups, engram_apply, engram_row_ids, hyper_coeff, hyper_mix_projection,
+        lagged_block, missing_tensors, moe_route, mqa_with_sink, swiglu_clamped, HyperWeights,
+        REQUIRED_TENSORS,
     };
 
     #[test]
-    fn hyper_coeff_accepts_the_gguf_out_in_matrix() {
+    fn hyper_coeff_takes_the_gguf_out_in_matrix_oriented_at_load() {
         let device = Device::Cpu;
         let hc = 2usize;
         let hidden = 5usize;
@@ -465,9 +477,9 @@ mod tests {
         let right = hyper_coeff(
             &h,
             &HyperWeights {
-                fn_weight: out_in,
-                scale,
-                base,
+                fn_weight: hyper_mix_projection(out_in.clone(), flat_in).expect("oriented"),
+                scale: scale.clone(),
+                base: base.clone(),
             },
             hc,
             1,
@@ -487,6 +499,25 @@ mod tests {
                 .expect("flat")
                 .to_vec1::<f32>()
                 .expect("pre")
+        );
+        let unoriented = hyper_coeff(
+            &h,
+            &HyperWeights {
+                fn_weight: out_in,
+                scale,
+                base,
+            },
+            hc,
+            1,
+            1e-5,
+            1e-6,
+        )
+        .err()
+        .expect("an unoriented mix is refused")
+        .to_string();
+        assert_eq!(
+            unoriented,
+            "deepseek41 hyper-connection mix is [8, 10], but the streams flatten to 10 values"
         );
     }
 
@@ -588,10 +619,24 @@ mod tests {
         .unwrap();
         let q = Tensor::from_vec(vec![0.2f32, -0.3, 0.4, -0.1], (2, 2), &device).unwrap();
         let k = Tensor::from_vec(vec![0.5f32, 0.25, -0.5, 1.0], (2, 2), &device).unwrap();
-        let out = engram_apply(&h, &rows, &wkv, &q, &k, 1e-6).unwrap();
+        let out = engram_apply(
+            &h,
+            &rows.reshape((1, 2)).unwrap().matmul(&wkv).unwrap(),
+            &q,
+            &k,
+            1e-6,
+        )
+        .unwrap();
         close(&out, &h);
         let rows = Tensor::from_vec(vec![1f32, -1.0], (1, 1, 2), &device).unwrap();
-        let changed = engram_apply(&h, &rows, &wkv, &q, &k, 1e-6).unwrap();
+        let changed = engram_apply(
+            &h,
+            &rows.reshape((1, 2)).unwrap().matmul(&wkv).unwrap(),
+            &q,
+            &k,
+            1e-6,
+        )
+        .unwrap();
         assert_ne!(
             changed.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             h.flatten_all().unwrap().to_vec1::<f32>().unwrap()

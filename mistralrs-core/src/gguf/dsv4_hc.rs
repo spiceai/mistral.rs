@@ -13,7 +13,25 @@ fn normalize_dim(x: &Tensor, dim: D, eps: f32) -> Result<Tensor> {
 }
 
 /// `logits` is `[n_tokens, dst, src]`. Softmax runs over destinations.
+///
+/// On CUDA this is one fused kernel; elsewhere it is [`sinkhorn_reference`].
 pub(crate) fn sinkhorn(logits: &Tensor, iters: usize, eps: f32) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if logits.device().is_cuda()
+        && logits.dtype() == candle_core::DType::F32
+        && iters >= 1
+        && logits.rank() >= 2
+        && logits.dim(D::Minus1)? == logits.dim(D::Minus2)?
+        && logits.dim(D::Minus1)? <= crate::cuda::sinkhorn::MAX_HC
+    {
+        return crate::cuda::sinkhorn::sinkhorn(logits, iters, eps);
+    }
+    sinkhorn_reference(logits, iters, eps)
+}
+
+/// The sinkhorn mixer as separate tensor ops: the CPU path, and the reference the
+/// fused CUDA kernel is tested against.
+pub(crate) fn sinkhorn_reference(logits: &Tensor, iters: usize, eps: f32) -> Result<Tensor> {
     let mut comb = candle_nn::ops::softmax(logits, D::Minus2)?;
     comb = (comb + f64::from(eps))?;
     comb = normalize_dim(&comb, D::Minus1, eps)?;
@@ -53,6 +71,36 @@ mod tests {
     use candle_core::{Device, Tensor};
 
     use super::{combine_streams, mix_streams, sinkhorn};
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn the_fused_sinkhorn_matches_the_tensor_ops_on_cuda() {
+        let device = Device::new_cuda(0).expect("cuda device");
+        for (n, hc, iters) in [(1usize, 4usize, 20usize), (7, 4, 20), (5, 3, 1), (3, 4, 2)] {
+            let values: Vec<f32> = (0..n * hc * hc)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.07)
+                .collect();
+            let logits = Tensor::from_vec(values, (n, hc, hc), &device).expect("logits");
+            let fused = sinkhorn(&logits, iters, 1e-6)
+                .expect("fused sinkhorn")
+                .flatten_all()
+                .expect("flat")
+                .to_vec1::<f32>()
+                .expect("fused values");
+            let reference = super::sinkhorn_reference(&logits, iters, 1e-6)
+                .expect("reference sinkhorn")
+                .flatten_all()
+                .expect("flat")
+                .to_vec1::<f32>()
+                .expect("reference values");
+            for (index, (got, expect)) in fused.iter().zip(&reference).enumerate() {
+                assert!(
+                    (got - expect).abs() <= 1e-6,
+                    "n={n} hc={hc} iters={iters} index={index}: fused {got}, tensor ops {expect}"
+                );
+            }
+        }
+    }
 
     fn close(got: &[f32], expect: &[f32]) {
         assert_eq!(got.len(), expect.len());
