@@ -1795,6 +1795,106 @@ mod tests {
         failures
     }
 
+    /// `base_meta` with one engram layer on block 0: two hash heads over 2-grams, so a token's
+    /// gathered rows are `2 * key_length` wide rather than one table row.
+    fn engram_meta(ratio: u32) -> Vec<Meta> {
+        let mut meta = with_meta(
+            base_meta(ratio),
+            "deepseek41.engram.layer_ids",
+            MetaValue::U32s(vec![0]),
+        );
+        meta.extend([
+            Meta {
+                key: "deepseek41.engram.head_count",
+                value: MetaValue::U32(2),
+            },
+            Meta {
+                key: "deepseek41.engram.key_length",
+                value: MetaValue::U32(8),
+            },
+            Meta {
+                key: "deepseek41.engram.max_ngram_size",
+                value: MetaValue::U32(2),
+            },
+            Meta {
+                key: "deepseek41.engram.pad_id",
+                value: MetaValue::U32(0),
+            },
+            Meta {
+                key: "deepseek41.engram.token_map",
+                value: MetaValue::U32s((0..16).collect()),
+            },
+            Meta {
+                key: "deepseek41.engram.multipliers",
+                value: MetaValue::U32s(vec![3, 5]),
+            },
+            Meta {
+                key: "deepseek41.engram.primes",
+                value: MetaValue::U32s(vec![5, 7]),
+            },
+            Meta {
+                key: "deepseek41.engram.offsets",
+                value: MetaValue::U32s(vec![0, 5]),
+            },
+        ]);
+        meta
+    }
+
+    /// The engram tensors for `engram_meta`. The table has 12 rows: head 0's buckets are
+    /// 0..5 and head 1's are offset to 5..12. `wkv` is `[(hc + 1) * hidden, 2 * key_length]`;
+    /// `None` makes it all zeros.
+    fn engram_weights(wkv_salt: Option<f32>) -> Vec<Weight> {
+        let wkv_shape = [768u64, 16];
+        let wkv = match wkv_salt {
+            Some(salt) => f32_weight("blk.0.engram_wkv.weight", &wkv_shape, salt),
+            None => Weight {
+                name: "blk.0.engram_wkv.weight".to_string(),
+                shape: wkv_shape.to_vec(),
+                dtype: 0,
+                data: f32_bytes(&vec![0.0; 768 * 16]),
+            },
+        };
+        vec![
+            f32_weight("blk.0.engram_embd.weight", &[12, 8], 0.3),
+            wkv,
+            f32_weight("blk.0.engram_q.weight", &[2, 256], 0.2),
+            f32_weight("blk.0.engram_k.weight", &[2, 256], 0.25),
+        ]
+    }
+
+    #[test]
+    fn an_engram_layer_runs_through_its_quantized_projection() {
+        let tokens: Vec<u32> = (0..10u32).map(|i| (i * 7 + 2) % 16).collect();
+        let load_with = |wkv_salt: Option<f32>| {
+            let mut weights = tiny_weights(0.1, false);
+            weights.extend(engram_weights(wkv_salt));
+            load(&write_gguf(&engram_meta(0), &weights))
+        };
+        let model = load_with(Some(0.1));
+        let engram = logits(&model, &tokens);
+        let silent = logits(&load_with(None), &tokens);
+        let plain = logits(
+            &load(&write_gguf(&base_meta(0), &tiny_weights(0.1, false))),
+            &tokens,
+        );
+        // A zero projection gives a zero key and value, which leaves the streams unchanged.
+        assert_eq!(silent, plain);
+        assert_ne!(engram, plain, "the engram projection reaches the logits");
+        for (step, got) in decoded_logits(&model, &tokens, 3).iter().enumerate() {
+            let want = logits(&model, &tokens[..3 + step]);
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(got, want)| (got - want).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst <= 1.5e-4,
+                "token {}: max |decode - prefill| = {worst:e}",
+                2 + step
+            );
+        }
+    }
+
     /// The broadcast form `sparse_mqa` replaced: `k` broadcast across the heads.
     fn sparse_mqa_broadcast(q: &Tensor, k: &Tensor, sinks: &Tensor, visible: &Tensor) -> Tensor {
         let (batch, _seq, heads, dim) = q.dims4().expect("q dims");
