@@ -387,11 +387,7 @@ impl ModelWeights {
                     },
                     wkv: engram_projection(
                         dense(&archive, &blk(layer, "engram_wkv.weight"), device)?,
-                        *archive
-                            .tensor_info(&blk(layer, "engram_embd.weight"))?
-                            .shape()
-                            .last()
-                            .unwrap_or(&0),
+                        (hc + 1) * hidden,
                     )?,
                     q: dense(&archive, &blk(layer, "engram_q.weight"), device)?,
                     k: dense(&archive, &blk(layer, "engram_k.weight"), device)?,

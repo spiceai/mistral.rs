@@ -297,12 +297,19 @@ where
 /// Gated write of gathered Engram rows into the residual streams.
 /// `wkv` is `[cols * head_dim, hc * hidden + hidden]`. A zero row leaves `h` unchanged.
 /// Orients a GGUF `engram_wkv` as the `[in_dim, out]` matrix [`engram_apply`] multiplies
-/// the gathered rows by, transposing it when it is stored `[out, in_dim]`.
-pub(crate) fn engram_projection(wkv: Tensor, in_dim: usize) -> Result<Tensor> {
-    if wkv.dim(1)? == in_dim {
+/// the gathered rows by, transposing it when it is stored `[out, in_dim]`. `out` is
+/// `(hc + 1) * hidden`: `hc` keys and one value. The input width is not the table's row
+/// width, since a token's gathered rows are concatenated, so orientation goes by `out`.
+pub(crate) fn engram_projection(wkv: Tensor, out: usize) -> Result<Tensor> {
+    let (rows, cols) = wkv.dims2()?;
+    if rows == out {
         wkv.t()?.contiguous()
-    } else {
+    } else if cols == out {
         Ok(wkv)
+    } else {
+        candle_core::bail!(
+            "deepseek41 engram projection is [{rows}, {cols}], and neither dimension is the {out} keys and value it produces"
+        )
     }
 }
 
@@ -661,7 +668,8 @@ mod tests {
         // GGUF stores the projection `[out, in_dim]`.
         let stored = in_by_out.t().unwrap().contiguous().unwrap();
 
-        let oriented = engram_projection(stored.clone(), 2).unwrap();
+        // `hc` and `hidden` are both 2, so the projection produces `(hc + 1) * hidden = 6`.
+        let oriented = engram_projection(stored.clone(), 6).unwrap();
         assert_eq!(oriented.dims(), &[2, 6]);
         assert_eq!(
             engram_apply(&h, &rows, &oriented, &q, &k, 1e-6)
@@ -684,6 +692,14 @@ mod tests {
         assert_eq!(
             unoriented,
             "deepseek41 engram projection is [6, 2], but the gathered rows have 2 columns"
+        );
+        let misshapen = engram_projection(Tensor::zeros((3, 2), DType::F32, &device).unwrap(), 6)
+            .err()
+            .expect("a projection that produces the wrong width is refused at load")
+            .to_string();
+        assert_eq!(
+            misshapen,
+            "deepseek41 engram projection is [3, 2], and neither dimension is the 6 keys and value it produces"
         );
     }
 
