@@ -167,7 +167,9 @@ pub use pipeline::hf::{
     HF_HUB_OFFLINE_ENV,
 };
 pub use pipeline::{
-    chat_template::{is_chat_template_request_error, ChatTemplate},
+    chat_template::{
+        apply_chat_template_to, is_chat_template_request_error, ChatTemplate, ChatTemplateValue,
+    },
     expand_isq_value, expand_uqff_shards, parse_isq_value, parse_uqff_shard,
     resolve_uqff_report_output, resolve_uqff_shorthand, AdapterPaths, AnyMoeLoader, AnyMoePipeline,
     AutoDeviceMapParams, AutoLoader, AutoLoaderBuilder, DiffusionGenerationParams, DiffusionLoader,
