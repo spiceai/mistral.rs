@@ -216,8 +216,8 @@ use tokio::runtime::Runtime;
 use toml_selector::{TomlLoaderArgs, TomlSelector};
 pub use tools::{
     AllowedToolChoice, AllowedToolsMode, AllowedToolsToolChoice, AllowedToolsToolChoiceType,
-    BuiltinToolChoice, BuiltinToolChoiceType, NamedFunctionToolChoice, ToolCallResponse,
-    ToolCallType, ToolCallbacks, ToolChoice,
+    BuiltinToolChoice, BuiltinToolChoiceType, NamedFunctionToolChoice, ToolCallFormat,
+    ToolCallResponse, ToolCallType, ToolCallbacks, ToolCallingMatcher, ToolChoice,
 };
 pub use topology::{LayerTopology, Topology};
 pub use utils::debug::{
