@@ -99,6 +99,11 @@ mistralrs-metal-compile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[[example]]
+name = "ring_collectives"
+required-features = ["ring"]
 
 [[example]]
 name = "nvfp4_bench"

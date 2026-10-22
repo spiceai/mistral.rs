@@ -949,18 +949,46 @@ mod ring_ops {
             .clone()
     }
 
-    /// Runs one hop of the ring over RDMA when the ring has it: sends `send` to the right
-    /// neighbour and fills `recv` from the left one. False when the hop is TCP's to run.
-    fn rdma_hop(rdma: &SharedRdma, send: &[u8], recv: &mut [u8], left: &TcpStream) -> Result<bool> {
-        let Some(rdma) = rdma else {
-            return Ok(false);
+    /// One hop of the ring: sends `send` to the right neighbour and fills `recv` from the left
+    /// one, over RDMA when the ring has it and otherwise over TCP.
+    fn ring_hop(
+        rdma: &SharedRdma,
+        right: &mut TcpStream,
+        left: &mut TcpStream,
+        send: &[u8],
+        recv: &mut [u8],
+    ) -> Result<()> {
+        if let Some(rdma) = rdma {
+            let mut ring = rdma.lock().map_err(|e| {
+                candle_core::Error::msg(format!("Failed to lock the RDMA ring: {:?}", e))
+            })?;
+            return ring
+                .exchange(send, recv, left)
+                .map_err(|e| candle_core::Error::msg(format!("ring exchange over RDMA: {e}")));
+        }
+        // For the typical tensor size we see (~ 6 KiB) a single write/read pair is faster
+        // than chunking because the extra system-call and loop overhead dominates. A larger
+        // payload alternates 64 KiB writes and reads: every rank writes before it reads, so a
+        // payload larger than the socket buffers would otherwise leave every rank blocked in
+        // its write.
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let chunk = if send.len() <= 8 * 1024 {
+            send.len().max(1)
+        } else {
+            CHUNK_SIZE
         };
-        let mut ring = rdma.lock().map_err(|e| {
-            candle_core::Error::msg(format!("Failed to lock the RDMA ring: {:?}", e))
-        })?;
-        ring.exchange(send, recv, left)
-            .map_err(|e| candle_core::Error::msg(format!("ring exchange over RDMA: {e}")))?;
-        Ok(true)
+        let mut offset = 0;
+        while offset < send.len() || offset < recv.len() {
+            let out = offset.min(send.len())..(offset + chunk).min(send.len());
+            let into = offset.min(recv.len())..(offset + chunk).min(recv.len());
+            right
+                .write_all(&send[out])
+                .map_err(|e| candle_core::Error::msg(format!("write error: {:?}", e)))?;
+            left.read_exact(&mut recv[into])
+                .map_err(|e| candle_core::Error::msg(format!("read error: {:?}", e)))?;
+            offset += chunk;
+        }
+        Ok(())
     }
 
     #[derive(Clone, Debug)]
@@ -1043,46 +1071,13 @@ mod ring_ops {
             let mut delta: Option<Tensor> = None;
             for hop in 0..self.world_size - 1 {
                 let send_bytes: &[u8] = if hop == 0 { data_bytes } else { &fwd_buf };
-
-                // For the typical tensor size we see (~ 6 KiB) a single
-                // write/read pair is faster than chunking because the extra
-                // system‑call and loop overhead dominates.  Only fall back to the
-                // chunked "ping‑pong" pipeline for larger transfers.
-                let over_rdma = rdma_hop(&self.rdma, send_bytes, &mut recv_buf, &left_guard)?;
-                if over_rdma {
-                    // The RDMA links ran the hop.
-                } else if nbytes <= 8 * 1024 {
-                    // --- fast path: one shot ------------------------------------
-                    right_guard
-                        .write_all(send_bytes)
-                        .map_err(|e| candle_core::Error::msg(format!("write error: {:?}", e)))?;
-
-                    left_guard
-                        .read_exact(&mut recv_buf)
-                        .map_err(|e| candle_core::Error::msg(format!("read error: {:?}", e)))?;
-                } else {
-                    // --- slow path: chunked ping‑pong ---------------------------
-                    const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
-                    let mut offset = 0;
-
-                    while offset < nbytes {
-                        let len = std::cmp::min(CHUNK_SIZE, nbytes - offset);
-
-                        // send this chunk to the right neighbour
-                        right_guard
-                            .write_all(&send_bytes[offset..offset + len])
-                            .map_err(|e| {
-                                candle_core::Error::msg(format!("write error: {:?}", e))
-                            })?;
-
-                        // receive the matching chunk from the left neighbour
-                        left_guard
-                            .read_exact(&mut recv_buf[offset..offset + len])
-                            .map_err(|e| candle_core::Error::msg(format!("read error: {:?}", e)))?;
-
-                        offset += len;
-                    }
-                }
+                ring_hop(
+                    &self.rdma,
+                    &mut right_guard,
+                    &mut left_guard,
+                    send_bytes,
+                    &mut recv_buf,
+                )?;
 
                 // ---------------------------------------------------------------------
                 // Interpret the received bytes as a slice of T and accumulate them.
@@ -1196,47 +1191,32 @@ mod ring_ops {
 
             let right = self.right.clone();
             let left = self.left.clone();
-            let mut send_piece: &[T] = x;
+            // Each hop forwards the slice it received last from that slice's slot in `out`,
+            // which no hop receives into, so a hop never sends from the buffer it fills.
+            let mut forward = start;
 
             for step in 0..(self.world_size - 1) {
+                let piece = &out[forward..forward + elem_cnt];
                 let bytes =
-                    unsafe { std::slice::from_raw_parts(send_piece.as_ptr() as *const u8, nbytes) };
+                    unsafe { std::slice::from_raw_parts(piece.as_ptr() as *const u8, nbytes) };
                 let mut bg = self.buffers.lock().map_err(|e| {
                     candle_core::Error::msg(format!("Failed to lock buffers mutex: {:?}", e))
                 })?;
                 let buf = bg.entry(nbytes).or_insert_with(|| vec![0u8; nbytes]);
-                let over_rdma = {
-                    let lg = left.lock().map_err(|e| {
+                {
+                    let mut rg = right.lock().map_err(|e| {
                         candle_core::Error::msg(format!(
-                            "Failed to lock left stream mutex: {:?}",
+                            "Failed to lock right stream mutex: {:?}",
                             e
                         ))
                     })?;
-                    rdma_hop(&self.rdma, bytes, buf, &lg)?
-                };
-                if !over_rdma {
-                    // ---------- send to the right ----------
-                    {
-                        let mut rg = right.lock().map_err(|e| {
-                            candle_core::Error::msg(format!(
-                                "Failed to lock right stream mutex: {:?}",
-                                e
-                            ))
-                        })?;
-                        rg.write_all(bytes).map_err(|e| {
-                            candle_core::Error::msg(format!("write error: {:?}", e))
-                        })?;
-                    }
-
-                    // ---------- receive from the left ----------
                     let mut lg = left.lock().map_err(|e| {
                         candle_core::Error::msg(format!(
                             "Failed to lock left stream mutex: {:?}",
                             e
                         ))
                     })?;
-                    lg.read_exact(buf)
-                        .map_err(|e| candle_core::Error::msg(format!("read error: {:?}", e)))?;
+                    ring_hop(&self.rdma, &mut rg, &mut lg, bytes, buf)?;
                 }
                 let recv_piece: &[T] =
                     unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const T, elem_cnt) };
@@ -1247,7 +1227,7 @@ mod ring_ops {
                 out[dst..dst + elem_cnt].copy_from_slice(recv_piece);
 
                 // Forward that slice in the next iteration.
-                send_piece = recv_piece;
+                forward = dst;
             }
 
             let mut out_dims = dims.to_vec();

@@ -37,6 +37,15 @@ const ENDPOINT_LEN: usize = 1 + 4 + 4 + 16 + 4;
 
 pub type Result<T> = std::result::Result<T, String>;
 
+/// A finished send or receive: its buffer slot, its length, and, for a receive, the exchange
+/// the sender sent it in.
+#[derive(Clone, Copy)]
+struct Completion {
+    slot: usize,
+    bytes: usize,
+    exchange: u32,
+}
+
 /// What a neighbour needs to connect to one of this rank's queue pairs.
 #[derive(Clone, Copy)]
 struct Endpoint {
@@ -95,10 +104,17 @@ fn source_address(peer: IpAddr) -> Result<Ipv4Addr> {
 pub struct RdmaRing {
     right: Link,
     left: Link,
-    done: Vec<(usize, usize)>,
+    done: Vec<Completion>,
     /// Messages received from the left but not yet taken, as `(slot, bytes)` in arrival
     /// order. A neighbour that is ahead sends its next hop before this one is taken.
-    arrived: VecDeque<(usize, usize)>,
+    arrived: VecDeque<Completion>,
+    /// How many exchanges this rank has run. Every message carries the count of the exchange
+    /// it belongs to, so ranks that disagree on a tensor's size fail instead of summing one
+    /// exchange's chunk into another.
+    exchanges: u32,
+    /// Why an exchange failed. A failed exchange may leave sends in flight from the buffers
+    /// the next one would refill, so the ring is not used again.
+    failed: Option<String>,
 }
 
 impl std::fmt::Debug for RdmaRing {
@@ -185,6 +201,8 @@ impl RdmaRing {
             left: left_link,
             done: Vec::new(),
             arrived: VecDeque::with_capacity(RX_DEPTH),
+            exchanges: 0,
+            failed: None,
         }))
     }
 
@@ -201,6 +219,21 @@ impl RdmaRing {
     /// exactly `recv.len()` bytes from the left one. `left_tcp` is the left neighbour's TCP
     /// connection, idle while the ring runs on RDMA, which is watched for a hang-up.
     pub fn exchange(&mut self, send: &[u8], recv: &mut [u8], left_tcp: &TcpStream) -> Result<()> {
+        if let Some(why) = &self.failed {
+            return Err(format!(
+                "an earlier exchange over RDMA failed, so the ring cannot be used again: {why}"
+            ));
+        }
+        let id = self.exchanges;
+        self.exchanges = self.exchanges.wrapping_add(1);
+        let outcome = self.run(id, send, recv, left_tcp);
+        if let Err(why) = &outcome {
+            self.failed = Some(why.clone());
+        }
+        outcome
+    }
+
+    fn run(&mut self, id: u32, send: &[u8], recv: &mut [u8], left_tcp: &TcpStream) -> Result<()> {
         let outgoing = send.len().div_ceil(CHUNK);
         let incoming = recv.len().div_ceil(CHUNK);
         let (mut posted, mut sent, mut received) = (0, 0, 0);
@@ -212,7 +245,7 @@ impl RdmaRing {
                 let chunk = &send[posted * CHUNK..send.len().min((posted + 1) * CHUNK)];
                 let slot = posted % TX_DEPTH;
                 self.right.buf[slot * CHUNK..][..chunk.len()].copy_from_slice(chunk);
-                self.right.post_send(slot, chunk.len())?;
+                self.right.post_send(slot, chunk.len(), id)?;
                 posted += 1;
                 progressed = true;
             }
@@ -222,15 +255,20 @@ impl RdmaRing {
             self.left.completions(&mut self.done)?;
             self.arrived.extend(self.done.iter().copied());
             while received < incoming {
-                let Some((slot, bytes)) = self.arrived.pop_front() else {
+                let Some(Completion {
+                    slot,
+                    bytes,
+                    exchange,
+                }) = self.arrived.pop_front()
+                else {
                     break;
                 };
                 progressed = true;
                 let at = received * CHUNK;
                 let expected = CHUNK.min(recv.len() - at);
-                if slot >= RX_DEPTH || bytes != expected {
+                if slot >= RX_DEPTH || bytes != expected || exchange != id {
                     return Err(format!(
-                        "ring all-reduce received {bytes} bytes in slot {slot} from the left neighbour where {expected} were due; the ranks disagree on the tensor being reduced"
+                        "exchange {id} received {bytes} bytes of exchange {exchange} in slot {slot} from the left neighbour where {expected} bytes were due; the ranks disagree on the tensor being reduced"
                     ));
                 }
                 recv[at..at + bytes].copy_from_slice(&self.left.buf[slot * CHUNK..][..bytes]);
@@ -277,7 +315,10 @@ mod verbs {
 
     use sideway::ibverbs::{
         address::{AddressHandleAttribute, Gid, GidType},
-        completion::{ExtendedCompletionQueue, GenericCompletionQueue, WorkCompletionStatus},
+        completion::{
+            ExtendedCompletionQueue, GenericCompletionQueue, PollCompletionQueueError,
+            WorkCompletionStatus,
+        },
         device::{DeviceInfo, DeviceList},
         device_context::{DeviceContext, Mtu},
         memory_region::MemoryRegion,
@@ -289,7 +330,7 @@ mod verbs {
         AccessFlags,
     };
 
-    use super::{Endpoint, Result, CHUNK};
+    use super::{Completion, Endpoint, Result, CHUNK};
 
     /// The RDMA device and RoCE v2 address this host reaches a neighbour from.
     pub(super) struct Port {
@@ -462,22 +503,24 @@ mod verbs {
             guard.post().map_err(|e| e.to_string())
         }
 
-        pub(super) fn post_send(&mut self, slot: usize, len: usize) -> Result<()> {
+        pub(super) fn post_send(&mut self, slot: usize, len: usize, exchange: u32) -> Result<()> {
             let (lkey, addr) = (self.mr.lkey(), self.slot_addr(slot));
             let mut guard = self.qp.start_post_send();
             let wr = guard
                 .construct_wr(slot as u64, WorkRequestFlags::Signaled)
-                .setup_send();
+                .setup_send_imm(exchange);
             // SAFETY: the slot is inside the registered buffer and holds `len` bytes.
             unsafe { wr.setup_sge(lkey, addr, len as u32) };
             guard.post().map_err(|e| e.to_string())
         }
 
-        /// The completions waiting on this link, as `(slot, bytes)`; an error for a failed one.
-        pub(super) fn completions(&self, out: &mut Vec<(usize, usize)>) -> Result<()> {
+        /// The completions waiting on this link; an error for a failed one.
+        pub(super) fn completions(&self, out: &mut Vec<Completion>) -> Result<()> {
             out.clear();
-            let Ok(mut poller) = self.cq.start_poll() else {
-                return Ok(());
+            let mut poller = match self.cq.start_poll() {
+                Ok(poller) => poller,
+                Err(PollCompletionQueueError::CompletionQueueEmpty) => return Ok(()),
+                Err(e) => return Err(format!("polling {} failed: {e}", self.port.name)),
             };
             for wc in &mut poller {
                 if wc.status() != WorkCompletionStatus::Success as u32 {
@@ -488,7 +531,11 @@ mod verbs {
                         WorkCompletionStatus::from(wc.status())
                     ));
                 }
-                out.push((wc.wr_id() as usize, wc.byte_len() as usize));
+                out.push(Completion {
+                    slot: wc.wr_id() as usize,
+                    bytes: wc.byte_len() as usize,
+                    exchange: wc.imm_data(),
+                });
             }
             Ok(())
         }
@@ -500,7 +547,7 @@ mod verbs {
 mod verbs {
     use std::{convert::Infallible, net::Ipv4Addr};
 
-    use super::{Endpoint, Result};
+    use super::{Completion, Endpoint, Result};
 
     pub(super) enum Port {}
 
@@ -534,11 +581,16 @@ mod verbs {
             match self.never {}
         }
 
-        pub(super) fn post_send(&mut self, _slot: usize, _len: usize) -> Result<()> {
+        pub(super) fn post_send(
+            &mut self,
+            _slot: usize,
+            _len: usize,
+            _exchange: u32,
+        ) -> Result<()> {
             match self.never {}
         }
 
-        pub(super) fn completions(&self, _out: &mut Vec<(usize, usize)>) -> Result<()> {
+        pub(super) fn completions(&self, _out: &mut Vec<Completion>) -> Result<()> {
             match self.never {}
         }
     }
