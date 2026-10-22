@@ -2,6 +2,8 @@ use std::{fmt::Debug, fs::File, sync::Barrier};
 
 use candle_core::Result;
 pub mod layers;
+#[cfg(feature = "ring")]
+mod rdma_ring;
 pub mod socket;
 
 use serde::{Deserialize, Serialize};
@@ -872,6 +874,8 @@ mod ring_ops {
     // Friendly aliases to tame type complexity.
     type SharedTcpStream = Arc<Mutex<TcpStream>>;
     type LeftRight = (SharedTcpStream, SharedTcpStream);
+    /// The ring's RDMA links, when every link of the ring has them.
+    type SharedRdma = Option<Arc<Mutex<RdmaRing>>>;
     /// Reusable wire scratch keyed by payload size: `(receive, forward)`.
     type SizedBuffers = Arc<Mutex<HashMap<usize, (Vec<u8>, Vec<u8>)>>>;
 
@@ -879,12 +883,14 @@ mod ring_ops {
         backend::BackendStorage, CpuStorage, Device, Result, Storage, Tensor, WithDType,
     };
 
+    use super::rdma_ring::{self, RdmaRing};
     use super::RingConfig;
 
-    // Lazily–initialized pair of TCP streams shared by every ring‑based collective op
-    static LEFT_RIGHT_STREAMS: OnceLock<LeftRight> = OnceLock::new();
+    // Lazily–initialized pair of TCP streams shared by every ring‑based collective op, and
+    // the RDMA links that replace them for the exchange when the whole ring has them.
+    static LEFT_RIGHT_STREAMS: OnceLock<(LeftRight, SharedRdma)> = OnceLock::new();
 
-    fn get_ring_streams(config: &RingConfig) -> LeftRight {
+    fn get_ring_streams(config: &RingConfig) -> (LeftRight, SharedRdma) {
         LEFT_RIGHT_STREAMS
             .get_or_init(|| {
                 let cur_port = config.port;
@@ -897,7 +903,7 @@ mod ring_ops {
 
                 let start = Instant::now();
                 // Connect to the right neighbor using the provided IP
-                let right = loop {
+                let mut right = loop {
                     match TcpStream::connect(format!("{}:{}", right_ip, right_port)) {
                         Ok(s) => break s,
                         Err(_) if start.elapsed() > Duration::from_secs(10) => {
@@ -908,22 +914,60 @@ mod ring_ops {
                 };
 
                 // Accept connection from the left neighbour
-                let (left, _) = left_listener.accept().expect("accept left neighbour");
+                let (mut left, _) = left_listener.accept().expect("accept left neighbour");
 
                 left.set_nodelay(true).unwrap();
                 left.set_nonblocking(false).unwrap();
                 right.set_nodelay(true).unwrap();
                 right.set_nonblocking(false).unwrap();
 
-                (Arc::new(Mutex::new(left)), Arc::new(Mutex::new(right)))
+                // Every rank runs the RDMA handshake here, before any collective, so all of
+                // them agree on the transport.
+                let allowed = std::env::var(rdma_ring::DISABLE).map_or(true, |v| v != "1");
+                let rdma =
+                    match RdmaRing::connect(config.world_size, &mut right, &mut left, allowed)
+                        .expect("ring RDMA handshake")
+                    {
+                        Ok(ring) => {
+                            tracing::info!(
+                                "Ring backend exchanges over RDMA: {}.",
+                                ring.describe()
+                            );
+                            Some(Arc::new(Mutex::new(ring)))
+                        }
+                        Err(why) => {
+                            tracing::info!("Ring backend exchanges over TCP: {why}.");
+                            None
+                        }
+                    };
+
+                (
+                    (Arc::new(Mutex::new(left)), Arc::new(Mutex::new(right))),
+                    rdma,
+                )
             })
             .clone()
+    }
+
+    /// Runs one hop of the ring over RDMA when the ring has it: sends `send` to the right
+    /// neighbour and fills `recv` from the left one. False when the hop is TCP's to run.
+    fn rdma_hop(rdma: &SharedRdma, send: &[u8], recv: &mut [u8], left: &TcpStream) -> Result<bool> {
+        let Some(rdma) = rdma else {
+            return Ok(false);
+        };
+        let mut ring = rdma.lock().map_err(|e| {
+            candle_core::Error::msg(format!("Failed to lock the RDMA ring: {:?}", e))
+        })?;
+        ring.exchange(send, recv, left)
+            .map_err(|e| candle_core::Error::msg(format!("ring exchange over RDMA: {e}")))?;
+        Ok(true)
     }
 
     #[derive(Clone, Debug)]
     pub struct SumAllReduce {
         left: SharedTcpStream,
         right: SharedTcpStream,
+        rdma: SharedRdma,
         /// `.0` receives from the left neighbour, `.1` holds the previous hop's payload
         /// while it is forwarded to the right. `.1` stays empty at `world_size == 2`,
         /// where nothing is ever forwarded.
@@ -935,10 +979,11 @@ mod ring_ops {
         pub fn new(comm: &Arc<super::Comm>) -> Self {
             match &**comm {
                 super::Comm::Ring(ring_comm) => {
-                    let (left, right) = get_ring_streams(ring_comm.config());
+                    let ((left, right), rdma) = get_ring_streams(ring_comm.config());
                     Self {
                         left,
                         right,
+                        rdma,
                         buffers: Arc::new(Mutex::new(HashMap::new())),
                         world_size: ring_comm.world_size(),
                     }
@@ -1003,7 +1048,10 @@ mod ring_ops {
                 // write/read pair is faster than chunking because the extra
                 // system‑call and loop overhead dominates.  Only fall back to the
                 // chunked "ping‑pong" pipeline for larger transfers.
-                if nbytes <= 8 * 1024 {
+                let over_rdma = rdma_hop(&self.rdma, send_bytes, &mut recv_buf, &left_guard)?;
+                if over_rdma {
+                    // The RDMA links ran the hop.
+                } else if nbytes <= 8 * 1024 {
                     // --- fast path: one shot ------------------------------------
                     right_guard
                         .write_all(send_bytes)
@@ -1094,6 +1142,7 @@ mod ring_ops {
     pub struct AllGather {
         left: SharedTcpStream,
         right: SharedTcpStream,
+        rdma: SharedRdma,
         buffers: Arc<Mutex<HashMap<usize, Vec<u8>>>>,
         dim: usize,
         world_size: usize,
@@ -1104,10 +1153,11 @@ mod ring_ops {
         pub fn new(comm: &Arc<super::Comm>, dim: usize) -> Self {
             match &**comm {
                 super::Comm::Ring(ring_comm) => {
-                    let (left, right) = get_ring_streams(ring_comm.config());
+                    let ((left, right), rdma) = get_ring_streams(ring_comm.config());
                     Self {
                         left,
                         right,
+                        rdma,
                         buffers: Arc::new(Mutex::new(HashMap::new())),
                         dim,
                         world_size: ring_comm.world_size(),
@@ -1149,26 +1199,36 @@ mod ring_ops {
             let mut send_piece: &[T] = x;
 
             for step in 0..(self.world_size - 1) {
-                // ---------- send to the right ----------
                 let bytes =
                     unsafe { std::slice::from_raw_parts(send_piece.as_ptr() as *const u8, nbytes) };
-                {
-                    let mut rg = right.lock().map_err(|e| {
-                        candle_core::Error::msg(format!(
-                            "Failed to lock right stream mutex: {:?}",
-                            e
-                        ))
-                    })?;
-                    rg.write_all(bytes)
-                        .map_err(|e| candle_core::Error::msg(format!("write error: {:?}", e)))?;
-                }
-
-                // ---------- receive from the left ----------
                 let mut bg = self.buffers.lock().map_err(|e| {
                     candle_core::Error::msg(format!("Failed to lock buffers mutex: {:?}", e))
                 })?;
                 let buf = bg.entry(nbytes).or_insert_with(|| vec![0u8; nbytes]);
-                {
+                let over_rdma = {
+                    let lg = left.lock().map_err(|e| {
+                        candle_core::Error::msg(format!(
+                            "Failed to lock left stream mutex: {:?}",
+                            e
+                        ))
+                    })?;
+                    rdma_hop(&self.rdma, bytes, buf, &lg)?
+                };
+                if !over_rdma {
+                    // ---------- send to the right ----------
+                    {
+                        let mut rg = right.lock().map_err(|e| {
+                            candle_core::Error::msg(format!(
+                                "Failed to lock right stream mutex: {:?}",
+                                e
+                            ))
+                        })?;
+                        rg.write_all(bytes).map_err(|e| {
+                            candle_core::Error::msg(format!("write error: {:?}", e))
+                        })?;
+                    }
+
+                    // ---------- receive from the left ----------
                     let mut lg = left.lock().map_err(|e| {
                         candle_core::Error::msg(format!(
                             "Failed to lock left stream mutex: {:?}",

@@ -45,6 +45,11 @@ sysinfo.workspace = true
 cutile = { workspace = true, optional = true, features = ["experimental-tune"] }
 mistralrs-metal-compile = { workspace = true, optional = true, features = ["metal"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The ring backend's RDMA transport. libibverbs is loaded at run time, so a host without it
+# keeps the TCP transport.
+sideway = { workspace = true, optional = true }
+
 [features]
 cuda = [
     "candle-core/cuda",
@@ -67,7 +72,7 @@ metal = [
 ]
 accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
 arm-nightly-feat = []
-ring = []
+ring = ["dep:sideway"]
 
 cuda-11040 = []
 cuda-11050 = []
