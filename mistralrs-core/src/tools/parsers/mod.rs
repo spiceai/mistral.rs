@@ -5,6 +5,7 @@
 
 pub(crate) mod atem;
 mod deepseek;
+mod dsml;
 mod gemma4;
 mod gemma4_strict;
 pub(crate) mod harmony;
@@ -49,6 +50,8 @@ pub enum ToolCallFormat {
     Hunyuan,
     /// Multi-line with ` ```json` fence and `<｜tool▁call▁end｜>` delimiter
     DeepSeek,
+    /// DeepSeek-V4's DSML markup: `<｜DSML｜tool_calls>` around `invoke` and `parameter` tags
+    DeepSeekDsml,
     /// `<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>` (non-JSON)
     Gemma4,
     /// Harmony commentary channel tool call with `to=...` recipient.
@@ -98,6 +101,7 @@ pub trait ToolFormatParser: Send + Sync {
 static PARSERS: std::sync::LazyLock<Vec<Box<dyn ToolFormatParser>>> =
     std::sync::LazyLock::new(|| {
         vec![
+            Box::new(dsml::DsmlParser),
             Box::new(atem::AtemParser),
             Box::new(gemma4::Gemma4Parser),
             Box::new(liquid::LiquidParser),
@@ -124,6 +128,11 @@ pub fn build_tool_call_grammar(text: &str, tools: &[Tool]) -> Option<TopLevelGra
             // DeepSeek: wait until the JSON fence is present so we don't
             // activate grammar before the function name is complete.
             if parser.format() == ToolCallFormat::DeepSeek && !text.contains("```json\n") {
+                return None;
+            }
+            // DSML tags open with `｜DSML｜`, a token of its own. A grammar written in text would
+            // make the model spell it byte by byte, so DSML calls are read, not constrained.
+            if parser.format() == ToolCallFormat::DeepSeekDsml {
                 return None;
             }
             return Some(parser.tool_call_grammar(tools, text));
@@ -198,6 +207,7 @@ fn strip_tool_call_segments(message: &str, format: ToolCallFormat) -> String {
         ToolCallFormat::DeepSeek => {
             strip_delimited_segments(message, "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>")
         }
+        ToolCallFormat::DeepSeekDsml => dsml::strip_calls(message),
         ToolCallFormat::MistralNemo => strip_from_first(message, "[TOOL_CALLS]"),
         ToolCallFormat::Hunyuan => {
             strip_delimited_segments(message, "<tool_calls>", "</tool_calls>")
