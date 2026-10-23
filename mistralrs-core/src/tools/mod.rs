@@ -645,4 +645,23 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "write_file");
     }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML opener inside another format's call
+    /// claimed the message for DSML, and the call it sat in was lost
+    #[test]
+    fn a_dsml_opener_inside_another_formats_call_is_that_calls_text() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": "write_file", "parameters": { "type": "object" } },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        let calls = matcher
+            .get_call(r#"<tool_call>{"name": "write_file", "arguments": {"content": "<｜DSML｜tool_calls>"}}</tool_call>"#)
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"content": "<｜DSML｜tool_calls>"}));
+    }
 }

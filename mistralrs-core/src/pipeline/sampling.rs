@@ -1427,6 +1427,19 @@ pub async fn sample_sequence(
     if stop_token_requires_tool {
         activate_required_tool_call_grammar(seq, llg_factory.as_ref(), max_model_len, true);
     }
+    // A stop token the required call blocks, where no grammar could be forced (as inside an
+    // unfinished DSML call), is masked out and resampled: kept, its text would be written into
+    // the output.
+    let blocked: Vec<u32> = if stop_token_requires_tool {
+        eos_tok
+            .unwrap_or_default()
+            .iter()
+            .chain(seq.stop_tokens())
+            .copied()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let bias_if_not_allowed = match &mut seq.recognizer {
         SequenceRecognizer::Llguidance(ref mut llg) => {
@@ -1466,6 +1479,15 @@ pub async fn sample_sequence(
                     Some(acc)
                 }
             }
+        }
+        SequenceRecognizer::None if !blocked.is_empty() => {
+            let mut acc = vec![0.0f32; logits.dims1()?];
+            for token in &blocked {
+                if let Some(slot) = acc.get_mut(*token as usize) {
+                    *slot = -f32::INFINITY;
+                }
+            }
+            Some(acc)
         }
         SequenceRecognizer::None => None,
     };
@@ -1679,6 +1701,48 @@ mod tests {
         .await
         .unwrap()
         .token
+    }
+
+    /// regression test for spiceai/mistral.rs#54: inside an unfinished required DSML call no
+    /// grammar can be forced, and a blocked stop token was kept, its text written into the call
+    #[tokio::test]
+    async fn a_stop_token_blocked_inside_an_unfinished_required_call_is_resampled() {
+        let mut state = ToolCallState::new(
+            ToolChoice::Required,
+            Some(&[weather_tool()]),
+            Some(crate::tools::ToolCallFormat::DeepSeekDsml),
+        )
+        .unwrap();
+        state.observe_token(
+            0,
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par".as_bytes(),
+        );
+        let mut seq = terminal_test_sequence(vec![], None, false);
+        seq.tool_call_state = Some(state);
+        // Greedy sampling picks token 3, the end of sequence; the next best is token 2.
+        let logits = Tensor::from_vec(
+            vec![0.1f32, 0.2, 0.3, 0.4],
+            (1, 1, 4),
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(999)));
+        let token = sample_sequence(
+            logits,
+            &mut seq,
+            false,
+            Some(&[3]),
+            None,
+            1024,
+            rng,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap()
+        .token;
+        assert_eq!(token, 2);
     }
 
     #[tokio::test]

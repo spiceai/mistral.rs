@@ -65,11 +65,12 @@ pub trait ToolFormatParser: Send + Sync {
     /// whether to buffer output.
     fn could_be_tool_call(&self, text: &str) -> bool;
 
-    /// Whether `message` opens a call in this format, finished or not. A message one format
-    /// claims is read only in that format, so text inside its calls never becomes a call in
-    /// another.
-    fn claims(&self, _message: &str) -> bool {
-        false
+    /// Where `message` opens a call in this format, finished or not, for a format that claims
+    /// the messages it opens a call in: one is read only in that format, so text inside its
+    /// calls never becomes a call in another. A call opened inside another format's call is
+    /// that call's text, and gives no claim.
+    fn claim_start(&self, _message: &str) -> Option<usize> {
+        None
     }
 
     /// Attempt to parse complete tool calls from `message`.
@@ -120,19 +121,35 @@ static PARSERS: std::sync::LazyLock<Vec<Box<dyn ToolFormatParser>>> =
         ]
     });
 
-/// The parsers to read `message` with, in order: only the one that claims it, if one does.
-fn parsers_for(message: &str) -> &'static [Box<dyn ToolFormatParser>] {
-    let parsers: &'static [Box<dyn ToolFormatParser>] = &PARSERS;
-    match parsers.iter().position(|parser| parser.claims(message)) {
-        Some(at) => &parsers[at..=at],
-        None => parsers,
+/// The parsers to read `message` with, in order. A format that opens a call in it outside any
+/// other format's call reads it alone; one whose call opens inside another format's call does
+/// not read it at all.
+fn parsers_for(message: &str) -> Vec<&'static dyn ToolFormatParser> {
+    let all = || PARSERS.iter().map(|parser| parser.as_ref());
+    for parser in all() {
+        let Some(start) = parser.claim_start(message) else {
+            continue;
+        };
+        let before = &message[..start];
+        let enclosed = all()
+            .any(|other| other.format() != parser.format() && other.could_be_tool_call(before));
+        return if enclosed {
+            all()
+                .filter(|other| other.format() != parser.format())
+                .collect()
+        } else {
+            vec![parser]
+        };
     }
+    all().collect()
 }
 
 /// Check whether `text` could contain a tool call prefix from any supported
 /// format.
 pub fn contains_tool_call_prefix(text: &str) -> bool {
-    parsers_for(text).iter().any(|p| p.could_be_tool_call(text))
+    parsers_for(text)
+        .into_iter()
+        .any(|p| p.could_be_tool_call(text))
 }
 
 /// Build a tool call grammar for the first matching format detected in

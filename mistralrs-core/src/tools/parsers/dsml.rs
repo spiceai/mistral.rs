@@ -15,8 +15,9 @@
 //! `calls`. It is read strictly otherwise: a block holds only invocations, an invocation only
 //! parameters, every tag closes before the next opens, a tag holds only the attributes the
 //! template writes, each once, and a parameter appears once. A block that breaks any of these
-//! stays content, so no call is made from it. Once a message opens a block, it is read only as
-//! DSML, so text inside a call never becomes a call in another format.
+//! stays content, so no call is made from it. A message that opens a block outside any other
+//! format's call is read only as DSML, so text inside a DSML call never becomes a call in
+//! another format; a block opened inside another format's call is that call's text.
 
 use candle_core::Result;
 use llguidance::api::{GrammarWithLexer, TopLevelGrammar};
@@ -46,8 +47,8 @@ impl ToolFormatParser for DsmlParser {
         matches!(scan(text), Scan::More)
     }
 
-    fn claims(&self, message: &str) -> bool {
-        opens_block(message)
+    fn claim_start(&self, message: &str) -> Option<usize> {
+        block_start(message)
     }
 
     fn format(&self) -> super::ToolCallFormat {
@@ -321,19 +322,22 @@ fn scan(message: &str) -> Scan<Found> {
     }
 }
 
-/// Whether `message` opens a block of calls, finished or not.
-fn opens_block(message: &str) -> bool {
-    message.match_indices(OPEN).any(|(start, _)| {
-        matches!(
-            tag_at(&message[start..], false, &BLOCK_NAMES),
-            Scan::Done(_)
-        )
-    })
+/// Where `message` opens its first block of calls, finished or not.
+fn block_start(message: &str) -> Option<usize> {
+    message
+        .match_indices(OPEN)
+        .map(|(start, _)| start)
+        .find(|&start| {
+            matches!(
+                tag_at(&message[start..], false, &BLOCK_NAMES),
+                Scan::Done(_)
+            )
+        })
 }
 
 /// Whether `message` opens a block of calls it does not finish.
 pub(super) fn unfinished_block(message: &str) -> bool {
-    opens_block(message) && matches!(scan(message), Scan::More)
+    block_start(message).is_some() && matches!(scan(message), Scan::More)
 }
 
 /// `message` without its blocks of calls: the text the model wrote around them.
@@ -447,25 +451,38 @@ const ANNOTATIONS: [&str; 7] = [
 ];
 
 fn property_value(property: &Value) -> PropertyValue {
+    let Some(object) = property.as_object() else {
+        return PropertyValue::Json;
+    };
+    // A shortcut stands in for the schema only when it is the property's one constraint: on
+    // a string, or with no type, and beside annotations alone.
+    let alone = |keyword: &str| {
+        object.get("type").is_none_or(|kind| kind == "string")
+            && object
+                .keys()
+                .all(|key| key == keyword || ANNOTATIONS.contains(&key.as_str()))
+    };
     let strings = |values: &[Value]| {
         values
             .iter()
             .map(|value| value.as_str().map(str::to_string))
             .collect::<Option<Vec<_>>>()
     };
-    if let Some(values) = property.get("enum").and_then(Value::as_array) {
-        return strings(values).map_or(PropertyValue::Json, PropertyValue::OneOf);
+    if alone("enum") {
+        if let Some(values) = object
+            .get("enum")
+            .and_then(Value::as_array)
+            .and_then(|v| strings(v))
+        {
+            return PropertyValue::OneOf(values);
+        }
     }
-    if let Some(value) = property.get("const") {
-        return value.as_str().map_or(PropertyValue::Json, |value| {
-            PropertyValue::OneOf(vec![value.to_string()])
-        });
+    if alone("const") {
+        if let Some(value) = object.get("const").and_then(Value::as_str) {
+            return PropertyValue::OneOf(vec![value.to_string()]);
+        }
     }
-    let text = property.get("type").and_then(Value::as_str) == Some("string")
-        && property
-            .as_object()
-            .is_some_and(|keys| keys.keys().all(|key| ANNOTATIONS.contains(&key.as_str())));
-    if text {
+    if object.get("type").and_then(Value::as_str) == Some("string") && alone("type") {
         PropertyValue::Text
     } else {
         PropertyValue::Json
@@ -949,5 +966,46 @@ mod tests {
             &[options],
             &one_call("set", &[("options", "false", r#"{"depth": "deep"}"#)])
         ));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: the `enum` and `const` shortcuts dropped the
+    /// property's other constraints
+    #[test]
+    fn a_forced_enum_keeps_the_propertys_other_constraints() {
+        let short = tool(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": { "type": "string", "enum": ["abc", "abcdef"], "maxLength": 3 },
+            },
+            "required": ["code"],
+            "additionalProperties": false,
+        }));
+        let code = |string: &str, value: &str| one_call("set", &[("code", string, value)]);
+        assert!(forced_call_accepts(
+            std::slice::from_ref(&short),
+            &code("false", "\"abc\"")
+        ));
+        assert!(!forced_call_accepts(
+            std::slice::from_ref(&short),
+            &code("false", "\"abcdef\"")
+        ));
+        assert!(!forced_call_accepts(&[short], &code("true", "abcdef")));
+
+        let pinned = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "mode": { "enum": ["a", "b"], "const": "a" } },
+            "required": ["mode"],
+            "additionalProperties": false,
+        }));
+        let mode = |string: &str, value: &str| one_call("set", &[("mode", string, value)]);
+        assert!(forced_call_accepts(
+            std::slice::from_ref(&pinned),
+            &mode("false", "\"a\"")
+        ));
+        assert!(!forced_call_accepts(
+            std::slice::from_ref(&pinned),
+            &mode("false", "\"b\"")
+        ));
+        assert!(!forced_call_accepts(&[pinned], &mode("true", "b")));
     }
 }
