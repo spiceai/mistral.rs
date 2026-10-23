@@ -174,6 +174,7 @@ impl ToolCallState {
         remaining: usize,
         max_generation_len: usize,
         force_now: bool,
+        content: Option<&str>,
     ) -> Option<TopLevelGrammar> {
         if self.grammar != ToolGrammarState::Inactive {
             return None;
@@ -188,8 +189,10 @@ impl ToolCallState {
             return None;
         }
         // A forced call would start a new block inside the one being written; the model
-        // finishes its own call instead.
-        if self.strategy.call_unfinished() {
+        // finishes its own call instead. `content` is the response without its reasoning, as
+        // prefix detection reads it, so a call written as an example in the reasoning counts
+        // for nothing.
+        if content.is_some_and(|content| self.strategy.call_unfinished(content)) {
             return None;
         }
         let tools = self.matcher.tools()?;
@@ -439,7 +442,7 @@ mod tests {
         .unwrap();
 
         let grammar = state
-            .maybe_force_required_grammar(2048, 8192, false)
+            .maybe_force_required_grammar(2048, 8192, false, None)
             .unwrap();
 
         assert!(lark(&grammar).contains("start: <|tool_call> tool_call_body"));
@@ -450,74 +453,45 @@ mod tests {
     #[test]
     fn required_tool_call_deadline_waits_for_an_unfinished_dsml_call() {
         let tools = vec![tool("get_weather")];
-        let new_state = || {
-            ToolCallState::new(
-                ToolChoice::Required,
-                Some(&tools),
-                Some(ToolCallFormat::DeepSeekDsml),
-            )
-            .unwrap()
-        };
-        let mut idle = new_state();
-        idle.observe_token(0, "The weather? Let me check. ".as_bytes());
-        assert!(idle.maybe_force_required_grammar(0, 8192, false).is_some());
-
-        let mut calling = new_state();
-        calling.observe_token(
-            0,
-            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par".as_bytes(),
-        );
-        assert!(calling
-            .maybe_force_required_grammar(0, 8192, false)
+        let mut state = ToolCallState::new(
+            ToolChoice::Required,
+            Some(&tools),
+            Some(ToolCallFormat::DeepSeekDsml),
+        )
+        .unwrap();
+        let calling = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par";
+        assert!(state
+            .maybe_force_required_grammar(0, 8192, false, Some(calling))
             .is_none());
-        assert!(calling
-            .maybe_force_required_grammar(0, 8192, true)
+        assert!(state
+            .maybe_force_required_grammar(0, 8192, true, Some(calling))
             .is_none());
+        assert!(state
+            .maybe_force_required_grammar(0, 8192, false, Some("The weather? Let me check. "))
+            .is_some());
     }
 
-    /// regression test for spiceai/mistral.rs#54: a strict tool's object-level constraints
-    /// were dropped from a forced DSML call
+    /// regression test for spiceai/mistral.rs#54: a DSML example in the reasoning hid an
+    /// unfinished call in the answer, and the deadline forced a second block into it. The
+    /// deadline reads the response without its reasoning, as prefix detection does.
     #[test]
-    fn a_required_dsml_call_refuses_object_constraints_it_cannot_enforce() {
-        let mut either: Tool = serde_json::from_value(serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "pick",
-                "strict": true,
-                "parameters": {
-                    "type": "object",
-                    "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
-                    "oneOf": [{ "required": ["a"] }, { "required": ["b"] }],
-                    "additionalProperties": false,
-                },
-            },
-        }))
+    fn a_dsml_example_in_reasoning_does_not_hide_an_unfinished_call() {
+        let tools = vec![tool("get_weather")];
+        let mut state = ToolCallState::new(
+            ToolChoice::Required,
+            Some(&tools),
+            Some(ToolCallFormat::DeepSeekDsml),
+        )
         .unwrap();
-        let error = ToolCallState::new(
-            ToolChoice::Required,
-            Some(std::slice::from_ref(&either)),
-            Some(ToolCallFormat::DeepSeekDsml),
-        )
-        .err()
-        .expect("a required call is refused");
-        assert_eq!(
-            error.to_string(),
-            "Tool 'pick' is strict, and its parameters schema constrains the object as a whole with `oneOf`, which a required DeepSeek-V4 tool call cannot enforce. Remove `strict` from the tool, or the `oneOf` from its schema."
+        // What the model wrote, its reasoning included, is never what the deadline reads.
+        state.observe_token(
+            0,
+            "<think>The wrapper is <｜DSML｜tool_calls> followed by invokes.</think>".as_bytes(),
         );
-        // An optional call is not forced, so nothing is enforced to refuse.
-        assert!(ToolCallState::new(
-            ToolChoice::Auto,
-            Some(std::slice::from_ref(&either)),
-            Some(ToolCallFormat::DeepSeekDsml),
-        )
-        .is_ok());
-        either.function.strict = None;
-        assert!(ToolCallState::new(
-            ToolChoice::Required,
-            Some(&[either]),
-            Some(ToolCallFormat::DeepSeekDsml),
-        )
-        .is_ok());
+        let answer = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par";
+        assert!(state
+            .maybe_force_required_grammar(0, 8192, false, Some(answer))
+            .is_none());
     }
 
     /// regression test for spiceai/mistral.rs#54: a required call refused an unenforceable
@@ -547,6 +521,37 @@ mod tests {
         );
     }
 
+    /// regression test for spiceai/mistral.rs#54: a strict schema requiring a property it
+    /// does not declare was forced with no arguments
+    #[test]
+    fn a_required_dsml_call_refuses_required_properties_it_cannot_write() {
+        for parameters in [
+            serde_json::json!({ "type": "object", "required": ["command"] }),
+            serde_json::json!({
+                "type": "object",
+                "properties": { "cwd": { "type": "string" } },
+                "required": ["command"],
+            }),
+        ] {
+            let strict: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function",
+                "function": { "name": "Bash", "strict": true, "parameters": parameters },
+            }))
+            .unwrap();
+            let error = ToolCallState::new(
+                ToolChoice::Required,
+                Some(&[strict]),
+                Some(ToolCallFormat::DeepSeekDsml),
+            )
+            .err()
+            .expect("a required call is refused");
+            assert_eq!(
+                error.to_string(),
+                "Tool 'Bash' is strict, and its parameters schema requires `command` without declaring it in `properties`, so a required DeepSeek-V4 tool call cannot write it. Declare `command` in `properties`, or remove `strict` from the tool."
+            );
+        }
+    }
+
     #[test]
     fn required_harmony_tool_call_deadline_forces_native_grammar() {
         let tools = vec![tool("get_weather")];
@@ -558,7 +563,7 @@ mod tests {
         .unwrap();
 
         let grammar = state
-            .maybe_force_required_grammar(8192, 8192, true)
+            .maybe_force_required_grammar(8192, 8192, true, None)
             .unwrap();
 
         assert!(lark(&grammar).contains("<|channel|>"));
@@ -665,7 +670,7 @@ mod tests {
             ToolCallState::new(choice, Some(&tools), Some(ToolCallFormat::Atem)).unwrap();
 
         let grammar = state
-            .maybe_force_required_grammar(8192, 8192, true)
+            .maybe_force_required_grammar(8192, 8192, true, None)
             .unwrap();
         let lark = grammar.grammars[0].lark_grammar.as_ref().unwrap();
         assert!(lark.contains("to=search"));
@@ -712,7 +717,9 @@ mod tests {
         .unwrap();
         state.observe_token(0, b" to=self<|message|>still thinking");
 
-        let grammar = state.maybe_force_required_grammar(0, 8192, true).unwrap();
+        let grammar = state
+            .maybe_force_required_grammar(0, 8192, true, None)
+            .unwrap();
         let lark = grammar.grammars[0].lark_grammar.as_ref().unwrap();
         assert!(lark.contains(r#""<|eom|>" "<|start|>" "assistant to=get_weather""#));
     }
@@ -728,7 +735,9 @@ mod tests {
         .unwrap();
         state.observe_token(0, b" to=self<|message|>done<|eom|><|start|>assistant");
 
-        let grammar = state.maybe_force_required_grammar(0, 8192, true).unwrap();
+        let grammar = state
+            .maybe_force_required_grammar(0, 8192, true, None)
+            .unwrap();
         let lark = grammar.grammars[0].lark_grammar.as_ref().unwrap();
         assert!(lark.contains(r#"" to=get_weather""#));
         assert!(!lark.contains(r#""<|start|>""#));
@@ -777,7 +786,7 @@ mod tests {
         let mut state = ToolCallState::new(choice, Some(&tools), None).unwrap();
 
         let grammar = state
-            .maybe_force_required_grammar(8192, 8192, true)
+            .maybe_force_required_grammar(8192, 8192, true, None)
             .unwrap();
         let schema = grammar.grammars[1].json_schema.as_ref().unwrap();
         let names = schema["properties"]["name"]["enum"]

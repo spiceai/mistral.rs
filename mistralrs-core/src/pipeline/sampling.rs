@@ -74,8 +74,15 @@ fn activate_required_tool_call_grammar(
     let max_generation_len = seq.max_generation_len(max_model_len);
     let (_, remaining, deadline_tokens) =
         ToolCallState::required_tool_call_deadline_status(generated, max_generation_len);
+    // The response so far without its reasoning, as prefix detection reads it.
+    let content = tool_detection_text(seq, None);
     let grm = seq.tool_call_state.as_mut().and_then(|state| {
-        state.maybe_force_required_grammar(remaining, max_generation_len, force_now)
+        state.maybe_force_required_grammar(
+            remaining,
+            max_generation_len,
+            force_now,
+            content.as_deref(),
+        )
     });
     let Some(mut grm) = grm else {
         return;
@@ -1703,20 +1710,17 @@ mod tests {
         .token
     }
 
-    /// regression test for spiceai/mistral.rs#54: inside an unfinished required DSML call no
-    /// grammar can be forced, and a blocked stop token was kept, its text written into the call
+    /// regression test for spiceai/mistral.rs#54: where no grammar can be forced, as inside an
+    /// unfinished DSML call, a blocked stop token was kept and its text written into the
+    /// output. Here no grammar can be forced because the test has no llguidance factory.
     #[tokio::test]
     async fn a_stop_token_blocked_inside_an_unfinished_required_call_is_resampled() {
-        let mut state = ToolCallState::new(
+        let state = ToolCallState::new(
             ToolChoice::Required,
             Some(&[weather_tool()]),
             Some(crate::tools::ToolCallFormat::DeepSeekDsml),
         )
         .unwrap();
-        state.observe_token(
-            0,
-            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par".as_bytes(),
-        );
         let mut seq = terminal_test_sequence(vec![], None, false);
         seq.tool_call_state = Some(state);
         // Greedy sampling picks token 3, the end of sequence; the next best is token 2.

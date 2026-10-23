@@ -310,11 +310,23 @@ fn scan(message: &str) -> Scan<Found> {
         blocks: Vec::new(),
     };
     let mut from = 0;
+    // Where the text outside DSML blocks resumes, after the last block read.
+    let mut outside = 0;
     while let Some(offset) = message[from..].find(OPEN) {
         let start = from + offset;
+        // An opener inside another format's call is that call's text.
+        if super::open_in_other_format(
+            &message[outside..start],
+            super::ToolCallFormat::DeepSeekDsml,
+        ) {
+            from = start + OPEN.len();
+            continue;
+        }
         let (attributes, open) = match tag_at(&message[start..], false, &BLOCK_NAMES) {
             Scan::Done(tag) => tag,
             Scan::More => return Scan::More,
+            // A block's opening tag that cannot be read leaves no place to resume.
+            Scan::Bad if names_block(&message[start..]) => return Scan::Bad,
             // A DSML tag that does not open a block is not a call.
             Scan::Bad => {
                 from = start + OPEN.len();
@@ -333,6 +345,7 @@ fn scan(message: &str) -> Scan<Found> {
             found.blocks.push(start..end);
         }
         from = end;
+        outside = end;
     }
     // The message may end partway through the marker that opens the next block.
     let tail = &message[from..];
@@ -347,7 +360,8 @@ fn scan(message: &str) -> Scan<Found> {
     }
 }
 
-/// Where `message` opens its first block of calls, finished or not.
+/// Where `message` opens its first block of calls outside any other format's call, finished
+/// or not.
 fn block_start(message: &str) -> Option<usize> {
     message
         .match_indices(OPEN)
@@ -356,8 +370,22 @@ fn block_start(message: &str) -> Option<usize> {
             matches!(
                 tag_at(&message[start..], false, &BLOCK_NAMES),
                 Scan::Done(_)
+            ) && !super::open_in_other_format(
+                &message[..start],
+                super::ToolCallFormat::DeepSeekDsml,
             )
         })
+}
+
+/// Whether the DSML tag at the start of `text` names a block, whether or not the tag can be
+/// read.
+fn names_block(text: &str) -> bool {
+    let rest = text.strip_prefix(OPEN).unwrap_or(text).trim_start();
+    BLOCK_NAMES.into_iter().any(|name| {
+        rest.strip_prefix(name).is_some_and(|tail| {
+            tail.starts_with(|c: char| c == '>' || c == '<' || c.is_whitespace())
+        })
+    })
 }
 
 /// Whether `message` opens a block of calls it does not finish, the block's opening tag
@@ -553,14 +581,26 @@ const ENFORCED_ROOT_KEYS: [&str; 13] = [
 pub(super) fn unenforceable(tools: &[Tool]) -> Option<String> {
     tools.iter().find_map(|tool| {
         let schema = tool.function.strict_parameters_schema()?;
-        let keyword = schema
-            .as_object()?
+        let object = schema.as_object()?;
+        let name = &tool.function.name;
+        if let Some(keyword) = object
             .keys()
-            .find(|key| !ENFORCED_ROOT_KEYS.contains(&key.as_str()))?
-            .clone();
+            .find(|key| !ENFORCED_ROOT_KEYS.contains(&key.as_str()))
+        {
+            return Some(format!(
+                "Tool '{name}' is strict, and its parameters schema constrains the object as a whole with `{keyword}`, which a required DeepSeek-V4 tool call cannot enforce. Remove `strict` from the tool, or the `{keyword}` from its schema."
+            ));
+        }
+        // The grammar writes declared properties only, so a required one must be declared.
+        let declared = object.get("properties").and_then(Value::as_object);
+        let missing = object
+            .get("required")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|required| declared.is_none_or(|declared| !declared.contains_key(*required)))?;
         Some(format!(
-            "Tool '{}' is strict, and its parameters schema constrains the object as a whole with `{keyword}`, which a required DeepSeek-V4 tool call cannot enforce. Remove `strict` from the tool, or the `{keyword}` from its schema.",
-            tool.function.name
+            "Tool '{name}' is strict, and its parameters schema requires `{missing}` without declaring it in `properties`, so a required DeepSeek-V4 tool call cannot write it. Declare `{missing}` in `properties`, or remove `strict` from the tool."
         ))
     })
 }
@@ -591,7 +631,32 @@ fn emit_arguments(
 ) -> String {
     let arguments = format!("arguments_{tool_index}");
     let Some(schema) = tool.function.strict_parameters_schema() else {
-        rules.push(format!("{arguments}: dsml_parameter*"));
+        // A tool that is not strict takes any value. Its declared parameters are written at
+        // most once each, as the parser reads a parameter given twice as malformed; one that
+        // declares none takes any parameters.
+        let declared = tool
+            .function
+            .parameters
+            .as_ref()
+            .and_then(|parameters| parameters.get("properties"))
+            .and_then(Value::as_object);
+        let Some(declared) = declared.filter(|declared| !declared.is_empty()) else {
+            rules.push(format!("{arguments}: dsml_parameter*"));
+            return arguments;
+        };
+        let mut names = declared.keys().collect::<Vec<_>>();
+        names.sort();
+        let mut sequence = Vec::new();
+        for (property_index, name) in names.into_iter().enumerate() {
+            let parameter = format!("parameter_{tool_index}_{property_index}");
+            rules.push(format!(
+                "{parameter}: {open} (\"true\" | \"false\") {after} {VALUE_THEN_CLOSE}",
+                open = tag(false, &format!("parameter name=\"{name}\" string=\"")),
+                after = lark_literal("\">"),
+            ));
+            sequence.push(format!("{parameter}?"));
+        }
+        rules.push(format!("{arguments}: {}", sequence.join(" ")));
         return arguments;
     };
     let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
@@ -811,7 +876,10 @@ mod tests {
             ),
             "{lark}"
         );
-        assert!(lark.contains("arguments_0: dsml_parameter*"), "{lark}");
+        assert!(
+            lark.contains("arguments_0: parameter_0_0? parameter_0_1?\n"),
+            "{lark}"
+        );
     }
 
     /// regression test for spiceai/mistral.rs#54: strict tools took any parameters
@@ -1211,5 +1279,33 @@ mod tests {
             &[("command", "true", &format!("a</{DSML}parameter>b"))],
         );
         assert!(!forced_call_accepts(&[bash(true)], &cut));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a block's opening tag that could not be
+    /// read was skipped, and a block written inside it made a call
+    #[test]
+    fn a_broken_opening_tag_of_a_block_calls_nothing() {
+        let inner = format!(
+            "{OPEN}tool_calls>{OPEN}invoke name=\"Bash\"></{DSML}invoke></{DSML}tool_calls>"
+        );
+        assert_eq!(calls(&format!("{OPEN}tool_calls x=\"{inner}\">")), None);
+        // An unrelated DSML tag is still passed over.
+        assert!(calls(&format!("{OPEN}note x=\"1\"> {inner}")).is_some());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a forced call to a tool that is not strict
+    /// could write a parameter twice, which the parser refuses
+    #[test]
+    fn a_forced_call_writes_each_parameter_once() {
+        let twice = one_call(
+            "Bash",
+            &[("command", "true", "ls"), ("command", "true", "pwd")],
+        );
+        assert!(!forced_call_accepts(&[bash(false)], &twice));
+        let once = one_call(
+            "Bash",
+            &[("command", "true", "ls"), ("timeout", "false", "5")],
+        );
+        assert!(forced_call_accepts(&[bash(false)], &once));
     }
 }

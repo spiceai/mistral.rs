@@ -687,4 +687,27 @@ mod tests {
             .collect();
         assert_eq!(names, ["write_file"]);
     }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML opener inside an earlier call in
+    /// another format took DSML out of the message, and a later block was read as Qwen
+    #[test]
+    fn a_dsml_opener_inside_an_earlier_call_leaves_later_blocks_to_dsml() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let message = "<tool_call>{\"name\": \"note\", \"arguments\": {\"text\": \"<｜DSML｜tool_calls>\"}}</tool_call>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+    }
 }

@@ -225,6 +225,13 @@ pub fn specialize_required_tool_call_grammar(
     }
 }
 
+/// Whether a call in a format other than `format` is open at the end of `text`.
+pub(super) fn open_in_other_format(text: &str, format: ToolCallFormat) -> bool {
+    PARSERS
+        .iter()
+        .any(|parser| parser.format() != format && parser.open_at_end(text))
+}
+
 /// Whether `text` ends after an `open` delimiter with no `close` after it.
 fn open_between(text: &str, open: &str, close: &str) -> bool {
     text.rfind(open)

@@ -26,9 +26,9 @@ pub(crate) trait ToolCallStrategy: Send + Sync {
     fn required_boundary(&self) -> ToolCallBoundary {
         ToolCallBoundary::ContinueCurrentMessage
     }
-    /// Whether the model is partway through a call that no grammar constrains, which forcing
-    /// a required call would write a second call into.
-    fn call_unfinished(&self) -> bool {
+    /// Whether `content`, the response so far without its reasoning, is partway through a call
+    /// that no grammar constrains, which forcing a required call would write a second call into.
+    fn call_unfinished(&self, _content: &str) -> bool {
         false
     }
     fn has_reasoning(&self) -> bool {
@@ -60,29 +60,20 @@ pub(crate) trait ToolCallStrategy: Send + Sync {
 
 pub(crate) struct TextToolCallStrategy {
     preferred_format: Option<ToolCallFormat>,
-    /// The output so far, kept only for DSML, whose calls no grammar constrains mid-stream.
-    bytes: Vec<u8>,
 }
 
 impl TextToolCallStrategy {
     pub(crate) fn new(preferred_format: Option<ToolCallFormat>) -> Self {
-        Self {
-            preferred_format,
-            bytes: Vec::new(),
-        }
+        Self { preferred_format }
     }
 }
 
 impl ToolCallStrategy for TextToolCallStrategy {
-    fn observe_token(&mut self, _token: u32, bytes: &[u8]) {
-        if self.preferred_format == Some(ToolCallFormat::DeepSeekDsml) {
-            self.bytes.extend_from_slice(bytes);
-        }
-    }
+    fn observe_token(&mut self, _token: u32, _bytes: &[u8]) {}
 
-    fn call_unfinished(&self) -> bool {
+    fn call_unfinished(&self, content: &str) -> bool {
         self.preferred_format == Some(ToolCallFormat::DeepSeekDsml)
-            && parsers::call_unfinished(&decode_streaming_utf8(&self.bytes))
+            && parsers::call_unfinished(content)
     }
 
     fn continuation_grammar(
