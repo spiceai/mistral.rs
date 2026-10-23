@@ -176,13 +176,16 @@ fn leading_whitespace(text: &str) -> usize {
 }
 
 /// A parameter's value, which runs from the end of its opening tag, the start of `text`, to
-/// its own closing tag: anything else in it, DSML tags included, is part of the value.
-fn value_at(text: &str) -> Scan<(&str, usize)> {
+/// its own closing tag: anything else in it, DSML tags included, is part of the value. The
+/// flag says whether the closing tag carried attributes, which the template never writes.
+fn value_at(text: &str) -> Scan<(&str, usize, bool)> {
     let mut from = 0;
     while let Some(offset) = text[from..].find(CLOSE) {
         let at = from + offset;
         match tag_at(&text[at..], true, &["parameter"]) {
-            Scan::Done((_, length)) => return Scan::Done((&text[..at], at + length)),
+            Scan::Done((attributes, length)) => {
+                return Scan::Done((&text[..at], at + length, !bare(attributes)));
+            }
             Scan::More => return Scan::More,
             Scan::Bad => from = at + CLOSE.len(),
         }
@@ -190,10 +193,18 @@ fn value_at(text: &str) -> Scan<(&str, usize)> {
     Scan::More
 }
 
+/// Whether a tag's attributes are none at all.
+fn bare(attributes: &str) -> bool {
+    attributes.trim().is_empty()
+}
+
 /// One invocation, from the end of its opening tag, the start of `text`, through its closing
-/// tag.
-fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize)> {
+/// tag, and whether it breaks a rule of the markup while its tags stay in place: a parameter
+/// without a name or with attributes the template does not write, a parameter given twice,
+/// or a closing tag with attributes. Such an invocation still has a known end.
+fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize, bool)> {
     let mut arguments = serde_json::Map::new();
+    let mut malformed = false;
     let mut at = 0;
     loop {
         at += leading_whitespace(&text[at..]);
@@ -202,8 +213,8 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize)> {
             return Scan::More;
         }
         let close = tag_at(rest, true, &["invoke"]);
-        if let Scan::Done((_, length)) = close {
-            return Scan::Done((arguments, at + length));
+        if let Scan::Done((attributes, length)) = close {
+            return Scan::Done((arguments, at + length, malformed || !bare(attributes)));
         }
         let (attributes, length) = match tag_at(rest, false, &["parameter"]) {
             Scan::Done(tag) => tag,
@@ -211,18 +222,16 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize)> {
             Scan::Bad if matches!(close, Scan::More) => return Scan::More,
             Scan::Bad => return Scan::Bad,
         };
-        let Some(attributes) = attribute_pairs(attributes, &["name", "string"]) else {
-            return Scan::Bad;
-        };
-        let Some(name) = attribute(&attributes, "name") else {
-            return Scan::Bad;
-        };
+        let attributes = attribute_pairs(attributes, &["name", "string"]).unwrap_or_default();
+        let name = attribute(&attributes, "name");
+        malformed |= name.is_none();
         at += length;
-        let (raw, length) = match value_at(&text[at..]) {
+        let (raw, length, closed_with_attributes) = match value_at(&text[at..]) {
             Scan::Done(value) => value,
             Scan::More => return Scan::More,
             Scan::Bad => return Scan::Bad,
         };
+        malformed |= closed_with_attributes;
         at += length;
         let value = if attribute(&attributes, "string") == Some("true") {
             Value::String(raw.to_string())
@@ -230,16 +239,19 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize)> {
             serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
         };
         // A parameter given twice has no one value to call with.
-        if arguments.insert(name.to_string(), value).is_some() {
-            return Scan::Bad;
+        if let Some(name) = name {
+            malformed |= arguments.insert(name.to_string(), value).is_some();
         }
     }
 }
 
 /// One block's calls, from the end of its opening tag, the start of `text`, through its
-/// closing tag.
-fn block_at(text: &str) -> Scan<(Vec<DsmlToolCall>, usize)> {
+/// closing tag, and whether it breaks a rule of the markup while its tags stay in place: no
+/// invocation, an invocation without a name or with attributes the template does not write,
+/// a malformed invocation, or a closing tag with attributes.
+fn block_at(text: &str) -> Scan<(Vec<DsmlToolCall>, usize, bool)> {
     let mut calls = Vec::new();
+    let mut malformed = false;
     let mut at = 0;
     loop {
         at += leading_whitespace(&text[at..]);
@@ -248,12 +260,9 @@ fn block_at(text: &str) -> Scan<(Vec<DsmlToolCall>, usize)> {
             return Scan::More;
         }
         let close = tag_at(rest, true, &BLOCK_NAMES);
-        if let Scan::Done((_, length)) = close {
-            return if calls.is_empty() {
-                Scan::Bad
-            } else {
-                Scan::Done((calls, at + length))
-            };
+        if let Scan::Done((attributes, length)) = close {
+            let malformed = malformed || calls.is_empty() || !bare(attributes);
+            return Scan::Done((calls, at + length, malformed));
         }
         let (attributes, length) = match tag_at(rest, false, &["invoke"]) {
             Scan::Done(tag) => tag,
@@ -261,27 +270,30 @@ fn block_at(text: &str) -> Scan<(Vec<DsmlToolCall>, usize)> {
             Scan::Bad if matches!(close, Scan::More) => return Scan::More,
             Scan::Bad => return Scan::Bad,
         };
-        let Some(attributes) = attribute_pairs(attributes, &["name"]) else {
-            return Scan::Bad;
-        };
-        let Some(name) = attribute(&attributes, "name") else {
-            return Scan::Bad;
-        };
+        let attributes = attribute_pairs(attributes, &["name"]).unwrap_or_default();
+        let name = attribute(&attributes, "name");
+        malformed |= name.is_none();
         at += length;
-        let (arguments, length) = match invocation_at(&text[at..]) {
+        let (arguments, length, invocation_malformed) = match invocation_at(&text[at..]) {
             Scan::Done(invocation) => invocation,
             Scan::More => return Scan::More,
             Scan::Bad => return Scan::Bad,
         };
+        malformed |= invocation_malformed;
         at += length;
-        calls.push(DsmlToolCall {
-            name: name.to_string(),
-            arguments: Value::Object(arguments),
-        });
+        if let Some(name) = name {
+            calls.push(DsmlToolCall {
+                name: name.to_string(),
+                arguments: Value::Object(arguments),
+            });
+        }
     }
 }
 
-/// Reads every block of calls in `message`.
+/// Reads every block of calls in `message`. A block that breaks a rule of the markup while
+/// its tags stay in place is content, and reading resumes after it; its values are read as
+/// values, so a block written inside one never becomes a call. A block whose tags cannot be
+/// read leaves no place to resume, so the message makes no call.
 fn scan(message: &str) -> Scan<Found> {
     let mut found = Found {
         calls: Vec::new(),
@@ -290,7 +302,7 @@ fn scan(message: &str) -> Scan<Found> {
     let mut from = 0;
     while let Some(offset) = message[from..].find(OPEN) {
         let start = from + offset;
-        let (_, open) = match tag_at(&message[start..], false, &BLOCK_NAMES) {
+        let (attributes, open) = match tag_at(&message[start..], false, &BLOCK_NAMES) {
             Scan::Done(tag) => tag,
             Scan::More => return Scan::More,
             // A DSML tag that does not open a block is not a call.
@@ -299,14 +311,16 @@ fn scan(message: &str) -> Scan<Found> {
                 continue;
             }
         };
-        let (calls, length) = match block_at(&message[start + open..]) {
+        let (calls, length, malformed) = match block_at(&message[start + open..]) {
             Scan::Done(block) => block,
             Scan::More => return Scan::More,
             Scan::Bad => return Scan::Bad,
         };
         let end = start + open + length;
-        found.calls.extend(calls);
-        found.blocks.push(start..end);
+        if !malformed && bare(attributes) {
+            found.calls.extend(calls);
+            found.blocks.push(start..end);
+        }
         from = end;
     }
     // The message may end partway through the marker that opens the next block.
@@ -366,7 +380,7 @@ fn lark_literal(value: &str) -> String {
 }
 
 /// A string parameter's value and its closing tag, as a grammar.
-const VALUE_THEN_CLOSE: &str = r#"dsml_value_lt_slash dsml_mark "parameter>\n""#;
+const VALUE_THEN_CLOSE: &str = r#"DSML_VALUE_LT_SLASH dsml_mark "parameter>\n""#;
 
 /// A tag in a grammar: `<`, or `</` with `closing`, the marker, then the rest as text.
 fn tag(closing: bool, rest: &str) -> String {
@@ -416,9 +430,9 @@ fn build_dsml_grammar(tools: &[Tool], required: bool) -> TopLevelGrammar {
         // ordinary markup such as `</div>` is part of it. One lexeme reads the value with the
         // `</` that ends it: written apart, a value ending in `<` or `</` would read the
         // closing tag's `<` as more value.
-        // The lexeme is text without `</` and the marker, through a final `</`: runs of `<`,
-        // and `</` before another `<`, carry on to the next character.
-        r"dsml_value_lt_slash: /(?:[^<]|<(?:<|\/<)*(?:[^<\/]|\/[^<｜]))*<(?:<|\/<)*\//".to_string(),
+        // The lexeme is text through a final `</` that holds no `</｜DSML｜`, the text the
+        // closing tag reads as whichever way the marker is written.
+        r#"DSML_VALUE_LT_SLASH: /(?s:.*)<\// & ~/(?s:.*)<\/｜DSML｜(?s:.*)/"#.to_string(),
         "PARAM_NAME: /[a-zA-Z_][a-zA-Z0-9_.-]*/".to_string(),
         MARK_RULE.to_string(),
     ]);
@@ -487,6 +501,42 @@ fn property_value(property: &Value) -> PropertyValue {
     } else {
         PropertyValue::Json
     }
+}
+
+/// The keys a strict tool's parameters schema may have for a required call's grammar to hold
+/// the object it describes: the grammar writes each declared property at most once, its
+/// required ones always, and no other.
+const ENFORCED_ROOT_KEYS: [&str; 13] = [
+    "type",
+    "properties",
+    "required",
+    "additionalProperties",
+    "description",
+    "title",
+    "$defs",
+    "definitions",
+    "$schema",
+    "$id",
+    "$comment",
+    "examples",
+    "default",
+];
+
+/// Why a required call cannot hold one of `tools` to its strict schema: a constraint on the
+/// object as a whole, which the parameter-by-parameter grammar cannot express.
+pub(super) fn unenforceable(tools: &[Tool]) -> Option<String> {
+    tools.iter().find_map(|tool| {
+        let schema = tool.function.strict_parameters_schema()?;
+        let keyword = schema
+            .as_object()?
+            .keys()
+            .find(|key| !ENFORCED_ROOT_KEYS.contains(&key.as_str()))?
+            .clone();
+        Some(format!(
+            "Tool '{}' is strict, and its parameters schema constrains the object as a whole with `{keyword}`, which a required DeepSeek-V4 tool call cannot enforce. Remove `strict` from the tool, or the `{keyword}` from its schema.",
+            tool.function.name
+        ))
+    })
 }
 
 /// `property` with the definitions of the tool schema `root`, which its references are
@@ -749,7 +799,7 @@ mod tests {
         );
         assert!(
             lark.contains(
-                "parameter_0_0: \"<\" dsml_mark \"parameter name=\\\"command\\\" string=\\\"true\\\">\" dsml_value"
+                "parameter_0_0: \"<\" dsml_mark \"parameter name=\\\"command\\\" string=\\\"true\\\">\" DSML_VALUE_LT_SLASH dsml_mark \"parameter>\\n\""
             ),
             "{lark}"
         );
@@ -784,22 +834,30 @@ mod tests {
         }
     }
 
-    /// ASCII bytes as tokens, then `<eos>` and `｜DSML｜` as special tokens, as DeepSeek-V4's
+    /// Every byte but 0xFF, which marks a special token, as a token, then `<eos>` and `｜DSML｜`
+    /// as special tokens, as DeepSeek-V4's
     /// tokenizer registers the marker.
     fn dsml_env() -> (toktrie::TokEnv, toktrie::TokenId) {
-        let mut tokens = (0_u8..=127).map(|byte| vec![byte]).collect::<Vec<_>>();
+        let env = byte_env(&["<eos>", DSML]);
+        let mark = env
+            .tok_trie()
+            .get_special_token(DSML)
+            .expect("the marker is a special token");
+        (env, mark)
+    }
+
+    /// Every byte but 0xFF, which marks a special token, as a token, then `specials`.
+    fn byte_env(specials: &[&str]) -> toktrie::TokEnv {
+        let mut tokens = (0_u8..=254).map(|byte| vec![byte]).collect::<Vec<_>>();
         let eos = u32::try_from(tokens.len()).expect("fits");
-        for token in ["<eos>", DSML] {
+        for token in specials {
             let mut bytes = vec![toktrie::TokTrie::SPECIAL_TOKEN_MARKER];
             bytes.extend_from_slice(token.as_bytes());
             tokens.push(bytes);
         }
         let vocab_size = u32::try_from(tokens.len()).expect("fits");
         let trie = toktrie::TokTrie::from(&toktrie::TokRxInfo::new(vocab_size, eos), &tokens);
-        let mark = trie
-            .get_special_token(DSML)
-            .expect("the marker is a special token");
-        (Arc::new(GreedyTokenizerEnv { trie }), mark)
+        Arc::new(GreedyTokenizerEnv { trie })
     }
 
     /// The tokens of a DSML text, with every marker as the special token.
@@ -1007,5 +1065,62 @@ mod tests {
             &mode("false", "\"b\"")
         ));
         assert!(!forced_call_accepts(&[pinned], &mode("true", "b")));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a block's opening tag and every closing tag
+    /// took any attributes
+    #[test]
+    fn a_tag_the_template_writes_bare_takes_no_attributes() {
+        for (open, invoke_close, parameter_close, block_close) in [
+            (" x=\"1\"", "", "", ""),
+            ("", " x=\"1\"", "", ""),
+            ("", "", " x=\"1\"", ""),
+            ("", "", "", " x=\"1\""),
+        ] {
+            let message = format!(
+                "{OPEN}tool_calls{open}>\n{OPEN}invoke name=\"Bash\">\n{OPEN}parameter name=\"command\" string=\"true\">ls</{DSML}parameter{parameter_close}>\n</{DSML}invoke{invoke_close}>\n</{DSML}tool_calls{block_close}>"
+            );
+            assert_eq!(calls(&message), None, "{message}");
+            assert_eq!(strip_calls(&message), message, "it stays content");
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a malformed block discarded every call in the
+    /// message, not only its own
+    #[test]
+    fn a_malformed_block_stays_content_and_later_blocks_still_call() {
+        let valid = format!(
+            "{OPEN}tool_calls>\n{OPEN}invoke name=\"Bash\">\n{OPEN}parameter name=\"command\" string=\"true\">ls</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        let empty = format!("{OPEN}tool_calls></{DSML}tool_calls>");
+        assert_eq!(
+            calls(&format!("{empty}\n{valid}")),
+            Some(serde_json::json!([{"name": "Bash", "arguments": {"command": "ls"}}]))
+        );
+        assert_eq!(
+            strip_calls(&format!("{empty}\n{valid}")),
+            format!("{empty}\n")
+        );
+
+        // A block whose invocation has no name stays content, and the call written inside its
+        // value is never made, though it reads as a block on its own.
+        let nameless = format!(
+            "{OPEN}tool_calls>\n{OPEN}invoke>\n{OPEN}parameter name=\"note\" string=\"true\">{OPEN}tool_calls>\n{OPEN}invoke name=\"Bash\">\n</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        assert_eq!(calls(&nameless), None);
+        assert_eq!(
+            calls(&format!("{nameless}\n{valid}")).map(|c| c.as_array().map(Vec::len)),
+            Some(Some(1))
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a forced value could not hold `</｜`, though
+    /// only `</｜DSML｜` reads as its closing tag
+    #[test]
+    fn a_forced_value_may_hold_the_markers_bar() {
+        for value in ["ls", "</b>", "</｜ordinary>", "a</｜", "｜ alone"] {
+            let call = one_call("Bash", &[("command", "true", value)]);
+            assert!(forced_call_accepts(&[bash(true)], &call), "{value:?}");
+        }
     }
 }

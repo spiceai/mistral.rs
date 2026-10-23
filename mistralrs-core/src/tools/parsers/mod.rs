@@ -65,6 +65,12 @@ pub trait ToolFormatParser: Send + Sync {
     /// whether to buffer output.
     fn could_be_tool_call(&self, text: &str) -> bool;
 
+    /// Whether `text` ends inside a call in this format: one has opened and not closed. A
+    /// format whose calls run to the end of the message is inside one from its marker on.
+    fn open_at_end(&self, text: &str) -> bool {
+        self.could_be_tool_call(text)
+    }
+
     /// Where `message` opens a call in this format, finished or not, for a format that claims
     /// the messages it opens a call in: one is read only in that format, so text inside its
     /// calls never becomes a call in another. A call opened inside another format's call is
@@ -131,8 +137,8 @@ fn parsers_for(message: &str) -> Vec<&'static dyn ToolFormatParser> {
             continue;
         };
         let before = &message[..start];
-        let enclosed = all()
-            .any(|other| other.format() != parser.format() && other.could_be_tool_call(before));
+        let enclosed =
+            all().any(|other| other.format() != parser.format() && other.open_at_end(before));
         return if enclosed {
             all()
                 .filter(|other| other.format() != parser.format())
@@ -215,6 +221,23 @@ pub fn specialize_required_tool_call_grammar(
     if let Some(mark) = tok_trie.get_special_token(dsml::DSML) {
         *lark = lark.replace(dsml::MARK_RULE, &format!("dsml_mark: <[{mark}]>"));
     }
+}
+
+/// Whether `text` ends after an `open` delimiter with no `close` after it.
+fn open_between(text: &str, open: &str, close: &str) -> bool {
+    text.rfind(open)
+        .is_some_and(|at| !text[at + open.len()..].contains(close))
+}
+
+/// Why a required call in `format` cannot hold one of `tools` to its strict schema, if it
+/// cannot.
+pub(crate) fn unenforceable_strict_tool(
+    format: Option<ToolCallFormat>,
+    tools: &[Tool],
+) -> Option<String> {
+    (format == Some(ToolCallFormat::DeepSeekDsml))
+        .then(|| dsml::unenforceable(tools))
+        .flatten()
 }
 
 /// Whether `message` opens a call in a format that no grammar constrains, and has not finished

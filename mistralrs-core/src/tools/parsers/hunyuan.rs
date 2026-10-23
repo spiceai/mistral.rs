@@ -18,6 +18,10 @@ impl ToolFormatParser for HunyuanParser {
         text.contains(START) || text.ends_with(PREFIX)
     }
 
+    fn open_at_end(&self, text: &str) -> bool {
+        super::open_between(text, START, END)
+    }
+
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::Hunyuan
     }

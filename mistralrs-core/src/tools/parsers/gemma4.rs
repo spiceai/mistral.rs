@@ -20,6 +20,10 @@ impl ToolFormatParser for Gemma4Parser {
         text.contains("<|tool_call>")
     }
 
+    fn open_at_end(&self, text: &str) -> bool {
+        super::open_between(text, "<|tool_call>", "<tool_call|>")
+    }
+
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::Gemma4
     }

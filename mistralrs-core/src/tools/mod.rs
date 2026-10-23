@@ -664,4 +664,27 @@ mod tests {
         let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args, json!({"content": "<｜DSML｜tool_calls>"}));
     }
+
+    /// regression test for spiceai/mistral.rs#54: a closed `<tool_call>` example before a DSML
+    /// block counted as enclosing it, and a Qwen call inside the block's value was made
+    #[test]
+    fn a_closed_example_before_a_dsml_block_does_not_enclose_it() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let message = "An empty example: <tool_call></tool_call>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+    }
 }

@@ -93,6 +93,14 @@ impl ToolCallState {
         preferred_format: Option<ToolCallFormat>,
     ) -> anyhow::Result<Self> {
         let matcher = ToolCallingMatcher::new_with_format(tool_choice, tools, preferred_format)?;
+        if matcher.requires_tool_call() {
+            if let Some(why) = crate::tools::parsers::unenforceable_strict_tool(
+                preferred_format,
+                tools.unwrap_or_default(),
+            ) {
+                anyhow::bail!(why);
+            }
+        }
         let strategy: Box<dyn ToolCallStrategy> = match preferred_format {
             Some(ToolCallFormat::Harmony) => Box::new(HarmonyToolCallStrategy::new()?),
             Some(ToolCallFormat::Atem) => {
@@ -464,6 +472,51 @@ mod tests {
         assert!(calling
             .maybe_force_required_grammar(0, 8192, true)
             .is_none());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a strict tool's object-level constraints
+    /// were dropped from a forced DSML call
+    #[test]
+    fn a_required_dsml_call_refuses_object_constraints_it_cannot_enforce() {
+        let mut either: Tool = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "pick",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
+                    "oneOf": [{ "required": ["a"] }, { "required": ["b"] }],
+                    "additionalProperties": false,
+                },
+            },
+        }))
+        .unwrap();
+        let error = ToolCallState::new(
+            ToolChoice::Required,
+            Some(std::slice::from_ref(&either)),
+            Some(ToolCallFormat::DeepSeekDsml),
+        )
+        .err()
+        .expect("a required call is refused");
+        assert_eq!(
+            error.to_string(),
+            "Tool 'pick' is strict, and its parameters schema constrains the object as a whole with `oneOf`, which a required DeepSeek-V4 tool call cannot enforce. Remove `strict` from the tool, or the `oneOf` from its schema."
+        );
+        // An optional call is not forced, so nothing is enforced to refuse.
+        assert!(ToolCallState::new(
+            ToolChoice::Auto,
+            Some(std::slice::from_ref(&either)),
+            Some(ToolCallFormat::DeepSeekDsml),
+        )
+        .is_ok());
+        either.function.strict = None;
+        assert!(ToolCallState::new(
+            ToolChoice::Required,
+            Some(&[either]),
+            Some(ToolCallFormat::DeepSeekDsml),
+        )
+        .is_ok());
     }
 
     #[test]

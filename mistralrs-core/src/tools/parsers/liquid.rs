@@ -25,6 +25,10 @@ impl ToolFormatParser for LiquidParser {
         text.contains(START)
     }
 
+    fn open_at_end(&self, text: &str) -> bool {
+        super::open_between(text, START, END)
+    }
+
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::Liquid
     }

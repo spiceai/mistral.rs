@@ -26,6 +26,10 @@ impl ToolFormatParser for DeepSeekParser {
         text.contains("<｜tool▁call▁begin｜>")
     }
 
+    fn open_at_end(&self, text: &str) -> bool {
+        super::open_between(text, "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>")
+    }
+
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::DeepSeek
     }
