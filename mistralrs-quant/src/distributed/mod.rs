@@ -987,6 +987,23 @@ mod ring_ops {
                 candle_core::Error::msg(format!("ring exchange over RDMA: {e}"))
             });
         }
+        let outcome = tcp_hop(right, left, send, recv);
+        if outcome.is_err() {
+            // As over RDMA, the ring cannot be used again, and the neighbours learn of the
+            // failure from the closed connections, which they pass on in turn.
+            let _ = right.shutdown(Shutdown::Both);
+            let _ = left.shutdown(Shutdown::Both);
+        }
+        outcome
+    }
+
+    /// One hop of the ring over TCP.
+    fn tcp_hop(
+        right: &mut TcpStream,
+        left: &mut TcpStream,
+        send: &[u8],
+        recv: &mut [u8],
+    ) -> Result<()> {
         // For the typical tensor size we see (~ 6 KiB) a single write/read pair is faster
         // than chunking because the extra system-call and loop overhead dominates. A larger
         // payload alternates 64 KiB writes and reads: every rank writes before it reads, so a
@@ -1022,10 +1039,6 @@ mod ring_ops {
                     .map_err(|e| candle_core::Error::msg(format!("read error: {:?}", e)))?;
                 let theirs = u64::from_le_bytes(theirs);
                 if theirs != recv.len() as u64 {
-                    // As over RDMA, the neighbours learn of the failure from the closed
-                    // connections.
-                    let _ = right.shutdown(Shutdown::Both);
-                    let _ = left.shutdown(Shutdown::Both);
                     return Err(candle_core::Error::msg(format!(
                         "ring exchange over TCP: the left neighbour sends {theirs} bytes where {} were due; the ranks disagree on the tensor being reduced",
                         recv.len()
