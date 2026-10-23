@@ -65,6 +65,13 @@ pub trait ToolFormatParser: Send + Sync {
     /// whether to buffer output.
     fn could_be_tool_call(&self, text: &str) -> bool;
 
+    /// Whether `message` opens a call in this format, finished or not. A message one format
+    /// claims is read only in that format, so text inside its calls never becomes a call in
+    /// another.
+    fn claims(&self, _message: &str) -> bool {
+        false
+    }
+
     /// Attempt to parse complete tool calls from `message`.
     ///
     /// Returns `Ok(Some(json))` if tool calls were found and parsed (the
@@ -113,17 +120,26 @@ static PARSERS: std::sync::LazyLock<Vec<Box<dyn ToolFormatParser>>> =
         ]
     });
 
+/// The parsers to read `message` with, in order: only the one that claims it, if one does.
+fn parsers_for(message: &str) -> &'static [Box<dyn ToolFormatParser>] {
+    let parsers: &'static [Box<dyn ToolFormatParser>] = &PARSERS;
+    match parsers.iter().position(|parser| parser.claims(message)) {
+        Some(at) => &parsers[at..=at],
+        None => parsers,
+    }
+}
+
 /// Check whether `text` could contain a tool call prefix from any supported
 /// format.
 pub fn contains_tool_call_prefix(text: &str) -> bool {
-    PARSERS.iter().any(|p| p.could_be_tool_call(text))
+    parsers_for(text).iter().any(|p| p.could_be_tool_call(text))
 }
 
 /// Build a tool call grammar for the first matching format detected in
 /// `text`.  Returns `None` if no format matches or if the format is not
 /// yet ready for grammar activation (e.g. DeepSeek before the JSON fence).
 pub fn build_tool_call_grammar(text: &str, tools: &[Tool]) -> Option<TopLevelGrammar> {
-    for parser in PARSERS.iter() {
+    for parser in parsers_for(text) {
         if parser.could_be_tool_call(text) {
             // DeepSeek: wait until the JSON fence is present so we don't
             // activate grammar before the function name is complete.
@@ -184,10 +200,16 @@ pub fn specialize_required_tool_call_grammar(
     }
 }
 
+/// Whether `message` opens a call in a format that no grammar constrains, and has not finished
+/// it: a DSML block.
+pub(crate) fn call_unfinished(message: &str) -> bool {
+    dsml::unfinished_block(message)
+}
+
 /// Try each parser in order to extract tool calls from `message`.
 /// Returns the original message unchanged if no parser matches.
 pub fn process_model_specific_message(message: &str) -> Result<String> {
-    for parser in PARSERS.iter() {
+    for parser in parsers_for(message) {
         if let Some(json) = parser.parse(message)? {
             return Ok(json);
         }
@@ -200,7 +222,7 @@ pub fn process_model_specific_message(message: &str) -> Result<String> {
 pub(crate) fn extract_model_specific_call(
     message: &str,
 ) -> Result<Option<(String, String, ToolCallFormat)>> {
-    for parser in PARSERS.iter() {
+    for parser in parsers_for(message) {
         if let Some(json) = parser.parse(message)? {
             let text = strip_tool_call_segments(message, parser.format());
             return Ok(Some((json, text, parser.format())));

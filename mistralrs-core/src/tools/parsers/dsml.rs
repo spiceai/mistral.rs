@@ -13,8 +13,10 @@
 //! JSON. The markup is read leniently, as quantized checkpoints write it: whitespace may
 //! follow the `｜DSML｜` token, and the block may be named `tool_calls`, `function_calls` or
 //! `calls`. It is read strictly otherwise: a block holds only invocations, an invocation only
-//! parameters, every tag closes before the next opens, and a parameter appears once. A block
-//! that breaks any of these stays content, so no call is made from it.
+//! parameters, every tag closes before the next opens, a tag holds only the attributes the
+//! template writes, each once, and a parameter appears once. A block that breaks any of these
+//! stays content, so no call is made from it. Once a message opens a block, it is read only as
+//! DSML, so text inside a call never becomes a call in another format.
 
 use candle_core::Result;
 use llguidance::api::{GrammarWithLexer, TopLevelGrammar};
@@ -42,6 +44,10 @@ pub struct DsmlParser;
 impl ToolFormatParser for DsmlParser {
     fn could_be_tool_call(&self, text: &str) -> bool {
         matches!(scan(text), Scan::More)
+    }
+
+    fn claims(&self, message: &str) -> bool {
+        opens_block(message)
     }
 
     fn format(&self) -> super::ToolCallFormat {
@@ -134,12 +140,34 @@ fn tag_at<'a>(text: &'a str, closing: bool, names: &[&str]) -> Scan<(&'a str, us
     }
 }
 
-/// The value of `attribute="..."` in a tag's attributes.
-fn attribute<'a>(attributes: &'a str, attribute: &str) -> Option<&'a str> {
-    let prefix = format!(r#"{attribute}=""#);
-    let start = attributes.find(&prefix)? + prefix.len();
-    let end = attributes[start..].find('"')? + start;
-    Some(&attributes[start..end])
+/// A tag's attributes, as `key="value"` pairs set apart by whitespace, each key among `keys`
+/// and given once; `None` for anything else.
+fn attribute_pairs<'a>(text: &'a str, keys: &[&str]) -> Option<Vec<(&'a str, &'a str)>> {
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    let mut rest = text;
+    loop {
+        let pair = rest.trim_start();
+        if pair.is_empty() {
+            return Some(pairs);
+        }
+        if pair.len() == rest.len() {
+            return None;
+        }
+        let (key, after) = pair.split_once("=\"")?;
+        if !keys.contains(&key) || pairs.iter().any(|(seen, _)| *seen == key) {
+            return None;
+        }
+        let (value, after) = after.split_once('"')?;
+        pairs.push((key, value));
+        rest = after;
+    }
+}
+
+/// The value of attribute `key` among `pairs`.
+fn attribute<'a>(pairs: &[(&str, &'a str)], key: &str) -> Option<&'a str> {
+    pairs
+        .iter()
+        .find_map(|&(name, value)| (name == key).then_some(value))
 }
 
 fn leading_whitespace(text: &str) -> usize {
@@ -182,7 +210,10 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize)> {
             Scan::Bad if matches!(close, Scan::More) => return Scan::More,
             Scan::Bad => return Scan::Bad,
         };
-        let Some(name) = attribute(attributes, "name") else {
+        let Some(attributes) = attribute_pairs(attributes, &["name", "string"]) else {
+            return Scan::Bad;
+        };
+        let Some(name) = attribute(&attributes, "name") else {
             return Scan::Bad;
         };
         at += length;
@@ -192,7 +223,7 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize)> {
             Scan::Bad => return Scan::Bad,
         };
         at += length;
-        let value = if attribute(attributes, "string") == Some("true") {
+        let value = if attribute(&attributes, "string") == Some("true") {
             Value::String(raw.to_string())
         } else {
             serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
@@ -229,7 +260,10 @@ fn block_at(text: &str) -> Scan<(Vec<DsmlToolCall>, usize)> {
             Scan::Bad if matches!(close, Scan::More) => return Scan::More,
             Scan::Bad => return Scan::Bad,
         };
-        let Some(name) = attribute(attributes, "name") else {
+        let Some(attributes) = attribute_pairs(attributes, &["name"]) else {
+            return Scan::Bad;
+        };
+        let Some(name) = attribute(&attributes, "name") else {
             return Scan::Bad;
         };
         at += length;
@@ -287,6 +321,21 @@ fn scan(message: &str) -> Scan<Found> {
     }
 }
 
+/// Whether `message` opens a block of calls, finished or not.
+fn opens_block(message: &str) -> bool {
+    message.match_indices(OPEN).any(|(start, _)| {
+        matches!(
+            tag_at(&message[start..], false, &BLOCK_NAMES),
+            Scan::Done(_)
+        )
+    })
+}
+
+/// Whether `message` opens a block of calls it does not finish.
+pub(super) fn unfinished_block(message: &str) -> bool {
+    opens_block(message) && matches!(scan(message), Scan::More)
+}
+
 /// `message` without its blocks of calls: the text the model wrote around them.
 pub(super) fn strip_calls(message: &str) -> String {
     let Scan::Done(found) = scan(message) else {
@@ -311,6 +360,9 @@ fn lark_literal(value: &str) -> String {
             .replace('\n', "\\n")
     )
 }
+
+/// A string parameter's value and its closing tag, as a grammar.
+const VALUE_THEN_CLOSE: &str = r#"dsml_value_lt_slash dsml_mark "parameter>\n""#;
 
 /// A tag in a grammar: `<`, or `</` with `closing`, the marker, then the rest as text.
 fn tag(closing: bool, rest: &str) -> String {
@@ -351,17 +403,18 @@ fn build_dsml_grammar(tools: &[Tool], required: bool) -> TopLevelGrammar {
     lines.extend(rules);
     lines.extend([
         format!(
-            "dsml_parameter: {} PARAM_NAME {} (\"true\" | \"false\") {} dsml_value {}",
+            "dsml_parameter: {} PARAM_NAME {} (\"true\" | \"false\") {} {VALUE_THEN_CLOSE}",
             tag(false, "parameter name=\""),
             lark_literal("\" string=\""),
             lark_literal("\">"),
-            tag(true, "parameter>\n"),
         ),
-        // A value is any text but its closing tag: `<` starts one only when `/` and the
-        // marker follow it, so ordinary markup such as `</div>` is part of the value.
-        "dsml_value: (dsml_text | dsml_lt)*".to_string(),
-        "dsml_text: /[^<]+/".to_string(),
-        r"dsml_lt: /<([^\/]|\/[^｜])/".to_string(),
+        // A value is any text but its closing tag, which `</` and then the marker start, so
+        // ordinary markup such as `</div>` is part of it. One lexeme reads the value with the
+        // `</` that ends it: written apart, a value ending in `<` or `</` would read the
+        // closing tag's `<` as more value.
+        // The lexeme is text without `</` and the marker, through a final `</`: runs of `<`,
+        // and `</` before another `<`, carry on to the next character.
+        r"dsml_value_lt_slash: /(?:[^<]|<(?:<|\/<)*(?:[^<\/]|\/[^<｜]))*<(?:<|\/<)*\//".to_string(),
         "PARAM_NAME: /[a-zA-Z_][a-zA-Z0-9_.-]*/".to_string(),
         MARK_RULE.to_string(),
     ]);
@@ -373,9 +426,70 @@ fn build_dsml_grammar(tools: &[Tool], required: bool) -> TopLevelGrammar {
     }
 }
 
+/// How a strict tool's property is written: as text, as one of a closed set of strings, or as
+/// JSON held to its schema.
+enum PropertyValue {
+    Text,
+    OneOf(Vec<String>),
+    Json,
+}
+
+/// The keys a string property may have and still take any text: `format` is an annotation,
+/// not a constraint.
+const ANNOTATIONS: [&str; 7] = [
+    "type",
+    "description",
+    "title",
+    "default",
+    "examples",
+    "format",
+    "$comment",
+];
+
+fn property_value(property: &Value) -> PropertyValue {
+    let strings = |values: &[Value]| {
+        values
+            .iter()
+            .map(|value| value.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+    };
+    if let Some(values) = property.get("enum").and_then(Value::as_array) {
+        return strings(values).map_or(PropertyValue::Json, PropertyValue::OneOf);
+    }
+    if let Some(value) = property.get("const") {
+        return value.as_str().map_or(PropertyValue::Json, |value| {
+            PropertyValue::OneOf(vec![value.to_string()])
+        });
+    }
+    let text = property.get("type").and_then(Value::as_str) == Some("string")
+        && property
+            .as_object()
+            .is_some_and(|keys| keys.keys().all(|key| ANNOTATIONS.contains(&key.as_str())));
+    if text {
+        PropertyValue::Text
+    } else {
+        PropertyValue::Json
+    }
+}
+
+/// `property` with the definitions of the tool schema `root`, which its references are
+/// relative to.
+fn with_definitions(property: &Value, root: &Value) -> Value {
+    let mut property = property.clone();
+    if let Some(object) = property.as_object_mut() {
+        for key in ["$defs", "definitions"] {
+            if let (Some(definitions), false) = (root.get(key), object.contains_key(key)) {
+                object.insert(key.to_string(), definitions.clone());
+            }
+        }
+    }
+    property
+}
+
 /// The rule for a call's parameters. A strict tool's parameters are its declared properties,
 /// each once, with its required ones present and every value held to its schema: a string
-/// property as text, any other as JSON. A tool that is not strict takes any parameters.
+/// property that takes any text as text, one with an `enum` or `const` of strings as one of
+/// them, and any other as JSON. A tool that is not strict takes any parameters.
 fn emit_arguments(
     tool: &Tool,
     tool_index: usize,
@@ -407,24 +521,32 @@ fn emit_arguments(
     for (property_index, name) in names.into_iter().enumerate() {
         let parameter = format!("parameter_{tool_index}_{property_index}");
         let property = &properties[name];
-        let (string, value) = if super::atem::schema_accepts_string(property) {
-            ("true", "dsml_value".to_string())
-        } else {
-            let grammar = format!("dsml_schema_{tool_index}_{property_index}");
-            schemas.push(GrammarWithLexer {
-                name: Some(grammar.clone()),
-                json_schema: Some(property.clone()),
-                ..Default::default()
-            });
-            ("false", format!("@{grammar}"))
+        let (string, value) = match property_value(property) {
+            PropertyValue::Text => ("true", VALUE_THEN_CLOSE.to_string()),
+            PropertyValue::OneOf(values) => {
+                let values = values
+                    .iter()
+                    .map(|value| lark_literal(value))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                ("true", format!("({values}) {}", tag(true, "parameter>\n")))
+            }
+            PropertyValue::Json => {
+                let grammar = format!("dsml_schema_{tool_index}_{property_index}");
+                schemas.push(GrammarWithLexer {
+                    name: Some(grammar.clone()),
+                    json_schema: Some(with_definitions(property, &schema)),
+                    ..Default::default()
+                });
+                ("false", format!("@{grammar} {}", tag(true, "parameter>\n")))
+            }
         };
         rules.push(format!(
-            "{parameter}: {open} {value} {close}",
+            "{parameter}: {open} {value}",
             open = tag(
                 false,
                 &format!("parameter name=\"{name}\" string=\"{string}\">")
             ),
-            close = tag(true, "parameter>\n"),
         ));
         sequence.push(if required.contains(name.as_str()) {
             parameter
@@ -698,5 +820,134 @@ mod tests {
             .consume_tokens(&dsml_tokens(&call, mark))
             .expect("the whole call");
         assert!(matcher.is_accepting().expect("state"));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: an attribute was found by substring, so
+    /// `xname` named the tool and `xstring` changed a value's type
+    #[test]
+    fn an_attribute_is_read_by_its_whole_key() {
+        assert_eq!(
+            calls(&format!(
+                "{OPEN}tool_calls>\n{OPEN}invoke xname=\"Bash\">\n{OPEN}parameter name=\"command\" string=\"true\">ls</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+            )),
+            None
+        );
+        assert_eq!(
+            calls(&format!(
+                "{OPEN}tool_calls>\n{OPEN}invoke name=\"note\">\n{OPEN}parameter name=\"count\" xstring=\"true\">3</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+            )),
+            None
+        );
+        assert_eq!(
+            calls(&format!(
+                "{OPEN}tool_calls>\n{OPEN}invoke title=\"see name=\" name=\"note\">\n</{DSML}invoke>\n</{DSML}tool_calls>"
+            )),
+            None
+        );
+    }
+
+    /// Runs `call` through the forced-call grammar for `tools`, from its opening `<`: whether
+    /// the grammar accepts it whole.
+    fn forced_call_accepts(tools: &[Tool], call: &str) -> bool {
+        let (env, mark) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let mut grammar = build_dsml_grammar(tools, true);
+        specialize_required_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+        let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
+        matcher.consume_tokens(&dsml_tokens(call, mark)).is_ok()
+            && matcher.is_accepting().unwrap_or(false)
+    }
+
+    fn one_call(name: &str, parameters: &[(&str, &str, &str)]) -> String {
+        let mut call = format!("<{DSML}tool_calls>\n<{DSML}invoke name=\"{name}\">\n");
+        for (parameter, string, value) in parameters {
+            call.push_str(&format!(
+                "<{DSML}parameter name=\"{parameter}\" string=\"{string}\">{value}</{DSML}parameter>\n"
+            ));
+        }
+        call.push_str(&format!("</{DSML}invoke>\n</{DSML}tool_calls>"));
+        call
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a forced string value could not end in `<`
+    /// or `</`, whose `<` the grammar read as the start of more value
+    #[test]
+    fn a_forced_value_may_end_in_the_start_of_a_tag() {
+        for value in ["<", "a <", "x<<", "a</", "</", "", "<b>bold</b>"] {
+            assert!(
+                forced_call_accepts(
+                    &[bash(true)],
+                    &one_call("Bash", &[("command", "true", value)])
+                ),
+                "{value:?}"
+            );
+        }
+    }
+
+    fn tool(parameters: Value) -> Tool {
+        serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": { "name": "set", "strict": true, "parameters": parameters },
+        }))
+        .expect("a tool")
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a strict string property's `enum` and
+    /// `const` were dropped, so a forced call could hold any text
+    #[test]
+    fn a_forced_string_keeps_to_its_enum_and_const() {
+        let units = tool(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "unit": { "type": "string", "enum": ["celsius", "fahrenheit"] },
+                "scale": { "type": "string", "const": "linear" },
+            },
+            "required": ["unit", "scale"],
+            "additionalProperties": false,
+        }));
+        let call = |unit: &str, scale: &str| {
+            one_call("set", &[("scale", "true", scale), ("unit", "true", unit)])
+        };
+        assert!(forced_call_accepts(
+            std::slice::from_ref(&units),
+            &call("celsius", "linear")
+        ));
+        assert!(!forced_call_accepts(
+            std::slice::from_ref(&units),
+            &call("kelvin", "linear")
+        ));
+        assert!(!forced_call_accepts(
+            std::slice::from_ref(&units),
+            &call("", "linear")
+        ));
+        assert!(!forced_call_accepts(&[units], &call("celsius", "log")));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a property's `$ref` lost the tool schema's
+    /// `$defs`, so the forced grammar did not compile
+    #[test]
+    fn a_forced_argument_resolves_references_against_the_tool_schema() {
+        let options = tool(serde_json::json!({
+            "type": "object",
+            "$defs": {
+                "Options": {
+                    "type": "object",
+                    "properties": { "depth": { "type": "integer" } },
+                    "required": ["depth"],
+                    "additionalProperties": false,
+                },
+            },
+            "properties": { "options": { "$ref": "#/$defs/Options" } },
+            "required": ["options"],
+            "additionalProperties": false,
+        }));
+        assert!(forced_call_accepts(
+            std::slice::from_ref(&options),
+            &one_call("set", &[("options", "false", r#"{"depth": 2}"#)])
+        ));
+        assert!(!forced_call_accepts(
+            &[options],
+            &one_call("set", &[("options", "false", r#"{"depth": "deep"}"#)])
+        ));
     }
 }

@@ -178,6 +178,11 @@ impl ToolCallState {
         {
             return None;
         }
+        // A forced call would start a new block inside the one being written; the model
+        // finishes its own call instead.
+        if self.strategy.call_unfinished() {
+            return None;
+        }
         let tools = self.matcher.tools()?;
         let boundary = self.strategy.required_boundary();
         Some(self.strategy.required_grammar(tools, boundary))
@@ -429,6 +434,36 @@ mod tests {
             .unwrap();
 
         assert!(lark(&grammar).contains("start: <|tool_call> tool_call_body"));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a required call's deadline, reached inside
+    /// an unfinished DSML call, forced a new block of calls into its value
+    #[test]
+    fn required_tool_call_deadline_waits_for_an_unfinished_dsml_call() {
+        let tools = vec![tool("get_weather")];
+        let new_state = || {
+            ToolCallState::new(
+                ToolChoice::Required,
+                Some(&tools),
+                Some(ToolCallFormat::DeepSeekDsml),
+            )
+            .unwrap()
+        };
+        let mut idle = new_state();
+        idle.observe_token(0, "The weather? Let me check. ".as_bytes());
+        assert!(idle.maybe_force_required_grammar(0, 8192, false).is_some());
+
+        let mut calling = new_state();
+        calling.observe_token(
+            0,
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par".as_bytes(),
+        );
+        assert!(calling
+            .maybe_force_required_grammar(0, 8192, false)
+            .is_none());
+        assert!(calling
+            .maybe_force_required_grammar(0, 8192, true)
+            .is_none());
     }
 
     #[test]

@@ -621,4 +621,28 @@ mod tests {
         let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args, json!({"text": "null", "count": 2}));
     }
+
+    /// regression test for spiceai/mistral.rs#54: while a DSML call was unfinished, a
+    /// `<tool_call>` example in one of its values read as a complete call in Qwen's format
+    #[test]
+    fn an_unfinished_dsml_call_keeps_other_formats_out_of_its_values() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let prefix = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Call it as <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call> and then";
+        assert_eq!(matcher.prefix_could_be_tool(prefix).unwrap(), (true, false));
+        assert!(matcher.get_call(prefix).unwrap().is_empty());
+        let finished =
+            format!("{prefix}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>");
+        let calls = matcher.get_call(&finished).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+    }
 }
