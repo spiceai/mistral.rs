@@ -710,4 +710,22 @@ mod tests {
             .collect();
         assert_eq!(names, ["write_file"]);
     }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML block opener that could not be read
+    /// claimed nothing, and a Qwen call written inside it was made
+    #[test]
+    fn a_broken_dsml_block_opener_keeps_other_formats_out() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": "Bash", "parameters": { "type": "object" } },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        for message in [
+            "<｜DSML｜tool_calls x=\"<tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>\">",
+            "<｜DSML｜tool_calls <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>",
+        ] {
+            assert!(matcher.get_call(message).unwrap().is_empty(), "{message}");
+        }
+    }
 }

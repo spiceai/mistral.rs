@@ -361,19 +361,23 @@ fn scan(message: &str) -> Scan<Found> {
 }
 
 /// Where `message` opens its first block of calls outside any other format's call, finished
-/// or not.
+/// or not, or names one in a tag that cannot be read: such a message calls nothing, in DSML
+/// or in another format.
 fn block_start(message: &str) -> Option<usize> {
     message
         .match_indices(OPEN)
         .map(|(start, _)| start)
         .find(|&start| {
-            matches!(
-                tag_at(&message[start..], false, &BLOCK_NAMES),
-                Scan::Done(_)
-            ) && !super::open_in_other_format(
-                &message[..start],
-                super::ToolCallFormat::DeepSeekDsml,
-            )
+            let opens = match tag_at(&message[start..], false, &BLOCK_NAMES) {
+                Scan::Done(_) => true,
+                Scan::Bad => names_block(&message[start..]),
+                Scan::More => false,
+            };
+            opens
+                && !super::open_in_other_format(
+                    &message[..start],
+                    super::ToolCallFormat::DeepSeekDsml,
+                )
         })
 }
 
@@ -682,12 +686,47 @@ fn emit_arguments(
         let (string, value) = match property_value(property) {
             PropertyValue::Text => ("true", VALUE_THEN_CLOSE.to_string()),
             PropertyValue::OneOf(values) => {
-                let values = values
-                    .iter()
-                    .map(|value| lark_literal(value))
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                ("true", format!("({values}) {}", tag(true, "parameter>\n")))
+                // A value holding the parameter's closing tag is written as JSON with its `<`
+                // escaped, so the parser cannot end the value inside it.
+                let (raw, closing): (Vec<&String>, Vec<&String>) =
+                    values.iter().partition(|value| !value.contains(CLOSE));
+                let alternatives = |values: Vec<String>| {
+                    values
+                        .iter()
+                        .map(|value| lark_literal(value))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                };
+                let mut written = Vec::new();
+                if !raw.is_empty() {
+                    let raw = alternatives(raw.into_iter().cloned().collect());
+                    written.push(format!("{} ({raw})", lark_literal("true\">")));
+                }
+                if !closing.is_empty() {
+                    let json = alternatives(
+                        closing
+                            .iter()
+                            .map(|value| {
+                                Value::String((*value).clone())
+                                    .to_string()
+                                    .replace('<', "\\u003c")
+                            })
+                            .collect(),
+                    );
+                    written.push(format!("{} ({json})", lark_literal("false\">")));
+                }
+                let open = tag(false, &format!("parameter name=\"{name}\" string=\""));
+                rules.push(format!(
+                    "{parameter}: {open} ({}) {}",
+                    written.join(" | "),
+                    tag(true, "parameter>\n")
+                ));
+                sequence.push(if required.contains(name.as_str()) {
+                    parameter
+                } else {
+                    format!("{parameter}?")
+                });
+                continue;
             }
             PropertyValue::Json => {
                 let grammar = format!("dsml_schema_{tool_index}_{property_index}");
@@ -1307,5 +1346,58 @@ mod tests {
             &[("command", "true", "ls"), ("timeout", "false", "5")],
         );
         assert!(forced_call_accepts(&[bash(false)], &once));
+    }
+
+    /// The tokens of a call to `name` with one parameter, whose `value` is text: any marker in
+    /// it is written out, as a grammar's literal lets the model write it.
+    fn call_with_text_value(name: &str, string: &str, value: &str, mark: u32) -> Vec<u32> {
+        let mut tokens = dsml_tokens(
+            &format!("<{DSML}tool_calls>\n<{DSML}invoke name=\"{name}\">\n<{DSML}parameter name=\"body\" string=\"{string}\">"),
+            mark,
+        );
+        tokens.extend(value.bytes().map(u32::from));
+        tokens.extend(dsml_tokens(
+            &format!("</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"),
+            mark,
+        ));
+        tokens
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a `const` holding a parameter's closing tag
+    /// was written as raw text, which the parser read as two parameters
+    #[test]
+    fn a_forced_const_holding_a_closing_tag_reads_back_whole() {
+        let value =
+            format!("x</{DSML}parameter>\n<{DSML}parameter name=\"injected\" string=\"true\">y");
+        let pinned = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "body": { "type": "string", "const": value } },
+            "required": ["body"],
+            "additionalProperties": false,
+        }));
+        let (env, mark) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let accepts = |tokens: &[u32]| {
+            let mut grammar = build_dsml_grammar(std::slice::from_ref(&pinned), true);
+            specialize_required_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+            let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
+            matcher.consume_tokens(tokens).is_ok() && matcher.is_accepting().unwrap_or(false)
+        };
+        // Written raw, the value would read back as two parameters.
+        assert!(!accepts(&call_with_text_value("set", "true", &value, mark)));
+        // Written as JSON with its `<` escaped, it reads back whole.
+        let escaped = serde_json::to_string(&value)
+            .expect("JSON")
+            .replace('<', "\\u003c");
+        assert!(accepts(&call_with_text_value(
+            "set", "false", &escaped, mark
+        )));
+        let text = format!(
+            "<{DSML}tool_calls>\n<{DSML}invoke name=\"set\">\n<{DSML}parameter name=\"body\" string=\"false\">{escaped}</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        assert_eq!(
+            calls(&text),
+            Some(serde_json::json!([{"name": "set", "arguments": {"body": value}}]))
+        );
     }
 }
