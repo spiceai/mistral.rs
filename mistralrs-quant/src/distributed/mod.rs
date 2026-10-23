@@ -869,7 +869,7 @@ mod ring_ops {
     };
 
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{Shutdown, TcpListener, TcpStream};
 
     // Friendly aliases to tame type complexity.
     type SharedTcpStream = Arc<Mutex<TcpStream>>;
@@ -962,9 +962,13 @@ mod ring_ops {
             let mut ring = rdma.lock().map_err(|e| {
                 candle_core::Error::msg(format!("Failed to lock the RDMA ring: {:?}", e))
             })?;
-            return ring
-                .exchange(send, recv, left)
-                .map_err(|e| candle_core::Error::msg(format!("ring exchange over RDMA: {e}")));
+            return ring.exchange(send, recv, left).map_err(|e| {
+                // The ring cannot be used again, and a neighbour waiting on this rank learns
+                // that only from its connections: an RDMA receive never sees its sender go.
+                let _ = right.shutdown(Shutdown::Both);
+                let _ = left.shutdown(Shutdown::Both);
+                candle_core::Error::msg(format!("ring exchange over RDMA: {e}"))
+            });
         }
         // For the typical tensor size we see (~ 6 KiB) a single write/read pair is faster
         // than chunking because the extra system-call and loop overhead dominates. A larger

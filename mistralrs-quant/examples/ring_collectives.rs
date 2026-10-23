@@ -9,7 +9,10 @@
 //! Each rank sum-reduces and gathers tensors from 1 element to 20 MiB, contributing values
 //! that make every expected element exact in f32, and exits non-zero on the first wrong
 //! element. `ring_collectives mismatch` gives the last rank a tensor twice as long, which
-//! every rank must refuse rather than reduce.
+//! every rank must refuse rather than reduce; `mismatch-small` does the same with one element
+//! against two. In both, each rank prints how long it took to answer, then keeps its process
+//! and connections open for 15 s, so a rank that only learns of the failure when a peer exits
+//! shows it.
 
 use std::sync::Arc;
 
@@ -29,7 +32,8 @@ fn main() -> candle_core::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new("mistralrs_quant=info"))
         .init();
-    let mismatch = std::env::args().nth(1).as_deref() == Some("mismatch");
+    let mode = std::env::args().nth(1);
+    let mismatch = matches!(mode.as_deref(), Some("mismatch" | "mismatch-small"));
     let config = RingConfig::load();
     let (rank, world) = (config.rank, config.world_size);
     let comm = Arc::new(Comm::from_device(Id::new(), &Device::Cpu, rank, world)?);
@@ -37,9 +41,15 @@ fn main() -> candle_core::Result<()> {
     let gather = AllGather::new(&comm, 0);
 
     if mismatch {
-        // Every rank holds one 1 MiB chunk of `rank + 1`; the last rank holds a second chunk
-        // of 100s. A rank that sums that second chunk in instead of refusing reports it.
-        let chunk = 262_144;
+        // Every rank holds one chunk of `rank + 1`, 1 MiB or, in `mismatch-small`, one
+        // element; the last rank holds a second chunk of 100s. A rank that sums that second
+        // chunk in instead of refusing reports it.
+        let chunk = if mode.as_deref() == Some("mismatch-small") {
+            1
+        } else {
+            262_144
+        };
+        let started = std::time::Instant::now();
         let mut mine = vec![(rank + 1) as f32; chunk];
         if rank == world - 1 {
             mine.extend(std::iter::repeat_n(100.0, chunk));
@@ -49,7 +59,11 @@ fn main() -> candle_core::Result<()> {
         let outcome = reduce
             .sum_all_reduce(&xs)
             .and_then(|sum| Ok(sum.to_vec1::<f32>()?[0]));
-        println!("rank {rank} mismatch: first element {outcome:?}");
+        println!(
+            "rank {rank} mismatch after {} ms: first element {outcome:?}",
+            started.elapsed().as_millis()
+        );
+        std::thread::sleep(std::time::Duration::from_secs(15));
         std::process::exit(i32::from(outcome.is_ok()));
     }
 
