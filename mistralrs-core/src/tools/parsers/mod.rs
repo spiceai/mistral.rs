@@ -219,7 +219,9 @@ pub fn specialize_required_tool_call_grammar(
     // DSML's marker is spelled through one rule, as the special token's id where the
     // tokenizer has one, since its text has no brackets to name it by.
     if let Some(mark) = tok_trie.get_special_token(dsml::DSML) {
-        *lark = lark.replace(dsml::MARK_RULE, &format!("dsml_mark: <[{mark}]>"));
+        *lark = lark
+            .replace(dsml::MARK_RULE, &format!("dsml_mark: <[{mark}]>"))
+            .replace(dsml::VALUE_RULES, dsml::VALUE_RULES_WITH_MARK_TOKEN);
     }
 }
 

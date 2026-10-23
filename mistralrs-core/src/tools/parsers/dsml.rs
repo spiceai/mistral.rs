@@ -245,11 +245,21 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize, boo
     }
 }
 
+/// The name of the block a complete opening tag `tag` opens.
+fn block_name(tag: &str) -> &'static str {
+    let rest = tag.strip_prefix(OPEN).unwrap_or(tag).trim_start();
+    BLOCK_NAMES
+        .into_iter()
+        .find(|name| rest.starts_with(name))
+        .unwrap_or(BLOCK)
+}
+
 /// One block's calls, from the end of its opening tag, the start of `text`, through its
-/// closing tag, and whether it breaks a rule of the markup while its tags stay in place: no
-/// invocation, an invocation without a name or with attributes the template does not write,
-/// a malformed invocation, or a closing tag with attributes.
-fn block_at(text: &str) -> Scan<(Vec<DsmlToolCall>, usize, bool)> {
+/// closing tag under the `name` it opened with, and whether it breaks a rule of the markup
+/// while its tags stay in place: no invocation, an invocation without a name or with
+/// attributes the template does not write, a malformed invocation, or a closing tag with
+/// attributes.
+fn block_at(text: &str, name: &str) -> Scan<(Vec<DsmlToolCall>, usize, bool)> {
     let mut calls = Vec::new();
     let mut malformed = false;
     let mut at = 0;
@@ -259,7 +269,7 @@ fn block_at(text: &str) -> Scan<(Vec<DsmlToolCall>, usize, bool)> {
         if rest.is_empty() {
             return Scan::More;
         }
-        let close = tag_at(rest, true, &BLOCK_NAMES);
+        let close = tag_at(rest, true, &[name]);
         if let Scan::Done((attributes, length)) = close {
             let malformed = malformed || calls.is_empty() || !bare(attributes);
             return Scan::Done((calls, at + length, malformed));
@@ -311,7 +321,8 @@ fn scan(message: &str) -> Scan<Found> {
                 continue;
             }
         };
-        let (calls, length, malformed) = match block_at(&message[start + open..]) {
+        let name = block_name(&message[start..start + open]);
+        let (calls, length, malformed) = match block_at(&message[start + open..], name) {
             Scan::Done(block) => block,
             Scan::More => return Scan::More,
             Scan::Bad => return Scan::Bad,
@@ -349,9 +360,10 @@ fn block_start(message: &str) -> Option<usize> {
         })
 }
 
-/// Whether `message` opens a block of calls it does not finish.
+/// Whether `message` opens a block of calls it does not finish, the block's opening tag
+/// included: text cut short partway through one could still be a call.
 pub(super) fn unfinished_block(message: &str) -> bool {
-    block_start(message).is_some() && matches!(scan(message), Scan::More)
+    matches!(scan(message), Scan::More)
 }
 
 /// `message` without its blocks of calls: the text the model wrote around them.
@@ -379,8 +391,24 @@ fn lark_literal(value: &str) -> String {
     )
 }
 
-/// A string parameter's value and its closing tag, as a grammar.
-const VALUE_THEN_CLOSE: &str = r#"DSML_VALUE_LT_SLASH dsml_mark "parameter>\n""#;
+/// A string parameter's value and its closing tag, as a grammar rule.
+const VALUE_THEN_CLOSE: &str = "dsml_vc";
+
+/// The value rules where the marker is text: any text through a final `</` that holds no
+/// `</｜DSML｜`, the text the closing tag reads as.
+pub(super) const VALUE_RULES: &str = r#"dsml_vc: DSML_VALUE_LT_SLASH dsml_mark "parameter>\n"
+DSML_VALUE_LT_SLASH: /(?s:.*)<\// & ~/(?s:.*)<\/｜DSML｜(?s:.*)/"#;
+
+/// The value rules where the marker is a special token, which no text lexeme can hold: text
+/// between markers, where a marker after `</` begins the closing tag only when `parameter`
+/// follows it, so other DSML tags are part of the value.
+pub(super) const VALUE_RULES_WITH_MARK_TOKEN: &str = r#"dsml_vc: dsml_vc_open | dsml_mark dsml_vc_open
+dsml_vc_open: DSML_LT_SLASH dsml_mark dsml_vc_closing | DSML_OTHER dsml_mark dsml_vc_open
+dsml_vc_closing: "parameter>\n" | DSML_NP_LT_SLASH dsml_mark dsml_vc_closing | DSML_NP_OTHER dsml_mark dsml_vc_open
+DSML_LT_SLASH: /(?s:.*)<\//
+DSML_OTHER: /(?s:.+)/ & ~/(?s:.*)<\//
+DSML_NP_LT_SLASH: /(?s:.*)<\// & ~/[ \t\r\n]*parameter[> \t\r\n](?s:.*)/
+DSML_NP_OTHER: /(?s:.+)/ & ~/(?s:.*)<\// & ~/[ \t\r\n]*parameter[> \t\r\n](?s:.*)/"#;
 
 /// A tag in a grammar: `<`, or `</` with `closing`, the marker, then the rest as text.
 fn tag(closing: bool, rest: &str) -> String {
@@ -427,12 +455,10 @@ fn build_dsml_grammar(tools: &[Tool], required: bool) -> TopLevelGrammar {
             lark_literal("\">"),
         ),
         // A value is any text but its closing tag, which `</` and then the marker start, so
-        // ordinary markup such as `</div>` is part of it. One lexeme reads the value with the
+        // ordinary markup such as `</div>` is part of it. A lexeme reads the value with the
         // `</` that ends it: written apart, a value ending in `<` or `</` would read the
         // closing tag's `<` as more value.
-        // The lexeme is text through a final `</` that holds no `</｜DSML｜`, the text the
-        // closing tag reads as whichever way the marker is written.
-        r#"DSML_VALUE_LT_SLASH: /(?s:.*)<\// & ~/(?s:.*)<\/｜DSML｜(?s:.*)/"#.to_string(),
+        VALUE_RULES.to_string(),
         "PARAM_NAME: /[a-zA-Z_][a-zA-Z0-9_.-]*/".to_string(),
         MARK_RULE.to_string(),
     ]);
@@ -799,7 +825,7 @@ mod tests {
         );
         assert!(
             lark.contains(
-                "parameter_0_0: \"<\" dsml_mark \"parameter name=\\\"command\\\" string=\\\"true\\\">\" DSML_VALUE_LT_SLASH dsml_mark \"parameter>\\n\""
+                "parameter_0_0: \"<\" dsml_mark \"parameter name=\\\"command\\\" string=\\\"true\\\">\" dsml_vc\n"
             ),
             "{lark}"
         );
@@ -1122,5 +1148,68 @@ mod tests {
             let call = one_call("Bash", &[("command", "true", value)]);
             assert!(forced_call_accepts(&[bash(true)], &call), "{value:?}");
         }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a block closed under another of the names a
+    /// block opens under was read as closed
+    #[test]
+    fn a_block_closes_under_the_name_it_opened_with() {
+        let body = format!("\n{OPEN}invoke name=\"Bash\">\n</{DSML}invoke>\n");
+        let mixed = format!("{OPEN}calls>{body}</{DSML}tool_calls>");
+        assert_eq!(calls(&mixed), None);
+        assert_eq!(strip_calls(&mixed), mixed);
+        assert_eq!(
+            calls(&format!("{OPEN}calls>{body}</{DSML}calls>")),
+            Some(serde_json::json!([{"name": "Bash", "arguments": {}}]))
+        );
+        assert_eq!(
+            calls(&format!("{OPEN} tool_calls>{body}</{DSML} tool_calls >")),
+            Some(serde_json::json!([{"name": "Bash", "arguments": {}}]))
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a block's opening tag cut short was not an
+    /// unfinished block, so a required call's deadline forced a second one after it
+    #[test]
+    fn a_cut_short_opening_tag_is_an_unfinished_block() {
+        for partial in [
+            "<",
+            "<｜DS",
+            &format!("{OPEN}tool_cal"),
+            &format!("{OPEN}tool_calls"),
+        ] {
+            assert!(
+                unfinished_block(&format!("Let me check. {partial}")),
+                "{partial:?}"
+            );
+        }
+        assert!(!unfinished_block("Let me check."));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a forced value could not hold a DSML tag
+    /// other than its own closing tag
+    #[test]
+    fn a_forced_value_may_hold_dsml_tags_but_its_closing_tag() {
+        for value in [
+            format!("echo '</{DSML}invoke>'"),
+            format!("<{DSML}invoke name=\"x\">"),
+            format!("a</{DSML}tool_calls>b</{DSML} parameters"),
+            format!("{DSML} at the start"),
+            "  <div>{\"not\": \"parsed\"}</div>".to_string(),
+        ] {
+            let call = one_call("Bash", &[("command", "true", &value)]);
+            assert!(forced_call_accepts(&[bash(true)], &call), "{value:?}");
+        }
+        // The parser's own example, a value holding the invocation's closing tag.
+        let example = format!(
+            "<{DSML}tool_calls>\n<{DSML}invoke name=\"Bash\">\n<{DSML}parameter name=\"command\" string=\"true\">  <div>{{\"not\": \"parsed\"}}</div></{DSML}invoke>\n</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        assert!(forced_call_accepts(&[bash(true)], &example));
+        // The closing tag ends the value wherever it appears.
+        let cut = one_call(
+            "Bash",
+            &[("command", "true", &format!("a</{DSML}parameter>b"))],
+        );
+        assert!(!forced_call_accepts(&[bash(true)], &cut));
     }
 }

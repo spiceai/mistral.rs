@@ -94,9 +94,10 @@ impl ToolCallState {
     ) -> anyhow::Result<Self> {
         let matcher = ToolCallingMatcher::new_with_format(tool_choice, tools, preferred_format)?;
         if matcher.requires_tool_call() {
+            // Only the tools a call may be made to are held to their schemas.
             if let Some(why) = crate::tools::parsers::unenforceable_strict_tool(
                 preferred_format,
-                tools.unwrap_or_default(),
+                matcher.tools().unwrap_or_default(),
             ) {
                 anyhow::bail!(why);
             }
@@ -517,6 +518,33 @@ mod tests {
             Some(ToolCallFormat::DeepSeekDsml),
         )
         .is_ok());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a required call refused an unenforceable
+    /// strict tool that `tool_choice` left out of the call
+    #[test]
+    fn a_required_dsml_call_checks_only_the_tools_it_may_call() {
+        let strict_either: Tool = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "pick",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "oneOf": [{ "required": ["a"] }],
+                },
+            },
+        }))
+        .unwrap();
+        let tools = vec![tool("get_weather"), strict_either];
+        let named = ToolChoice::NamedFunction(NamedFunctionToolChoice {
+            tp: ToolType::Function,
+            name: "get_weather".to_string(),
+        });
+        assert!(
+            ToolCallState::new(named, Some(&tools), Some(ToolCallFormat::DeepSeekDsml)).is_ok()
+        );
     }
 
     #[test]
