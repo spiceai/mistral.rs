@@ -18,6 +18,10 @@ impl ToolFormatParser for HunyuanParser {
         text.contains(START) || text.ends_with(PREFIX)
     }
 
+    fn open_at_end(&self, text: &str) -> bool {
+        super::open_between(text, START, END)
+    }
+
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::Hunyuan
     }
@@ -67,7 +71,7 @@ impl ToolFormatParser for HunyuanParser {
 #[cfg(test)]
 mod tests {
     use super::HunyuanParser;
-    use crate::tools::parsers::{extract_model_specific_message, ToolFormatParser};
+    use crate::tools::parsers::{extract_model_specific_call, ToolFormatParser};
 
     #[test]
     fn parses_parallel_tool_calls() {
@@ -83,7 +87,7 @@ mod tests {
     #[test]
     fn extracts_calls_without_discarding_text() {
         let message = r#"before<tool_calls>[{"name":"search","arguments":{}}]</tool_calls>after"#;
-        let (calls, content) = extract_model_specific_message(message).unwrap().unwrap();
+        let (calls, content, _) = extract_model_specific_call(message).unwrap().unwrap();
 
         assert_eq!(calls, r#"[{"name":"search","arguments":{}}]"#);
         assert_eq!(content, "beforeafter");

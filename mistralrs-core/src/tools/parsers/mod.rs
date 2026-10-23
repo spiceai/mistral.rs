@@ -5,6 +5,7 @@
 
 pub(crate) mod atem;
 mod deepseek;
+mod dsml;
 mod gemma4;
 mod gemma4_strict;
 pub(crate) mod harmony;
@@ -49,6 +50,8 @@ pub enum ToolCallFormat {
     Hunyuan,
     /// Multi-line with ` ```json` fence and `<｜tool▁call▁end｜>` delimiter
     DeepSeek,
+    /// DeepSeek-V4's DSML markup: `<｜DSML｜tool_calls>` around `invoke` and `parameter` tags
+    DeepSeekDsml,
     /// `<|tool_call>call:NAME{key:<|"|>value<|"|>}<tool_call|>` (non-JSON)
     Gemma4,
     /// Harmony commentary channel tool call with `to=...` recipient.
@@ -61,6 +64,20 @@ pub trait ToolFormatParser: Send + Sync {
     /// is) a tool call in this format.  Used during streaming to decide
     /// whether to buffer output.
     fn could_be_tool_call(&self, text: &str) -> bool;
+
+    /// Whether `text` ends inside a call in this format: one has opened and not closed. A
+    /// format whose calls run to the end of the message is inside one from its marker on.
+    fn open_at_end(&self, text: &str) -> bool {
+        self.could_be_tool_call(text)
+    }
+
+    /// Where `message` opens a call in this format, finished or not, for a format that claims
+    /// the messages it opens a call in: one is read only in that format, so text inside its
+    /// calls never becomes a call in another. A call opened inside another format's call is
+    /// that call's text, and gives no claim.
+    fn claim_start(&self, _message: &str) -> Option<usize> {
+        None
+    }
 
     /// Attempt to parse complete tool calls from `message`.
     ///
@@ -98,6 +115,7 @@ pub trait ToolFormatParser: Send + Sync {
 static PARSERS: std::sync::LazyLock<Vec<Box<dyn ToolFormatParser>>> =
     std::sync::LazyLock::new(|| {
         vec![
+            Box::new(dsml::DsmlParser),
             Box::new(atem::AtemParser),
             Box::new(gemma4::Gemma4Parser),
             Box::new(liquid::LiquidParser),
@@ -109,21 +127,51 @@ static PARSERS: std::sync::LazyLock<Vec<Box<dyn ToolFormatParser>>> =
         ]
     });
 
+/// The parsers to read `message` with, in order. A format that opens a call in it outside any
+/// other format's call reads it alone; one whose call opens inside another format's call does
+/// not read it at all.
+fn parsers_for(message: &str) -> Vec<&'static dyn ToolFormatParser> {
+    let all = || PARSERS.iter().map(|parser| parser.as_ref());
+    for parser in all() {
+        let Some(start) = parser.claim_start(message) else {
+            continue;
+        };
+        let before = &message[..start];
+        let enclosed =
+            all().any(|other| other.format() != parser.format() && other.open_at_end(before));
+        return if enclosed {
+            all()
+                .filter(|other| other.format() != parser.format())
+                .collect()
+        } else {
+            vec![parser]
+        };
+    }
+    all().collect()
+}
+
 /// Check whether `text` could contain a tool call prefix from any supported
 /// format.
 pub fn contains_tool_call_prefix(text: &str) -> bool {
-    PARSERS.iter().any(|p| p.could_be_tool_call(text))
+    parsers_for(text)
+        .into_iter()
+        .any(|p| p.could_be_tool_call(text))
 }
 
 /// Build a tool call grammar for the first matching format detected in
 /// `text`.  Returns `None` if no format matches or if the format is not
 /// yet ready for grammar activation (e.g. DeepSeek before the JSON fence).
 pub fn build_tool_call_grammar(text: &str, tools: &[Tool]) -> Option<TopLevelGrammar> {
-    for parser in PARSERS.iter() {
+    for parser in parsers_for(text) {
         if parser.could_be_tool_call(text) {
             // DeepSeek: wait until the JSON fence is present so we don't
             // activate grammar before the function name is complete.
             if parser.format() == ToolCallFormat::DeepSeek && !text.contains("```json\n") {
+                return None;
+            }
+            // DSML tags open with `｜DSML｜`, a token of its own. A grammar written in text would
+            // make the model spell it byte by byte, so DSML calls are read, not constrained.
+            if parser.format() == ToolCallFormat::DeepSeekDsml {
                 return None;
             }
             return Some(parser.tool_call_grammar(tools, text));
@@ -168,12 +216,49 @@ pub fn specialize_required_tool_call_grammar(
             *lark = lark.replace(&format!(r#""{token}""#), token);
         }
     }
+    // DSML's marker is spelled through one rule, as the special token's id where the
+    // tokenizer has one, since its text has no brackets to name it by.
+    if let Some(mark) = tok_trie.get_special_token(dsml::DSML) {
+        *lark = lark
+            .replace(dsml::MARK_RULE, &format!("dsml_mark: <[{mark}]>"))
+            .replace(dsml::VALUE_RULES, dsml::VALUE_RULES_WITH_MARK_TOKEN);
+    }
+}
+
+/// Whether a call in a format other than `format` is open at the end of `text`.
+pub(super) fn open_in_other_format(text: &str, format: ToolCallFormat) -> bool {
+    PARSERS
+        .iter()
+        .any(|parser| parser.format() != format && parser.open_at_end(text))
+}
+
+/// Whether `text` ends after an `open` delimiter with no `close` after it.
+fn open_between(text: &str, open: &str, close: &str) -> bool {
+    text.rfind(open)
+        .is_some_and(|at| !text[at + open.len()..].contains(close))
+}
+
+/// Why a required call in `format` cannot hold one of `tools` to its strict schema, if it
+/// cannot.
+pub(crate) fn unenforceable_strict_tool(
+    format: Option<ToolCallFormat>,
+    tools: &[Tool],
+) -> Option<String> {
+    (format == Some(ToolCallFormat::DeepSeekDsml))
+        .then(|| dsml::unenforceable(tools))
+        .flatten()
+}
+
+/// Whether `message` opens a call in a format that no grammar constrains, and has not finished
+/// it: a DSML block.
+pub(crate) fn call_unfinished(message: &str) -> bool {
+    dsml::unfinished_block(message)
 }
 
 /// Try each parser in order to extract tool calls from `message`.
 /// Returns the original message unchanged if no parser matches.
 pub fn process_model_specific_message(message: &str) -> Result<String> {
-    for parser in PARSERS.iter() {
+    for parser in parsers_for(message) {
         if let Some(json) = parser.parse(message)? {
             return Ok(json);
         }
@@ -181,11 +266,15 @@ pub fn process_model_specific_message(message: &str) -> Result<String> {
     Ok(message.to_string())
 }
 
-pub fn extract_model_specific_message(message: &str) -> Result<Option<(String, String)>> {
-    for parser in PARSERS.iter() {
+/// The calls a model-specific format reads out of `message`, as JSON, with the text around
+/// them and the format they were read in.
+pub(crate) fn extract_model_specific_call(
+    message: &str,
+) -> Result<Option<(String, String, ToolCallFormat)>> {
+    for parser in parsers_for(message) {
         if let Some(json) = parser.parse(message)? {
             let text = strip_tool_call_segments(message, parser.format());
-            return Ok(Some((json, text)));
+            return Ok(Some((json, text, parser.format())));
         }
     }
     Ok(None)
@@ -198,6 +287,7 @@ fn strip_tool_call_segments(message: &str, format: ToolCallFormat) -> String {
         ToolCallFormat::DeepSeek => {
             strip_delimited_segments(message, "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>")
         }
+        ToolCallFormat::DeepSeekDsml => dsml::strip_calls(message),
         ToolCallFormat::MistralNemo => strip_from_first(message, "[TOOL_CALLS]"),
         ToolCallFormat::Hunyuan => {
             strip_delimited_segments(message, "<tool_calls>", "</tool_calls>")

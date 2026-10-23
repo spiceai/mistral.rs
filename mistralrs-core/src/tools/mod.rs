@@ -236,18 +236,19 @@ impl ToolCallingMatcher {
         if matches!(self.tool_choice, ToolChoice::None) {
             return Ok((Some(message.to_string()), Vec::new()));
         }
-        let (message, content) =
-            if let Some((message, content)) = parsers::extract_model_specific_message(message)? {
-                let content = content.trim_start().to_string();
-                let content = if content.is_empty() {
-                    None
-                } else {
-                    Some(content)
-                };
-                (message, content)
+        let (message, content, format) = if let Some((message, content, format)) =
+            parsers::extract_model_specific_call(message)?
+        {
+            let content = content.trim_start().to_string();
+            let content = if content.is_empty() {
+                None
             } else {
-                (process_model_specific_message(message)?, None)
+                Some(content)
             };
+            (message, content, Some(format))
+        } else {
+            (process_model_specific_message(message)?, None, None)
+        };
         let message = fix_broken_json(&message)?;
 
         let mut calls = if let Ok(deser) =
@@ -287,8 +288,12 @@ impl ToolCallingMatcher {
             return Ok((Some(message), Vec::new()));
         };
 
+        // DSML marks each value's type itself, so its arguments are already what the model
+        // wrote; a string `null` stays a string.
         if let Some(tools) = self.tools.as_deref() {
-            coerce_arguments_by_schema(tools, &mut calls)?;
+            if format != Some(ToolCallFormat::DeepSeekDsml) {
+                coerce_arguments_by_schema(tools, &mut calls)?;
+            }
         }
 
         // Filter out hallucinated tool names.
@@ -588,5 +593,139 @@ mod tests {
             "{first}\n<tool_call>\n<function=get_time>\n<parameter=zone>\nUTC\n</parameter>\n</function>\n</tool_call>"
         );
         assert_eq!(matcher.get_call(&both).unwrap().len(), 2);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML string `null` became JSON null
+    #[test]
+    fn a_dsml_string_value_keeps_its_text_through_the_matcher() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "note",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "count": {"type": "integer"},
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        let calls = matcher
+            .get_call(
+                "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"note\">\n<｜DSML｜parameter name=\"text\" string=\"true\">null</｜DSML｜parameter>\n<｜DSML｜parameter name=\"count\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            )
+            .unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"text": "null", "count": 2}));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: while a DSML call was unfinished, a
+    /// `<tool_call>` example in one of its values read as a complete call in Qwen's format
+    #[test]
+    fn an_unfinished_dsml_call_keeps_other_formats_out_of_its_values() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let prefix = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Call it as <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call> and then";
+        assert_eq!(matcher.prefix_could_be_tool(prefix).unwrap(), (true, false));
+        assert!(matcher.get_call(prefix).unwrap().is_empty());
+        let finished =
+            format!("{prefix}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>");
+        let calls = matcher.get_call(&finished).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML opener inside another format's call
+    /// claimed the message for DSML, and the call it sat in was lost
+    #[test]
+    fn a_dsml_opener_inside_another_formats_call_is_that_calls_text() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": "write_file", "parameters": { "type": "object" } },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        let calls = matcher
+            .get_call(r#"<tool_call>{"name": "write_file", "arguments": {"content": "<｜DSML｜tool_calls>"}}</tool_call>"#)
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"content": "<｜DSML｜tool_calls>"}));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a closed `<tool_call>` example before a DSML
+    /// block counted as enclosing it, and a Qwen call inside the block's value was made
+    #[test]
+    fn a_closed_example_before_a_dsml_block_does_not_enclose_it() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let message = "An empty example: <tool_call></tool_call>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML opener inside an earlier call in
+    /// another format took DSML out of the message, and a later block was read as Qwen
+    #[test]
+    fn a_dsml_opener_inside_an_earlier_call_leaves_later_blocks_to_dsml() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let message = "<tool_call>{\"name\": \"note\", \"arguments\": {\"text\": \"<｜DSML｜tool_calls>\"}}</tool_call>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML block opener that could not be read
+    /// claimed nothing, and a Qwen call written inside it was made
+    #[test]
+    fn a_broken_dsml_block_opener_keeps_other_formats_out() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": "Bash", "parameters": { "type": "object" } },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        for message in [
+            "<｜DSML｜tool_calls x=\"<tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>\">",
+            "<｜DSML｜tool_calls <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>",
+        ] {
+            assert!(matcher.get_call(message).unwrap().is_empty(), "{message}");
+        }
     }
 }
