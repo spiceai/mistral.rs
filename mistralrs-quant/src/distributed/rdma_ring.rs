@@ -37,13 +37,57 @@ const ENDPOINT_LEN: usize = 1 + 4 + 4 + 16 + 4;
 
 pub type Result<T> = std::result::Result<T, String>;
 
-/// A finished send or receive: its buffer slot, its length, and, for a receive, the exchange
-/// the sender sent it in.
+/// A finished send or receive: its buffer slot, its length, and, for a receive, the sender's
+/// immediate data.
 #[derive(Clone, Copy)]
 struct Completion {
     slot: usize,
     bytes: usize,
+    imm: u32,
+}
+
+/// The bits of a message's immediate data that count its payload's chunks.
+const CHUNK_BITS: u32 = 24;
+
+/// What a message's immediate data says about the exchange it belongs to: the low bits of the
+/// exchange's number, and how many chunks its sender sends in it. A rank receives only from
+/// its left neighbour, which is at most one exchange ahead of it, so the low bits tell the
+/// exchanges whose messages can meet apart. The chunk count lets a receiver that expects a
+/// different payload fail at the first message, instead of returning early or waiting for
+/// chunks that never come.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Immediate {
     exchange: u32,
+    chunks: u32,
+}
+
+impl Immediate {
+    fn new(exchange: u32, chunks: usize) -> Result<Self> {
+        let chunks = u32::try_from(chunks)
+            .ok()
+            .filter(|&chunks| chunks < 1 << CHUNK_BITS)
+            .ok_or_else(|| {
+                format!(
+                    "a payload of {chunks} MiB is more than one exchange over RDMA carries ({} MiB)",
+                    (1u32 << CHUNK_BITS) - 1
+                )
+            })?;
+        Ok(Self {
+            exchange: exchange & (u32::MAX >> CHUNK_BITS),
+            chunks,
+        })
+    }
+
+    fn encode(self) -> u32 {
+        self.exchange << CHUNK_BITS | self.chunks
+    }
+
+    fn decode(imm: u32) -> Self {
+        Self {
+            exchange: imm >> CHUNK_BITS,
+            chunks: imm & ((1 << CHUNK_BITS) - 1),
+        }
+    }
 }
 
 /// What a neighbour needs to connect to one of this rank's queue pairs.
@@ -108,9 +152,9 @@ pub struct RdmaRing {
     /// Messages received from the left but not yet taken, as `(slot, bytes)` in arrival
     /// order. A neighbour that is ahead sends its next hop before this one is taken.
     arrived: VecDeque<Completion>,
-    /// How many exchanges this rank has run. Every message carries the count of the exchange
-    /// it belongs to, so ranks that disagree on a tensor's size fail instead of summing one
-    /// exchange's chunk into another.
+    /// How many exchanges this rank has run. Every message carries the low bits of the count
+    /// of the exchange it belongs to, and its payload's length in chunks, so ranks that
+    /// disagree on a tensor's size fail instead of summing one exchange's chunk into another.
     exchanges: u32,
     /// Why an exchange failed. A failed exchange may leave sends in flight from the buffers
     /// the next one would refill, so the ring is not used again.
@@ -234,8 +278,12 @@ impl RdmaRing {
     }
 
     fn run(&mut self, id: u32, send: &[u8], recv: &mut [u8], left_tcp: &TcpStream) -> Result<()> {
-        let outgoing = send.len().div_ceil(CHUNK);
-        let incoming = recv.len().div_ceil(CHUNK);
+        let ours = Immediate::new(id, send.len().div_ceil(CHUNK))?;
+        let due = Immediate::new(id, recv.len().div_ceil(CHUNK))?;
+        // An empty payload is still sent, as one empty message, so the neighbour learns its
+        // length.
+        let outgoing = (ours.chunks as usize).max(1);
+        let incoming = (due.chunks as usize).max(1);
         let (mut posted, mut sent, mut received) = (0, 0, 0);
         let mut idle_since: Option<Instant> = None;
         let mut checked = Instant::now();
@@ -245,7 +293,7 @@ impl RdmaRing {
                 let chunk = &send[posted * CHUNK..send.len().min((posted + 1) * CHUNK)];
                 let slot = posted % TX_DEPTH;
                 self.right.buf[slot * CHUNK..][..chunk.len()].copy_from_slice(chunk);
-                self.right.post_send(slot, chunk.len(), id)?;
+                self.right.post_send(slot, chunk.len(), ours.encode())?;
                 posted += 1;
                 progressed = true;
             }
@@ -255,20 +303,17 @@ impl RdmaRing {
             self.left.completions(&mut self.done)?;
             self.arrived.extend(self.done.iter().copied());
             while received < incoming {
-                let Some(Completion {
-                    slot,
-                    bytes,
-                    exchange,
-                }) = self.arrived.pop_front()
-                else {
+                let Some(Completion { slot, bytes, imm }) = self.arrived.pop_front() else {
                     break;
                 };
                 progressed = true;
                 let at = received * CHUNK;
                 let expected = CHUNK.min(recv.len() - at);
-                if slot >= RX_DEPTH || bytes != expected || exchange != id {
+                let theirs = Immediate::decode(imm);
+                if slot >= RX_DEPTH || theirs != due || bytes != expected {
                     return Err(format!(
-                        "exchange {id} received {bytes} bytes of exchange {exchange} in slot {slot} from the left neighbour where {expected} bytes were due; the ranks disagree on the tensor being reduced"
+                        "exchange {id} received {bytes} bytes in slot {slot} of a {}-chunk payload of exchange {} from the left neighbour, where {expected} bytes of a {}-chunk payload of exchange {} were due; the ranks disagree on the tensor being reduced",
+                        theirs.chunks, theirs.exchange, due.chunks, due.exchange
                     ));
                 }
                 recv[at..at + bytes].copy_from_slice(&self.left.buf[slot * CHUNK..][..bytes]);
@@ -503,12 +548,12 @@ mod verbs {
             guard.post().map_err(|e| e.to_string())
         }
 
-        pub(super) fn post_send(&mut self, slot: usize, len: usize, exchange: u32) -> Result<()> {
+        pub(super) fn post_send(&mut self, slot: usize, len: usize, imm: u32) -> Result<()> {
             let (lkey, addr) = (self.mr.lkey(), self.slot_addr(slot));
             let mut guard = self.qp.start_post_send();
             let wr = guard
                 .construct_wr(slot as u64, WorkRequestFlags::Signaled)
-                .setup_send_imm(exchange);
+                .setup_send_imm(imm);
             // SAFETY: the slot is inside the registered buffer and holds `len` bytes.
             unsafe { wr.setup_sge(lkey, addr, len as u32) };
             guard.post().map_err(|e| e.to_string())
@@ -534,7 +579,7 @@ mod verbs {
                 out.push(Completion {
                     slot: wc.wr_id() as usize,
                     bytes: wc.byte_len() as usize,
-                    exchange: wc.imm_data(),
+                    imm: wc.imm_data(),
                 });
             }
             Ok(())
@@ -581,12 +626,7 @@ mod verbs {
             match self.never {}
         }
 
-        pub(super) fn post_send(
-            &mut self,
-            _slot: usize,
-            _len: usize,
-            _exchange: u32,
-        ) -> Result<()> {
+        pub(super) fn post_send(&mut self, _slot: usize, _len: usize, _imm: u32) -> Result<()> {
             match self.never {}
         }
 

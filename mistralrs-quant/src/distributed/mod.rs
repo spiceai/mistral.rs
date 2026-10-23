@@ -868,7 +868,7 @@ mod ring_ops {
         time::{Duration, Instant},
     };
 
-    use std::io::{Read, Write};
+    use std::io::{IoSlice, Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
 
     // Friendly aliases to tame type complexity.
@@ -949,6 +949,23 @@ mod ring_ops {
             .clone()
     }
 
+    /// Writes all of `bufs`, in order, in as few writes as the stream takes.
+    fn write_all_vectored(
+        stream: &mut TcpStream,
+        mut bufs: &mut [IoSlice<'_>],
+    ) -> std::io::Result<()> {
+        IoSlice::advance_slices(&mut bufs, 0);
+        while !bufs.is_empty() {
+            match stream.write_vectored(bufs) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(written) => IoSlice::advance_slices(&mut bufs, written),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// One hop of the ring: sends `send` to the right neighbour and fills `recv` from the left
     /// one, over RDMA when the ring has it and otherwise over TCP.
     fn ring_hop(
@@ -981,16 +998,46 @@ mod ring_ops {
         } else {
             CHUNK_SIZE
         };
+        // Each hop starts with the payload's length, so ranks that disagree on the tensor fail
+        // here instead of reading one hop's bytes as the next's or waiting for bytes that never
+        // come. It goes out in the same write as the first chunk, so the neighbour wakes once
+        // for both.
+        let length = (send.len() as u64).to_le_bytes();
         let mut offset = 0;
-        while offset < send.len() || offset < recv.len() {
+        loop {
             let out = offset.min(send.len())..(offset + chunk).min(send.len());
             let into = offset.min(recv.len())..(offset + chunk).min(recv.len());
-            right
-                .write_all(&send[out])
-                .map_err(|e| candle_core::Error::msg(format!("write error: {:?}", e)))?;
+            let written = if offset == 0 {
+                write_all_vectored(
+                    right,
+                    &mut [IoSlice::new(&length), IoSlice::new(&send[out])],
+                )
+            } else {
+                right.write_all(&send[out])
+            };
+            written.map_err(|e| candle_core::Error::msg(format!("write error: {:?}", e)))?;
+            if offset == 0 {
+                let mut theirs = [0u8; 8];
+                left.read_exact(&mut theirs)
+                    .map_err(|e| candle_core::Error::msg(format!("read error: {:?}", e)))?;
+                let theirs = u64::from_le_bytes(theirs);
+                if theirs != recv.len() as u64 {
+                    // As over RDMA, the neighbours learn of the failure from the closed
+                    // connections.
+                    let _ = right.shutdown(Shutdown::Both);
+                    let _ = left.shutdown(Shutdown::Both);
+                    return Err(candle_core::Error::msg(format!(
+                        "ring exchange over TCP: the left neighbour sends {theirs} bytes where {} were due; the ranks disagree on the tensor being reduced",
+                        recv.len()
+                    )));
+                }
+            }
             left.read_exact(&mut recv[into])
                 .map_err(|e| candle_core::Error::msg(format!("read error: {:?}", e)))?;
             offset += chunk;
+            if offset >= send.len() && offset >= recv.len() {
+                break;
+            }
         }
         Ok(())
     }

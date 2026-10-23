@@ -6,20 +6,21 @@
 //! RING_CONFIG=rank0.json cargo run --release -p mistralrs-quant --features ring --example ring_collectives
 //! ```
 //!
-//! Each rank sum-reduces and gathers tensors from 1 element to 20 MiB, contributing values
+//! Each rank sum-reduces and gathers tensors from none to 20 MiB, contributing values
 //! that make every expected element exact in f32, and exits non-zero on the first wrong
-//! element. `ring_collectives mismatch` gives the last rank a tensor twice as long, which
-//! every rank must refuse rather than reduce; `mismatch-small` does the same with one element
-//! against two. In both, each rank prints how long it took to answer, then keeps its process
+//! element. `ring_collectives mismatch` gives the last rank a tensor twice as long, a whole
+//! 1 MiB chunk more than the others, which every rank must refuse rather than reduce;
+//! `mismatch-small` does the same with one element against two. In both, each rank prints how long it took to answer, then keeps its process
 //! and connections open for 15 s, so a rank that only learns of the failure when a peer exits
-//! shows it.
+//! shows it. `ring_collectives latency` times 10,000 sum-reduces of a decode step's 20 KiB and
+//! prints their P50, P99 and P99.9.
 
 use std::sync::Arc;
 
 use candle_core::{Device, Tensor};
 use mistralrs_quant::{distributed::AllGather, Comm, Id, RingConfig, SumAllReduce};
 
-const SIZES: [usize; 6] = [1, 5_120, 262_144, 786_432, 1_000_003, 5_242_880];
+const SIZES: [usize; 7] = [0, 1, 5_120, 262_144, 786_432, 1_000_003, 5_242_880];
 const ITERATIONS: usize = 20;
 
 /// Rank `rank`'s contribution to element `i` of iteration `step`: small integers, so every
@@ -39,6 +40,28 @@ fn main() -> candle_core::Result<()> {
     let comm = Arc::new(Comm::from_device(Id::new(), &Device::Cpu, rank, world)?);
     let reduce = SumAllReduce::new(&comm);
     let gather = AllGather::new(&comm, 0);
+
+    if mode.as_deref() == Some("latency") {
+        // The all-reduce of a decode step, 5120 f32 (20 KiB), timed one at a time.
+        const LEN: usize = 5_120;
+        const RUNS: usize = 10_000;
+        let xs = Tensor::from_vec(vec![1f32; LEN], LEN, &Device::Cpu)?;
+        let mut micros = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let started = std::time::Instant::now();
+            reduce.sum_all_reduce(&xs)?;
+            micros.push(started.elapsed().as_secs_f64() * 1e6);
+        }
+        micros.sort_by(f64::total_cmp);
+        let at = |q: f64| micros[((RUNS as f64 * q).ceil() as usize).clamp(1, RUNS) - 1];
+        println!(
+            "rank {rank}: {RUNS} sums of {LEN} elements: p50 {:.1} us, p99 {:.1} us, p99.9 {:.1} us",
+            at(0.5),
+            at(0.99),
+            at(0.999)
+        );
+        return Ok(());
+    }
 
     if mismatch {
         // Every rank holds one chunk of `rank + 1`, 1 MiB or, in `mismatch-small`, one
