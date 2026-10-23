@@ -177,6 +177,11 @@ pub fn specialize_required_tool_call_grammar(
             *lark = lark.replace(&format!(r#""{token}""#), token);
         }
     }
+    // DSML's marker is spelled through one rule, as the special token's id where the
+    // tokenizer has one, since its text has no brackets to name it by.
+    if let Some(mark) = tok_trie.get_special_token(dsml::DSML) {
+        *lark = lark.replace(dsml::MARK_RULE, &format!("dsml_mark: <[{mark}]>"));
+    }
 }
 
 /// Try each parser in order to extract tool calls from `message`.
@@ -190,11 +195,15 @@ pub fn process_model_specific_message(message: &str) -> Result<String> {
     Ok(message.to_string())
 }
 
-pub fn extract_model_specific_message(message: &str) -> Result<Option<(String, String)>> {
+/// The calls a model-specific format reads out of `message`, as JSON, with the text around
+/// them and the format they were read in.
+pub(crate) fn extract_model_specific_call(
+    message: &str,
+) -> Result<Option<(String, String, ToolCallFormat)>> {
     for parser in PARSERS.iter() {
         if let Some(json) = parser.parse(message)? {
             let text = strip_tool_call_segments(message, parser.format());
-            return Ok(Some((json, text)));
+            return Ok(Some((json, text, parser.format())));
         }
     }
     Ok(None)

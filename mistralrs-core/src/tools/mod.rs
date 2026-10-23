@@ -236,18 +236,19 @@ impl ToolCallingMatcher {
         if matches!(self.tool_choice, ToolChoice::None) {
             return Ok((Some(message.to_string()), Vec::new()));
         }
-        let (message, content) =
-            if let Some((message, content)) = parsers::extract_model_specific_message(message)? {
-                let content = content.trim_start().to_string();
-                let content = if content.is_empty() {
-                    None
-                } else {
-                    Some(content)
-                };
-                (message, content)
+        let (message, content, format) = if let Some((message, content, format)) =
+            parsers::extract_model_specific_call(message)?
+        {
+            let content = content.trim_start().to_string();
+            let content = if content.is_empty() {
+                None
             } else {
-                (process_model_specific_message(message)?, None)
+                Some(content)
             };
+            (message, content, Some(format))
+        } else {
+            (process_model_specific_message(message)?, None, None)
+        };
         let message = fix_broken_json(&message)?;
 
         let mut calls = if let Ok(deser) =
@@ -287,8 +288,12 @@ impl ToolCallingMatcher {
             return Ok((Some(message), Vec::new()));
         };
 
+        // DSML marks each value's type itself, so its arguments are already what the model
+        // wrote; a string `null` stays a string.
         if let Some(tools) = self.tools.as_deref() {
-            coerce_arguments_by_schema(tools, &mut calls)?;
+            if format != Some(ToolCallFormat::DeepSeekDsml) {
+                coerce_arguments_by_schema(tools, &mut calls)?;
+            }
         }
 
         // Filter out hallucinated tool names.
@@ -588,5 +593,32 @@ mod tests {
             "{first}\n<tool_call>\n<function=get_time>\n<parameter=zone>\nUTC\n</parameter>\n</function>\n</tool_call>"
         );
         assert_eq!(matcher.get_call(&both).unwrap().len(), 2);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML string `null` became JSON null
+    #[test]
+    fn a_dsml_string_value_keeps_its_text_through_the_matcher() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "note",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "count": {"type": "integer"},
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        let calls = matcher
+            .get_call(
+                "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"note\">\n<｜DSML｜parameter name=\"text\" string=\"true\">null</｜DSML｜parameter>\n<｜DSML｜parameter name=\"count\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            )
+            .unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"text": "null", "count": 2}));
     }
 }

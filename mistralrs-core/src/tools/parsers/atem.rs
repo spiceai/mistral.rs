@@ -231,7 +231,7 @@ fn schema_accepts_type(schema: &Value, expected: &str) -> bool {
         })
 }
 
-fn schema_accepts_string(schema: &Value) -> bool {
+pub(super) fn schema_accepts_string(schema: &Value) -> bool {
     schema_accepts_type(schema, "string")
         || schema
             .get("enum")

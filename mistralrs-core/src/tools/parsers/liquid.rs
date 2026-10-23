@@ -404,7 +404,7 @@ fn find_matching_delimiter(s: &str, start: usize, open: u8, close: u8) -> Option
 #[cfg(test)]
 mod tests {
     use super::LiquidParser;
-    use crate::tools::parsers::{extract_model_specific_message, ToolFormatParser};
+    use crate::tools::parsers::{extract_model_specific_call, ToolFormatParser};
     use crate::tools::{CalledFunctionParameters, ToolCallingMatcher, ToolChoice};
     use crate::{Function, Tool, ToolType};
 
@@ -458,7 +458,7 @@ mod tests {
     #[test]
     fn extracts_calls_without_losing_surrounding_text() {
         let message = r#"before <|tool_call_start|>[search(query="rust")]<|tool_call_end|> after"#;
-        let (calls, content) = extract_model_specific_message(message).unwrap().unwrap();
+        let (calls, content, _) = extract_model_specific_call(message).unwrap().unwrap();
         let parsed: Vec<CalledFunctionParameters> = serde_json::from_str(&calls).unwrap();
 
         assert_eq!(parsed[0].name, "search");

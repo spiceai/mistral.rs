@@ -9,9 +9,12 @@
 //! </｜DSML｜tool_calls>
 //! ```
 //!
-//! A parameter marked `string="true"` is the string as written; any other value is JSON. The
-//! markup is read leniently, as quantized checkpoints write it: whitespace may follow the
-//! `｜DSML｜` token, and the block may be named `tool_calls`, `function_calls` or `calls`.
+//! A parameter marked `string="true"` is its text exactly as written; any other value is
+//! JSON. The markup is read leniently, as quantized checkpoints write it: whitespace may
+//! follow the `｜DSML｜` token, and the block may be named `tool_calls`, `function_calls` or
+//! `calls`. It is read strictly otherwise: a block holds only invocations, an invocation only
+//! parameters, every tag closes before the next opens, and a parameter appears once. A block
+//! that breaks any of these stays content, so no call is made from it.
 
 use candle_core::Result;
 use llguidance::api::{GrammarWithLexer, TopLevelGrammar};
@@ -22,21 +25,23 @@ use super::ToolFormatParser;
 use crate::Tool;
 
 /// The token every DSML tag starts with after its `<` or `</`.
-const DSML: &str = "｜DSML｜";
+pub(super) const DSML: &str = "｜DSML｜";
 const OPEN: &str = "<｜DSML｜";
 const CLOSE: &str = "</｜DSML｜";
-/// The names a block of calls is written under, longest first so a prefix never shadows one.
+/// The names a block of calls is written under, longest first.
 const BLOCK_NAMES: [&str; 3] = ["function_calls", "tool_calls", "calls"];
 /// The block name the chat template uses, and the one a grammar writes.
 const BLOCK: &str = "tool_calls";
+/// The grammar rule that spells the `｜DSML｜` marker in every tag. Where the tokenizer has
+/// the marker as a special token, `specialize_required_tool_call_grammar` makes the rule that
+/// token, which text cannot match.
+pub(super) const MARK_RULE: &str = r#"dsml_mark: "｜DSML｜""#;
 
 pub struct DsmlParser;
 
 impl ToolFormatParser for DsmlParser {
     fn could_be_tool_call(&self, text: &str) -> bool {
-        // An open block that has not closed, a DSML tag still being written, or a tail that
-        // could become one.
-        open_block_unclosed(text) || unfinished_tag(text) || ends_with_tag_prefix(text)
+        matches!(scan(text), Scan::More)
     }
 
     fn format(&self) -> super::ToolCallFormat {
@@ -52,10 +57,13 @@ impl ToolFormatParser for DsmlParser {
     }
 
     fn parse(&self, message: &str) -> Result<Option<String>> {
-        let Some(calls) = parse_calls(message) else {
+        let Scan::Done(found) = scan(message) else {
             return Ok(None);
         };
-        serde_json::to_string(&calls)
+        if found.calls.is_empty() {
+            return Ok(None);
+        }
+        serde_json::to_string(&found.calls)
             .map(Some)
             .map_err(candle_core::Error::msg)
     }
@@ -67,43 +75,63 @@ struct DsmlToolCall {
     arguments: Value,
 }
 
-/// A DSML tag found in the text.
-struct Tag<'a> {
-    /// Where the tag's `<` is.
-    start: usize,
-    /// Just past the tag's `>`.
-    end: usize,
-    /// What follows the name inside the tag, such as its attributes.
-    attributes: &'a str,
+/// How far a piece of DSML text reads.
+enum Scan<T> {
+    /// It reads as `T`.
+    Done(T),
+    /// It ends before what it started is complete, so more text could finish it.
+    More,
+    /// It cannot be read, whatever follows.
+    Bad,
 }
 
-/// The first complete tag at or after `from` that opens (or, with `closing`, closes) one of
-/// `names`.
-fn find_tag<'a>(text: &'a str, from: usize, closing: bool, names: &[&'a str]) -> Option<Tag<'a>> {
+/// The calls in a message, and where each block of them sits in it.
+struct Found {
+    calls: Vec<DsmlToolCall>,
+    blocks: Vec<std::ops::Range<usize>>,
+}
+
+/// A tag at the start of `text` that opens (or, with `closing`, closes) one of `names`, as
+/// `(attributes, length)`.
+fn tag_at<'a>(text: &'a str, closing: bool, names: &[&str]) -> Scan<(&'a str, usize)> {
     let marker = if closing { CLOSE } else { OPEN };
-    let mut cursor = from;
-    while let Some(offset) = text[cursor..].find(marker) {
-        let start = cursor + offset;
-        let after = start + marker.len();
-        let rest = text[after..].trim_start();
-        let name_at = text.len() - rest.len();
-        cursor = after;
-        let Some(&name) = names.iter().find(|name| rest.starts_with(**name)) else {
-            continue;
+    let Some(after) = text.strip_prefix(marker) else {
+        return if marker.starts_with(text) {
+            Scan::More
+        } else {
+            Scan::Bad
         };
-        let after_name = name_at + name.len();
-        // The name ends at whitespace or the tag's end, so `calls` does not match `callsX`.
-        if !text[after_name..].starts_with(|c: char| c == '>' || c.is_whitespace()) {
-            continue;
-        }
-        let close = text[after_name..].find('>')?;
-        return Some(Tag {
-            start,
-            end: after_name + close + 1,
-            attributes: &text[after_name..after_name + close],
-        });
+    };
+    let rest = after.trim_start();
+    if rest.is_empty() {
+        return Scan::More;
     }
-    None
+    let mut could_become = false;
+    for name in names {
+        if let Some(tail) = rest.strip_prefix(name) {
+            if tail.is_empty() {
+                return Scan::More;
+            }
+            // The name ends at whitespace or the tag's end, so `calls` does not read `callsX`.
+            if !tail.starts_with(|c: char| c == '>' || c.is_whitespace()) {
+                continue;
+            }
+            // The tag ends at its `>`; a `<` first means another tag began inside it.
+            return match tail.find(['<', '>']) {
+                Some(end) if tail[end..].starts_with('>') => {
+                    Scan::Done((&tail[..end], text.len() - tail.len() + end + 1))
+                }
+                Some(_) => Scan::Bad,
+                None => Scan::More,
+            };
+        }
+        could_become |= name.starts_with(rest);
+    }
+    if could_become {
+        Scan::More
+    } else {
+        Scan::Bad
+    }
 }
 
 /// The value of `attribute="..."` in a tag's attributes.
@@ -114,93 +142,164 @@ fn attribute<'a>(attributes: &'a str, attribute: &str) -> Option<&'a str> {
     Some(&attributes[start..end])
 }
 
-/// Every call in every complete block of `message`, or `None` when there is no complete block,
-/// or a block holds a call that cannot be read, so the text is left as the model wrote it.
-fn parse_calls(message: &str) -> Option<Vec<DsmlToolCall>> {
-    let mut calls = Vec::new();
-    let mut cursor = 0;
-    while let Some(open) = find_tag(message, cursor, false, &BLOCK_NAMES) {
-        let close = find_tag(message, open.end, true, &BLOCK_NAMES)?;
-        calls.extend(parse_invocations(&message[open.end..close.start])?);
-        cursor = close.end;
-    }
-    (!calls.is_empty()).then_some(calls)
+fn leading_whitespace(text: &str) -> usize {
+    text.len() - text.trim_start().len()
 }
 
-fn parse_invocations(block: &str) -> Option<Vec<DsmlToolCall>> {
-    let mut calls = Vec::new();
-    let mut cursor = 0;
-    while let Some(open) = find_tag(block, cursor, false, &["invoke"]) {
-        let name = attribute(open.attributes, "name")?;
-        let close = find_tag(block, open.end, true, &["invoke"])?;
-        calls.push(DsmlToolCall {
-            name: name.to_string(),
-            arguments: Value::Object(parse_parameters(&block[open.end..close.start])?),
-        });
-        cursor = close.end;
+/// A parameter's value, which runs from the end of its opening tag, the start of `text`, to
+/// its own closing tag: anything else in it, DSML tags included, is part of the value.
+fn value_at(text: &str) -> Scan<(&str, usize)> {
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(CLOSE) {
+        let at = from + offset;
+        match tag_at(&text[at..], true, &["parameter"]) {
+            Scan::Done((_, length)) => return Scan::Done((&text[..at], at + length)),
+            Scan::More => return Scan::More,
+            Scan::Bad => from = at + CLOSE.len(),
+        }
     }
-    Some(calls)
+    Scan::More
 }
 
-fn parse_parameters(invocation: &str) -> Option<serde_json::Map<String, Value>> {
-    let mut parameters = serde_json::Map::new();
-    let mut cursor = 0;
-    while let Some(open) = find_tag(invocation, cursor, false, &["parameter"]) {
-        let name = attribute(open.attributes, "name")?;
-        let close = find_tag(invocation, open.end, true, &["parameter"])?;
-        let raw = &invocation[open.end..close.start];
-        let value = if attribute(open.attributes, "string") == Some("true") {
+/// One invocation, from the end of its opening tag, the start of `text`, through its closing
+/// tag.
+fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize)> {
+    let mut arguments = serde_json::Map::new();
+    let mut at = 0;
+    loop {
+        at += leading_whitespace(&text[at..]);
+        let rest = &text[at..];
+        if rest.is_empty() {
+            return Scan::More;
+        }
+        let close = tag_at(rest, true, &["invoke"]);
+        if let Scan::Done((_, length)) = close {
+            return Scan::Done((arguments, at + length));
+        }
+        let (attributes, length) = match tag_at(rest, false, &["parameter"]) {
+            Scan::Done(tag) => tag,
+            Scan::More => return Scan::More,
+            Scan::Bad if matches!(close, Scan::More) => return Scan::More,
+            Scan::Bad => return Scan::Bad,
+        };
+        let Some(name) = attribute(attributes, "name") else {
+            return Scan::Bad;
+        };
+        at += length;
+        let (raw, length) = match value_at(&text[at..]) {
+            Scan::Done(value) => value,
+            Scan::More => return Scan::More,
+            Scan::Bad => return Scan::Bad,
+        };
+        at += length;
+        let value = if attribute(attributes, "string") == Some("true") {
             Value::String(raw.to_string())
         } else {
             serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
         };
-        parameters.insert(name.to_string(), value);
-        cursor = close.end;
+        // A parameter given twice has no one value to call with.
+        if arguments.insert(name.to_string(), value).is_some() {
+            return Scan::Bad;
+        }
     }
-    Some(parameters)
+}
+
+/// One block's calls, from the end of its opening tag, the start of `text`, through its
+/// closing tag.
+fn block_at(text: &str) -> Scan<(Vec<DsmlToolCall>, usize)> {
+    let mut calls = Vec::new();
+    let mut at = 0;
+    loop {
+        at += leading_whitespace(&text[at..]);
+        let rest = &text[at..];
+        if rest.is_empty() {
+            return Scan::More;
+        }
+        let close = tag_at(rest, true, &BLOCK_NAMES);
+        if let Scan::Done((_, length)) = close {
+            return if calls.is_empty() {
+                Scan::Bad
+            } else {
+                Scan::Done((calls, at + length))
+            };
+        }
+        let (attributes, length) = match tag_at(rest, false, &["invoke"]) {
+            Scan::Done(tag) => tag,
+            Scan::More => return Scan::More,
+            Scan::Bad if matches!(close, Scan::More) => return Scan::More,
+            Scan::Bad => return Scan::Bad,
+        };
+        let Some(name) = attribute(attributes, "name") else {
+            return Scan::Bad;
+        };
+        at += length;
+        let (arguments, length) = match invocation_at(&text[at..]) {
+            Scan::Done(invocation) => invocation,
+            Scan::More => return Scan::More,
+            Scan::Bad => return Scan::Bad,
+        };
+        at += length;
+        calls.push(DsmlToolCall {
+            name: name.to_string(),
+            arguments: Value::Object(arguments),
+        });
+    }
+}
+
+/// Reads every block of calls in `message`.
+fn scan(message: &str) -> Scan<Found> {
+    let mut found = Found {
+        calls: Vec::new(),
+        blocks: Vec::new(),
+    };
+    let mut from = 0;
+    while let Some(offset) = message[from..].find(OPEN) {
+        let start = from + offset;
+        let (_, open) = match tag_at(&message[start..], false, &BLOCK_NAMES) {
+            Scan::Done(tag) => tag,
+            Scan::More => return Scan::More,
+            // A DSML tag that does not open a block is not a call.
+            Scan::Bad => {
+                from = start + OPEN.len();
+                continue;
+            }
+        };
+        let (calls, length) = match block_at(&message[start + open..]) {
+            Scan::Done(block) => block,
+            Scan::More => return Scan::More,
+            Scan::Bad => return Scan::Bad,
+        };
+        let end = start + open + length;
+        found.calls.extend(calls);
+        found.blocks.push(start..end);
+        from = end;
+    }
+    // The message may end partway through the marker that opens the next block.
+    let tail = &message[from..];
+    let partial = OPEN
+        .char_indices()
+        .skip(1)
+        .any(|(at, _)| tail.ends_with(&OPEN[..at]));
+    if partial {
+        Scan::More
+    } else {
+        Scan::Done(found)
+    }
 }
 
 /// `message` without its blocks of calls: the text the model wrote around them.
 pub(super) fn strip_calls(message: &str) -> String {
+    let Scan::Done(found) = scan(message) else {
+        return message.to_string();
+    };
     let mut out = String::new();
     let mut cursor = 0;
-    while let Some(open) = find_tag(message, cursor, false, &BLOCK_NAMES) {
-        out.push_str(&message[cursor..open.start]);
-        let Some(close) = find_tag(message, open.end, true, &BLOCK_NAMES) else {
-            return out;
-        };
-        cursor = close.end;
+    for block in found.blocks {
+        out.push_str(&message[cursor..block.start]);
+        cursor = block.end;
     }
     out.push_str(&message[cursor..]);
     out
-}
-
-fn open_block_unclosed(text: &str) -> bool {
-    let mut cursor = 0;
-    while let Some(open) = find_tag(text, cursor, false, &BLOCK_NAMES) {
-        let Some(close) = find_tag(text, open.end, true, &BLOCK_NAMES) else {
-            return true;
-        };
-        cursor = close.end;
-    }
-    false
-}
-
-/// Whether the text's last DSML marker starts a tag that has not reached its `>`.
-fn unfinished_tag(text: &str) -> bool {
-    text.rfind(DSML)
-        .is_some_and(|at| !text[at + DSML.len()..].contains('>'))
-}
-
-/// Whether the text ends partway through `<｜DSML｜` or `</｜DSML｜`.
-fn ends_with_tag_prefix(text: &str) -> bool {
-    [OPEN, CLOSE].iter().any(|marker| {
-        marker
-            .char_indices()
-            .skip(1)
-            .map(|(at, _)| &marker[..at])
-            .any(|prefix| text.ends_with(prefix))
-    })
 }
 
 fn lark_literal(value: &str) -> String {
@@ -213,26 +312,37 @@ fn lark_literal(value: &str) -> String {
     )
 }
 
+/// A tag in a grammar: `<`, or `</` with `closing`, the marker, then the rest as text.
+fn tag(closing: bool, rest: &str) -> String {
+    format!(
+        "{} dsml_mark {}",
+        lark_literal(if closing { "</" } else { "<" }),
+        lark_literal(rest)
+    )
+}
+
 /// A grammar for DSML calls to `tools`: the whole block when `required`, otherwise what
 /// follows a block's opening tag.
 fn build_dsml_grammar(tools: &[Tool], required: bool) -> TopLevelGrammar {
     let mut rules = Vec::new();
+    let mut schemas = Vec::new();
     let mut invokes = Vec::new();
     for (index, tool) in tools.iter().enumerate() {
         let invoke = format!("invoke_{index}");
+        let arguments = emit_arguments(tool, index, &mut rules, &mut schemas);
         rules.push(format!(
-            "{invoke}: {open} dsml_parameter* {close}",
-            open = lark_literal(&format!("{OPEN}invoke name=\"{}\">\n", tool.function.name)),
-            close = lark_literal(&format!("{CLOSE}invoke>\n")),
+            "{invoke}: {open} {arguments} {close}",
+            open = tag(false, &format!("invoke name=\"{}\">\n", tool.function.name)),
+            close = tag(true, "invoke>\n"),
         ));
         invokes.push(invoke);
     }
     let calls = format!("({})+", invokes.join(" | "));
-    let block_close = lark_literal(&format!("{CLOSE}{BLOCK}>"));
+    let block_close = tag(true, &format!("{BLOCK}>"));
     let start = if required {
         format!(
             "start: {} {calls} {block_close}",
-            lark_literal(&format!("{OPEN}{BLOCK}>\n"))
+            tag(false, &format!("{BLOCK}>\n"))
         )
     } else {
         format!("start: \"\\n\"? {calls} {block_close}")
@@ -242,31 +352,121 @@ fn build_dsml_grammar(tools: &[Tool], required: bool) -> TopLevelGrammar {
     lines.extend([
         format!(
             "dsml_parameter: {} PARAM_NAME {} (\"true\" | \"false\") {} dsml_value {}",
-            lark_literal(&format!("{OPEN}parameter name=\"")),
+            tag(false, "parameter name=\""),
             lark_literal("\" string=\""),
             lark_literal("\">"),
-            lark_literal(&format!("{CLOSE}parameter>\n")),
+            tag(true, "parameter>\n"),
         ),
+        // A value is any text but its closing tag: `<` starts one only when `/` and the
+        // marker follow it, so ordinary markup such as `</div>` is part of the value.
         "dsml_value: (dsml_text | dsml_lt)*".to_string(),
         "dsml_text: /[^<]+/".to_string(),
-        r#"dsml_lt: "<" /[^\/]/"#.to_string(),
+        r"dsml_lt: /<([^\/]|\/[^｜])/".to_string(),
         "PARAM_NAME: /[a-zA-Z_][a-zA-Z0-9_.-]*/".to_string(),
+        MARK_RULE.to_string(),
     ]);
+    let mut grammars = vec![GrammarWithLexer::from_lark(lines.join("\n"))];
+    grammars.extend(schemas);
     TopLevelGrammar {
-        grammars: vec![GrammarWithLexer::from_lark(lines.join("\n"))],
+        grammars,
         max_tokens: None,
     }
 }
 
+/// The rule for a call's parameters. A strict tool's parameters are its declared properties,
+/// each once, with its required ones present and every value held to its schema: a string
+/// property as text, any other as JSON. A tool that is not strict takes any parameters.
+fn emit_arguments(
+    tool: &Tool,
+    tool_index: usize,
+    rules: &mut Vec<String>,
+    schemas: &mut Vec<GrammarWithLexer>,
+) -> String {
+    let arguments = format!("arguments_{tool_index}");
+    let Some(schema) = tool.function.strict_parameters_schema() else {
+        rules.push(format!("{arguments}: dsml_parameter*"));
+        return arguments;
+    };
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        rules.push(format!("{arguments}:"));
+        return arguments;
+    };
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut names = properties.keys().collect::<Vec<_>>();
+    names.sort();
+    let mut sequence = Vec::new();
+    for (property_index, name) in names.into_iter().enumerate() {
+        let parameter = format!("parameter_{tool_index}_{property_index}");
+        let property = &properties[name];
+        let (string, value) = if super::atem::schema_accepts_string(property) {
+            ("true", "dsml_value".to_string())
+        } else {
+            let grammar = format!("dsml_schema_{tool_index}_{property_index}");
+            schemas.push(GrammarWithLexer {
+                name: Some(grammar.clone()),
+                json_schema: Some(property.clone()),
+                ..Default::default()
+            });
+            ("false", format!("@{grammar}"))
+        };
+        rules.push(format!(
+            "{parameter}: {open} {value} {close}",
+            open = tag(
+                false,
+                &format!("parameter name=\"{name}\" string=\"{string}\">")
+            ),
+            close = tag(true, "parameter>\n"),
+        ));
+        sequence.push(if required.contains(name.as_str()) {
+            parameter
+        } else {
+            format!("{parameter}?")
+        });
+    }
+    rules.push(format!("{arguments}: {}", sequence.join(" ")));
+    arguments
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::tools::parsers::specialize_required_tool_call_grammar;
 
     fn calls(message: &str) -> Option<Value> {
         DsmlParser
             .parse(message)
             .expect("parse")
             .map(|json| serde_json::from_str(&json).expect("JSON"))
+    }
+
+    fn bash(strict: bool) -> Tool {
+        serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "strict": strict,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        }))
+        .expect("tool")
     }
 
     #[test]
@@ -297,12 +497,12 @@ mod tests {
     }
 
     #[test]
-    fn a_string_parameter_keeps_its_text_exactly() {
-        let message = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"write\"><｜DSML｜parameter name=\"body\" string=\"true\">  {\"not\": \"parsed\"}\n</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>";
+    fn a_string_parameter_keeps_its_text_exactly_tags_included() {
+        let message = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"write\"><｜DSML｜parameter name=\"body\" string=\"true\">  <div>{\"not\": \"parsed\"}</div></｜DSML｜invoke>\n</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>";
         assert_eq!(
             calls(message),
             Some(serde_json::json!([
-                {"name": "write", "arguments": {"body": "  {\"not\": \"parsed\"}\n"}},
+                {"name": "write", "arguments": {"body": "  <div>{\"not\": \"parsed\"}</div></｜DSML｜invoke>\n"}},
             ]))
         );
     }
@@ -331,35 +531,172 @@ mod tests {
             "",
         ] {
             assert_eq!(calls(text), None, "{text:?}");
+            assert!(!DsmlParser.could_be_tool_call(text), "{text:?}");
         }
-        assert!(!DsmlParser.could_be_tool_call("a < b and c"));
-        assert!(!DsmlParser.could_be_tool_call("done."));
     }
 
+    /// regression test for spiceai/mistral.rs#54: malformed blocks made calls
     #[test]
-    fn an_invocation_without_a_name_leaves_the_text_as_written() {
-        let message = "<｜DSML｜tool_calls><｜DSML｜invoke><｜DSML｜parameter name=\"a\" string=\"true\">1</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>";
-        assert_eq!(calls(message), None);
+    fn a_malformed_block_stays_content() {
+        let open = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"Bash\">";
+        let parameter = |name: &str, value: &str| {
+            format!(
+                "<｜DSML｜parameter name=\"{name}\" string=\"true\">{value}</｜DSML｜parameter>"
+            )
+        };
+        let cases = [
+            // A named invocation that never closes, then an unnamed one.
+            format!(
+                "{open}{}<｜DSML｜invoke>{}</｜DSML｜invoke></｜DSML｜tool_calls>",
+                parameter("command", "ls"),
+                parameter("command", "rm -rf /")
+            ),
+            // A valid call, then an invocation that is opened and never finished.
+            format!(
+                "{open}{}</｜DSML｜invoke><｜DSML｜invoke name=\"Bash\"</｜DSML｜tool_calls>",
+                parameter("command", "ls")
+            ),
+            // A parameter given twice.
+            format!(
+                "{open}{}{}</｜DSML｜invoke></｜DSML｜tool_calls>",
+                parameter("command", "ls"),
+                parameter("command", "rm -rf /")
+            ),
+            // A parameter outside any invocation.
+            format!(
+                "<｜DSML｜tool_calls>{}</｜DSML｜tool_calls>",
+                parameter("command", "ls")
+            ),
+            // An invocation without a name.
+            "<｜DSML｜tool_calls><｜DSML｜invoke></｜DSML｜invoke></｜DSML｜tool_calls>"
+                .to_string(),
+            // A block with nothing in it.
+            "<｜DSML｜tool_calls></｜DSML｜tool_calls>".to_string(),
+        ];
+        for case in cases {
+            assert_eq!(calls(&case), None, "{case}");
+            assert!(!DsmlParser.could_be_tool_call(&case), "{case}");
+            assert_eq!(strip_calls(&case), case);
+        }
     }
 
     #[test]
     fn the_required_grammar_writes_the_templates_markup() {
-        let tool: Tool = serde_json::from_value(serde_json::json!({
-            "type": "function",
-            "function": {"name": "Bash", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}
-        }))
-        .expect("tool");
-        let grammar = build_dsml_grammar(&[tool], true);
+        let grammar = build_dsml_grammar(&[bash(false)], true);
         let lark = grammar.grammars[0].lark_grammar.as_deref().expect("lark");
         assert!(
             lark.starts_with(
-                "start: \"<｜DSML｜tool_calls>\\n\" (invoke_0)+ \"</｜DSML｜tool_calls>\""
+                "start: \"<\" dsml_mark \"tool_calls>\\n\" (invoke_0)+ \"</\" dsml_mark \"tool_calls>\""
             ),
             "{lark}"
         );
         assert!(
-            lark.contains("invoke_0: \"<｜DSML｜invoke name=\\\"Bash\\\">\\n\""),
+            lark.contains(
+                "invoke_0: \"<\" dsml_mark \"invoke name=\\\"Bash\\\">\\n\" arguments_0 \"</\" dsml_mark \"invoke>\\n\""
+            ),
             "{lark}"
         );
+        assert!(lark.contains("arguments_0: dsml_parameter*"), "{lark}");
+    }
+
+    /// regression test for spiceai/mistral.rs#54: strict tools took any parameters
+    #[test]
+    fn a_strict_tools_grammar_holds_its_declared_parameters() {
+        let grammar = build_dsml_grammar(&[bash(true)], true);
+        let lark = grammar.grammars[0].lark_grammar.as_deref().expect("lark");
+        assert!(
+            lark.contains("arguments_0: parameter_0_0 parameter_0_1?"),
+            "{lark}"
+        );
+        assert!(
+            lark.contains(
+                "parameter_0_0: \"<\" dsml_mark \"parameter name=\\\"command\\\" string=\\\"true\\\">\" dsml_value"
+            ),
+            "{lark}"
+        );
+        assert!(
+            lark.contains(
+                "parameter_0_1: \"<\" dsml_mark \"parameter name=\\\"timeout\\\" string=\\\"false\\\">\" @dsml_schema_0_1"
+            ),
+            "{lark}"
+        );
+        assert_eq!(grammar.grammars.len(), 2);
+        assert_eq!(
+            grammar.grammars[1].json_schema,
+            Some(serde_json::json!({"type": "integer"}))
+        );
+    }
+
+    struct GreedyTokenizerEnv {
+        trie: toktrie::TokTrie,
+    }
+
+    impl toktrie::TokenizerEnv for GreedyTokenizerEnv {
+        fn tok_trie(&self) -> &toktrie::TokTrie {
+            &self.trie
+        }
+
+        fn tokenize_bytes(&self, bytes: &[u8]) -> Vec<toktrie::TokenId> {
+            self.trie.greedy_tokenize(bytes)
+        }
+
+        fn tokenize_is_canonical(&self) -> bool {
+            false
+        }
+    }
+
+    /// ASCII bytes as tokens, then `<eos>` and `｜DSML｜` as special tokens, as DeepSeek-V4's
+    /// tokenizer registers the marker.
+    fn dsml_env() -> (toktrie::TokEnv, toktrie::TokenId) {
+        let mut tokens = (0_u8..=127).map(|byte| vec![byte]).collect::<Vec<_>>();
+        let eos = u32::try_from(tokens.len()).expect("fits");
+        for token in ["<eos>", DSML] {
+            let mut bytes = vec![toktrie::TokTrie::SPECIAL_TOKEN_MARKER];
+            bytes.extend_from_slice(token.as_bytes());
+            tokens.push(bytes);
+        }
+        let vocab_size = u32::try_from(tokens.len()).expect("fits");
+        let trie = toktrie::TokTrie::from(&toktrie::TokRxInfo::new(vocab_size, eos), &tokens);
+        let mark = trie
+            .get_special_token(DSML)
+            .expect("the marker is a special token");
+        (Arc::new(GreedyTokenizerEnv { trie }), mark)
+    }
+
+    /// The tokens of a DSML text, with every marker as the special token.
+    fn dsml_tokens(text: &str, mark: toktrie::TokenId) -> Vec<toktrie::TokenId> {
+        let mut tokens = Vec::new();
+        for (index, piece) in text.split(DSML).enumerate() {
+            if index > 0 {
+                tokens.push(mark);
+            }
+            tokens.extend(piece.bytes().map(u32::from));
+        }
+        tokens
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a forced call had to spell the marker as
+    /// text, and could not write a closing tag inside a value
+    #[test]
+    fn a_forced_call_writes_the_marker_token_and_markup_in_values() {
+        let (env, mark) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let mut grammar = build_dsml_grammar(&[bash(true)], true);
+        specialize_required_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+        let lark = grammar.grammars[0].lark_grammar.as_deref().expect("lark");
+        assert!(lark.contains(&format!("dsml_mark: <[{mark}]>")), "{lark}");
+        let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
+        matcher
+            .consume_tokens(&[u32::from(b'<')])
+            .expect("the call opens with `<`");
+        let mask = matcher.compute_mask().expect("a mask");
+        assert!(mask.is_allowed(mark), "the marker token follows `<`");
+        let call = format!(
+            "{DSML}tool_calls>\n<{DSML}invoke name=\"Bash\">\n<{DSML}parameter name=\"command\" string=\"true\">echo '<div>Hi</div>'</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        matcher
+            .consume_tokens(&dsml_tokens(&call, mark))
+            .expect("the whole call");
+        assert!(matcher.is_accepting().expect("state"));
     }
 }

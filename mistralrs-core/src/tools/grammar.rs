@@ -195,7 +195,7 @@ mod tests {
             (parsers::ToolCallFormat::DeepSeek, "<｜tool▁call▁begin｜>"),
             (
                 parsers::ToolCallFormat::DeepSeekDsml,
-                r#"start: "<｜DSML｜tool_calls>\n""#,
+                r#"start: "<" dsml_mark "tool_calls>\n""#,
             ),
             (
                 parsers::ToolCallFormat::Gemma4,
