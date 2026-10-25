@@ -786,4 +786,65 @@ mod tests {
             .collect();
         assert_eq!(names, ["write_file"]);
     }
+
+    /// regression test for spiceai/mistral.rs#54: a block that broke a rule while its tags
+    /// stayed in place streamed out as content, and what the model wrote after it was read on
+    /// its own, so a `<tool_call>` example after it made a call the whole message does not
+    #[test]
+    fn a_message_that_opened_a_block_streams_nothing_after_it() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let empty = "Sure.\n<｜DSML｜tool_calls></｜DSML｜tool_calls>";
+        assert_eq!(matcher.prefix_could_be_tool(empty).unwrap(), (true, false));
+        let example =
+            format!("{empty} <tool_call>{{\"name\": \"Bash\", \"arguments\": {{}}}}</tool_call>");
+        assert_eq!(
+            matcher.prefix_could_be_tool(&example).unwrap(),
+            (true, false)
+        );
+        assert!(matcher.get_call(&example).unwrap().is_empty());
+        // A valid block after it still calls, and completes the message.
+        let later_block = format!(
+            "{empty}\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">x</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        assert_eq!(
+            matcher.prefix_could_be_tool(&later_block).unwrap(),
+            (false, true)
+        );
+        let calls = matcher.get_call(&later_block).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a finished call's span was blanked format by
+    /// format, so an opener of one format written inside a call of another, with the closer
+    /// after that call, blanked the enclosing call's closer and left it open
+    #[test]
+    fn a_marker_inside_a_finished_call_does_not_hide_that_calls_closer() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let message = "<tool_call>{\"name\": \"note\", \"arguments\": {\"text\": \"<atem:function_calls>\"}}</tool_call></atem:function_calls>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+    }
 }

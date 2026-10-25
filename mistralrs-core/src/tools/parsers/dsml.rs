@@ -10,14 +10,16 @@
 //! ```
 //!
 //! A parameter marked `string="true"` is its text exactly as written; any other value is
-//! JSON. The markup is read leniently, as quantized checkpoints write it: whitespace may
-//! follow the `｜DSML｜` token, and the block may be named `tool_calls`, `function_calls` or
-//! `calls`. It is read strictly otherwise: a block holds only invocations, an invocation only
-//! parameters, every tag closes before the next opens, a tag holds only the attributes the
-//! template writes, each once, and a parameter appears once. A block that breaks any of these
-//! stays content, so no call is made from it. A message that opens a block outside any other
-//! format's call is read only as DSML, so text inside a DSML call never becomes a call in
-//! another format; a block opened inside another format's call is that call's text.
+//! JSON, read to the first closing tag that leaves it readable as JSON, so a string may hold
+//! a tag's text. The markup is read leniently, as quantized checkpoints write it: spaces, tabs
+//! or line breaks may follow the `｜DSML｜` token, and the block may be named `tool_calls`,
+//! `function_calls` or `calls`. It is read strictly otherwise: a block holds only invocations,
+//! an invocation only parameters, every tag closes before the next opens, a tag holds only the
+//! attributes the template writes, each once, and a parameter appears once. A block that
+//! breaks any of these stays content, so no call is made from it. A message that opens a block
+//! outside any other format's call is read only as DSML, and whole: text inside a DSML call
+//! never becomes a call in another format, and nothing after the block streams out before the
+//! turn ends; a block opened inside another format's call is that call's text.
 
 use candle_core::Result;
 use llguidance::api::{GrammarWithLexer, TopLevelGrammar};
@@ -31,6 +33,10 @@ use crate::Tool;
 pub(super) const DSML: &str = "｜DSML｜";
 const OPEN: &str = "<｜DSML｜";
 const CLOSE: &str = "</｜DSML｜";
+/// The whitespace a tag may hold, as the grammars' value lexemes know it: `[ \t\r\n]`. The
+/// scanner reads no other whitespace in a tag, so a tag a grammar lets through as value text,
+/// such as one with a no-break space before its name, is value text to the scanner too.
+const WHITESPACE: [char; 4] = [' ', '\t', '\r', '\n'];
 /// The names a block of calls is written under, longest first.
 const BLOCK_NAMES: [&str; 3] = ["function_calls", "tool_calls", "calls"];
 /// The block name the chat template uses, and the one a grammar writes.
@@ -43,12 +49,13 @@ pub(super) const MARK_RULE: &str = r#"dsml_mark: "｜DSML｜""#;
 pub struct DsmlParser;
 
 impl ToolFormatParser for DsmlParser {
-    /// A block that is not finished could become a call. A block whose tags cannot be read makes
-    /// the whole message content, so the text from it on is held back too: streamed out, the
-    /// text after it would be read on its own, and a block in it could make a call the message
-    /// does not.
+    /// A block that is not finished could become a call. Once a message has opened a block,
+    /// finished or not, readable or not, the text from the block on is held back: a message
+    /// that opens a block is read whole and only as DSML, so streamed out, the text after the
+    /// block would be read on its own, and a block or another format's call in it could make
+    /// a call the message does not. A complete call ends the turn, so a call costs nothing.
     fn could_be_tool_call(&self, text: &str) -> bool {
-        !matches!(scan(text), Scan::Done(_))
+        block_start(text).is_some() || matches!(scan(text), Scan::More)
     }
 
     fn claim_start(&self, message: &str) -> Option<usize> {
@@ -121,7 +128,7 @@ fn tag_at<'a>(text: &'a str, closing: bool, names: &[&str]) -> Scan<(&'a str, us
             Scan::Bad
         };
     };
-    let rest = after.trim_start();
+    let rest = after.trim_start_matches(WHITESPACE);
     if rest.is_empty() {
         return Scan::More;
     }
@@ -132,7 +139,7 @@ fn tag_at<'a>(text: &'a str, closing: bool, names: &[&str]) -> Scan<(&'a str, us
                 return Scan::More;
             }
             // The name ends at whitespace or the tag's end, so `calls` does not read `callsX`.
-            if !tail.starts_with(|c: char| c == '>' || c.is_whitespace()) {
+            if !tail.starts_with(|c: char| c == '>' || WHITESPACE.contains(&c)) {
                 continue;
             }
             // The tag ends at its `>`; a `<` first means another tag began inside it.
@@ -159,7 +166,7 @@ fn attribute_pairs<'a>(text: &'a str, keys: &[&str]) -> Option<Vec<(&'a str, &'a
     let mut pairs: Vec<(&str, &str)> = Vec::new();
     let mut rest = text;
     loop {
-        let pair = rest.trim_start();
+        let pair = rest.trim_start_matches(WHITESPACE);
         if pair.is_empty() {
             return Some(pairs);
         }
@@ -184,30 +191,45 @@ fn attribute<'a>(pairs: &[(&str, &'a str)], key: &str) -> Option<&'a str> {
 }
 
 fn leading_whitespace(text: &str) -> usize {
-    text.len() - text.trim_start().len()
+    text.len() - text.trim_start_matches(WHITESPACE).len()
 }
 
 /// A parameter's value, which runs from the end of its opening tag, the start of `text`, to
 /// its own closing tag: anything else in it, DSML tags included, is part of the value. The
 /// flag says whether the closing tag carried attributes, which the template never writes.
-fn value_at(text: &str) -> Scan<(&str, usize, bool)> {
+///
+/// A `json` value may spell a closing tag inside a JSON string, so it ends at the first closing
+/// tag that leaves it readable as JSON. One that no closing tag leaves readable is text ending
+/// at the first, as the parser reads a value that does not parse; but when it begins a JSON
+/// string, object or array, which could hold the tag's text, the text so far may still be cut
+/// short, and more could finish it.
+fn value_at(text: &str, json: bool) -> Scan<(&str, usize, bool)> {
+    let mut first = None;
     let mut from = 0;
     while let Some(offset) = text[from..].find(CLOSE) {
         let at = from + offset;
         match tag_at(&text[at..], true, &["parameter"]) {
             Scan::Done((attributes, length)) => {
-                return Scan::Done((&text[..at], at + length, !bare(attributes)));
+                let value = (&text[..at], at + length, !bare(attributes));
+                if !json || serde_json::from_str::<Value>(value.0.trim()).is_ok() {
+                    return Scan::Done(value);
+                }
+                first.get_or_insert(value);
+                from = at + length;
             }
             Scan::More => return Scan::More,
             Scan::Bad => from = at + CLOSE.len(),
         }
     }
-    Scan::More
+    match first {
+        Some(value) if !value.0.trim_start().starts_with(['"', '{', '[']) => Scan::Done(value),
+        _ => Scan::More,
+    }
 }
 
 /// Whether a tag's attributes are none at all.
 fn bare(attributes: &str) -> bool {
-    attributes.trim().is_empty()
+    attributes.trim_matches(WHITESPACE).is_empty()
 }
 
 /// One invocation, from the end of its opening tag, the start of `text`, through its closing
@@ -238,17 +260,18 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize, boo
         let name = attribute(&attributes, "name");
         malformed |= name.is_none();
         at += length;
-        let (raw, length, closed_with_attributes) = match value_at(&text[at..]) {
+        let json = attribute(&attributes, "string") != Some("true");
+        let (raw, length, closed_with_attributes) = match value_at(&text[at..], json) {
             Scan::Done(value) => value,
             Scan::More => return Scan::More,
             Scan::Bad => return Scan::Bad,
         };
         malformed |= closed_with_attributes;
         at += length;
-        let value = if attribute(&attributes, "string") == Some("true") {
-            Value::String(raw.to_string())
-        } else {
+        let value = if json {
             serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
+        } else {
+            Value::String(raw.to_string())
         };
         // A parameter given twice has no one value to call with.
         if let Some(name) = name {
@@ -259,7 +282,10 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize, boo
 
 /// The name of the block a complete opening tag `tag` opens.
 fn block_name(tag: &str) -> &'static str {
-    let rest = tag.strip_prefix(OPEN).unwrap_or(tag).trim_start();
+    let rest = tag
+        .strip_prefix(OPEN)
+        .unwrap_or(tag)
+        .trim_start_matches(WHITESPACE);
     BLOCK_NAMES
         .into_iter()
         .find(|name| rest.starts_with(name))
@@ -396,10 +422,13 @@ fn block_start(message: &str) -> Option<usize> {
 /// Whether the DSML tag at the start of `text` names a block, whether or not the tag can be
 /// read.
 fn names_block(text: &str) -> bool {
-    let rest = text.strip_prefix(OPEN).unwrap_or(text).trim_start();
+    let rest = text
+        .strip_prefix(OPEN)
+        .unwrap_or(text)
+        .trim_start_matches(WHITESPACE);
     BLOCK_NAMES.into_iter().any(|name| {
         rest.strip_prefix(name).is_some_and(|tail| {
-            tail.starts_with(|c: char| c == '>' || c == '<' || c.is_whitespace())
+            tail.starts_with(|c: char| c == '>' || c == '<' || WHITESPACE.contains(&c))
         })
     })
 }
@@ -445,12 +474,12 @@ DSML_VALUE_LT_SLASH: /(?s:.*)<\// & ~/(?s:.*)<\/｜DSML｜(?s:.*)/"#;
 
 /// The value rules where the marker is a special token: text between markers, where a marker
 /// after `</` begins the closing tag only when `parameter` follows it, so other DSML tags are
-/// part of the value. No text lexeme holds the marker's text: the parser reads a marker spelled
-/// in ordinary tokens as the token, so a value spelling its closing tag that way would read as
-/// the end of the value and parameters after it.
+/// part of the value, and markers may follow one another. No text lexeme holds the marker's
+/// text: the parser reads a marker spelled in ordinary tokens as the token, so a value spelling
+/// its closing tag that way would read as the end of the value and parameters after it.
 pub(super) const VALUE_RULES_WITH_MARK_TOKEN: &str = r#"dsml_vc: dsml_vc_open | dsml_mark dsml_vc_open
-dsml_vc_open: DSML_LT_SLASH dsml_mark dsml_vc_closing | DSML_OTHER dsml_mark dsml_vc_open
-dsml_vc_closing: "parameter>\n" | DSML_NP_LT_SLASH dsml_mark dsml_vc_closing | DSML_NP_OTHER dsml_mark dsml_vc_open
+dsml_vc_open: DSML_LT_SLASH dsml_mark dsml_vc_closing | DSML_OTHER dsml_mark dsml_vc_open | dsml_mark dsml_vc_open
+dsml_vc_closing: "parameter>\n" | DSML_NP_LT_SLASH dsml_mark dsml_vc_closing | DSML_NP_OTHER dsml_mark dsml_vc_open | dsml_mark dsml_vc_open
 DSML_LT_SLASH: /(?s:.*)<\// & ~/(?s:.*)｜DSML｜(?s:.*)/
 DSML_OTHER: /(?s:.+)/ & ~/(?s:.*)<\// & ~/(?s:.*)｜DSML｜(?s:.*)/
 DSML_NP_LT_SLASH: /(?s:.*)<\// & ~/[ \t\r\n]*parameter[> \t\r\n](?s:.*)/ & ~/(?s:.*)｜DSML｜(?s:.*)/
@@ -900,7 +929,8 @@ mod tests {
             cut += whole[cut..].chars().next().expect("a char").len_utf8();
         }
         assert!(calls(whole).is_some());
-        assert!(!DsmlParser.could_be_tool_call(whole));
+        // The message is DSML's from the block on; the complete call ends the turn.
+        assert!(DsmlParser.could_be_tool_call(whole));
     }
 
     #[test]
@@ -917,8 +947,9 @@ mod tests {
     }
 
     /// regression test for spiceai/mistral.rs#54: malformed blocks made calls. A block that
-    /// breaks a rule while its tags stay in place streams on as content; one whose tags cannot
-    /// be read is content too, held back with the rest of the message.
+    /// breaks a rule while its tags stay in place is content, and reading resumes after it; one
+    /// whose tags cannot be read is content with everything after it. Either holds back the
+    /// message from the block on, so nothing after it is read on its own.
     #[test]
     fn a_malformed_block_stays_content() {
         let open = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"Bash\">";
@@ -940,10 +971,23 @@ mod tests {
             // A block with nothing in it.
             "<｜DSML｜tool_calls></｜DSML｜tool_calls>".to_string(),
         ];
+        let valid_after = |case: &str| {
+            format!(
+                "{case}\n<｜DSML｜tool_calls><｜DSML｜invoke name=\"Bash\">{}</｜DSML｜invoke></｜DSML｜tool_calls>",
+                parameter("command", "ls")
+            )
+        };
         for case in readable {
             assert_eq!(calls(&case), None, "{case}");
-            assert!(!DsmlParser.could_be_tool_call(&case), "{case}");
+            assert!(DsmlParser.could_be_tool_call(&case), "{case}");
             assert_eq!(strip_calls(&case), case);
+            // Reading resumes after it: a valid block after it calls.
+            let followed = valid_after(&case);
+            assert_eq!(
+                calls(&followed),
+                Some(serde_json::json!([{"name": "Bash", "arguments": {"command": "ls"}}])),
+                "{followed}"
+            );
         }
         let unreadable = [
             // A named invocation that never closes, then an unnamed one.
@@ -968,7 +1012,7 @@ mod tests {
             assert!(DsmlParser.could_be_tool_call(&case), "{case}");
             assert_eq!(strip_calls(&case), case);
             // Whatever follows is held with it, and makes no call.
-            let followed = format!("{case}\n<｜DSML｜tool_calls><｜DSML｜invoke name=\"Bash\">{}</｜DSML｜invoke></｜DSML｜tool_calls>", parameter("command", "ls"));
+            let followed = valid_after(&case);
             assert_eq!(calls(&followed), None, "{followed}");
             assert!(DsmlParser.could_be_tool_call(&followed), "{followed}");
         }
@@ -1531,17 +1575,119 @@ mod tests {
         assert!(!accepts(&tokens));
     }
 
-    /// A JSON value that spells a parameter's closing tag in ordinary tokens ends the parameter
-    /// there, and the block cannot be read past the quote that follows: the message makes no
-    /// call, rather than a call with the rest of the value read as more parameters.
+    /// regression test for spiceai/mistral.rs#54: a JSON value that spelled its parameter's
+    /// closing tag inside a string ended the parameter there, so a forced call could end with
+    /// its required parameters left out, or could not be read at all
     #[test]
-    fn a_json_value_spelling_the_closing_tag_as_text_makes_no_call() {
-        let message = format!(
-            "<{DSML}tool_calls>\n<{DSML}invoke name=\"set\">\n<{DSML}parameter name=\"body\" string=\"false\">\"</{DSML}parameter>\"</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+    fn a_json_value_may_hold_its_closing_tag_in_a_string() {
+        let json_call = |body: &str, after: &str| {
+            format!(
+                "<{DSML}tool_calls>\n<{DSML}invoke name=\"set\">\n<{DSML}parameter name=\"body\" string=\"false\">{body}</{DSML}parameter>\n{after}</{DSML}invoke>\n</{DSML}tool_calls>"
+            )
+        };
+        let count =
+            format!("<{DSML}parameter name=\"count\" string=\"false\">2</{DSML}parameter>\n");
+        // The review's case: the whole block's closing tags inside the string.
+        let tags = format!("ok</{DSML}parameter></{DSML}invoke></{DSML}tool_calls>");
+        let message = json_call(&format!("\"{tags}\""), &count);
+        assert_eq!(
+            calls(&message),
+            Some(serde_json::json!([{"name": "set", "arguments": {"body": tags, "count": 2}}]))
         );
-        assert_eq!(calls(&message), None);
-        // The message is held back whole, as one that cannot be read.
-        assert!(DsmlParser.could_be_tool_call(&message));
+        // Cut before the closing quote, the call is not complete: the string may still close.
+        let cut = &message[..message.find(&format!("{tags}\"")).expect("the value") + tags.len()];
+        assert_eq!(calls(cut), None);
+        assert!(DsmlParser.could_be_tool_call(cut));
+        // A closing tag alone in the string.
+        assert_eq!(
+            calls(&json_call(&format!("\"</{DSML}parameter>\""), "")),
+            Some(
+                serde_json::json!([{"name": "set", "arguments": {"body": format!("</{DSML}parameter>")}}])
+            )
+        );
+        // A value that is not JSON is still its text, ending at the first closing tag.
+        assert_eq!(
+            calls(&json_call("maybe", &count)),
+            Some(serde_json::json!([{"name": "set", "arguments": {"body": "maybe", "count": 2}}]))
+        );
+        // One that begins like JSON and never reads as JSON could still be cut short.
+        assert_eq!(calls(&json_call("{\"a\": ", &count)), None);
+        // Through the forced grammar, as JSON held to its schema: the string is written in
+        // ordinary tokens, tags included, and reads back whole.
+        let strict_json = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "body": { "type": "string", "minLength": 1 } },
+            "required": ["body"],
+            "additionalProperties": false,
+        }));
+        let (env, mark) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let mut grammar = build_dsml_grammar(std::slice::from_ref(&strict_json), Block::Whole);
+        specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+        let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
+        let value = format!("\"{tags}\"");
+        let tokens = call_with_text_value("set", "false", &value, mark);
+        assert!(matcher.consume_tokens(&tokens).is_ok() && matcher.is_accepting().expect("state"));
+        let written = format!(
+            "<{DSML}tool_calls>\n<{DSML}invoke name=\"set\">\n<{DSML}parameter name=\"body\" string=\"false\">{value}</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        assert_eq!(
+            calls(&written),
+            Some(serde_json::json!([{"name": "set", "arguments": {"body": tags}}]))
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: the scanner read any Unicode whitespace in a
+    /// tag, but the grammars' value lexemes know only `[ \t\r\n]`, so a closing tag with a
+    /// no-break space before its name passed a forced value as text and ended the parameter in
+    /// the scanner, with parameters the schema does not have after it
+    #[test]
+    fn a_tag_with_other_whitespace_is_value_text_to_the_scanner_too() {
+        let body_only = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "body": { "type": "string" } },
+            "required": ["body"],
+            "additionalProperties": false,
+        }));
+        let value = format!(
+            "x</{DSML}\u{a0}parameter>\n<{DSML}parameter name=\"injected\" string=\"true\">y"
+        );
+        let written = format!(
+            "<{DSML}tool_calls>\n<{DSML}invoke name=\"set\">\n<{DSML}parameter name=\"body\" string=\"true\">{value}</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        // The grammar lets the value through, with the markers as the token.
+        let (env, mark) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let mut grammar = build_dsml_grammar(std::slice::from_ref(&body_only), Block::Whole);
+        specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+        let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
+        assert!(
+            matcher.consume_tokens(&dsml_tokens(&written, mark)).is_ok()
+                && matcher.is_accepting().expect("state")
+        );
+        // The scanner reads the same value, whole.
+        assert_eq!(
+            calls(&written),
+            Some(serde_json::json!([{"name": "set", "arguments": {"body": value}}]))
+        );
+        // The template's own spacing still reads.
+        assert!(calls(&format!(
+            "<{DSML} tool_calls>\n<{DSML} invoke name=\"set\">\n<{DSML} parameter name=\"body\" string=\"true\">v</{DSML} parameter>\n</{DSML} invoke>\n</{DSML} tool_calls>"
+        ))
+        .is_some());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a forced value could not hold two markers in
+    /// a row, which the scanner reads as value text
+    #[test]
+    fn a_forced_value_may_hold_adjacent_markers() {
+        let value = format!("a{DSML}{DSML}b");
+        let call = one_call("Bash", &[("command", "true", &value)]);
+        assert!(forced_call_accepts(&[bash(true)], &call));
+        assert_eq!(
+            calls(&call),
+            Some(serde_json::json!([{"name": "Bash", "arguments": {"command": value}}]))
+        );
     }
 
     /// Runs `rest`, written after the block that `opener` ends by opening, through the

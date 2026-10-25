@@ -248,23 +248,33 @@ const CLOSED_CALL_DELIMITERS: [(ToolCallFormat, &str, &str); 6] = [
 ];
 
 /// `text` with every finished call of a format whose calls close blanked out, so a marker the
-/// model wrote inside one, as an argument's text, does not open a call in another format.
+/// model wrote inside one, as an argument's text, does not open a call in another format. The
+/// calls are read left to right: the earliest opener claims the text through its closer, and
+/// a marker inside that span, whichever format's, is the call's text. An opener that never
+/// closes is a call that holds everything after it, which is left as it is.
 fn without_closed_calls(text: &str) -> String {
     let mut out = text.to_string();
-    for (_, start, end) in CLOSED_CALL_DELIMITERS {
-        let mut from = 0;
-        while let Some(offset) = out[from..].find(start) {
-            let open = from + offset;
-            let Some(length) = out[open + start.len()..].find(end) else {
-                break;
-            };
-            let close = open + start.len() + length + end.len();
-            let blank = " ".repeat(out[open..close].chars().count());
-            out.replace_range(open..close, &blank);
-            from = open + blank.len();
-        }
+    let mut from = 0;
+    loop {
+        let Some((open, start, end)) = CLOSED_CALL_DELIMITERS
+            .iter()
+            .filter_map(|(_, start, end)| {
+                out[from..]
+                    .find(start)
+                    .map(|offset| (from + offset, *start, *end))
+            })
+            .min_by_key(|(open, start, _)| (*open, std::cmp::Reverse(start.len())))
+        else {
+            return out;
+        };
+        let Some(length) = out[open + start.len()..].find(end) else {
+            return out;
+        };
+        let close = open + start.len() + length + end.len();
+        let blank = " ".repeat(out[open..close].chars().count());
+        out.replace_range(open..close, &blank);
+        from = open + blank.len();
     }
-    out
 }
 
 /// Whether a call in a format other than `format` is open at the end of `text`. A marker inside
