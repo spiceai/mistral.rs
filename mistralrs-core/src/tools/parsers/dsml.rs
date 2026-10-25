@@ -266,7 +266,9 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize, boo
         };
         let (attributes, well_formed) = attribute_pairs(attributes, &["name", "string"]);
         let name = attribute(&attributes, "name");
-        malformed |= !well_formed || name.is_none();
+        // A parameter name the markup cannot write (`""`, `1st`, `a b`) is one no grammar would
+        // have written, and no tool declares: the invocation is content, its framing kept.
+        malformed |= !well_formed || !name.is_some_and(writable_name);
         at += length;
         let json = attribute(&attributes, "string") != Some("true");
         let (raw, length, closed_with_attributes) = match value_at(&text[at..], json) {
@@ -1977,6 +1979,30 @@ mod tests {
         // Without the flag the same value is JSON cut short, and the block waits for more.
         let unflagged = stray.replace(" string=\"true\" extra=\"1\"", " extra=\"1\"");
         assert_eq!(calls(&format!("{unflagged}\n{valid}")), None);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: with no grammar active, a parameter named
+    /// `""`, `1st` or `a b` was read as an argument of an executable call, though no grammar
+    /// writes such a name and no tool declares one
+    #[test]
+    fn a_parameter_name_the_markup_cannot_write_makes_the_block_content() {
+        let valid = format!(
+            "<{DSML}tool_calls>\n<{DSML}invoke name=\"Bash\">\n<{DSML}parameter name=\"command\" string=\"true\">ls</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        for bad in ["", "1st", "a b", "x>y"] {
+            let block = format!(
+                "<{DSML}tool_calls>\n<{DSML}invoke name=\"Bash\">\n<{DSML}parameter name=\"{bad}\" string=\"true\">{{ text</{DSML}parameter>\n<{DSML}parameter name=\"command\" string=\"true\">ls</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+            );
+            assert_eq!(calls(&block), None, "{bad:?}");
+            assert_eq!(strip_calls(&block), block, "{bad:?}");
+            // The block ends where the model closed it, so a valid block after it still calls.
+            assert_eq!(
+                calls(&format!("{block}\n{valid}")),
+                Some(serde_json::json!([{"name": "Bash", "arguments": {"command": "ls"}}])),
+                "{bad:?}"
+            );
+        }
+        assert!(calls(&valid.replace("command", "a.b-c_9")).is_some());
     }
 
     /// regression test for spiceai/mistral.rs#54: a strict property whose name the markup cannot

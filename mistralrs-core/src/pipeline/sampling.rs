@@ -70,6 +70,15 @@ fn activate_required_tool_call_grammar(
     if !matches!(seq.recognizer, SequenceRecognizer::None) {
         return;
     }
+    // Only a required call still owed can be forced; ordinary generation skips the rest, which
+    // copies the response so far on every token.
+    if !seq
+        .tool_call_state
+        .as_ref()
+        .is_some_and(ToolCallState::required_tool_call_unsatisfied)
+    {
+        return;
+    }
     let generated = seq.generated_len();
     let max_generation_len = seq.max_generation_len(max_model_len);
     let (_, remaining, deadline_tokens) =
