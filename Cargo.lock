@@ -449,6 +449,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags 2.10.0",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.12.1",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 2.1.1",
+ "shlex",
+ "syn 2.0.114",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -495,6 +515,16 @@ name = "bitflags"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "812e12b5285cc515a9c72a5c1d3b6d46a19dac5acfef5265968c166106e31dd3"
+
+[[package]]
+name = "bitmask-enum"
+version = "2.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6cbbb8f56245b5a479b30a62cdc86d26e2f35c2b9f594bc4671654b03851380"
+dependencies = [
+ "quote",
+ "syn 2.0.114",
+]
 
 [[package]]
 name = "bitstream-io"
@@ -568,6 +598,12 @@ name = "bumpalo"
 version = "3.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5dd9dc738b7a8311c7ade152424974d8115f2cdad61e8dab8dac9f2362298510"
+
+[[package]]
+name = "bytecount"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 
 [[package]]
 name = "bytemuck"
@@ -1203,7 +1239,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f42e2c99c56bf2eef9d569435bfd72a478dfaea3f178b8e5bae891875bbbe2e"
 dependencies = [
- "bindgen",
+ "bindgen 0.69.5",
  "libloading 0.8.9",
  "prettyplease",
  "proc-macro2",
@@ -3888,11 +3924,13 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "sideway",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "yoke",
 ]
 
@@ -4399,6 +4437,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "os_socketaddr"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fa149f3ec09cadeb41968390fcd71e6ea038a9a373d1d4eb070f4d9484d4b244"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "oxide-artifacts"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4414,6 +4462,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69e0a534dd2e6aefce319af62a0aa0066a76bdfcec0201dfe02df226bc9ec70"
 dependencies = [
  "num-traits",
+]
+
+[[package]]
+name = "papergrid"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b915f831b85d984193fdc3d3611505871dc139b2534530fa01c1a6a6707b6723"
+dependencies = [
+ "bytecount",
+ "fnv",
+ "unicode-width",
 ]
 
 [[package]]
@@ -5134,6 +5193,19 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rdma-mummy-sys"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5374aa8973cc929fabf02775c927e123737cee4a8eef4e296600424a578a190a"
+dependencies = [
+ "bindgen 0.72.1",
+ "cmake",
+ "libc",
+ "memoffset",
+ "paste",
 ]
 
 [[package]]
@@ -5999,6 +6071,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "sideway"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7669500361477013bc37bcf21f6c9cd6ffcf4839b6fbffb3cb9df11e30a78c3e"
+dependencies = [
+ "bitmask-enum",
+ "libc",
+ "os_socketaddr",
+ "rdma-mummy-sys",
+ "serde",
+ "tabled",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "signal-hook"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6496,6 +6583,29 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "tabled"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "121d8171ee5687a4978d1b244f7d99c43e7385a272185a2f1e1fa4dc0979d444"
+dependencies = [
+ "papergrid",
+ "tabled_derive",
+]
+
+[[package]]
+name = "tabled_derive"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52d9946811baad81710ec921809e2af67ad77719418673b2a3794932d57b7538"
+dependencies = [
+ "heck",
+ "proc-macro-error2",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
 ]
 
 [[package]]
