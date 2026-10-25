@@ -466,6 +466,8 @@ fn lark_literal(value: &str) -> String {
 
 /// A string parameter's value and its closing tag, as a grammar rule.
 const VALUE_THEN_CLOSE: &str = "dsml_vc";
+/// The sub-grammar for any JSON value, the `string="false"` value of a parameter no schema holds.
+const ANY_JSON: &str = "dsml_json";
 
 /// The value rules where the marker is text: any text through a final `</` that holds no
 /// `</｜DSML｜`, the text the closing tag reads as.
@@ -571,11 +573,15 @@ fn build_dsml_grammar(tools: &[Tool], block: Block) -> TopLevelGrammar {
     let mut lines = vec![start];
     lines.extend(rules);
     lines.extend([
+        // Any parameter: text as `string="true"`, or one complete JSON value as `string="false"`,
+        // which the parser reads as JSON; a value that is not JSON would be read as text, and
+        // one cut short would leave the block unfinished.
         format!(
-            "dsml_parameter: {} PARAM_NAME {} (\"true\" | \"false\") {} {VALUE_THEN_CLOSE}",
+            "dsml_parameter: {} PARAM_NAME {} (\"true\" {after} {VALUE_THEN_CLOSE} | \"false\" {after} @{ANY_JSON} {close})",
             tag(false, "parameter name=\""),
             lark_literal("\" string=\""),
-            lark_literal("\">"),
+            after = lark_literal("\">"),
+            close = tag(true, "parameter>\n"),
         ),
         // A value is any text but its closing tag, which `</` and then the marker start, so
         // ordinary markup such as `</div>` is part of it. A lexeme reads the value with the
@@ -587,6 +593,12 @@ fn build_dsml_grammar(tools: &[Tool], block: Block) -> TopLevelGrammar {
     ]);
     let mut grammars = vec![GrammarWithLexer::from_lark(lines.join("\n"))];
     grammars.extend(schemas);
+    // The value of a `string="false"` parameter of a tool that is not strict: any JSON.
+    grammars.push(GrammarWithLexer {
+        name: Some(ANY_JSON.to_string()),
+        json_schema: Some(serde_json::json!({})),
+        ..Default::default()
+    });
     TopLevelGrammar {
         grammars,
         max_tokens: None,
@@ -721,23 +733,72 @@ fn property_schema(root: &Value, name: &str) -> Value {
 }
 
 /// Every `$ref` in `schema` that points into its own document (`#/...`) made relative to `base`.
+/// Only the keywords that hold schemas are entered: `const`, `enum`, `default`, `examples` and
+/// the annotations hold data, where a `$ref` key is a value's own.
 fn rebase_references(schema: &mut Value, base: &str) {
-    match schema {
-        Value::Object(object) => {
-            for (key, value) in object.iter_mut() {
-                match value {
-                    Value::String(reference) if key == "$ref" && reference.starts_with('#') => {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    let each = |values: &mut Value| {
+        if let Some(map) = values.as_object_mut() {
+            map.values_mut()
+                .for_each(|value| rebase_references(value, base));
+        } else if let Some(items) = values.as_array_mut() {
+            items
+                .iter_mut()
+                .for_each(|item| rebase_references(item, base));
+        }
+    };
+    for (key, value) in object.iter_mut() {
+        match key.as_str() {
+            "$ref" => {
+                if let Value::String(reference) = value {
+                    if reference.starts_with('#') {
                         *reference = format!("{base}{}", &reference[1..]);
                     }
-                    _ => rebase_references(value, base),
                 }
             }
+            // A schema, a map of schemas, or an array of schemas.
+            "additionalProperties"
+            | "unevaluatedProperties"
+            | "propertyNames"
+            | "items"
+            | "additionalItems"
+            | "unevaluatedItems"
+            | "contains"
+            | "not"
+            | "if"
+            | "then"
+            | "else"
+            | "contentSchema"
+            | "properties"
+            | "patternProperties"
+            | "$defs"
+            | "definitions"
+            | "dependentSchemas"
+            | "allOf"
+            | "anyOf"
+            | "oneOf"
+            | "prefixItems" => {
+                if value.is_object() && !is_schema_map(key) {
+                    rebase_references(value, base);
+                } else {
+                    each(value);
+                }
+            }
+            // A map of schemas or of property-name arrays.
+            "dependencies" => each(value),
+            _ => {}
         }
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| rebase_references(item, base)),
-        _ => {}
     }
+}
+
+/// Whether `keyword` holds a map from names to schemas, rather than one schema.
+fn is_schema_map(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
+    )
 }
 
 /// The rule for a call's parameters. A strict tool's parameters are its declared properties,
@@ -771,9 +832,10 @@ fn emit_arguments(
         for (property_index, name) in names.into_iter().enumerate() {
             let parameter = format!("parameter_{tool_index}_{property_index}");
             rules.push(format!(
-                "{parameter}: {open} (\"true\" | \"false\") {after} {VALUE_THEN_CLOSE}",
+                "{parameter}: {open} (\"true\" {after} {VALUE_THEN_CLOSE} | \"false\" {after} @{ANY_JSON} {close})",
                 open = tag(false, &format!("parameter name=\"{name}\" string=\"")),
                 after = lark_literal("\">"),
+                close = tag(true, "parameter>\n"),
             ));
             sequence.push(format!("{parameter}?"));
         }
@@ -1087,7 +1149,8 @@ mod tests {
             ),
             "{lark}"
         );
-        assert_eq!(grammar.grammars.len(), 2);
+        // The property's schema, then the any-JSON grammar for parameters no schema holds.
+        assert_eq!(grammar.grammars.len(), 3);
         // The property's schema refers into the whole tool schema, so its references resolve
         // as they do there.
         assert_eq!(
@@ -1097,6 +1160,103 @@ mod tests {
                 "$defs": { "tool": bash(true).function.parameters.expect("parameters") },
             }))
         );
+        assert_eq!(grammar.grammars[2].name.as_deref(), Some("dsml_json"));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a tool that is not strict could write a
+    /// `string="false"` value that is not JSON, or JSON cut short, which the parser reads as
+    /// unfinished, so a forced call could end with no call read from it
+    #[test]
+    fn a_tools_json_parameter_is_one_complete_json_value() {
+        for (value, accepted) in [
+            ("5", true),
+            ("{\"a\": [1, 2]}", true),
+            ("\"text\"", true),
+            ("{", false),
+            ("[1,", false),
+            ("maybe", false),
+        ] {
+            // A declared parameter of a tool that is not strict.
+            assert_eq!(
+                forced_call_accepts(
+                    &[bash(false)],
+                    &one_call("Bash", &[("timeout", "false", value)])
+                ),
+                accepted,
+                "declared {value:?}"
+            );
+            // Any parameter of a tool that declares none.
+            let any = tool(serde_json::json!({ "type": "object" }));
+            let mut any = any;
+            any.function.strict = Some(false);
+            assert_eq!(
+                forced_call_accepts(
+                    std::slice::from_ref(&any),
+                    &one_call("set", &[("x", "false", value)])
+                ),
+                accepted,
+                "undeclared {value:?}"
+            );
+        }
+        // Text takes anything.
+        assert!(forced_call_accepts(
+            &[bash(false)],
+            &one_call("Bash", &[("command", "true", "{")])
+        ));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: rebasing a property schema's references also
+    /// rewrote a `$ref` key inside a `const` value, which is data, so the forced grammar
+    /// required a value the schema does not allow
+    #[test]
+    fn rebasing_references_leaves_a_schemas_data_alone() {
+        let root = serde_json::json!({
+            "type": "object",
+            "$defs": { "Any": {} },
+            "properties": {
+                "pinned": { "type": "object", "const": { "$ref": "#/original" } },
+                "listed": { "enum": [{ "$ref": "#/original" }], "default": { "$ref": "#/d" } },
+                "nested": { "type": "array", "items": { "$ref": "#/$defs/Any" } },
+            },
+            "required": ["pinned", "listed", "nested"],
+            "additionalProperties": false,
+        });
+        let schema = property_schema(&root, "pinned");
+        let tool_copy = &schema["$defs"]["tool"];
+        assert_eq!(
+            tool_copy["properties"]["pinned"]["const"],
+            serde_json::json!({ "$ref": "#/original" })
+        );
+        assert_eq!(
+            tool_copy["properties"]["listed"]["enum"],
+            serde_json::json!([{ "$ref": "#/original" }])
+        );
+        assert_eq!(
+            tool_copy["properties"]["listed"]["default"],
+            serde_json::json!({ "$ref": "#/d" })
+        );
+        assert_eq!(
+            tool_copy["properties"]["nested"]["items"]["$ref"],
+            serde_json::json!("#/$defs/tool/$defs/Any")
+        );
+        // Through the forced grammar: the constant as the schema gives it, and nothing else.
+        let pinned = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "pinned": { "type": "object", "const": { "$ref": "#/original" } } },
+            "required": ["pinned"],
+            "additionalProperties": false,
+        }));
+        assert!(forced_call_accepts(
+            std::slice::from_ref(&pinned),
+            &one_call("set", &[("pinned", "false", r##"{"$ref": "#/original"}"##)])
+        ));
+        assert!(!forced_call_accepts(
+            &[pinned],
+            &one_call(
+                "set",
+                &[("pinned", "false", r##"{"$ref": "#/$defs/tool/original"}"##)]
+            )
+        ));
     }
 
     struct GreedyTokenizerEnv {
