@@ -105,6 +105,20 @@ fn fix_broken_json(raw: &str) -> anyhow::Result<String> {
     }
 }
 
+/// `message` with `fix_broken_json`'s repair, unless `format` writes exact JSON of its own: a
+/// DSML call's arguments are what the parser read, so a string parameter named `arguments`
+/// holding `{}` is a string, which the repair would turn into an object.
+fn repaired_unless_exact(
+    message: String,
+    format: Option<ToolCallFormat>,
+) -> anyhow::Result<String> {
+    if format == Some(ToolCallFormat::DeepSeekDsml) {
+        Ok(message)
+    } else {
+        fix_broken_json(&message)
+    }
+}
+
 impl ToolCallingMatcher {
     #[cfg(test)]
     pub fn new(tool_choice: ToolChoice, tools: Option<&[crate::Tool]>) -> anyhow::Result<Self> {
@@ -200,8 +214,12 @@ impl ToolCallingMatcher {
             return Ok((false, false));
         }
         let raw_prefix = message_prefix;
-        let message_prefix = process_model_specific_message(message_prefix)?;
-        let message_prefix = fix_broken_json(&message_prefix).map_err(candle_core::Error::msg)?;
+        let (message_prefix, format) = match parsers::extract_model_specific_call(message_prefix)? {
+            Some((json, _, format)) => (json, Some(format)),
+            None => (process_model_specific_message(message_prefix)?, None),
+        };
+        let message_prefix =
+            repaired_unless_exact(message_prefix, format).map_err(candle_core::Error::msg)?;
 
         // Check if the prefix could be a JSON serialization of any of the following types.
         let (could_be_tool, is_complete_tool) = [
@@ -249,7 +267,7 @@ impl ToolCallingMatcher {
         } else {
             (process_model_specific_message(message)?, None, None)
         };
-        let message = fix_broken_json(&message)?;
+        let message = repaired_unless_exact(message, format)?;
 
         let mut calls = if let Ok(deser) =
             serde_json::from_str::<CalledFunctionParameters>(&message)
@@ -846,5 +864,26 @@ mod tests {
             .map(|call| call.function.name.as_str())
             .collect();
         assert_eq!(names, ["write_file"]);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: the repair for a model's stringified
+    /// `arguments` ran on the DSML parser's own JSON, so a string parameter named `arguments`
+    /// holding `{}` reached the tool as an object
+    #[test]
+    fn a_dsml_string_parameter_named_arguments_stays_a_string() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": "note", "parameters": { "type": "object" } },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        let message = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"note\">\n<｜DSML｜parameter name=\"arguments\" string=\"true\">{}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        assert_eq!(
+            matcher.prefix_could_be_tool(message).unwrap(),
+            (false, true)
+        );
+        let calls = matcher.get_call(message).unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"arguments": "{}"}));
     }
 }

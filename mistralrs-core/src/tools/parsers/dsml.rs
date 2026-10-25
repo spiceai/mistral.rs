@@ -700,18 +700,44 @@ pub(super) fn unenforceable(tools: &[Tool]) -> Option<String> {
     })
 }
 
-/// `property` with the definitions of the tool schema `root`, which its references are
-/// relative to.
-fn with_definitions(property: &Value, root: &Value) -> Value {
-    let mut property = property.clone();
-    if let Some(object) = property.as_object_mut() {
-        for key in ["$defs", "definitions"] {
-            if let (Some(definitions), false) = (root.get(key), object.contains_key(key)) {
-                object.insert(key.to_string(), definitions.clone());
+/// The definition the whole tool schema is kept under in a property's schema.
+const TOOL_SCHEMA: &str = "tool";
+
+/// The schema of property `name` of the tool schema `root`, as a schema of its own: a reference
+/// into a copy of the whole tool schema, kept under a definition, with every reference in the
+/// copy rebased onto it. A reference in the tool schema is relative to the tool schema's root,
+/// so one to the root's `$defs`, to another property, or into the property's own definitions
+/// resolves as it does there; a property copied out alone would lose the first two, and could
+/// bind the first to definitions of its own.
+fn property_schema(root: &Value, name: &str) -> Value {
+    let mut tool = root.clone();
+    rebase_references(&mut tool, &format!("#/$defs/{TOOL_SCHEMA}"));
+    // A property name in a JSON pointer escapes `~` and `/`.
+    let pointer = name.replace('~', "~0").replace('/', "~1");
+    serde_json::json!({
+        "$ref": format!("#/$defs/{TOOL_SCHEMA}/properties/{pointer}"),
+        "$defs": { TOOL_SCHEMA: tool },
+    })
+}
+
+/// Every `$ref` in `schema` that points into its own document (`#/...`) made relative to `base`.
+fn rebase_references(schema: &mut Value, base: &str) {
+    match schema {
+        Value::Object(object) => {
+            for (key, value) in object.iter_mut() {
+                match value {
+                    Value::String(reference) if key == "$ref" && reference.starts_with('#') => {
+                        *reference = format!("{base}{}", &reference[1..]);
+                    }
+                    _ => rebase_references(value, base),
+                }
             }
         }
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| rebase_references(item, base)),
+        _ => {}
     }
-    property
 }
 
 /// The rule for a call's parameters. A strict tool's parameters are its declared properties,
@@ -823,7 +849,7 @@ fn emit_arguments(
                 let grammar = format!("dsml_schema_{tool_index}_{property_index}");
                 schemas.push(GrammarWithLexer {
                     name: Some(grammar.clone()),
-                    json_schema: Some(with_definitions(property, &schema)),
+                    json_schema: Some(property_schema(&schema, name)),
                     ..Default::default()
                 });
                 ("false", format!("@{grammar} {}", tag(true, "parameter>\n")))
@@ -1062,9 +1088,14 @@ mod tests {
             "{lark}"
         );
         assert_eq!(grammar.grammars.len(), 2);
+        // The property's schema refers into the whole tool schema, so its references resolve
+        // as they do there.
         assert_eq!(
             grammar.grammars[1].json_schema,
-            Some(serde_json::json!({"type": "integer"}))
+            Some(serde_json::json!({
+                "$ref": "#/$defs/tool/properties/timeout",
+                "$defs": { "tool": bash(true).function.parameters.expect("parameters") },
+            }))
         );
     }
 
@@ -1275,6 +1306,53 @@ mod tests {
         assert!(!forced_call_accepts(
             &[options],
             &one_call("set", &[("options", "false", r#"{"depth": "deep"}"#)])
+        ));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a property copied out of the tool schema as a
+    /// schema of its own lost a reference to another property, and a reference to the root's
+    /// `$defs` could bind to definitions of the property's own, so a forced argument was held
+    /// to the wrong schema, or the grammar did not compile and the call went unconstrained
+    #[test]
+    fn a_forced_arguments_references_resolve_as_in_the_tool_schema() {
+        let refs = tool(serde_json::json!({
+            "type": "object",
+            "$defs": { "Count": { "type": "integer" } },
+            "properties": {
+                "left": { "$ref": "#/$defs/Count" },
+                // To another property, through the root.
+                "right": { "$ref": "#/properties/left" },
+                // The root's `Count`, not the property's own, which only a longer pointer names.
+                "inner": {
+                    "type": "object",
+                    "$defs": { "Count": { "type": "string" } },
+                    "properties": { "n": { "$ref": "#/$defs/Count" } },
+                    "required": ["n"],
+                    "additionalProperties": false,
+                },
+            },
+            "required": ["left", "right", "inner"],
+            "additionalProperties": false,
+        }));
+        let call = |left: &str, right: &str, inner: &str| {
+            one_call(
+                "set",
+                &[
+                    ("inner", "false", inner),
+                    ("left", "false", left),
+                    ("right", "false", right),
+                ],
+            )
+        };
+        let tools = std::slice::from_ref(&refs);
+        assert!(forced_call_accepts(tools, &call("1", "2", r#"{"n": 3}"#)));
+        assert!(!forced_call_accepts(
+            tools,
+            &call("1", "\"two\"", r#"{"n": 3}"#)
+        ));
+        assert!(!forced_call_accepts(
+            tools,
+            &call("1", "2", r#"{"n": "three"}"#)
         ));
     }
 
