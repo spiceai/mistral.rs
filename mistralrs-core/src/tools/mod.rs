@@ -866,6 +866,51 @@ mod tests {
         assert_eq!(names, ["write_file"]);
     }
 
+    /// regression test for spiceai/mistral.rs#54: a DSML block opener still being written, or
+    /// only its marker, claimed nothing, so a finished `<tool_call>` example earlier in the
+    /// message was dispatched as a complete call and the turn ended before the DSML call
+    #[test]
+    fn a_partial_dsml_opener_claims_the_message_before_an_example_is_dispatched() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let example = "Like this: <tool_call>{\"name\": \"note\", \"arguments\": {}}</tool_call>\nNow for real:\n";
+        for partial in [
+            "<｜",
+            "<｜DSML｜",
+            "<｜DSML｜tool_cal",
+            "<｜DSML｜tool_calls>\n<｜DSML｜inv",
+        ] {
+            let prefix = format!("{example}{partial}");
+            assert_eq!(
+                matcher.prefix_could_be_tool(&prefix).unwrap(),
+                (true, false),
+                "{partial:?}"
+            );
+            assert!(matcher.get_call(&prefix).unwrap().is_empty(), "{partial:?}");
+        }
+        let whole = format!(
+            "{example}<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">x</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        let calls = matcher.get_call(&whole).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        // A tag that is not a block's, or a marker inside another format's open call, claims nothing.
+        assert!(
+            matcher
+                .prefix_could_be_tool(&format!("{example}<｜DSML｜note>"))
+                .unwrap()
+                .1
+        );
+    }
+
     /// regression test for spiceai/mistral.rs#54: the repair for a model's stringified
     /// `arguments` ran on the DSML parser's own JSON, so a string parameter named `arguments`
     /// holding `{}` reached the tool as an object

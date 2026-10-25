@@ -160,25 +160,33 @@ fn tag_at<'a>(text: &'a str, closing: bool, names: &[&str]) -> Scan<(&'a str, us
     }
 }
 
-/// A tag's attributes, as `key="value"` pairs set apart by whitespace, each key among `keys`
-/// and given once; `None` for anything else.
-fn attribute_pairs<'a>(text: &'a str, keys: &[&str]) -> Option<Vec<(&'a str, &'a str)>> {
+/// A tag's attributes, as the `key="value"` pairs that can be read from it, and whether the tag
+/// holds exactly what the template writes: pairs set apart by whitespace, each key among
+/// `keys` and given once. The pairs are read even from a tag that does not, so a parameter's
+/// `string` flag still frames its value while the stray attribute makes the block content.
+fn attribute_pairs<'a>(text: &'a str, keys: &[&str]) -> (Vec<(&'a str, &'a str)>, bool) {
     let mut pairs: Vec<(&str, &str)> = Vec::new();
+    let mut well_formed = true;
     let mut rest = text;
     loop {
         let pair = rest.trim_start_matches(WHITESPACE);
         if pair.is_empty() {
-            return Some(pairs);
+            return (pairs, well_formed);
         }
         if pair.len() == rest.len() {
-            return None;
+            well_formed = false;
         }
-        let (key, after) = pair.split_once("=\"")?;
+        let Some((key, after)) = pair.split_once("=\"") else {
+            return (pairs, false);
+        };
+        let Some((value, after)) = after.split_once('"') else {
+            return (pairs, false);
+        };
         if !keys.contains(&key) || pairs.iter().any(|(seen, _)| *seen == key) {
-            return None;
+            well_formed = false;
+        } else {
+            pairs.push((key, value));
         }
-        let (value, after) = after.split_once('"')?;
-        pairs.push((key, value));
         rest = after;
     }
 }
@@ -256,9 +264,9 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize, boo
             Scan::Bad if matches!(close, Scan::More) => return Scan::More,
             Scan::Bad => return Scan::Bad,
         };
-        let attributes = attribute_pairs(attributes, &["name", "string"]).unwrap_or_default();
+        let (attributes, well_formed) = attribute_pairs(attributes, &["name", "string"]);
         let name = attribute(&attributes, "name");
-        malformed |= name.is_none();
+        malformed |= !well_formed || name.is_none();
         at += length;
         let json = attribute(&attributes, "string") != Some("true");
         let (raw, length, closed_with_attributes) = match value_at(&text[at..], json) {
@@ -318,9 +326,9 @@ fn block_at(text: &str, name: &str) -> Scan<(Vec<DsmlToolCall>, usize, bool)> {
             Scan::Bad if matches!(close, Scan::More) => return Scan::More,
             Scan::Bad => return Scan::Bad,
         };
-        let attributes = attribute_pairs(attributes, &["name"]).unwrap_or_default();
+        let (attributes, well_formed) = attribute_pairs(attributes, &["name"]);
         let name = attribute(&attributes, "name");
-        malformed |= name.is_none();
+        malformed |= !well_formed || name.is_none();
         at += length;
         let (arguments, length, invocation_malformed) = match invocation_at(&text[at..]) {
             Scan::Done(invocation) => invocation,
@@ -400,23 +408,34 @@ fn scan(message: &str) -> Scan<Found> {
 
 /// Where `message` opens its first block of calls outside any other format's call, finished
 /// or not, or names one in a tag that cannot be read: such a message calls nothing, in DSML
-/// or in another format.
+/// or in another format. A message that ends inside a tag that could still open a block, its
+/// marker included, is claimed as well, so an example in another format earlier in it is not
+/// dispatched as a call while the block is still being written.
 fn block_start(message: &str) -> Option<usize> {
-    message
+    let outside = |start: usize| {
+        !super::open_in_other_format(&message[..start], super::ToolCallFormat::DeepSeekDsml)
+    };
+    let opener = message
         .match_indices(OPEN)
         .map(|(start, _)| start)
         .find(|&start| {
             let opens = match tag_at(&message[start..], false, &BLOCK_NAMES) {
-                Scan::Done(_) => true,
+                Scan::Done(_) | Scan::More => true,
                 Scan::Bad => names_block(&message[start..]),
-                Scan::More => false,
             };
-            opens
-                && !super::open_in_other_format(
-                    &message[..start],
-                    super::ToolCallFormat::DeepSeekDsml,
-                )
-        })
+            opens && outside(start)
+        });
+    if opener.is_some() {
+        return opener;
+    }
+    // The message may end partway through the marker that opens a block; prefixes of the
+    // marker end in different characters, so at most one of them ends the message.
+    OPEN.char_indices()
+        .skip(1)
+        .map(|(at, _)| at)
+        .find(|&at| message.ends_with(&OPEN[..at]))
+        .map(|at| message.len() - at)
+        .filter(|&start| outside(start))
 }
 
 /// Whether the DSML tag at the start of `text` names a block, whether or not the tag can be
@@ -700,6 +719,13 @@ pub(super) fn unenforceable(tools: &[Tool]) -> Option<String> {
         }
         // The grammar writes declared properties only, so a required one must be declared.
         let declared = object.get("properties").and_then(Value::as_object);
+        if let Some(unwritable) = declared.and_then(|declared| {
+            declared.keys().find(|property| !writable_name(property))
+        }) {
+            return Some(format!(
+                "Tool '{name}' is strict, and its parameter `{unwritable}` has a name a DeepSeek-V4 tool call cannot write: a name is letters, digits, `_`, `.` and `-`, and does not start with a digit. Rename the parameter, or remove `strict` from the tool."
+            ));
+        }
         let missing = object
             .get("required")
             .and_then(Value::as_array)?
@@ -710,6 +736,16 @@ pub(super) fn unenforceable(tools: &[Tool]) -> Option<String> {
             "Tool '{name}' is strict, and its parameters schema requires `{missing}` without declaring it in `properties`, so a required DeepSeek-V4 tool call cannot write it. Declare `{missing}` in `properties`, or remove `strict` from the tool."
         ))
     })
+}
+
+/// Whether a parameter name can be written in a tag's `name="..."` attribute and read back:
+/// the names `PARAM_NAME` spells, letters, digits, `_`, `.` and `-`, not starting with a digit.
+fn writable_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 /// The definition the whole tool schema is kept under in a property's schema.
@@ -826,7 +862,11 @@ fn emit_arguments(
             rules.push(format!("{arguments}: dsml_parameter*"));
             return arguments;
         };
-        let mut names = declared.keys().collect::<Vec<_>>();
+        // A name the markup cannot write is left out: the model could not write it either.
+        let mut names = declared
+            .keys()
+            .filter(|name| writable_name(name))
+            .collect::<Vec<_>>();
         names.sort();
         let mut sequence = Vec::new();
         for (property_index, name) in names.into_iter().enumerate() {
@@ -1913,6 +1953,72 @@ mod tests {
             "<{DSML} tool_calls>\n<{DSML} invoke name=\"set\">\n<{DSML} parameter name=\"body\" string=\"true\">v</{DSML} parameter>\n</{DSML} invoke>\n</{DSML} tool_calls>"
         ))
         .is_some());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a parameter tag with an attribute the template
+    /// does not write lost its `string` flag along with it, so a text value beginning like JSON
+    /// read as JSON cut short, and the block never finished: a valid block after it was lost
+    #[test]
+    fn a_parameter_with_a_stray_attribute_keeps_its_string_framing() {
+        let stray = format!(
+            "<{DSML}tool_calls>\n<{DSML}invoke name=\"note\">\n<{DSML}parameter name=\"body\" string=\"true\" extra=\"1\">{{ literal text</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        // The stray attribute makes the block content, read whole.
+        assert_eq!(calls(&stray), None);
+        assert_eq!(strip_calls(&stray), stray);
+        // Reading resumes after it.
+        let valid = format!(
+            "<{DSML}tool_calls>\n<{DSML}invoke name=\"Bash\">\n<{DSML}parameter name=\"command\" string=\"true\">ls</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        assert_eq!(
+            calls(&format!("{stray}\n{valid}")),
+            Some(serde_json::json!([{"name": "Bash", "arguments": {"command": "ls"}}]))
+        );
+        // Without the flag the same value is JSON cut short, and the block waits for more.
+        let unflagged = stray.replace(" string=\"true\" extra=\"1\"", " extra=\"1\"");
+        assert_eq!(calls(&format!("{unflagged}\n{valid}")), None);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a strict property whose name the markup cannot
+    /// write (`a"b`, `a>b`) was written into `name="..."` as it was, so a required call could
+    /// complete its grammar and not read back as a call; a tool that is not strict wrote it too
+    #[test]
+    fn a_parameter_name_the_markup_cannot_write_is_refused_or_left_out() {
+        for bad in ["a\"b", "a>b", "a b", "1st", "a<b"] {
+            let strict = tool(serde_json::json!({
+                "type": "object",
+                "properties": { bad: { "type": "string" }, "ok": { "type": "string" } },
+                "required": ["ok"],
+                "additionalProperties": false,
+            }));
+            let why = unenforceable(std::slice::from_ref(&strict)).expect("refused");
+            assert!(why.contains(&format!("`{bad}`")), "{why}");
+            assert!(continuation_grammar(&[strict], &format!("<{DSML}tool_calls>")).is_none());
+        }
+        for good in ["ok", "_x", "a.b-c", "camelCase9"] {
+            let strict = tool(serde_json::json!({
+                "type": "object",
+                "properties": { good: { "type": "string" } },
+                "required": [good],
+                "additionalProperties": false,
+            }));
+            assert_eq!(unenforceable(&[strict]), None, "{good}");
+        }
+        // A tool that is not strict leaves such a parameter out of its grammar.
+        let mut lax = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "a>b": { "type": "string" }, "ok": { "type": "string" } },
+        }));
+        lax.function.strict = Some(false);
+        let tools = std::slice::from_ref(&lax);
+        assert!(forced_call_accepts(
+            tools,
+            &one_call("set", &[("ok", "true", "x")])
+        ));
+        assert!(!forced_call_accepts(
+            tools,
+            &one_call("set", &[("a>b", "true", "x")])
+        ));
     }
 
     /// regression test for spiceai/mistral.rs#54: a forced value could not hold two markers in
