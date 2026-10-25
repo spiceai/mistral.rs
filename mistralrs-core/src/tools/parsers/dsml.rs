@@ -36,15 +36,19 @@ const BLOCK_NAMES: [&str; 3] = ["function_calls", "tool_calls", "calls"];
 /// The block name the chat template uses, and the one a grammar writes.
 const BLOCK: &str = "tool_calls";
 /// The grammar rule that spells the `｜DSML｜` marker in every tag. Where the tokenizer has
-/// the marker as a special token, `specialize_required_tool_call_grammar` makes the rule that
+/// the marker as a special token, `specialize_tool_call_grammar` makes the rule that
 /// token, which text cannot match.
 pub(super) const MARK_RULE: &str = r#"dsml_mark: "｜DSML｜""#;
 
 pub struct DsmlParser;
 
 impl ToolFormatParser for DsmlParser {
+    /// A block that is not finished could become a call. A block whose tags cannot be read makes
+    /// the whole message content, so the text from it on is held back too: streamed out, the
+    /// text after it would be read on its own, and a block in it could make a call the message
+    /// does not.
     fn could_be_tool_call(&self, text: &str) -> bool {
-        matches!(scan(text), Scan::More)
+        !matches!(scan(text), Scan::Done(_))
     }
 
     fn claim_start(&self, message: &str) -> Option<usize> {
@@ -55,12 +59,20 @@ impl ToolFormatParser for DsmlParser {
         super::ToolCallFormat::DeepSeekDsml
     }
 
-    fn tool_call_grammar(&self, tools: &[Tool], _text: &str) -> TopLevelGrammar {
-        build_dsml_grammar(tools, false)
+    fn tool_call_grammar(&self, tools: &[Tool], text: &str) -> TopLevelGrammar {
+        continuation_grammar(tools, text).unwrap_or_else(|| {
+            build_dsml_grammar(
+                tools,
+                Block::Rest {
+                    name: BLOCK,
+                    after_newline: false,
+                },
+            )
+        })
     }
 
     fn required_tool_call_grammar(&self, tools: &[Tool]) -> TopLevelGrammar {
-        build_dsml_grammar(tools, true)
+        build_dsml_grammar(tools, Block::Whole)
     }
 
     fn parse(&self, message: &str) -> Result<Option<String>> {
@@ -431,16 +443,18 @@ const VALUE_THEN_CLOSE: &str = "dsml_vc";
 pub(super) const VALUE_RULES: &str = r#"dsml_vc: DSML_VALUE_LT_SLASH dsml_mark "parameter>\n"
 DSML_VALUE_LT_SLASH: /(?s:.*)<\// & ~/(?s:.*)<\/｜DSML｜(?s:.*)/"#;
 
-/// The value rules where the marker is a special token, which no text lexeme can hold: text
-/// between markers, where a marker after `</` begins the closing tag only when `parameter`
-/// follows it, so other DSML tags are part of the value.
+/// The value rules where the marker is a special token: text between markers, where a marker
+/// after `</` begins the closing tag only when `parameter` follows it, so other DSML tags are
+/// part of the value. No text lexeme holds the marker's text: the parser reads a marker spelled
+/// in ordinary tokens as the token, so a value spelling its closing tag that way would read as
+/// the end of the value and parameters after it.
 pub(super) const VALUE_RULES_WITH_MARK_TOKEN: &str = r#"dsml_vc: dsml_vc_open | dsml_mark dsml_vc_open
 dsml_vc_open: DSML_LT_SLASH dsml_mark dsml_vc_closing | DSML_OTHER dsml_mark dsml_vc_open
 dsml_vc_closing: "parameter>\n" | DSML_NP_LT_SLASH dsml_mark dsml_vc_closing | DSML_NP_OTHER dsml_mark dsml_vc_open
-DSML_LT_SLASH: /(?s:.*)<\//
-DSML_OTHER: /(?s:.+)/ & ~/(?s:.*)<\//
-DSML_NP_LT_SLASH: /(?s:.*)<\// & ~/[ \t\r\n]*parameter[> \t\r\n](?s:.*)/
-DSML_NP_OTHER: /(?s:.+)/ & ~/(?s:.*)<\// & ~/[ \t\r\n]*parameter[> \t\r\n](?s:.*)/"#;
+DSML_LT_SLASH: /(?s:.*)<\// & ~/(?s:.*)｜DSML｜(?s:.*)/
+DSML_OTHER: /(?s:.+)/ & ~/(?s:.*)<\// & ~/(?s:.*)｜DSML｜(?s:.*)/
+DSML_NP_LT_SLASH: /(?s:.*)<\// & ~/[ \t\r\n]*parameter[> \t\r\n](?s:.*)/ & ~/(?s:.*)｜DSML｜(?s:.*)/
+DSML_NP_OTHER: /(?s:.+)/ & ~/(?s:.*)<\// & ~/[ \t\r\n]*parameter[> \t\r\n](?s:.*)/ & ~/(?s:.*)｜DSML｜(?s:.*)/"#;
 
 /// A tag in a grammar: `<`, or `</` with `closing`, the marker, then the rest as text.
 fn tag(closing: bool, rest: &str) -> String {
@@ -451,9 +465,51 @@ fn tag(closing: bool, rest: &str) -> String {
     )
 }
 
-/// A grammar for DSML calls to `tools`: the whole block when `required`, otherwise what
-/// follows a block's opening tag.
-fn build_dsml_grammar(tools: &[Tool], required: bool) -> TopLevelGrammar {
+/// How much of a block a grammar writes.
+#[derive(Clone, Copy)]
+enum Block<'a> {
+    /// The whole block, from its opening tag.
+    Whole,
+    /// The rest of a block the model has opened under `name`: what follows its opening tag and,
+    /// with `after_newline`, the newline the model wrote after it.
+    Rest { name: &'a str, after_newline: bool },
+}
+
+/// The grammar for the rest of the block that `text`, the message so far, ends by opening:
+/// its opening tag is complete, and at most a newline follows it. The grammar writes the
+/// invocations and the closing tag under the name the block opened with, so a call the model
+/// writes on its own is held to the offered tools and to a strict tool's schema, as in the other
+/// formats. `None` once the block's body has begun, where a grammar could not know what the
+/// model has written; when the opening tag cannot be read; and for a strict tool whose schema
+/// the grammar cannot hold (`unenforceable`), which stays unconstrained.
+pub(super) fn continuation_grammar(tools: &[Tool], text: &str) -> Option<TopLevelGrammar> {
+    if unenforceable(tools).is_some() {
+        return None;
+    }
+    let start = block_start(text)?;
+    let Scan::Done((attributes, length)) = tag_at(&text[start..], false, &BLOCK_NAMES) else {
+        return None;
+    };
+    if !bare(attributes) {
+        return None;
+    }
+    let after_newline = match &text[start + length..] {
+        "" => false,
+        "\n" => true,
+        _ => return None,
+    };
+    let name = block_name(&text[start..start + length]);
+    Some(build_dsml_grammar(
+        tools,
+        Block::Rest {
+            name,
+            after_newline,
+        },
+    ))
+}
+
+/// A grammar for DSML calls to `tools`, writing `block`.
+fn build_dsml_grammar(tools: &[Tool], block: Block) -> TopLevelGrammar {
     let mut rules = Vec::new();
     let mut schemas = Vec::new();
     let mut invokes = Vec::new();
@@ -468,14 +524,20 @@ fn build_dsml_grammar(tools: &[Tool], required: bool) -> TopLevelGrammar {
         invokes.push(invoke);
     }
     let calls = format!("({})+", invokes.join(" | "));
-    let block_close = tag(true, &format!("{BLOCK}>"));
-    let start = if required {
-        format!(
-            "start: {} {calls} {block_close}",
-            tag(false, &format!("{BLOCK}>\n"))
-        )
-    } else {
-        format!("start: \"\\n\"? {calls} {block_close}")
+    let start = match block {
+        Block::Whole => format!(
+            "start: {} {calls} {}",
+            tag(false, &format!("{BLOCK}>\n")),
+            tag(true, &format!("{BLOCK}>"))
+        ),
+        Block::Rest {
+            name,
+            after_newline,
+        } => format!(
+            "start: {}{calls} {}",
+            if after_newline { "" } else { "\"\\n\"? " },
+            tag(true, &format!("{name}>"))
+        ),
     };
     let mut lines = vec![start];
     lines.extend(rules);
@@ -760,7 +822,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::tools::parsers::specialize_required_tool_call_grammar;
+    use crate::tools::parsers::specialize_tool_call_grammar;
 
     fn calls(message: &str) -> Option<Value> {
         DsmlParser
@@ -854,7 +916,9 @@ mod tests {
         }
     }
 
-    /// regression test for spiceai/mistral.rs#54: malformed blocks made calls
+    /// regression test for spiceai/mistral.rs#54: malformed blocks made calls. A block that
+    /// breaks a rule while its tags stay in place streams on as content; one whose tags cannot
+    /// be read is content too, held back with the rest of the message.
     #[test]
     fn a_malformed_block_stays_content() {
         let open = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"Bash\">";
@@ -863,7 +927,25 @@ mod tests {
                 "<｜DSML｜parameter name=\"{name}\" string=\"true\">{value}</｜DSML｜parameter>"
             )
         };
-        let cases = [
+        let readable = [
+            // A parameter given twice.
+            format!(
+                "{open}{}{}</｜DSML｜invoke></｜DSML｜tool_calls>",
+                parameter("command", "ls"),
+                parameter("command", "rm -rf /")
+            ),
+            // An invocation without a name.
+            "<｜DSML｜tool_calls><｜DSML｜invoke></｜DSML｜invoke></｜DSML｜tool_calls>"
+                .to_string(),
+            // A block with nothing in it.
+            "<｜DSML｜tool_calls></｜DSML｜tool_calls>".to_string(),
+        ];
+        for case in readable {
+            assert_eq!(calls(&case), None, "{case}");
+            assert!(!DsmlParser.could_be_tool_call(&case), "{case}");
+            assert_eq!(strip_calls(&case), case);
+        }
+        let unreadable = [
             // A named invocation that never closes, then an unnamed one.
             format!(
                 "{open}{}<｜DSML｜invoke>{}</｜DSML｜invoke></｜DSML｜tool_calls>",
@@ -875,33 +957,26 @@ mod tests {
                 "{open}{}</｜DSML｜invoke><｜DSML｜invoke name=\"Bash\"</｜DSML｜tool_calls>",
                 parameter("command", "ls")
             ),
-            // A parameter given twice.
-            format!(
-                "{open}{}{}</｜DSML｜invoke></｜DSML｜tool_calls>",
-                parameter("command", "ls"),
-                parameter("command", "rm -rf /")
-            ),
             // A parameter outside any invocation.
             format!(
                 "<｜DSML｜tool_calls>{}</｜DSML｜tool_calls>",
                 parameter("command", "ls")
             ),
-            // An invocation without a name.
-            "<｜DSML｜tool_calls><｜DSML｜invoke></｜DSML｜invoke></｜DSML｜tool_calls>"
-                .to_string(),
-            // A block with nothing in it.
-            "<｜DSML｜tool_calls></｜DSML｜tool_calls>".to_string(),
         ];
-        for case in cases {
+        for case in unreadable {
             assert_eq!(calls(&case), None, "{case}");
-            assert!(!DsmlParser.could_be_tool_call(&case), "{case}");
+            assert!(DsmlParser.could_be_tool_call(&case), "{case}");
             assert_eq!(strip_calls(&case), case);
+            // Whatever follows is held with it, and makes no call.
+            let followed = format!("{case}\n<｜DSML｜tool_calls><｜DSML｜invoke name=\"Bash\">{}</｜DSML｜invoke></｜DSML｜tool_calls>", parameter("command", "ls"));
+            assert_eq!(calls(&followed), None, "{followed}");
+            assert!(DsmlParser.could_be_tool_call(&followed), "{followed}");
         }
     }
 
     #[test]
     fn the_required_grammar_writes_the_templates_markup() {
-        let grammar = build_dsml_grammar(&[bash(false)], true);
+        let grammar = build_dsml_grammar(&[bash(false)], Block::Whole);
         let lark = grammar.grammars[0].lark_grammar.as_deref().expect("lark");
         assert!(
             lark.starts_with(
@@ -924,7 +999,7 @@ mod tests {
     /// regression test for spiceai/mistral.rs#54: strict tools took any parameters
     #[test]
     fn a_strict_tools_grammar_holds_its_declared_parameters() {
-        let grammar = build_dsml_grammar(&[bash(true)], true);
+        let grammar = build_dsml_grammar(&[bash(true)], Block::Whole);
         let lark = grammar.grammars[0].lark_grammar.as_deref().expect("lark");
         assert!(
             lark.contains("arguments_0: parameter_0_0 parameter_0_1?"),
@@ -1011,8 +1086,8 @@ mod tests {
     fn a_forced_call_writes_the_marker_token_and_markup_in_values() {
         let (env, mark) = dsml_env();
         let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
-        let mut grammar = build_dsml_grammar(&[bash(true)], true);
-        specialize_required_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+        let mut grammar = build_dsml_grammar(&[bash(true)], Block::Whole);
+        specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
         let lark = grammar.grammars[0].lark_grammar.as_deref().expect("lark");
         assert!(lark.contains(&format!("dsml_mark: <[{mark}]>")), "{lark}");
         let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
@@ -1059,8 +1134,8 @@ mod tests {
     fn forced_call_accepts(tools: &[Tool], call: &str) -> bool {
         let (env, mark) = dsml_env();
         let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
-        let mut grammar = build_dsml_grammar(tools, true);
-        specialize_required_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+        let mut grammar = build_dsml_grammar(tools, Block::Whole);
+        specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
         let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
         matcher.consume_tokens(&dsml_tokens(call, mark)).is_ok()
             && matcher.is_accepting().unwrap_or(false)
@@ -1378,8 +1453,8 @@ mod tests {
         let (env, mark) = dsml_env();
         let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
         let accepts = |tokens: &[u32]| {
-            let mut grammar = build_dsml_grammar(std::slice::from_ref(&pinned), true);
-            specialize_required_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+            let mut grammar = build_dsml_grammar(std::slice::from_ref(&pinned), Block::Whole);
+            specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
             let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
             matcher.consume_tokens(tokens).is_ok() && matcher.is_accepting().unwrap_or(false)
         };
@@ -1399,5 +1474,178 @@ mod tests {
             calls(&text),
             Some(serde_json::json!([{"name": "set", "arguments": {"body": value}}]))
         );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: where the marker is a token, a forced value
+    /// could still spell `｜DSML｜` in ordinary tokens, which the parser read as the marker: a
+    /// strict string could end its parameter early and write parameters the schema does not have
+    #[test]
+    fn a_forced_value_spells_the_marker_only_as_its_token() {
+        let body_only = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "body": { "type": "string" } },
+            "required": ["body"],
+            "additionalProperties": false,
+        }));
+        let (env, mark) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let accepts = |tokens: &[u32]| {
+            let mut grammar = build_dsml_grammar(std::slice::from_ref(&body_only), Block::Whole);
+            specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+            let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
+            matcher.consume_tokens(tokens).is_ok() && matcher.is_accepting().unwrap_or(false)
+        };
+        let injected =
+            format!("x</{DSML}parameter>\n<{DSML}parameter name=\"injected\" string=\"true\">y");
+        // Spelled in ordinary tokens, the marker is refused wherever it is in the value.
+        assert!(!accepts(&call_with_text_value(
+            "set", "true", &injected, mark
+        )));
+        assert!(!accepts(&call_with_text_value(
+            "set",
+            "true",
+            &format!("see {DSML} here"),
+            mark
+        )));
+        assert!(!accepts(&call_with_text_value(
+            "set",
+            "true",
+            &format!("echo '</{DSML}invoke>'"),
+            mark
+        )));
+        // As the token, another DSML tag is part of the value.
+        let mut tokens = dsml_tokens(
+            &format!(
+                "<{DSML}tool_calls>\n<{DSML}invoke name=\"set\">\n<{DSML}parameter name=\"body\" string=\"true\">echo '</{DSML}invoke>'</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+            ),
+            mark,
+        );
+        assert!(accepts(&tokens));
+        // As the token, the closing tag ends the value, and a parameter after it is refused.
+        tokens = dsml_tokens(
+            &format!(
+                "<{DSML}tool_calls>\n<{DSML}invoke name=\"set\">\n<{DSML}parameter name=\"body\" string=\"true\">{injected}</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+            ),
+            mark,
+        );
+        assert!(!accepts(&tokens));
+    }
+
+    /// A JSON value that spells a parameter's closing tag in ordinary tokens ends the parameter
+    /// there, and the block cannot be read past the quote that follows: the message makes no
+    /// call, rather than a call with the rest of the value read as more parameters.
+    #[test]
+    fn a_json_value_spelling_the_closing_tag_as_text_makes_no_call() {
+        let message = format!(
+            "<{DSML}tool_calls>\n<{DSML}invoke name=\"set\">\n<{DSML}parameter name=\"body\" string=\"false\">\"</{DSML}parameter>\"</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        assert_eq!(calls(&message), None);
+        // The message is held back whole, as one that cannot be read.
+        assert!(DsmlParser.could_be_tool_call(&message));
+    }
+
+    /// Runs `rest`, written after the block that `opener` ends by opening, through the
+    /// continuation grammar: whether the grammar accepts it whole.
+    fn continuation_accepts(tools: &[Tool], opener: &str, rest: &str) -> bool {
+        let (env, mark) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let Some(mut grammar) = continuation_grammar(tools, opener) else {
+            return false;
+        };
+        specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+        let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
+        matcher.consume_tokens(&dsml_tokens(rest, mark)).is_ok()
+            && matcher.is_accepting().unwrap_or(false)
+    }
+
+    /// regression test for spiceai/mistral.rs#54: no grammar held a call the model wrote on its
+    /// own to a strict tool's schema, so `Bash`, which requires `command`, could be called
+    /// without it
+    #[test]
+    fn a_call_the_model_writes_is_held_to_a_strict_tools_schema() {
+        let opener = format!("<{DSML}tool_calls>");
+        let body = |parameters: &str| {
+            format!(
+                "\n<{DSML}invoke name=\"Bash\">\n{parameters}</{DSML}invoke>\n</{DSML}tool_calls>"
+            )
+        };
+        let command =
+            format!("<{DSML}parameter name=\"command\" string=\"true\">ls</{DSML}parameter>\n");
+        assert!(continuation_accepts(
+            &[bash(true)],
+            &opener,
+            &body(&command)
+        ));
+        assert!(!continuation_accepts(&[bash(true)], &opener, &body("")));
+        assert!(!continuation_accepts(
+            &[bash(true)],
+            &opener,
+            &body(&format!(
+                "{command}<{DSML}parameter name=\"cwd\" string=\"true\">/</{DSML}parameter>\n"
+            ))
+        ));
+        // A tool that is not offered is refused.
+        assert!(!continuation_accepts(
+            &[bash(true)],
+            &opener,
+            &body(&command).replace("Bash", "Shell")
+        ));
+        // The newline the model wrote after the opening tag is not written again.
+        assert!(continuation_accepts(
+            &[bash(true)],
+            &format!("{opener}\n"),
+            &body(&command)[1..]
+        ));
+        // A block opened under another name closes under it.
+        let calls_opener = format!("I'll run it.\n\n<{DSML} calls>");
+        assert!(continuation_accepts(
+            &[bash(true)],
+            &calls_opener,
+            &body(&command).replace("tool_calls>", "calls>")
+        ));
+        assert!(!continuation_accepts(
+            &[bash(true)],
+            &calls_opener,
+            &body(&command)
+        ));
+    }
+
+    /// The continuation grammar takes over right after a block's opening tag, before the model
+    /// has begun the block's body, and only for a block the grammar can write.
+    #[test]
+    fn the_continuation_grammar_starts_right_after_a_blocks_opening_tag() {
+        for text in [
+            format!("<{DSML}tool_calls>"),
+            format!("Sure.\n<{DSML}tool_calls>"),
+            format!("<{DSML}tool_calls>\n"),
+            format!("<{DSML} calls>"),
+        ] {
+            assert!(
+                continuation_grammar(&[bash(true)], &text).is_some(),
+                "{text:?}"
+            );
+        }
+        for text in [
+            format!("<{DSML}tool_"),
+            format!("<{DSML}tool_calls>\n<"),
+            format!("<{DSML}tool_calls>\n<{DSML}invoke name=\"Bash\">\n"),
+            format!("<{DSML}tool_calls x=\"1\">"),
+            format!("<{DSML}tool_calls>!"),
+            "Just text".to_string(),
+        ] {
+            assert!(
+                continuation_grammar(&[bash(true)], &text).is_none(),
+                "{text:?}"
+            );
+        }
+        // A strict tool whose schema the grammar cannot hold leaves the call unconstrained.
+        let either = tool(serde_json::json!({
+            "type": "object",
+            "oneOf": [
+                { "properties": { "a": { "type": "string" } }, "required": ["a"] },
+                { "properties": { "b": { "type": "string" } }, "required": ["b"] },
+            ],
+        }));
+        assert!(continuation_grammar(&[either], &format!("<{DSML}tool_calls>")).is_none());
     }
 }

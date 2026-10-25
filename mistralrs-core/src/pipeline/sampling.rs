@@ -91,7 +91,7 @@ fn activate_required_tool_call_grammar(
         tracing::warn!("Cannot force required tool call: llguidance is unavailable");
         return;
     };
-    crate::tools::specialize_required_tool_call_grammar(&mut grm, factory.tok_env().tok_trie());
+    crate::tools::specialize_tool_call_grammar(&mut grm, factory.tok_env().tok_trie());
     match crate::pipeline::llg::constraint_from_llg_grammar(factory, grm) {
         Ok(matcher) => {
             seq.recognizer = SequenceRecognizer::Llguidance(Box::new(matcher));
@@ -251,8 +251,9 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             .as_mut()
             .and_then(|state| state.maybe_activate_continuation_grammar(text.as_deref()));
 
-        if let Some(grm) = grm {
+        if let Some(mut grm) = grm {
             if let Some(ref factory) = metadata.llg_factory {
+                crate::tools::specialize_tool_call_grammar(&mut grm, factory.tok_env().tok_trie());
                 match crate::pipeline::llg::constraint_from_llg_grammar(factory, grm) {
                     Ok(matcher) => {
                         tracing::debug!("Activated tool call grammar");

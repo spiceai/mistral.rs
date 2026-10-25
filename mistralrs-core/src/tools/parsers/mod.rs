@@ -136,9 +136,7 @@ fn parsers_for(message: &str) -> Vec<&'static dyn ToolFormatParser> {
         let Some(start) = parser.claim_start(message) else {
             continue;
         };
-        let before = &message[..start];
-        let enclosed =
-            all().any(|other| other.format() != parser.format() && other.open_at_end(before));
+        let enclosed = open_in_other_format(&message[..start], parser.format());
         return if enclosed {
             all()
                 .filter(|other| other.format() != parser.format())
@@ -169,10 +167,11 @@ pub fn build_tool_call_grammar(text: &str, tools: &[Tool]) -> Option<TopLevelGra
             if parser.format() == ToolCallFormat::DeepSeek && !text.contains("```json\n") {
                 return None;
             }
-            // DSML tags open with `｜DSML｜`, a token of its own. A grammar written in text would
-            // make the model spell it byte by byte, so DSML calls are read, not constrained.
+            // DSML: the grammar takes over right after a block's opening tag, and spells the
+            // `｜DSML｜` marker through one rule that `specialize_tool_call_grammar` makes the
+            // tokenizer's special token.
             if parser.format() == ToolCallFormat::DeepSeekDsml {
-                return None;
+                return dsml::continuation_grammar(tools, text);
             }
             return Some(parser.tool_call_grammar(tools, text));
         }
@@ -199,10 +198,10 @@ pub fn build_required_tool_call_grammar(
     qwen::QwenParser.required_tool_call_grammar(tools)
 }
 
-pub fn specialize_required_tool_call_grammar(
-    grammar: &mut TopLevelGrammar,
-    tok_trie: &toktrie::TokTrie,
-) {
+/// Spells a tool-call grammar's control tokens, and DSML's marker, as the tokenizer's special
+/// tokens where it has them, for a required call's grammar and for the grammar that takes over a
+/// call the model began.
+pub fn specialize_tool_call_grammar(grammar: &mut TopLevelGrammar, tok_trie: &toktrie::TokTrie) {
     let Some(lark) = grammar
         .grammars
         .first_mut()
@@ -225,11 +224,56 @@ pub fn specialize_required_tool_call_grammar(
     }
 }
 
-/// Whether a call in a format other than `format` is open at the end of `text`.
+/// The delimiters of the formats whose calls close, in the order the parsers are tried: Gemma 4
+/// before Qwen, as `<|tool_call>` holds `<tool_call>`.
+const CLOSED_CALL_DELIMITERS: [(ToolCallFormat, &str, &str); 6] = [
+    (
+        ToolCallFormat::Atem,
+        "<atem:function_calls>",
+        "</atem:function_calls>",
+    ),
+    (ToolCallFormat::Gemma4, "<|tool_call>", "<tool_call|>"),
+    (ToolCallFormat::Qwen, "<tool_call>", "</tool_call>"),
+    (ToolCallFormat::Hunyuan, "<tool_calls>", "</tool_calls>"),
+    (
+        ToolCallFormat::DeepSeek,
+        "<｜tool▁call▁begin｜>",
+        "<｜tool▁call▁end｜>",
+    ),
+    (
+        ToolCallFormat::Liquid,
+        "<|tool_call_start|>",
+        "<|tool_call_end|>",
+    ),
+];
+
+/// `text` with every finished call of a format whose calls close blanked out, so a marker the
+/// model wrote inside one, as an argument's text, does not open a call in another format.
+fn without_closed_calls(text: &str) -> String {
+    let mut out = text.to_string();
+    for (_, start, end) in CLOSED_CALL_DELIMITERS {
+        let mut from = 0;
+        while let Some(offset) = out[from..].find(start) {
+            let open = from + offset;
+            let Some(length) = out[open + start.len()..].find(end) else {
+                break;
+            };
+            let close = open + start.len() + length + end.len();
+            let blank = " ".repeat(out[open..close].chars().count());
+            out.replace_range(open..close, &blank);
+            from = open + blank.len();
+        }
+    }
+    out
+}
+
+/// Whether a call in a format other than `format` is open at the end of `text`. A marker inside
+/// a finished call of some format is that call's text, and opens nothing.
 pub(super) fn open_in_other_format(text: &str, format: ToolCallFormat) -> bool {
+    let outside = without_closed_calls(text);
     PARSERS
         .iter()
-        .any(|parser| parser.format() != format && parser.open_at_end(text))
+        .any(|parser| parser.format() != format && parser.open_at_end(&outside))
 }
 
 /// Whether `text` ends after an `open` delimiter with no `close` after it.
@@ -281,25 +325,17 @@ pub(crate) fn extract_model_specific_call(
 }
 
 fn strip_tool_call_segments(message: &str, format: ToolCallFormat) -> String {
+    if let Some((_, start, end)) = CLOSED_CALL_DELIMITERS
+        .iter()
+        .find(|(delimited, _, _)| *delimited == format)
+    {
+        return strip_delimited_segments(message, start, end);
+    }
     match format {
-        ToolCallFormat::Qwen => strip_delimited_segments(message, "<tool_call>", "</tool_call>"),
-        ToolCallFormat::Gemma4 => strip_delimited_segments(message, "<|tool_call>", "<tool_call|>"),
-        ToolCallFormat::DeepSeek => {
-            strip_delimited_segments(message, "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>")
-        }
         ToolCallFormat::DeepSeekDsml => dsml::strip_calls(message),
         ToolCallFormat::MistralNemo => strip_from_first(message, "[TOOL_CALLS]"),
-        ToolCallFormat::Hunyuan => {
-            strip_delimited_segments(message, "<tool_calls>", "</tool_calls>")
-        }
         ToolCallFormat::Llama => strip_from_first(message, "<|python_tag|>"),
-        ToolCallFormat::Liquid => {
-            strip_delimited_segments(message, "<|tool_call_start|>", "<|tool_call_end|>")
-        }
-        ToolCallFormat::Atem => {
-            strip_delimited_segments(message, "<atem:function_calls>", "</atem:function_calls>")
-        }
-        ToolCallFormat::Harmony => message.to_string(),
+        _ => message.to_string(),
     }
 }
 

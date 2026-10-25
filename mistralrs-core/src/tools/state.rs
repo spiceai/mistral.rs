@@ -407,6 +407,38 @@ mod tests {
         assert_eq!(grammar.grammars.len(), 2);
     }
 
+    /// regression test for spiceai/mistral.rs#54: no grammar took over a DSML call the model
+    /// began on its own, so a strict tool's schema held only for a forced call
+    #[test]
+    fn a_dsml_block_opener_activates_the_continuation_grammar() {
+        let tools = vec![tool("get_weather")];
+        let mut state = ToolCallState::new(
+            ToolChoice::Auto,
+            Some(&tools),
+            Some(ToolCallFormat::DeepSeekDsml),
+        )
+        .unwrap();
+        assert!(state
+            .maybe_activate_continuation_grammar(Some("Let me check.\n<｜DSML｜tool_"))
+            .is_none());
+        let grammar = state
+            .maybe_activate_continuation_grammar(Some("Let me check.\n<｜DSML｜tool_calls>"))
+            .unwrap();
+        assert!(
+            lark(&grammar)
+                .starts_with("start: \"\\n\"? (invoke_0)+ \"</\" dsml_mark \"tool_calls>\"\n"),
+            "{}",
+            lark(&grammar)
+        );
+        assert!(
+            lark(&grammar).contains(
+                "\ninvoke_0: \"<\" dsml_mark \"invoke name=\\\"get_weather\\\">\\n\" arguments_0 \"</\" dsml_mark \"invoke>\\n\"\n"
+            ),
+            "{}",
+            lark(&grammar)
+        );
+    }
+
     #[test]
     fn tool_call_choice_none_does_not_activate_continuation_grammar() {
         let tools = vec![tool("get_weather")];

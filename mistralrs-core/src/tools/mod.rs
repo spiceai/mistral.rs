@@ -6,7 +6,7 @@ pub(crate) mod state;
 pub(crate) mod strategy;
 
 use candle_core::Result;
-pub(crate) use parsers::specialize_required_tool_call_grammar;
+pub(crate) use parsers::specialize_tool_call_grammar;
 pub use parsers::ToolCallFormat;
 pub use request::*;
 pub use response::*;
@@ -727,5 +727,63 @@ mod tests {
         ] {
             assert!(matcher.get_call(message).unwrap().is_empty(), "{message}");
         }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a block whose tags could not be read was
+    /// streamed out as text, and what the model wrote after it was read on its own, so a block
+    /// or a `<tool_call>` example after it made a call the whole message does not
+    #[test]
+    fn a_block_that_cannot_be_read_holds_the_message_and_calls_nothing() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let broken = "Sure.\n<｜DSML｜tool_calls>!";
+        assert_eq!(matcher.prefix_could_be_tool(broken).unwrap(), (true, false));
+        let later_block = format!(
+            "{broken}\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">x</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        assert_eq!(
+            matcher.prefix_could_be_tool(&later_block).unwrap(),
+            (true, false)
+        );
+        assert!(matcher.get_call(&later_block).unwrap().is_empty());
+        let example =
+            format!("{broken} <tool_call>{{\"name\": \"Bash\", \"arguments\": {{}}}}</tool_call>");
+        assert_eq!(
+            matcher.prefix_could_be_tool(&example).unwrap(),
+            (true, false)
+        );
+        assert!(matcher.get_call(&example).unwrap().is_empty());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a marker written as argument text inside a
+    /// finished call in one format counted as opening a call in another, which took a DSML
+    /// block after it out of DSML's hands, and a `<tool_call>` example in that block was made
+    #[test]
+    fn a_marker_inside_a_finished_call_does_not_enclose_a_later_dsml_block() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let message = "<tool_call>{\"name\": \"note\", \"arguments\": {\"text\": \"[TOOL_CALLS]\"}}</tool_call>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
     }
 }
