@@ -937,10 +937,25 @@ fn property_schema(root: &Value, name: &str, anchors: &HashMap<String, String>) 
     let property = format!("/properties/{}", pointer_segment(name));
     let mut tool = reached_copy(root, &property, anchors).unwrap_or_else(|| root.clone());
     rebase_references(&mut tool, &format!("#/$defs/{TOOL_SCHEMA}"));
+    remove_formats(&mut tool);
     serde_json::json!({
         "$ref": format!("#/$defs/{TOOL_SCHEMA}{property}"),
         "$defs": { TOOL_SCHEMA: tool },
     })
+}
+
+/// `schema` without its `format` keywords, wherever a schema sits in it. A format is an
+/// annotation: a call is not held to it when read (`should_validate_formats(false)`), and the
+/// grammar's JSON parser refuses a format it does not know, such as `uri`, which would leave no
+/// grammar at all, so the grammar does not hold a value to its format either. Every other
+/// keyword the validator leaves unchecked, as `contentEncoding` or `deprecated`, the parser
+/// takes as it is. A property named `format` is not a keyword, and is kept.
+fn remove_formats(schema: &mut Value) {
+    for pointer in schema_pointers(schema) {
+        if let Some(object) = schema.pointer_mut(&pointer).and_then(Value::as_object_mut) {
+            object.remove("format");
+        }
+    }
 }
 
 /// A copy of the parts of `root` that the schema at `pointer` reaches: that schema, and each
@@ -3311,6 +3326,64 @@ mod tests {
                 Some(serde_json::json!([{ "name": "Bash", "arguments": { "command": "ls" } }])),
                 "{opener:?}"
             );
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a strict tool's parameter with a `format` the
+    /// grammar's JSON parser does not know, `uri` or one a tool makes up, left the DSML grammar
+    /// unable to compile, so neither a forced call nor a continued one was held to anything. A
+    /// format is an annotation, which the call read is not held to either, so the grammar holds
+    /// the value to the rest of its schema, and the property named `format` keeps its own.
+    #[test]
+    fn a_format_the_grammar_does_not_know_is_an_annotation() {
+        let opener = format!("<{DSML}tool_calls>");
+        for format in ["uri", "my-format"] {
+            let tool: Tool = serde_json::from_value(serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "Fetch",
+                    "strict": true,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": { "type": "string", "format": format },
+                            "links": { "type": "array", "items": { "type": "string", "format": format } },
+                            "format": { "type": "string", "enum": ["json", "text"] },
+                        },
+                        "required": ["url"],
+                        "additionalProperties": false,
+                    },
+                },
+            }))
+            .expect("tool");
+            let tools = [tool];
+            for call in [
+                one_call("Fetch", &[("url", "true", "https://example.com")]),
+                one_call("Fetch", &[("url", "false", "\"https://example.com\"")]),
+                one_call(
+                    "Fetch",
+                    &[
+                        ("format", "true", "json"),
+                        ("links", "false", "[\"a\", \"b\"]"),
+                        ("url", "true", "x"),
+                    ],
+                ),
+            ] {
+                assert!(forced_call_accepts(&tools, &call), "{format}: {call}");
+                assert!(
+                    continuation_accepts(&tools, &opener, &call[opener.len()..]),
+                    "{format}: {call}"
+                );
+            }
+            // The rest of the schema still holds: `url` is required, `links` holds strings,
+            // and `format` is one of its values.
+            for call in [
+                one_call("Fetch", &[("format", "true", "json")]),
+                one_call("Fetch", &[("links", "false", "[1]"), ("url", "true", "x")]),
+                one_call("Fetch", &[("format", "true", "xml"), ("url", "true", "x")]),
+            ] {
+                assert!(!forced_call_accepts(&tools, &call), "{format}: {call}");
+            }
         }
     }
 }
