@@ -67,15 +67,8 @@ impl ToolFormatParser for DsmlParser {
     }
 
     fn tool_call_grammar(&self, tools: &[Tool], text: &str) -> TopLevelGrammar {
-        continuation_grammar(tools, text).unwrap_or_else(|| {
-            build_dsml_grammar(
-                tools,
-                Block::Rest {
-                    name: BLOCK,
-                    after_newline: false,
-                },
-            )
-        })
+        continuation_grammar(tools, text)
+            .unwrap_or_else(|| build_dsml_grammar(tools, Block::Rest { name: BLOCK }))
     }
 
     fn required_tool_call_grammar(&self, tools: &[Tool]) -> TopLevelGrammar {
@@ -219,7 +212,7 @@ fn value_at(text: &str, json: bool) -> Scan<(&str, usize, bool)> {
         match tag_at(&text[at..], true, &["parameter"]) {
             Scan::Done((attributes, length)) => {
                 let value = (&text[..at], at + length, !bare(attributes));
-                if !json || serde_json::from_str::<Value>(value.0.trim()).is_ok() {
+                if !json || is_json(value.0) {
                     return Scan::Done(value);
                 }
                 first.get_or_insert(value);
@@ -233,6 +226,14 @@ fn value_at(text: &str, json: bool) -> Scan<(&str, usize, bool)> {
         Some(value) if !value.0.trim_start().starts_with(['"', '{', '[']) => Scan::Done(value),
         _ => Scan::More,
     }
+}
+
+/// Whether `text` is one JSON value in form, which reading it as `IgnoredAny` checks without
+/// converting its numbers. A number too large to hold is JSON in form, so a value holding one
+/// ends where its JSON does, and is refused for what it holds (`invocation_at`) rather than
+/// read on past its closing tag.
+fn is_json(text: &str) -> bool {
+    serde_json::from_str::<serde::de::IgnoredAny>(text.trim()).is_ok()
 }
 
 /// Whether a tag's attributes are none at all.
@@ -278,9 +279,16 @@ fn invocation_at(text: &str) -> Scan<(serde_json::Map<String, Value>, usize, boo
         };
         malformed |= closed_with_attributes;
         at += length;
-        let value = if json {
-            serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.to_string()))
+        let value = if !json {
+            Value::String(raw.to_string())
+        } else if let Ok(value) = serde_json::from_str(raw.trim()) {
+            value
         } else {
+            // Text that is not JSON is read as text, as a model writing without a grammar may
+            // put it in a `string="false"` value. JSON the parser cannot hold, a number out of
+            // range, is no value to call with: read as text, it would call with a string where
+            // the model wrote a number.
+            malformed |= is_json(raw);
             Value::String(raw.to_string())
         };
         // A parameter given twice has no one value to call with.
@@ -522,22 +530,20 @@ fn tag(closing: bool, rest: &str) -> String {
 enum Block<'a> {
     /// The whole block, from its opening tag.
     Whole,
-    /// The rest of a block the model has opened under `name`: what follows its opening tag and,
-    /// with `after_newline`, the newline the model wrote after it.
-    Rest { name: &'a str, after_newline: bool },
+    /// The rest of a block the model has opened under `name`: what follows its opening tag and
+    /// any whitespace the model wrote after it.
+    Rest { name: &'a str },
 }
 
 /// The grammar for the rest of the block that `text`, the message so far, ends by opening:
-/// its opening tag is complete, and at most a newline follows it. The grammar writes the
+/// its opening tag is complete, and only whitespace follows it. The grammar writes the
 /// invocations and the closing tag under the name the block opened with, so a call the model
 /// writes on its own is held to the offered tools and to a strict tool's schema, as in the other
-/// formats. `None` once the block's body has begun, where a grammar could not know what the
-/// model has written; when the opening tag cannot be read; and for a strict tool whose schema
-/// the grammar cannot hold (`unenforceable`), which stays unconstrained.
+/// formats; a strict tool whose schema the grammar cannot hold (`unenforceable`) is written as
+/// one that is not strict, and its calls are held to the schema when read. `None` once the
+/// block's body has begun, where a grammar could not know what the model has written, and when
+/// the opening tag cannot be read.
 pub(super) fn continuation_grammar(tools: &[Tool], text: &str) -> Option<TopLevelGrammar> {
-    if unenforceable(tools).is_some() {
-        return None;
-    }
     let start = block_start(text)?;
     let Scan::Done((attributes, length)) = tag_at(&text[start..], false, &BLOCK_NAMES) else {
         return None;
@@ -545,19 +551,16 @@ pub(super) fn continuation_grammar(tools: &[Tool], text: &str) -> Option<TopLeve
     if !bare(attributes) {
         return None;
     }
-    let after_newline = match &text[start + length..] {
-        "" => false,
-        "\n" => true,
-        _ => return None,
-    };
+    // Whitespace after the opening tag, however much the token that closed the tag carried, is
+    // the model's; the grammar matches none of it. Anything else begins the block's body.
+    if !text[start + length..]
+        .chars()
+        .all(|c| WHITESPACE.contains(&c))
+    {
+        return None;
+    }
     let name = block_name(&text[start..start + length]);
-    Some(build_dsml_grammar(
-        tools,
-        Block::Rest {
-            name,
-            after_newline,
-        },
-    ))
+    Some(build_dsml_grammar(tools, Block::Rest { name }))
 }
 
 /// A grammar for DSML calls to `tools`, writing `block`.
@@ -582,18 +585,16 @@ fn build_dsml_grammar(tools: &[Tool], block: Block) -> TopLevelGrammar {
             tag(false, &format!("{BLOCK}>\n")),
             tag(true, &format!("{BLOCK}>"))
         ),
-        Block::Rest {
-            name,
-            after_newline,
-        } => format!(
-            "start: {}{calls} {}",
-            if after_newline { "" } else { "\"\\n\"? " },
-            tag(true, &format!("{name}>"))
-        ),
+        // Whitespace the model may still write before the first call, after whatever it wrote
+        // already, which the grammar does not see.
+        Block::Rest { name } => {
+            format!("start: DSML_WS? {calls} {}", tag(true, &format!("{name}>")))
+        }
     };
     let mut lines = vec![start];
     lines.extend(rules);
     lines.extend([
+        r"DSML_WS: /[ \t\r\n]+/".to_string(),
         // Any parameter: text as `string="true"`, or one complete JSON value as `string="false"`,
         // which the parser reads as JSON; a value that is not JSON would be read as text, and
         // one cut short would leave the block unfinished.
@@ -707,37 +708,40 @@ const ENFORCED_ROOT_KEYS: [&str; 13] = [
 /// Why a required call cannot hold one of `tools` to its strict schema: a constraint on the
 /// object as a whole, which the parameter-by-parameter grammar cannot express.
 pub(super) fn unenforceable(tools: &[Tool]) -> Option<String> {
-    tools.iter().find_map(|tool| {
-        let schema = tool.function.strict_parameters_schema()?;
-        let object = schema.as_object()?;
-        let name = &tool.function.name;
-        if let Some(keyword) = object
-            .keys()
-            .find(|key| !ENFORCED_ROOT_KEYS.contains(&key.as_str()))
-        {
-            return Some(format!(
-                "Tool '{name}' is strict, and its parameters schema constrains the object as a whole with `{keyword}`, which a required DeepSeek-V4 tool call cannot enforce. Remove `strict` from the tool, or the `{keyword}` from its schema."
-            ));
-        }
-        // The grammar writes declared properties only, so a required one must be declared.
-        let declared = object.get("properties").and_then(Value::as_object);
-        if let Some(unwritable) = declared.and_then(|declared| {
-            declared.keys().find(|property| !writable_name(property))
-        }) {
-            return Some(format!(
-                "Tool '{name}' is strict, and its parameter `{unwritable}` has a name a DeepSeek-V4 tool call cannot write: a name is letters, digits, `_`, `.` and `-`, and does not start with a digit. Rename the parameter, or remove `strict` from the tool."
-            ));
-        }
-        let missing = object
-            .get("required")
-            .and_then(Value::as_array)?
-            .iter()
-            .filter_map(Value::as_str)
-            .find(|required| declared.is_none_or(|declared| !declared.contains_key(*required)))?;
-        Some(format!(
-            "Tool '{name}' is strict, and its parameters schema requires `{missing}` without declaring it in `properties`, so a required DeepSeek-V4 tool call cannot write it. Declare `{missing}` in `properties`, or remove `strict` from the tool."
-        ))
-    })
+    tools.iter().find_map(unenforceable_tool)
+}
+
+/// Why a required call cannot hold `tool` to its strict schema, if it cannot.
+fn unenforceable_tool(tool: &Tool) -> Option<String> {
+    let schema = tool.function.strict_parameters_schema()?;
+    let object = schema.as_object()?;
+    let name = &tool.function.name;
+    if let Some(keyword) = object
+        .keys()
+        .find(|key| !ENFORCED_ROOT_KEYS.contains(&key.as_str()))
+    {
+        return Some(format!(
+            "Tool '{name}' is strict, and its parameters schema constrains the object as a whole with `{keyword}`, which a required DeepSeek-V4 tool call cannot enforce. Remove `strict` from the tool, or the `{keyword}` from its schema."
+        ));
+    }
+    // The grammar writes declared properties only, so a required one must be declared.
+    let declared = object.get("properties").and_then(Value::as_object);
+    if let Some(unwritable) =
+        declared.and_then(|declared| declared.keys().find(|property| !writable_name(property)))
+    {
+        return Some(format!(
+            "Tool '{name}' is strict, and its parameter `{unwritable}` has a name a DeepSeek-V4 tool call cannot write: a name is letters, digits, `_`, `.` and `-`, and does not start with a digit. Rename the parameter, or remove `strict` from the tool."
+        ));
+    }
+    let missing = object
+        .get("required")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|required| declared.is_none_or(|declared| !declared.contains_key(*required)))?;
+    Some(format!(
+        "Tool '{name}' is strict, and its parameters schema requires `{missing}` without declaring it in `properties`, so a required DeepSeek-V4 tool call cannot write it. Declare `{missing}` in `properties`, or remove `strict` from the tool."
+    ))
 }
 
 /// Whether a parameter name can be written in a tag's `name="..."` attribute and read back:
@@ -850,7 +854,13 @@ fn emit_arguments(
     schemas: &mut Vec<GrammarWithLexer>,
 ) -> String {
     let arguments = format!("arguments_{tool_index}");
-    let Some(schema) = tool.function.strict_parameters_schema() else {
+    // A strict tool whose schema the grammar cannot hold is written as one that is not strict;
+    // its calls are held to the schema when read.
+    let schema = tool
+        .function
+        .strict_parameters_schema()
+        .filter(|_| unenforceable_tool(tool).is_none());
+    let Some(schema) = schema else {
         // A tool that is not strict takes any value. Its declared parameters are written at
         // most once each, as the parser reads a parameter given twice as malformed; one that
         // declares none takes any parameters.
@@ -904,8 +914,23 @@ fn emit_arguments(
     for (property_index, name) in names.into_iter().enumerate() {
         let parameter = format!("parameter_{tool_index}_{property_index}");
         let property = &properties[name];
-        let (string, value) = match property_value(property) {
-            PropertyValue::Text => ("true", VALUE_THEN_CLOSE.to_string()),
+        let open = tag(false, &format!("parameter name=\"{name}\" string=\""));
+        let close = tag(true, "parameter>\n");
+        let as_text = lark_literal("true\">");
+        let as_json = lark_literal("false\">");
+        // A value written as JSON, held to the property's schema as a sub-grammar.
+        let mut held = || {
+            let grammar = format!("dsml_schema_{tool_index}_{property_index}");
+            schemas.push(GrammarWithLexer {
+                name: Some(grammar.clone()),
+                json_schema: Some(property_schema(&schema, name)),
+                ..Default::default()
+            });
+            format!("{as_json} @{grammar} {close}")
+        };
+        let written = match property_value(property) {
+            // Text, or a JSON string: text cannot hold the parameter's closing tag.
+            PropertyValue::Text => format!("{as_text} {VALUE_THEN_CLOSE} | {}", held()),
             PropertyValue::OneOf(values) => {
                 // A value holding the parameter's closing tag is written as JSON with its `<`
                 // escaped, so the parser cannot end the value inside it.
@@ -921,7 +946,7 @@ fn emit_arguments(
                 let mut written = Vec::new();
                 if !raw.is_empty() {
                     let raw = alternatives(raw.into_iter().cloned().collect());
-                    written.push(format!("{} ({raw})", lark_literal("true\">")));
+                    written.push(format!("{as_text} ({raw}) {close}"));
                 }
                 if !closing.is_empty() {
                     let json = alternatives(
@@ -934,38 +959,13 @@ fn emit_arguments(
                             })
                             .collect(),
                     );
-                    written.push(format!("{} ({json})", lark_literal("false\">")));
+                    written.push(format!("{as_json} ({json}) {close}"));
                 }
-                let open = tag(false, &format!("parameter name=\"{name}\" string=\""));
-                rules.push(format!(
-                    "{parameter}: {open} ({}) {}",
-                    written.join(" | "),
-                    tag(true, "parameter>\n")
-                ));
-                sequence.push(if required.contains(name.as_str()) {
-                    parameter
-                } else {
-                    format!("{parameter}?")
-                });
-                continue;
+                written.join(" | ")
             }
-            PropertyValue::Json => {
-                let grammar = format!("dsml_schema_{tool_index}_{property_index}");
-                schemas.push(GrammarWithLexer {
-                    name: Some(grammar.clone()),
-                    json_schema: Some(property_schema(&schema, name)),
-                    ..Default::default()
-                });
-                ("false", format!("@{grammar} {}", tag(true, "parameter>\n")))
-            }
+            PropertyValue::Json => held(),
         };
-        rules.push(format!(
-            "{parameter}: {open} {value}",
-            open = tag(
-                false,
-                &format!("parameter name=\"{name}\" string=\"{string}\">")
-            ),
-        ));
+        rules.push(format!("{parameter}: {open} ({written})"));
         sequence.push(if required.contains(name.as_str()) {
             parameter
         } else {
@@ -1179,30 +1179,39 @@ mod tests {
             lark.contains("arguments_0: parameter_0_0 parameter_0_1?"),
             "{lark}"
         );
+        // A plain string is text, or a JSON string held to its schema.
         assert!(
             lark.contains(
-                "parameter_0_0: \"<\" dsml_mark \"parameter name=\\\"command\\\" string=\\\"true\\\">\" dsml_vc\n"
+                "parameter_0_0: \"<\" dsml_mark \"parameter name=\\\"command\\\" string=\\\"\" (\"true\\\">\" dsml_vc | \"false\\\">\" @dsml_schema_0_0 \"</\" dsml_mark \"parameter>\\n\")\n"
             ),
             "{lark}"
         );
         assert!(
             lark.contains(
-                "parameter_0_1: \"<\" dsml_mark \"parameter name=\\\"timeout\\\" string=\\\"false\\\">\" @dsml_schema_0_1"
+                "parameter_0_1: \"<\" dsml_mark \"parameter name=\\\"timeout\\\" string=\\\"\" (\"false\\\">\" @dsml_schema_0_1 \"</\" dsml_mark \"parameter>\\n\")\n"
             ),
             "{lark}"
         );
-        // The property's schema, then the any-JSON grammar for parameters no schema holds.
-        assert_eq!(grammar.grammars.len(), 3);
-        // The property's schema refers into the whole tool schema, so its references resolve
-        // as they do there.
+        // Each property's schema, then the any-JSON grammar for parameters no schema holds.
+        assert_eq!(grammar.grammars.len(), 4);
+        // A property's schema refers into the whole tool schema, so its references resolve as
+        // they do there.
+        let tool_schema = bash(true).function.parameters.expect("parameters");
         assert_eq!(
             grammar.grammars[1].json_schema,
             Some(serde_json::json!({
-                "$ref": "#/$defs/tool/properties/timeout",
-                "$defs": { "tool": bash(true).function.parameters.expect("parameters") },
+                "$ref": "#/$defs/tool/properties/command",
+                "$defs": { "tool": tool_schema },
             }))
         );
-        assert_eq!(grammar.grammars[2].name.as_deref(), Some("dsml_json"));
+        assert_eq!(
+            grammar.grammars[2].json_schema,
+            Some(serde_json::json!({
+                "$ref": "#/$defs/tool/properties/timeout",
+                "$defs": { "tool": tool_schema },
+            }))
+        );
+        assert_eq!(grammar.grammars[3].name.as_deref(), Some("dsml_json"));
     }
 
     /// regression test for spiceai/mistral.rs#54: a tool that is not strict could write a
@@ -2019,7 +2028,29 @@ mod tests {
             }));
             let why = unenforceable(std::slice::from_ref(&strict)).expect("refused");
             assert!(why.contains(&format!("`{bad}`")), "{why}");
-            assert!(continuation_grammar(&[strict], &format!("<{DSML}tool_calls>")).is_none());
+            // The grammar that takes over a call the model began writes the tool as one that
+            // is not strict: its declared parameters the markup can write, and no other.
+            let opener = format!("<{DSML}tool_calls>");
+            let body = |parameters: &str| {
+                format!(
+                    "\n<{DSML}invoke name=\"set\">\n{parameters}</{DSML}invoke>\n</{DSML}tool_calls>"
+                )
+            };
+            let ok = format!("<{DSML}parameter name=\"ok\" string=\"true\">x</{DSML}parameter>\n");
+            assert!(
+                continuation_accepts(std::slice::from_ref(&strict), &opener, &body(&ok)),
+                "{bad:?}"
+            );
+            assert!(
+                !continuation_accepts(
+                    std::slice::from_ref(&strict),
+                    &opener,
+                    &body(&format!(
+                        "{ok}<{DSML}parameter name=\"{bad}\" string=\"true\">x</{DSML}parameter>\n"
+                    ))
+                ),
+                "{bad:?}"
+            );
         }
         for good in ["ok", "_x", "a.b-c", "camelCase9"] {
             let strict = tool(serde_json::json!({
@@ -2106,12 +2137,18 @@ mod tests {
             &opener,
             &body(&command).replace("Bash", "Shell")
         ));
-        // The newline the model wrote after the opening tag is not written again.
-        assert!(continuation_accepts(
-            &[bash(true)],
-            &format!("{opener}\n"),
-            &body(&command)[1..]
-        ));
+        // Whitespace the model wrote after the opening tag, a newline or more, is not written
+        // again.
+        for written in ["\n", "\n\n", "\n  \n"] {
+            assert!(
+                continuation_accepts(
+                    &[bash(true)],
+                    &format!("{opener}{written}"),
+                    &body(&command)[1..]
+                ),
+                "{written:?}"
+            );
+        }
         // A block opened under another name closes under it.
         let calls_opener = format!("I'll run it.\n\n<{DSML} calls>");
         assert!(continuation_accepts(
@@ -2134,6 +2171,8 @@ mod tests {
             format!("<{DSML}tool_calls>"),
             format!("Sure.\n<{DSML}tool_calls>"),
             format!("<{DSML}tool_calls>\n"),
+            format!("<{DSML}tool_calls>\n\n"),
+            format!("<{DSML}tool_calls>\n  \n"),
             format!("<{DSML} calls>"),
         ] {
             assert!(
@@ -2154,7 +2193,8 @@ mod tests {
                 "{text:?}"
             );
         }
-        // A strict tool whose schema the grammar cannot hold leaves the call unconstrained.
+        // A strict tool whose schema the grammar cannot hold is written as any parameters, and
+        // held to its schema when read, so the other tools stay held to theirs.
         let either = tool(serde_json::json!({
             "type": "object",
             "oneOf": [
@@ -2162,6 +2202,112 @@ mod tests {
                 { "properties": { "b": { "type": "string" } }, "required": ["b"] },
             ],
         }));
-        assert!(continuation_grammar(&[either], &format!("<{DSML}tool_calls>")).is_none());
+        let opener = format!("<{DSML}tool_calls>");
+        let tools = [either, bash(true)];
+        assert!(continuation_grammar(&tools, &opener).is_some());
+        let body = |name: &str, parameters: &str| {
+            format!("\n<{DSML}invoke name=\"{name}\">\n{parameters}</{DSML}invoke>\n</{DSML}tool_calls>")
+        };
+        let parameter = |name: &str, value: &str| {
+            format!("<{DSML}parameter name=\"{name}\" string=\"true\">{value}</{DSML}parameter>\n")
+        };
+        assert!(continuation_accepts(
+            &tools,
+            &opener,
+            &body(
+                "set",
+                &format!("{}{}", parameter("a", "1"), parameter("c", "3"))
+            )
+        ));
+        assert!(continuation_accepts(
+            &tools,
+            &opener,
+            &body("Bash", &parameter("command", "ls"))
+        ));
+        assert!(!continuation_accepts(&tools, &opener, &body("Bash", "")));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a `string="false"` value that is JSON but a
+    /// number the parser cannot hold (`1e309`) read as the string "1e309", and one inside an
+    /// array left the block unfinished, so the call was lost
+    #[test]
+    fn a_json_number_the_parser_cannot_hold_makes_the_block_content() {
+        let ls = one_call("Bash", &[("command", "true", "ls")]);
+        for value in ["1e309", "[1e309]", "{\"n\": -1e400}"] {
+            let block = one_call("set", &[("n", "false", value)]);
+            assert_eq!(calls(&block), None, "{value}");
+            assert!(!unfinished_block(&block), "{value}");
+            // The block is content, and reading resumes after it.
+            assert_eq!(
+                calls(&format!("{block}\n{ls}")),
+                Some(serde_json::json!([{"name": "Bash", "arguments": {"command": "ls"}}])),
+                "{value}"
+            );
+        }
+        // Text that is not JSON in a `string="false"` value is still read as text.
+        assert_eq!(
+            calls(&one_call("set", &[("n", "false", "soon")])),
+            Some(serde_json::json!([{"name": "set", "arguments": {"n": "soon"}}]))
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a strict tool's plain string parameter was
+    /// written as text only, which cannot hold the parameter's closing tag, so a value with
+    /// `</｜DSML｜parameter>` in it could not be written at all
+    #[test]
+    fn a_forced_plain_string_may_hold_its_closing_tag_as_a_json_string() {
+        let value = format!("the tag is </{DSML}parameter>, and that is fine");
+        let json = Value::String(value.clone()).to_string();
+        // The parser reads the JSON string back as its text.
+        assert_eq!(
+            calls(&one_call("Bash", &[("command", "false", json.as_str())])),
+            Some(serde_json::json!([{"name": "Bash", "arguments": {"command": value}}]))
+        );
+        // The forced grammar writes it. The JSON string's text is in ordinary tokens, the
+        // marker in it included: the special token cannot be part of a JSON value.
+        let (env, mark) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let mut grammar = build_dsml_grammar(&[bash(true)], Block::Whole);
+        specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+        let accepts = |value: &str| {
+            let mut tokens = dsml_tokens(
+                &format!(
+                    "<{DSML}tool_calls>\n<{DSML}invoke name=\"Bash\">\n<{DSML}parameter name=\"command\" string=\"false\">"
+                ),
+                mark,
+            );
+            tokens.extend(value.bytes().map(u32::from));
+            tokens.extend(dsml_tokens(
+                &format!("</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"),
+                mark,
+            ));
+            let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar.clone()));
+            matcher.consume_tokens(&tokens).is_ok() && matcher.is_accepting().unwrap_or(false)
+        };
+        assert!(accepts(&json));
+        // As JSON, the value is held to the property's schema: a string.
+        assert!(!accepts("42"));
+        assert!(!accepts("[\"ls\"]"));
+    }
+
+    /// A tool that declares no parameters takes any in a forced call, under any names: a grammar
+    /// cannot tell a name from one written before it. The parser reads a parameter given twice
+    /// as a block that is content, and a required call then fails (see the matcher's tests).
+    #[test]
+    fn a_tool_declaring_no_parameters_takes_any_names_in_a_forced_call() {
+        let any: Tool = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": { "name": "set", "parameters": { "type": "object" } },
+        }))
+        .expect("a tool");
+        let distinct = one_call("set", &[("a", "true", "1"), ("b", "true", "2")]);
+        let twice = one_call("set", &[("a", "true", "1"), ("a", "true", "2")]);
+        assert!(forced_call_accepts(std::slice::from_ref(&any), &distinct));
+        assert!(forced_call_accepts(&[any], &twice));
+        assert_eq!(
+            calls(&distinct),
+            Some(serde_json::json!([{"name": "set", "arguments": {"a": "1", "b": "2"}}]))
+        );
+        assert_eq!(calls(&twice), None);
     }
 }

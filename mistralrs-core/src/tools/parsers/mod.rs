@@ -256,21 +256,28 @@ fn without_closed_calls(text: &str) -> String {
     let mut out = text.to_string();
     let mut from = 0;
     loop {
-        let Some((open, start, end)) = CLOSED_CALL_DELIMITERS
+        let Some((format, open, start, end)) = CLOSED_CALL_DELIMITERS
             .iter()
-            .filter_map(|(_, start, end)| {
+            .filter_map(|(format, start, end)| {
                 out[from..]
                     .find(start)
-                    .map(|offset| (from + offset, *start, *end))
+                    .map(|offset| (*format, from + offset, *start, *end))
             })
-            .min_by_key(|(open, start, _)| (*open, std::cmp::Reverse(start.len())))
+            .min_by_key(|(_, open, start, _)| (*open, std::cmp::Reverse(start.len())))
         else {
             return out;
         };
-        let Some(length) = out[open + start.len()..].find(end) else {
+        // A Gemma 4 call quotes its string values, and a closer inside one is the value's text.
+        let close = if format == ToolCallFormat::Gemma4 {
+            gemma4::call_end(&out, open)
+        } else {
+            out[open + start.len()..]
+                .find(end)
+                .map(|length| open + start.len() + length + end.len())
+        };
+        let Some(close) = close else {
             return out;
         };
-        let close = open + start.len() + length + end.len();
         let blank = " ".repeat(out[open..close].chars().count());
         out.replace_range(open..close, &blank);
         from = open + blank.len();

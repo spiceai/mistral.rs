@@ -307,9 +307,18 @@ impl ToolCallingMatcher {
         };
 
         // DSML marks each value's type itself, so its arguments are already what the model
-        // wrote; a string `null` stays a string.
+        // wrote; a string `null` stays a string. A call to a strict tool is held to the tool's
+        // schema here, as the grammar that holds the model to it while it writes may not have
+        // run: the token that closed the block's opening tag carried more than whitespace, or
+        // the schema is one the grammar cannot hold.
         if let Some(tools) = self.tools.as_deref() {
-            if format != Some(ToolCallFormat::DeepSeekDsml) {
+            if format == Some(ToolCallFormat::DeepSeekDsml) {
+                retain_calls_within_strict_schemas(
+                    tools,
+                    &mut calls,
+                    self.tool_choice.requires_tool_call(),
+                )?;
+            } else {
                 coerce_arguments_by_schema(tools, &mut calls)?;
             }
         }
@@ -349,6 +358,61 @@ fn qwen_more_calls_possible(text: &str) -> bool {
     tail.is_empty()
         || QWEN_TOOL_CALL_OPEN.starts_with(tail)
         || tail.starts_with(QWEN_TOOL_CALL_OPEN)
+}
+
+/// Drops from `calls` each call to a strict tool whose arguments do not match the tool's
+/// parameters schema, and fails when a call is `required` and none is left: a strict tool is
+/// promised arguments that match its schema, so a call with others is not made.
+fn retain_calls_within_strict_schemas(
+    tools: &[crate::Tool],
+    calls: &mut Vec<ToolCallResponse>,
+    required: bool,
+) -> anyhow::Result<()> {
+    let mut dropped = None;
+    calls.retain(|call| {
+        let Some(schema) = tools
+            .iter()
+            .find(|tool| tool.function.name == call.function.name)
+            .and_then(|tool| tool.function.strict_parameters_schema())
+        else {
+            return true;
+        };
+        let Some(why) = strict_schema_mismatch(&schema, &call.function.arguments) else {
+            return true;
+        };
+        tracing::warn!("Dropping tool call `{}`: it {why}", call.function.name);
+        dropped.get_or_insert_with(|| format!("`{}` {why}", call.function.name));
+        false
+    });
+    if let Some(dropped) = dropped.filter(|_| required && calls.is_empty()) {
+        anyhow::bail!("Tool choice was required but the model's call to strict tool {dropped}");
+    }
+    Ok(())
+}
+
+/// Why `arguments` do not match the strict tool's parameters `schema`, if they do not.
+fn strict_schema_mismatch(schema: &Value, arguments: &str) -> Option<String> {
+    let arguments: Value = match serde_json::from_str(arguments) {
+        Ok(arguments) => arguments,
+        Err(error) => return Some(format!("has arguments that are not JSON: {error}")),
+    };
+    let validator = match jsonschema::options()
+        .should_validate_formats(false)
+        .build(schema)
+    {
+        Ok(validator) => validator,
+        Err(error) => {
+            return Some(format!(
+                "has a parameters schema its arguments cannot be checked against: {error}. Fix the schema, or remove `strict` from the tool"
+            ))
+        }
+    };
+    validator.validate(&arguments).err().map(|error| {
+        format!(
+            "has arguments that do not match its parameters schema at `{}`: {error}",
+            error.instance_path()
+        )
+    })
 }
 
 /// XML-style tool formats (Qwen3.5) carry every argument as text; the tool schema decides its JSON type (vLLM parity).
@@ -864,6 +928,112 @@ mod tests {
             .map(|call| call.function.name.as_str())
             .collect();
         assert_eq!(names, ["write_file"]);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a Gemma 4 call was framed at the first
+    /// `<tool_call|>`, even one inside a `<|"|>`-quoted value, so a DSML block later in that
+    /// value read as outside any call and claimed the message for DSML
+    #[test]
+    fn a_closer_quoted_in_a_gemma_value_does_not_end_its_call() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let value = "End a call with <tool_call|>, then run:\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let message =
+            format!("<|tool_call>call:write_file{{content:<|\"|>{value}<|\"|>}}<tool_call|>");
+        let calls = matcher.get_call(&message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({ "content": value }));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML call to a strict tool was read as
+    /// written, with nothing holding it to the tool's schema when no grammar had held the model
+    /// to it, so `Bash`, which requires `command`, could be called without it
+    #[test]
+    fn a_dsml_call_to_a_strict_tool_is_held_to_its_schema_when_read() {
+        let bash: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        }))
+        .unwrap();
+        let call = |parameters: &str| {
+            format!(
+                "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"Bash\">\n{parameters}</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+            )
+        };
+        let command =
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n";
+        let without_command = call("");
+        let timeout_as_text = call(&format!(
+            "{command}<｜DSML｜parameter name=\"timeout\" string=\"true\">30</｜DSML｜parameter>\n"
+        ));
+        let valid = call(&format!(
+            "{command}<｜DSML｜parameter name=\"timeout\" string=\"false\">30</｜DSML｜parameter>\n"
+        ));
+        let auto =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(std::slice::from_ref(&bash))).unwrap();
+        assert!(auto.get_call(&without_command).unwrap().is_empty());
+        assert!(auto.get_call(&timeout_as_text).unwrap().is_empty());
+        let calls = auto.get_call(&valid).unwrap();
+        assert_eq!(calls.len(), 1);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"command": "ls", "timeout": 30}));
+        let required =
+            ToolCallingMatcher::new(ToolChoice::Required, Some(std::slice::from_ref(&bash)))
+                .unwrap();
+        let error = required.get_call(&without_command).unwrap_err().to_string();
+        assert!(
+            error.contains("strict tool `Bash`")
+                && error.contains("\"command\" is a required property"),
+            "{error}"
+        );
+        assert_eq!(required.get_call(&valid).unwrap().len(), 1);
+        // A tool that is not strict is read as written.
+        let mut loose = bash;
+        loose.function.strict = None;
+        let auto = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[loose])).unwrap();
+        assert_eq!(auto.get_call(&without_command).unwrap().len(), 1);
+    }
+
+    /// A tool that declares no parameters takes any in a forced call, so no grammar keeps the
+    /// model from giving a parameter twice. Such a block is content, and a required call ends
+    /// the request with an error rather than calling with one of the two values.
+    #[test]
+    fn a_required_call_with_a_parameter_given_twice_is_an_error_not_a_call() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": "set", "parameters": { "type": "object" } },
+        }))
+        .unwrap();
+        let twice = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"set\">\n<｜DSML｜parameter name=\"a\" string=\"true\">1</｜DSML｜parameter>\n<｜DSML｜parameter name=\"a\" string=\"true\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let required = ToolCallingMatcher::new(ToolChoice::Required, Some(&[tool])).unwrap();
+        assert_eq!(
+            required.get_call(twice).unwrap_err().to_string(),
+            "Tool choice was required but no tools were called."
+        );
     }
 
     /// regression test for spiceai/mistral.rs#54: a DSML block opener still being written, or

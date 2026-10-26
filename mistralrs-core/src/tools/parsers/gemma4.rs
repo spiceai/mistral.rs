@@ -13,6 +13,31 @@ use crate::Tool;
 /// Gemma 4 string delimiter token.
 const GEMMA4_STR_DELIM: &str = "<|\"|>";
 
+const CALL_OPEN: &str = "<|tool_call>";
+const CALL_CLOSE: &str = "<tool_call|>";
+
+/// Where the call that `<|tool_call>` opens at `open` in `text` ends, past its `<tool_call|>`,
+/// read as the parser reads it: `call:NAME{...}` runs to the brace matching its first, and a
+/// `<tool_call|>` inside a `<|"|>`-quoted value is that value's text. A call whose text does
+/// not reach a brace before a closer ends at that closer. `None` while the call is still open.
+pub(super) fn call_end(text: &str, open: usize) -> Option<usize> {
+    let body = open + CALL_OPEN.len();
+    let closer = |from: usize| {
+        text[from..]
+            .find(CALL_CLOSE)
+            .map(|at| from + at + CALL_CLOSE.len())
+    };
+    let brace = text[body..]
+        .strip_prefix("call:")
+        .and_then(|name| name.find('{'))
+        .map(|at| body + "call:".len() + at)
+        .filter(|&brace| text[body..brace].find(CALL_CLOSE).is_none());
+    match brace {
+        Some(brace) => closer(extract_matched_braces(text, brace)?.1),
+        None => closer(body),
+    }
+}
+
 pub struct Gemma4Parser;
 
 impl ToolFormatParser for Gemma4Parser {
@@ -21,7 +46,14 @@ impl ToolFormatParser for Gemma4Parser {
     }
 
     fn open_at_end(&self, text: &str) -> bool {
-        super::open_between(text, "<|tool_call>", "<tool_call|>")
+        let mut from = 0;
+        while let Some(offset) = text[from..].find(CALL_OPEN) {
+            let Some(end) = call_end(text, from + offset) else {
+                return true;
+            };
+            from = end;
+        }
+        false
     }
 
     fn format(&self) -> super::ToolCallFormat {

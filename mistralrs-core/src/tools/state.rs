@@ -426,7 +426,7 @@ mod tests {
             .unwrap();
         assert!(
             lark(&grammar)
-                .starts_with("start: \"\\n\"? (invoke_0)+ \"</\" dsml_mark \"tool_calls>\"\n"),
+                .starts_with("start: DSML_WS? (invoke_0)+ \"</\" dsml_mark \"tool_calls>\"\n"),
             "{}",
             lark(&grammar)
         );
