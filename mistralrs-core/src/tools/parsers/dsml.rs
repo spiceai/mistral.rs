@@ -574,10 +574,12 @@ const VALUE_THEN_CLOSE: &str = "dsml_vc";
 /// The sub-grammar for any JSON value, the `string="false"` value of a parameter no schema holds.
 const ANY_JSON: &str = "dsml_json";
 
-/// The value rules where the marker is text: any text through a final `</` that holds no
-/// `</｜DSML｜`, the text the closing tag reads as.
-pub(super) const VALUE_RULES: &str = r#"dsml_vc: DSML_VALUE_LT_SLASH dsml_mark "parameter>\n"
-DSML_VALUE_LT_SLASH: /(?s:.*)<\// & ~/(?s:.*)<\/｜DSML｜(?s:.*)/"#;
+/// The value rules where the marker is text: the value runs to its first closing tag, which
+/// ends it, and holds any text but a closing tag of a parameter, where the scanner would end it
+/// (`value_at`), so it may hold other DSML tags. The value is lazy: the parser's lexer extends a
+/// lexeme as far as it can, so a value written as the longest text before a `</` would run on
+/// past its closing tag, and never close.
+pub(super) const VALUE_RULES: &str = r#"dsml_vc[suffix="</｜DSML｜parameter>\n"]: /(?s:.*)/ & ~/(?s:.*)<\/｜DSML｜[ \t\r\n]*parameter[> \t\r\n](?s:.*)/"#;
 
 /// The value rules where the marker is a special token: text between markers, where a marker
 /// after `</` begins the closing tag only when `parameter` follows it, so other DSML tags are
@@ -1734,6 +1736,43 @@ mod tests {
             )),
             None
         );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: with no special token for the marker, a
+    /// forced call's string value was the longest text before a `</`, which the parser's lexer
+    /// ran on past the value's closing tag, so no string value could close, and a value could
+    /// not hold another DSML closing tag, which the scanner reads as the value's text. A value
+    /// now runs to its first closing tag, and holds whatever the scanner reads as its text.
+    #[test]
+    fn a_forced_call_without_the_marker_token_writes_any_value_the_scanner_reads() {
+        let env = byte_env(&["<eos>"]);
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let accepts = |call: &str| {
+            let mut grammar = build_dsml_grammar(&[bash(true)], Block::Whole);
+            specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+            let mut matcher = llguidance::Matcher::new(factory.create_parser(grammar));
+            let tokens: Vec<u32> = call.bytes().map(u32::from).collect();
+            matcher.consume_tokens(&tokens).is_ok() && matcher.is_accepting().unwrap_or(false)
+        };
+        for value in [
+            "ls",
+            "echo '<div>Hi</div>'",
+            "echo '</｜DSML｜invoke>'",
+            "a ｜DSML｜ b",
+        ] {
+            let call = one_call("Bash", &[("command", "true", value)]);
+            assert!(accepts(&call), "{value}");
+            assert_eq!(
+                calls(&call),
+                Some(serde_json::json!([{ "name": "Bash", "arguments": { "command": value } }])),
+                "{value}"
+            );
+        }
+        // A closing tag of a parameter ends the value where the scanner ends it, so a value
+        // cannot hold one.
+        let call = one_call("Bash", &[("command", "true", "x</｜DSML｜parameter >y")]);
+        assert!(!accepts(&call));
+        assert_eq!(calls(&call), None);
     }
 
     /// Runs `call` through the forced-call grammar for `tools`, from its opening `<`: whether
