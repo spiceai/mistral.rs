@@ -106,10 +106,16 @@ enum Scan<T> {
     Bad,
 }
 
-/// The calls in a message, and where each block of them sits in it.
+/// The calls in a message, in order, and the blocks they were read from.
 struct Found {
     calls: Vec<DsmlToolCall>,
-    blocks: Vec<std::ops::Range<usize>>,
+    blocks: Vec<FoundBlock>,
+}
+
+/// Where a block of calls sits in a message, and how many of the message's calls it holds.
+struct FoundBlock {
+    span: std::ops::Range<usize>,
+    calls: usize,
 }
 
 /// A tag at the start of `text` that opens (or, with `closing`, closes) one of `names`, as
@@ -399,8 +405,11 @@ fn scan(message: &str) -> Scan<Found> {
         };
         let end = start + open + length;
         if !malformed && bare(attributes) {
+            found.blocks.push(FoundBlock {
+                span: start..end,
+                calls: calls.len(),
+            });
             found.calls.extend(calls);
-            found.blocks.push(start..end);
         }
         from = end;
         outside = end;
@@ -472,14 +481,27 @@ pub(super) fn unfinished_block(message: &str) -> bool {
 
 /// `message` without its blocks of calls: the text the model wrote around them.
 pub(super) fn strip_calls(message: &str) -> String {
+    strip_blocks_making_calls(message, |_| true)
+}
+
+/// `message` without the blocks that made a call, where `made` says whether the call at an
+/// index among the message's calls, in order, was made. A block none of whose calls were made
+/// is content, as a malformed one is.
+pub(super) fn strip_blocks_making_calls(message: &str, made: impl Fn(usize) -> bool) -> String {
     let Scan::Done(found) = scan(message) else {
         return message.to_string();
     };
     let mut out = String::new();
     let mut cursor = 0;
+    let mut first = 0;
     for block in found.blocks {
-        out.push_str(&message[cursor..block.start]);
-        cursor = block.end;
+        let calls = first..first + block.calls;
+        first = calls.end;
+        if !calls.into_iter().any(&made) {
+            continue;
+        }
+        out.push_str(&message[cursor..block.span.start]);
+        cursor = block.span.end;
     }
     out.push_str(&message[cursor..]);
     out

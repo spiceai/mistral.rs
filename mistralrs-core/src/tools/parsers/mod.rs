@@ -341,6 +341,16 @@ pub(crate) fn extract_model_specific_call(
     Ok(None)
 }
 
+/// `message` without the DSML blocks that made a call, where `made` says whether the call at
+/// an index among the message's calls, in order, was made. A block none of whose calls were
+/// made is content, as a malformed one is.
+pub(crate) fn strip_dsml_blocks_making_calls(
+    message: &str,
+    made: impl Fn(usize) -> bool,
+) -> String {
+    dsml::strip_blocks_making_calls(message, made)
+}
+
 fn strip_tool_call_segments(message: &str, format: ToolCallFormat) -> String {
     if let Some((_, start, end)) = CLOSED_CALL_DELIMITERS
         .iter()

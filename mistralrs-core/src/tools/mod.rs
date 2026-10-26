@@ -36,10 +36,16 @@ fn process_model_specific_message(message: &str) -> Result<String> {
     parsers::process_model_specific_message(message)
 }
 
+/// A strict tool's parameters schema compiled to hold the tool's calls to, or why it cannot be.
+type StrictValidator = std::result::Result<jsonschema::Validator, String>;
+
 pub struct ToolCallingMatcher {
     tool_choice: ToolChoice,
     known_tool_names: Option<std::collections::HashSet<String>>,
     tools: Option<Arc<Vec<crate::Tool>>>,
+    /// Each strict tool's parameters schema, by the tool's name, compiled once to hold the
+    /// tool's calls to when they are read, or why it cannot be compiled.
+    strict_validators: Arc<HashMap<String, StrictValidator>>,
 }
 
 // Same as CalledFunction, but has different cases for variations on the names
@@ -183,11 +189,20 @@ impl ToolCallingMatcher {
                 .map(|tool| tool.function.name.clone())
                 .collect::<std::collections::HashSet<_>>()
         });
+        let strict_validators = selected_tools
+            .iter()
+            .flatten()
+            .filter_map(|tool| {
+                let schema = tool.function.strict_parameters_schema()?;
+                Some((tool.function.name.clone(), compile_strict_schema(&schema)))
+            })
+            .collect::<HashMap<_, _>>();
         let tools_arc = selected_tools.map(Arc::new);
         Ok(Self {
             tool_choice,
             known_tool_names,
             tools: tools_arc,
+            strict_validators: Arc::new(strict_validators),
         })
     }
 
@@ -335,10 +350,11 @@ impl ToolCallingMatcher {
         // schema here, as the grammar that holds the model to it while it writes may not have
         // run: the token that closed the block's opening tag carried more than whitespace, or
         // the schema is one the grammar cannot hold.
+        let read = calls.len();
         if let Some(tools) = self.tools.as_deref() {
             if format == Some(ToolCallFormat::DeepSeekDsml) {
                 retain_calls_within_strict_schemas(
-                    tools,
+                    &self.strict_validators,
                     &mut calls,
                     self.tool_choice.requires_tool_call(),
                 )?;
@@ -366,11 +382,23 @@ impl ToolCallingMatcher {
             }
         }
 
-        // A DSML block that makes no call is content, as a malformed one is: the message is
-        // returned as the model wrote it, the block included, rather than with the block gone
-        // and no call in its place.
-        if calls.is_empty() && format == Some(ToolCallFormat::DeepSeekDsml) {
-            return Ok((Some(written.to_string()), calls));
+        // A DSML block that makes no call is content, as a malformed one is: a message none of
+        // whose blocks makes a call is returned as the model wrote it, and one with a block that
+        // does is returned with only the blocks that make a call stripped, rather than with
+        // every block gone.
+        if format == Some(ToolCallFormat::DeepSeekDsml) && calls.len() < read {
+            if calls.is_empty() {
+                return Ok((Some(written.to_string()), calls));
+            }
+            let made = calls
+                .iter()
+                .map(|call| call.index)
+                .collect::<std::collections::HashSet<_>>();
+            let content =
+                parsers::strip_dsml_blocks_making_calls(written, |index| made.contains(&index))
+                    .trim_start()
+                    .to_string();
+            return Ok(((!content.is_empty()).then_some(content), calls));
         }
 
         Ok((content, calls))
@@ -391,24 +419,30 @@ fn qwen_more_calls_possible(text: &str) -> bool {
         || tail.starts_with(QWEN_TOOL_CALL_OPEN)
 }
 
+/// A strict tool's parameters `schema` compiled to hold the tool's calls to, or why it cannot
+/// be. `format` is an annotation, not a constraint.
+fn compile_strict_schema(schema: &Value) -> StrictValidator {
+    jsonschema::options()
+        .should_validate_formats(false)
+        .build(schema)
+        .map_err(|error| error.to_string())
+}
+
 /// Drops from `calls` each call to a strict tool whose arguments do not match the tool's
-/// parameters schema, and fails when a call is `required` and none is left: a strict tool is
-/// promised arguments that match its schema, so a call with others is not made.
+/// parameters schema (`validators`, by the tool's name), and fails when a call is `required`
+/// and none is left: a strict tool is promised arguments that match its schema, so a call with
+/// others is not made.
 fn retain_calls_within_strict_schemas(
-    tools: &[crate::Tool],
+    validators: &HashMap<String, StrictValidator>,
     calls: &mut Vec<ToolCallResponse>,
     required: bool,
 ) -> anyhow::Result<()> {
     let mut dropped = None;
     calls.retain(|call| {
-        let Some(schema) = tools
-            .iter()
-            .find(|tool| tool.function.name == call.function.name)
-            .and_then(|tool| tool.function.strict_parameters_schema())
-        else {
+        let Some(validator) = validators.get(&call.function.name) else {
             return true;
         };
-        let Some(why) = strict_schema_mismatch(&schema, &call.function.arguments) else {
+        let Some(why) = strict_schema_mismatch(validator, &call.function.arguments) else {
             return true;
         };
         tracing::warn!("Dropping tool call `{}`: it {why}", call.function.name);
@@ -421,16 +455,14 @@ fn retain_calls_within_strict_schemas(
     Ok(())
 }
 
-/// Why `arguments` do not match the strict tool's parameters `schema`, if they do not.
-fn strict_schema_mismatch(schema: &Value, arguments: &str) -> Option<String> {
+/// Why `arguments` do not match the strict tool's parameters schema, compiled as `validator`,
+/// if they do not.
+fn strict_schema_mismatch(validator: &StrictValidator, arguments: &str) -> Option<String> {
     let arguments: Value = match serde_json::from_str(arguments) {
         Ok(arguments) => arguments,
         Err(error) => return Some(format!("has arguments that are not JSON: {error}")),
     };
-    let validator = match jsonschema::options()
-        .should_validate_formats(false)
-        .build(schema)
-    {
+    let validator = match validator {
         Ok(validator) => validator,
         Err(error) => {
             return Some(format!(
@@ -1176,6 +1208,96 @@ mod tests {
         assert_eq!(
             matcher.prefix_could_be_tool(block_then_example).unwrap(),
             (true, false)
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML block whose every call was refused
+    /// vanished from the content when another block in the message made a call, as every block
+    /// was stripped once a call survived. Only a block that made a call is stripped; one that
+    /// made none is content, as a malformed one is.
+    #[test]
+    fn a_refused_dsml_block_stays_content_beside_a_block_that_calls() {
+        let bash: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        }))
+        .unwrap();
+        let block = |name: &str, parameter: &str| {
+            format!(
+                "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"{name}\">\n<｜DSML｜parameter {parameter}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+            )
+        };
+        let refused = block("Bash", "name=\"timeout\" string=\"false\">30");
+        let not_offered = block("Shell", "name=\"command\" string=\"true\">ls");
+        let calling = block("Bash", "name=\"command\" string=\"true\">ls");
+        let auto = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[bash])).unwrap();
+        for (message, content) in [
+            (
+                format!("First.\n{refused}\nThen.\n{calling}"),
+                format!("First.\n{refused}\nThen.\n"),
+            ),
+            (
+                format!("{calling}\n{not_offered}\nDone."),
+                format!("{not_offered}\nDone."),
+            ),
+        ] {
+            assert_eq!(
+                auto.prefix_could_be_tool(&message).unwrap(),
+                (false, true),
+                "{message}"
+            );
+            let (got, calls) = auto.get_call_with_content(&message).unwrap();
+            assert_eq!(got.as_deref(), Some(content.as_str()), "{message}");
+            let args: Vec<Value> = calls
+                .iter()
+                .map(|call| serde_json::from_str(&call.function.arguments).unwrap())
+                .collect();
+            assert_eq!(args, [json!({"command": "ls"})], "{message}");
+        }
+    }
+
+    /// A strict tool whose parameters schema cannot be compiled, here a `minimum` that is not a
+    /// number, cannot hold a call: the call is refused with the reason, in `auto` mode dropped
+    /// and in `required` mode an error, as a call to a strict tool is held to the schema when
+    /// read.
+    #[test]
+    fn a_strict_schema_that_cannot_be_compiled_refuses_its_calls_with_the_reason() {
+        let broken: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "set",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": { "n": { "type": "integer", "minimum": "zero" } },
+                },
+            },
+        }))
+        .unwrap();
+        let call = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"set\">\n<｜DSML｜parameter name=\"n\" string=\"false\">1</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let auto =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(std::slice::from_ref(&broken))).unwrap();
+        let (content, calls) = auto.get_call_with_content(call).unwrap();
+        assert_eq!(content.as_deref(), Some(call));
+        assert!(calls.is_empty());
+        let required = ToolCallingMatcher::new(ToolChoice::Required, Some(&[broken])).unwrap();
+        let error = required.get_call(call).unwrap_err().to_string();
+        assert!(
+            error.contains("strict tool `set`")
+                && error.contains("cannot be checked against")
+                && error.contains("remove `strict` from the tool"),
+            "{error}"
         );
     }
 
