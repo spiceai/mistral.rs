@@ -240,6 +240,22 @@ impl ToolCallingMatcher {
         if is_complete_tool && qwen_more_calls_possible(raw_prefix) {
             return Ok((true, false));
         }
+        // A DSML block makes the calls that survive being read: a call to a strict tool that its
+        // schema refuses, or to a tool not offered, is not made. A block that makes none is
+        // content, as a malformed one is, and the message stays held back from it until the turn
+        // ends. A required call that makes none fails when read, so it stays complete and fails
+        // at once.
+        if is_complete_tool
+            && format == Some(ToolCallFormat::DeepSeekDsml)
+            && !self.tool_choice.requires_tool_call()
+        {
+            let (_, calls) = self
+                .get_call_with_content(raw_prefix)
+                .map_err(candle_core::Error::msg)?;
+            if calls.is_empty() {
+                return Ok((true, false));
+            }
+        }
         Ok((could_be_tool, is_complete_tool))
     }
 
@@ -254,6 +270,7 @@ impl ToolCallingMatcher {
         if matches!(self.tool_choice, ToolChoice::None) {
             return Ok((Some(message.to_string()), Vec::new()));
         }
+        let written = message;
         let (message, content, format) = if let Some((message, content, format)) =
             parsers::extract_model_specific_call(message)?
         {
@@ -340,6 +357,13 @@ impl ToolCallingMatcher {
             if calls.is_empty() && before > 0 && self.tool_choice.requires_tool_call() {
                 anyhow::bail!("Tool choice was required but model called unknown tools.");
             }
+        }
+
+        // A DSML block that makes no call is content, as a malformed one is: the message is
+        // returned as the model wrote it, the block included, rather than with the block gone
+        // and no call in its place.
+        if calls.is_empty() && format == Some(ToolCallFormat::DeepSeekDsml) {
+            return Ok((Some(written.to_string()), calls));
         }
 
         Ok((content, calls))
@@ -1016,6 +1040,87 @@ mod tests {
         loose.function.strict = None;
         let auto = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[loose])).unwrap();
         assert_eq!(auto.get_call(&without_command).unwrap().len(), 1);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML block whose every call was refused when
+    /// read, as a call to a strict tool with arguments its schema does not allow or to a tool
+    /// not offered is, was still reported complete, with the block stripped from the content, so
+    /// a stream ended with `finish_reason: "tool_calls"`, no calls, and the block gone. A block
+    /// that makes no call is content, as a malformed one is: the message stays held back from it
+    /// until the turn ends, then is returned as the model wrote it.
+    #[test]
+    fn a_dsml_block_whose_calls_are_all_refused_is_content_not_a_complete_call() {
+        let bash: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        }))
+        .unwrap();
+        let block = |invocations: &str| {
+            format!("Running it.\n\n<｜DSML｜tool_calls>\n{invocations}</｜DSML｜tool_calls>")
+        };
+        let invoke = |name: &str, parameters: &str| {
+            format!("<｜DSML｜invoke name=\"{name}\">\n{parameters}</｜DSML｜invoke>\n")
+        };
+        let command =
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n";
+        let timeout =
+            "<｜DSML｜parameter name=\"timeout\" string=\"false\">30</｜DSML｜parameter>\n";
+        let auto =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(std::slice::from_ref(&bash))).unwrap();
+        // Refused by the tool's schema, and a tool that is not offered.
+        for refused in [
+            block(&invoke("Bash", timeout)),
+            block(&invoke("Shell", command)),
+        ] {
+            assert_eq!(
+                auto.prefix_could_be_tool(&refused).unwrap(),
+                (true, false),
+                "{refused}"
+            );
+            let (content, calls) = auto.get_call_with_content(&refused).unwrap();
+            assert_eq!(content.as_deref(), Some(refused.as_str()), "{refused}");
+            assert!(calls.is_empty(), "{refused}");
+        }
+        // A block that makes a call beside one it does not still ends the turn with that call.
+        let one_of_two = block(&format!(
+            "{}{}",
+            invoke("Bash", timeout),
+            invoke("Bash", command)
+        ));
+        assert_eq!(
+            auto.prefix_could_be_tool(&one_of_two).unwrap(),
+            (false, true)
+        );
+        let (content, calls) = auto.get_call_with_content(&one_of_two).unwrap();
+        assert_eq!(content.as_deref(), Some("Running it.\n\n"));
+        let args: Vec<Value> = calls
+            .iter()
+            .map(|call| serde_json::from_str(&call.function.arguments).unwrap())
+            .collect();
+        assert_eq!(args, [json!({"command": "ls"})]);
+        // A required call that makes none fails as soon as it is read.
+        let required = ToolCallingMatcher::new(ToolChoice::Required, Some(&[bash])).unwrap();
+        let refused = block(&invoke("Bash", timeout));
+        assert_eq!(
+            required.prefix_could_be_tool(&refused).unwrap(),
+            (false, true)
+        );
+        let error = required.get_call(&refused).unwrap_err().to_string();
+        assert!(
+            error.contains("\"command\" is a required property"),
+            "{error}"
+        );
     }
 
     /// A tool that declares no parameters takes any in a forced call, so no grammar keeps the

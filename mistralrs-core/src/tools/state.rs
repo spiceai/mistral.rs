@@ -526,6 +526,67 @@ mod tests {
             .is_none());
     }
 
+    /// regression test for spiceai/mistral.rs#54: a DSML call to a strict tool, refused by the
+    /// tool's schema when read, was reported complete while the stream was still being read, so
+    /// the stream ended with `finish_reason: "tool_calls"`, no calls, and the block gone from the
+    /// content. The block is content: held back until the turn ends, then returned as written.
+    #[test]
+    fn a_stream_holds_back_a_dsml_block_whose_calls_are_all_refused_until_the_turn_ends() {
+        let bash: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string" },
+                        "timeout": { "type": "integer" },
+                    },
+                    "required": ["command"],
+                },
+            },
+        }))
+        .unwrap();
+        let tools = vec![bash];
+        let mut state = ToolCallState::new(
+            ToolChoice::Auto,
+            Some(&tools),
+            Some(ToolCallFormat::DeepSeekDsml),
+        )
+        .unwrap();
+        let refused = "Running it.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"timeout\" string=\"false\">30</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        // While the turn goes on: a call is still possible and none is complete, so nothing is
+        // sent.
+        assert_eq!(state.prefix_status(refused).unwrap(), (true, false));
+        assert!(state.complete_if_tool_call(refused).unwrap().is_empty());
+        let parsed = state
+            .parse_streaming(Some(refused.to_string()), refused, None, false, false)
+            .unwrap();
+        assert!(parsed.tool_use_still_possible);
+        assert!(!parsed.tool_use_is_done);
+        assert!(parsed.tool_calls.is_empty());
+        // When the turn ends: the message as the model wrote it, and no call ended the turn.
+        let parsed = state
+            .parse_streaming(Some(refused.to_string()), refused, None, false, true)
+            .unwrap();
+        assert_eq!(parsed.content.as_deref(), Some(refused));
+        assert!(parsed.tool_calls.is_empty());
+        assert!(!parsed.tool_use_is_done);
+        // A call the schema allows ends the turn.
+        let accepted = refused.replace(
+            "name=\"timeout\" string=\"false\">30",
+            "name=\"command\" string=\"true\">ls",
+        );
+        assert_eq!(state.prefix_status(&accepted).unwrap(), (false, true));
+        let parsed = state
+            .parse_streaming(Some(accepted.clone()), &accepted, None, false, false)
+            .unwrap();
+        assert_eq!(parsed.content.as_deref(), Some("Running it.\n\n"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert!(parsed.tool_use_is_done);
+    }
+
     /// regression test for spiceai/mistral.rs#54: a required call refused an unenforceable
     /// strict tool that `tool_choice` left out of the call
     #[test]

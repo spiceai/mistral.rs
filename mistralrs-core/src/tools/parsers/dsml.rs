@@ -21,6 +21,8 @@
 //! never becomes a call in another format, and nothing after the block streams out before the
 //! turn ends; a block opened inside another format's call is that call's text.
 
+use std::collections::HashMap;
+
 use candle_core::Result;
 use llguidance::api::{GrammarWithLexer, TopLevelGrammar};
 use serde::Serialize;
@@ -733,6 +735,12 @@ fn unenforceable_tool(tool: &Tool) -> Option<String> {
             "Tool '{name}' is strict, and its parameter `{unwritable}` has a name a DeepSeek-V4 tool call cannot write: a name is letters, digits, `_`, `.` and `-`, and does not start with a digit. Rename the parameter, or remove `strict` from the tool."
         ));
     }
+    // The grammar follows a reference into the schema only.
+    if let Some(reference) = unfollowable_reference(&schema) {
+        return Some(format!(
+            "Tool '{name}' is strict, and its parameters schema refers to `{reference}`, which a DeepSeek-V4 tool call cannot follow: a reference names the schema's root (`#`), a pointer into it (`#/...`), or an `$anchor` it declares. Point the reference into the schema, or remove `strict` from the tool."
+        ));
+    }
     let missing = object
         .get("required")
         .and_then(Value::as_array)?
@@ -766,73 +774,146 @@ const TOOL_SCHEMA: &str = "tool";
 fn property_schema(root: &Value, name: &str) -> Value {
     let mut tool = root.clone();
     rebase_references(&mut tool, &format!("#/$defs/{TOOL_SCHEMA}"));
-    // A property name in a JSON pointer escapes `~` and `/`.
-    let pointer = name.replace('~', "~0").replace('/', "~1");
     serde_json::json!({
-        "$ref": format!("#/$defs/{TOOL_SCHEMA}/properties/{pointer}"),
+        "$ref": format!("#/$defs/{TOOL_SCHEMA}/properties/{}", pointer_segment(name)),
         "$defs": { TOOL_SCHEMA: tool },
     })
 }
 
-/// Every `$ref` in `schema` that points into its own document (`#/...`) made relative to `base`.
-/// Only the keywords that hold schemas are entered: `const`, `enum`, `default`, `examples` and
-/// the annotations hold data, where a `$ref` key is a value's own.
+/// `key` as a segment of a JSON pointer, which escapes `~` and `/`.
+fn pointer_segment(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+/// Every `$ref` in `schema` into its own document made relative to `base`, as a pointer, which
+/// is all the grammar follows: `#` names the root, `#/...` is a pointer from it, and `#name` is
+/// the schema declaring `$anchor: "name"`, written as the pointer to it. A reference the grammar
+/// cannot follow (`unfollowable_reference`) is left as written.
 fn rebase_references(schema: &mut Value, base: &str) {
-    let Some(object) = schema.as_object_mut() else {
-        return;
-    };
-    let each = |values: &mut Value| {
-        if let Some(map) = values.as_object_mut() {
-            map.values_mut()
-                .for_each(|value| rebase_references(value, base));
-        } else if let Some(items) = values.as_array_mut() {
-            items
-                .iter_mut()
-                .for_each(|item| rebase_references(item, base));
-        }
-    };
-    for (key, value) in object.iter_mut() {
-        match key.as_str() {
-            "$ref" => {
-                if let Value::String(reference) = value {
-                    if reference.starts_with('#') {
-                        *reference = format!("{base}{}", &reference[1..]);
-                    }
-                }
-            }
-            // A schema, a map of schemas, or an array of schemas.
-            "additionalProperties"
-            | "unevaluatedProperties"
-            | "propertyNames"
-            | "items"
-            | "additionalItems"
-            | "unevaluatedItems"
-            | "contains"
-            | "not"
-            | "if"
-            | "then"
-            | "else"
-            | "contentSchema"
-            | "properties"
-            | "patternProperties"
-            | "$defs"
-            | "definitions"
-            | "dependentSchemas"
-            | "allOf"
-            | "anyOf"
-            | "oneOf"
-            | "prefixItems" => {
-                if value.is_object() && !is_schema_map(key) {
-                    rebase_references(value, base);
-                } else {
-                    each(value);
-                }
-            }
-            // A map of schemas or of property-name arrays.
-            "dependencies" => each(value),
-            _ => {}
+    let anchors = anchors(schema);
+    for pointer in schema_pointers(schema) {
+        let Some(Value::String(reference)) = schema
+            .pointer_mut(&pointer)
+            .and_then(|schema| schema.get_mut("$ref"))
+        else {
+            continue;
+        };
+        if let Some(rebased) = rebased(reference, base, &anchors) {
+            *reference = rebased;
         }
     }
+}
+
+/// `reference` as a pointer from `base`: `#` is `base`, `#/...` is `base/...`, and `#name` is
+/// `base` and then the pointer to the schema declaring the anchor `name`, when one does. Any
+/// other reference has no pointer the grammar can follow.
+fn rebased(reference: &str, base: &str, anchors: &HashMap<String, String>) -> Option<String> {
+    let fragment = reference.strip_prefix('#')?;
+    if fragment.is_empty() {
+        return Some(base.to_string());
+    }
+    if fragment.starts_with('/') {
+        return Some(format!("{base}{fragment}"));
+    }
+    anchors
+        .get(fragment)
+        .map(|pointer| format!("{base}{pointer}"))
+}
+
+/// The first `$ref` in `schema` the grammar cannot follow, if any. The grammar follows a
+/// reference into the schema's own document only: `#`, a pointer `#/...` that names something
+/// in it, or the name of an `$anchor` it declares.
+fn unfollowable_reference(schema: &Value) -> Option<String> {
+    let anchors = anchors(schema);
+    schema_pointers(schema).into_iter().find_map(|pointer| {
+        let reference = schema.pointer(&pointer)?.get("$ref")?.as_str()?;
+        let followable = match reference.strip_prefix('#') {
+            Some("") => true,
+            Some(fragment) if fragment.starts_with('/') => schema.pointer(fragment).is_some(),
+            Some(fragment) => anchors.contains_key(fragment),
+            None => false,
+        };
+        (!followable).then(|| reference.to_string())
+    })
+}
+
+/// The pointer of each schema in `schema` that declares an `$anchor`, by the anchor's name. The
+/// first declaration of a name is kept; a schema declaring one twice is not a valid schema.
+fn anchors(schema: &Value) -> HashMap<String, String> {
+    let mut anchors = HashMap::new();
+    for pointer in schema_pointers(schema) {
+        let Some(name) = schema
+            .pointer(&pointer)
+            .and_then(|schema| schema.get("$anchor"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        anchors.entry(name.to_string()).or_insert(pointer);
+    }
+    anchors
+}
+
+/// The JSON pointer of each schema in `schema`, itself included. Only the keywords that hold
+/// schemas are entered: `const`, `enum`, `default`, `examples` and the annotations hold data,
+/// where a `$ref` or `$anchor` key is a value's own.
+fn schema_pointers(schema: &Value) -> Vec<String> {
+    fn collect(schema: &Value, pointer: String, out: &mut Vec<String>) {
+        let Some(object) = schema.as_object() else {
+            return;
+        };
+        for (key, value) in object {
+            let under = format!("{pointer}/{}", pointer_segment(key));
+            match key.as_str() {
+                // A schema, a map of schemas, or an array of schemas.
+                "additionalProperties"
+                | "unevaluatedProperties"
+                | "propertyNames"
+                | "items"
+                | "additionalItems"
+                | "unevaluatedItems"
+                | "contains"
+                | "not"
+                | "if"
+                | "then"
+                | "else"
+                | "contentSchema"
+                | "properties"
+                | "patternProperties"
+                | "$defs"
+                | "definitions"
+                | "dependentSchemas"
+                | "allOf"
+                | "anyOf"
+                | "oneOf"
+                | "prefixItems" => {
+                    if value.is_object() && !is_schema_map(key) {
+                        collect(value, under, out);
+                    } else {
+                        each(value, under, out);
+                    }
+                }
+                // A map of schemas or of property-name arrays.
+                "dependencies" => each(value, under, out),
+                _ => {}
+            }
+        }
+        out.push(pointer);
+    }
+    fn each(values: &Value, pointer: String, out: &mut Vec<String>) {
+        if let Some(map) = values.as_object() {
+            for (name, schema) in map {
+                collect(schema, format!("{pointer}/{}", pointer_segment(name)), out);
+            }
+        } else if let Some(items) = values.as_array() {
+            for (index, item) in items.iter().enumerate() {
+                collect(item, format!("{pointer}/{index}"), out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    collect(schema, String::new(), &mut out);
+    out
 }
 
 /// Whether `keyword` holds a map from names to schemas, rather than one schema.
@@ -1565,6 +1646,114 @@ mod tests {
             tools,
             &call("1", "2", r#"{"n": "three"}"#)
         ));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a `$ref` to a named anchor, `#Count` for the
+    /// schema declaring `$anchor: "Count"`, was rebased like a pointer, to `#/$defs/toolCount`,
+    /// which names nothing, so the forced grammar did not compile. The grammar follows pointers
+    /// only, so the reference is written as the pointer to the schema declaring the anchor.
+    #[test]
+    fn a_forced_arguments_reference_to_an_anchor_resolves_to_the_schema_declaring_it() {
+        use crate::tools::{ToolCallingMatcher, ToolChoice};
+        let schema = serde_json::json!({
+            "type": "object",
+            "$defs": { "Count": { "$anchor": "Count", "type": "integer" } },
+            "properties": {
+                "n": { "$ref": "#Count" },
+                // A pointer to the same schema.
+                "m": { "$ref": "#/$defs/Count" },
+                // An anchor declared on a property.
+                "min": { "$anchor": "Min", "type": "integer", "minimum": 0 },
+                "max": { "$ref": "#Min" },
+            },
+            "required": ["n", "m", "max"],
+            "additionalProperties": false,
+        });
+        let copy = &property_schema(&schema, "n")["$defs"]["tool"]["properties"];
+        assert_eq!(
+            copy["n"]["$ref"],
+            serde_json::json!("#/$defs/tool/$defs/Count")
+        );
+        assert_eq!(
+            copy["m"]["$ref"],
+            serde_json::json!("#/$defs/tool/$defs/Count")
+        );
+        assert_eq!(
+            copy["max"]["$ref"],
+            serde_json::json!("#/$defs/tool/properties/min")
+        );
+        let anchored = tool(schema);
+        assert_eq!(unenforceable_tool(&anchored), None);
+        // The parameters in the grammar's order: the names sorted.
+        let call = |n: &str, max: &str| {
+            one_call(
+                "set",
+                &[
+                    ("m", "false", "4"),
+                    ("max", "false", max),
+                    ("n", "false", n),
+                ],
+            )
+        };
+        let tools = std::slice::from_ref(&anchored);
+        assert!(forced_call_accepts(tools, &call("3", "7")));
+        assert!(!forced_call_accepts(tools, &call("\"three\"", "7")));
+        assert!(!forced_call_accepts(tools, &call("3", "-1")));
+        // A call read is held to the anchor's schema too.
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(tools)).expect("a matcher");
+        assert_eq!(matcher.get_call(&call("3", "7")).expect("read").len(), 1);
+        assert!(matcher
+            .get_call(&call("\"three\"", "7"))
+            .expect("read")
+            .is_empty());
+    }
+
+    /// A strict tool's schema with a reference the grammar cannot follow, to nothing in the
+    /// schema or outside it, is one the grammar cannot hold: a required call refuses it, naming
+    /// the reference, and a call the model writes on its own is read unconstrained and held to
+    /// the schema when read, so the other tools stay held to theirs.
+    #[test]
+    fn a_reference_the_grammar_cannot_follow_makes_a_strict_tool_unenforceable() {
+        let opener = format!("<{DSML}tool_calls>");
+        let body = |name: &str, parameters: &str| {
+            format!("\n<{DSML}invoke name=\"{name}\">\n{parameters}</{DSML}invoke>\n</{DSML}tool_calls>")
+        };
+        for reference in [
+            "#Missing",
+            "#/$defs/Missing",
+            "https://example.com/count.json",
+            "count.json#/Count",
+        ] {
+            let unfollowable = tool(serde_json::json!({
+                "type": "object",
+                "$defs": { "Count": { "$anchor": "Count", "type": "integer" } },
+                "properties": { "n": { "$ref": reference } },
+                "required": ["n"],
+                "additionalProperties": false,
+            }));
+            let why = unenforceable_tool(&unfollowable)
+                .unwrap_or_else(|| panic!("{reference} makes the tool unenforceable"));
+            assert!(why.contains(&format!("refers to `{reference}`")), "{why}");
+            // Written as a tool that is not strict, beside one that stays held to its schema.
+            let tools = [unfollowable, bash(true)];
+            assert!(
+                continuation_accepts(
+                    &tools,
+                    &opener,
+                    &body(
+                        "set",
+                        &format!(
+                            "<{DSML}parameter name=\"n\" string=\"true\">anything</{DSML}parameter>\n"
+                        )
+                    )
+                ),
+                "{reference}"
+            );
+            assert!(
+                !continuation_accepts(&tools, &opener, &body("Bash", "")),
+                "{reference}"
+            );
+        }
     }
 
     /// regression test for spiceai/mistral.rs#54: the `enum` and `const` shortcuts dropped the
