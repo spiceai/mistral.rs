@@ -403,15 +403,6 @@ fn block_at(text: &str, name: &str) -> Scan<(Vec<DsmlToolCall>, usize, bool)> {
     }
 }
 
-/// Whether the DSML tag at the start of `text` opens a block, or may once more is written,
-/// read or not: what `frame` takes for a block.
-pub(super) fn opens_block(text: &str) -> bool {
-    match tag_at(text, false, &BLOCK_NAMES) {
-        Scan::Done(_) | Scan::More => true,
-        Scan::Bad => names_block(text),
-    }
-}
-
 /// How a DSML tag at an offset of a message frames what follows it.
 pub(super) enum Frame {
     /// The tag opens no block: it is text.

@@ -273,7 +273,7 @@ pub(super) fn intended_streaming_difference(
 const AS_WRITTEN: &str = "a message that makes no call is its content as the model wrote it, where the base returned the text a parser had read or repaired from it";
 const PARTIAL_OPENER: &str = "a message ending partway through a marker that begins a call, outside any other call, is held back and makes no call yet, as it may be opening one, a DSML block that would claim the message included, where the base streamed it or read a call before it";
 const HELD_IN_CALL: &str = "a message inside a call that has not ended, such as a bare-JSON call that does not read, is held back and makes no call yet, where the base streamed it, so the rest of the call is never read on its own";
-const COMPLETE_OUTSIDE_QWEN: &str = "a finished call in a format other than Qwen is complete, and makes the same calls, where the base held it back as if more Qwen calls could follow, though it reads only the first format's calls";
+const COMPLETE_OUTSIDE_QWEN: &str = "a finished call in a format other than Qwen is complete, and makes the same calls, none included, where the base held it back at a Qwen closer as if more Qwen calls could follow, though it reads only the first format's calls";
 const SAME_STREAMED_CALLS: &str = "streamed, a message makes the calls the base's streaming made, with the content sent before them cut elsewhere, as a marker that may begin a call is held back";
 const STREAMED_AS_READ: &str = "streamed in chunks that cut a call's marker, a message makes only calls the base reads from it or from a prefix of it before any DSML block, or fails as one does, where the base streamed the cut marker out as text and missed them";
 
@@ -299,7 +299,7 @@ pub(super) fn dsml_calls(entry: &Entry, cut: usize) -> Option<(&'static str, Val
 /// a DSML block (`dsml_calls`), if it may: a prefix ending partway through a call marker is
 /// held back with no call; a prefix inside a call that has not ended, which the base streamed,
 /// is held back with no call; a finished call in another format than Qwen is complete where
-/// the base waited for more Qwen calls; and a prefix that makes no call, read with the same
+/// the base, at a Qwen closer, waited for more Qwen calls; and a prefix that makes no call, read with the same
 /// streaming state, is content as written.
 pub(super) fn intended_difference(
     entry: &Entry,
@@ -322,11 +322,13 @@ pub(super) fn intended_difference(
     if held && base[0] == json!("ff") && base[1][1] == no_call {
         return Some(HELD_IN_CALL);
     }
-    if head[0] == json!("ft")
-        && base[0] == json!("tf")
-        && head[1] == base[1]
-        && base[1][1] != no_call
-    {
+    // The base held back any text whose last Qwen closer only a Qwen opener, or the start of
+    // one, follows.
+    let at_qwen_closer = text.rfind("</tool_call>").is_some_and(|close| {
+        let tail = text[close + "</tool_call>".len()..].trim_start();
+        "<tool_call>".starts_with(tail) || tail.starts_with("<tool_call>")
+    });
+    if head[0] == json!("ft") && base[0] == json!("tf") && head[1] == base[1] && at_qwen_closer {
         return Some(COMPLETE_OUTSIDE_QWEN);
     }
     (head[0] == base[0] && base[1][1] == no_call && head[1] == json!([true, no_call]))
@@ -1139,6 +1141,119 @@ fn mutations() -> Vec<Entry> {
     entries
 }
 
+/// The ways a call is left unfinished: without the opener of its arguments, with a value never
+/// closed, without its closer, and with its closer only inside its own value.
+const UNFINISHED: [&str; 4] = [
+    "no-argument-opener",
+    "unterminated-value",
+    "closer-missing",
+    "closer-only-in-its-value",
+];
+
+/// A call to `write_file` in the format `SHAPES[shape]`, or in DSML for `SHAPES.len()`, left
+/// unfinished in the way `UNFINISHED[way]`, and the closer it lacks, if its calls close.
+fn unfinished_call(shape: usize, way: usize) -> (String, &'static str) {
+    let name = SHAPES.get(shape).map_or("dsml", |&(name, _, _)| name);
+    let closer = SHAPES
+        .get(shape)
+        .map_or(Some(BLOCK_CLOSER), |&(_, _, closer)| closer)
+        .unwrap_or("");
+    // A JSON call: its text up to the call's JSON, the key its arguments are under, and the
+    // text that closes the JSON after the arguments, less the last bracket of a format whose
+    // calls have no closer, which is the bracket in place of a closer.
+    let json = |head: &str, arguments: &str, outer: &str, own: &str| {
+        let value = if closer.is_empty() { own } else { closer };
+        match way {
+            0 => format!(r#"{head}{{"name":"write_file","#),
+            1 => format!(r#"{head}{{"name":"write_file","{arguments}":{{"content":"abc"#),
+            2 => format!(r#"{head}{{"name":"write_file","{arguments}":{{"content":"abc"}}{outer}"#),
+            _ => format!(
+                r#"{head}{{"name":"write_file","{arguments}":{{"content":"{value}"}}{outer}"#
+            ),
+        }
+    };
+    // A call whose values are tagged: its text up to the first value, the value's tags, and
+    // what ends the call's text before its closer.
+    let tagged = |head: &str, open: &str, close: &str, tail: &str| match way {
+        0 => head.to_string(),
+        1 => format!("{head}{open}abc"),
+        2 => format!("{head}{open}abc{close}{tail}"),
+        _ => format!("{head}{open}{closer}{close}{tail}"),
+    };
+    let deepseek = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>write_file\n";
+    let call = match name {
+        "qwen-json" => json("<tool_call>", "arguments", "}", ""),
+        "qwen-xml" => tagged(
+            "<tool_call>\n<function=write_file>\n",
+            "<parameter=content>\n",
+            "\n</parameter>\n",
+            "</function>\n",
+        ),
+        "hunyuan" => json("<tool_calls>[", "arguments", "}]", ""),
+        "deepseek" => match way {
+            0 => deepseek.to_string(),
+            1 => format!("{deepseek}```json\n{{\"content\":\"abc"),
+            2 => format!("{deepseek}```json\n{{\"content\":\"abc\"}}\n```"),
+            _ => format!("{deepseek}```json\n{{\"content\":\"{closer}\"}}\n```"),
+        },
+        "mistral-nemo" => json("[TOOL_CALLS][", "arguments", "}", "]"),
+        "llama" => json("<|python_tag|>", "parameters", "", "}"),
+        "liquid" => match way {
+            0 => "<|tool_call_start|>[write_file".to_string(),
+            1 => "<|tool_call_start|>[write_file(content='abc".to_string(),
+            2 => "<|tool_call_start|>[write_file(content='abc')]".to_string(),
+            _ => format!("<|tool_call_start|>[write_file(content='{closer}')]"),
+        },
+        "gemma4" => match way {
+            0 => "<|tool_call>call:write_file\n".to_string(),
+            1 => "<|tool_call>call:write_file{content:<|\"|>abc".to_string(),
+            2 => "<|tool_call>call:write_file{content:<|\"|>abc<|\"|>}".to_string(),
+            _ => format!("<|tool_call>call:write_file{{content:<|\"|>{closer}<|\"|>}}"),
+        },
+        "atem" => tagged(
+            "<atem:function_calls>\n<atem:invoke name=\"write_file\">\n",
+            "<atem:parameter name=\"content\">",
+            "</atem:parameter>\n",
+            "</atem:invoke>\n",
+        ),
+        _ => tagged(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n",
+            "<｜DSML｜parameter name=\"content\" string=\"true\">",
+            "</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+        ),
+    };
+    (call, closer)
+}
+
+/// For every format, a call left unfinished in each way `UNFINISHED` lists, then a call to
+/// `write_file` in every format whose value holds the unfinished call's closer and then a DSML
+/// block: the closer in the later call's value does not end the unfinished one, so the block
+/// stays in that value, as text. An unfinished DSML block is outside any other call, so it
+/// claims the message, and makes no call.
+fn unfinished_then_call() -> Vec<Entry> {
+    let mut entries = Vec::new();
+    for shape in 0..=SHAPES.len() {
+        let name = SHAPES.get(shape).map_or("dsml", |&(name, _, _)| name);
+        for (way, unfinished) in UNFINISHED.iter().enumerate() {
+            let (call, closer) = unfinished_call(shape, way);
+            for (later, &(later_name, _, _)) in SHAPES.iter().enumerate() {
+                let message = format!(
+                    "{call}\n{}",
+                    shaped_call(later, &format!("{closer}{DELETE_ALL}"))
+                );
+                let dsml = (shape == SHAPES.len()).then(|| (0, Vec::new()));
+                entries.push(mutated(
+                    format!("unfinished:{name}:{unfinished}:then:{later_name}"),
+                    message,
+                    dsml,
+                ));
+            }
+        }
+    }
+    entries
+}
+
 /// Messages heavy with markers, `n` of them each, by name: Qwen openers rejected for want of a
 /// call, repeated Gemma 4 calls with no arguments, DSML openers in a bare-JSON string, closing
 /// tags in a JSON parameter value, and, for every format, `n` stray openers before a real call.
@@ -1177,6 +1292,23 @@ pub(super) fn marker_heavy_messages(n: usize) -> Vec<(String, String)> {
                 shaped_call(shape, "hello")
             ),
         ));
+    }
+    // Each unfinished call is read up to the next, which decides whether the one before it
+    // begins a call at all.
+    for shape in 0..=SHAPES.len() {
+        let name = SHAPES.get(shape).map_or("dsml", |&(name, _, _)| name);
+        let real = if shape == SHAPES.len() {
+            write_file_hello_block()
+        } else {
+            shaped_call(shape, "hello")
+        };
+        for (way, unfinished) in UNFINISHED.iter().enumerate() {
+            let (call, _) = unfinished_call(shape, way);
+            messages.push((
+                format!("unfinished-calls:{name}:{unfinished}"),
+                format!("{}{real}", format!("{call}\n").repeat(n)),
+            ));
+        }
     }
     messages
 }
@@ -1221,11 +1353,13 @@ fn mutated(id: String, message: String, dsml: Option<(usize, Vec<(String, String
     }
 }
 
-/// The hand-written entries, then `GENERATED` drawn from `SEED`, then the mutations.
+/// The hand-written entries, then `GENERATED` drawn from `SEED`, then the mutations, then the
+/// unfinished calls followed by a call in every format.
 pub(super) fn corpus() -> Vec<Entry> {
     let mut entries = hand_corpus();
     let mut rng = Rng(SEED);
     entries.extend((0..GENERATED).map(|case| generated(&mut rng, case)));
     entries.extend(mutations());
+    entries.extend(unfinished_then_call());
     entries
 }

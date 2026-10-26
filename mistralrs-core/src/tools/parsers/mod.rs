@@ -267,12 +267,16 @@ pub(super) enum SpanEnd {
     Unreadable,
 }
 
-/// The calls of `text`, left to right, in one pass: a bare-JSON call at its start, then from
-/// the earliest marker that begins one, each call to where its format ends it, with the next
-/// looked for after it, so a marker inside a call, whichever format's, is that call's text. A
-/// call that has not ended, such as one that does not read once closed, holds everything after
-/// it, and is the last. Each marker is looked for from where the last call ended, and each
-/// call's text is read once, so the pass takes time linear in `text`.
+/// The calls of `text`, left to right: a bare-JSON call at its start, then from the earliest
+/// marker that begins one, each call to where its format ends it, with the next looked for
+/// after it, so a marker inside a call, whichever format's, is that call's text.
+///
+/// A marker begins a call only if the call can be read to its end, in its format, before
+/// another marker in its framing, its text outside its values, begins a call that can be: a
+/// marker whose call another cuts short is text, so its closer, written in the other call's
+/// value, does not end it there. A call that has not ended, or may yet begin, holds everything
+/// after it, and is the last. Each marker is read once, and the markers read as text are passed
+/// over together, so the pass takes time linear in `text`.
 pub(super) fn call_spans(text: &str) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut from = 0;
@@ -296,50 +300,37 @@ pub(super) fn call_spans(text: &str) -> Vec<Span> {
             }
         }
     }
-    // Where each closer and tag a call is framed by next occurs, carried from call to call.
     let mut ahead = Ahead::new(text);
-    // Where each marker next occurs at or after `from`, found again only once `from` passes it.
-    let mut next: Vec<Option<usize>> = CALL_OPENERS
-        .iter()
-        .map(|(_, marker)| text[from..].find(marker).map(|at| from + at))
-        .collect();
+    let mut index = ahead.first_marker_at(from);
     loop {
-        for ((_, marker), at) in CALL_OPENERS.iter().zip(next.iter_mut()) {
-            if at.is_some_and(|at| at < from) {
-                *at = text[from..].find(marker).map(|offset| from + offset);
+        let (next, reading) = match ahead.next_not_text(index) {
+            Ok(Some(next)) => next,
+            Ok(None) => return spans,
+            Err(unread) => {
+                ahead.resolve(unread);
+                index = unread;
+                continue;
             }
-        }
-        let Some((format, marker, open)) = CALL_OPENERS
-            .iter()
-            .zip(&next)
-            .filter_map(|(&(format, marker), at)| at.map(|at| (format, marker, at)))
-            .min_by_key(|&(_, marker, at)| (at, std::cmp::Reverse(marker.len())))
-        else {
-            return spans;
         };
-        let body = open + marker.len();
-        let end = if format == ToolCallFormat::DeepSeekDsml {
-            match dsml::frame(text, open) {
-                dsml::Frame::NotABlock => {
-                    from = body;
-                    continue;
-                }
-                dsml::Frame::Block(end) => SpanEnd::At(end),
-                dsml::Frame::Open => SpanEnd::Open,
-                dsml::Frame::Unreadable => SpanEnd::Unreadable,
+        let (open, format, _) = ahead.markers[next];
+        let end = match reading {
+            Reading::Call(end) => SpanEnd::At(end),
+            Reading::Open => SpanEnd::Open,
+            Reading::Unreadable => SpanEnd::Unreadable,
+            Reading::Text => {
+                index = next + 1;
+                continue;
             }
-        } else {
-            call_end(format, &mut ahead, open, body).map_or(SpanEnd::Open, SpanEnd::At)
         };
         spans.push(Span {
             format: Some(format),
             open,
             end,
         });
-        match end {
-            SpanEnd::At(end) => from = end,
-            SpanEnd::Open | SpanEnd::Unreadable => return spans,
-        }
+        let SpanEnd::At(end) = end else {
+            return spans;
+        };
+        index = ahead.first_marker_at(end);
     }
 }
 
@@ -415,271 +406,638 @@ fn json_end(text: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// The next occurrence of each closer and tag a call is framed by, at or after a position in a
-/// text: each is looked for again only once a lookup passes the occurrence found, so the
-/// lookups of one pass over the text, which move forward, take time linear in it.
+/// How the text from a marker that may begin a call reads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reading {
+    /// The marker begins a call that ends at this offset.
+    Call(usize),
+    /// The marker begins no call: it is text.
+    Text,
+    /// The marker begins a call that has not ended, or may yet begin one: it holds everything
+    /// after it.
+    Open,
+    /// The marker opens a DSML block whose tags cannot be read: it holds everything after it,
+    /// and the message makes no call.
+    Unreadable,
+}
+
+/// A value, or, as `Err`, the index of the later marker not yet read that it waits on.
+type Waits<T> = std::result::Result<T, usize>;
+
+/// How a call's JSON value reads.
+#[derive(Clone, Copy)]
+enum Json {
+    /// It ends at this offset.
+    Ends(usize),
+    /// It has not ended, or does not read: the call holds everything after it.
+    Open,
+    /// A marker outside its strings begins a call, which cuts this one short.
+    Interrupted,
+}
+
+/// The markers of a text that may begin a call, how each reads once read, and where each closer
+/// and tag a call is framed by occurs.
 struct Ahead<'a> {
     text: &'a str,
-    found: Vec<(&'static str, usize, Option<usize>)>,
-    /// Where the next call begins at or after a position, and the position it was found from.
-    begins: Option<(usize, Option<usize>)>,
+    /// Each marker, as its offset, format and text, in order. A marker inside an earlier one,
+    /// as `<tool_call>` is inside `<|tool_call>`, is part of it, and is left out.
+    markers: Vec<(usize, ToolCallFormat, &'static str)>,
+    /// How the marker at each index reads, once read.
+    readings: Vec<Option<Reading>>,
+    /// For a marker read as text, a later index such that every marker between the two is
+    /// read as text too, so a search for the next marker that is not passes them together.
+    skip: Vec<usize>,
+    /// Every occurrence of each closer and tag looked for, in order.
+    occurrences: Vec<(&'static str, Vec<usize>)>,
+    /// How a call whose values are tagged, by the tag that opens one, reads from an offset
+    /// where its framing goes on, once read: two calls read to the same offset read the same
+    /// from there.
+    tails: std::collections::HashMap<(usize, &'static str), Reading>,
+    /// How the JSON value that begins at an offset reads, once read.
+    json_values: std::collections::HashMap<usize, Json>,
 }
 
 impl<'a> Ahead<'a> {
     fn new(text: &'a str) -> Self {
+        let mut found: Vec<(usize, ToolCallFormat, &'static str)> = CALL_OPENERS
+            .iter()
+            .flat_map(|&(format, marker)| {
+                text.match_indices(marker)
+                    .map(move |(at, _)| (at, format, marker))
+            })
+            .collect();
+        found.sort_unstable_by_key(|&(at, _, marker)| (at, std::cmp::Reverse(marker.len())));
+        let mut markers = Vec::with_capacity(found.len());
+        let mut end = 0;
+        for (at, format, marker) in found {
+            if at >= end {
+                markers.push((at, format, marker));
+                end = at + marker.len();
+            }
+        }
+        let count = markers.len();
         Self {
             text,
-            found: Vec::new(),
-            begins: None,
+            markers,
+            readings: vec![None; count],
+            skip: (1..=count).collect(),
+            occurrences: Vec::new(),
+            tails: std::collections::HashMap::new(),
+            json_values: std::collections::HashMap::new(),
         }
     }
 
-    /// Where the next marker at or after `from` that begins a call, as the text right after it
-    /// shows (`starts_call`), opens.
-    fn next_call(&mut self, from: usize) -> Option<usize> {
-        if let Some((searched, next)) = self.begins {
-            if searched <= from && next.is_none_or(|at| at >= from) {
-                return next;
-            }
-        }
-        let mut at = from;
-        let next = loop {
-            let Some((format, marker, open)) = CALL_OPENERS
-                .iter()
-                .filter_map(|&(format, marker)| {
-                    self.find(marker, at).map(|open| (format, marker, open))
-                })
-                .min_by_key(|&(_, marker, open)| (open, std::cmp::Reverse(marker.len())))
-            else {
-                break None;
-            };
-            if starts_call(format, self.text, open, open + marker.len()) {
-                break Some(open);
-            }
-            at = open + marker.len();
-        };
-        self.begins = Some((from, next));
-        next
+    /// The index of the first marker at or after the offset `from`.
+    fn first_marker_at(&self, from: usize) -> usize {
+        self.markers.partition_point(|&(at, _, _)| at < from)
     }
 
     /// Where `needle` next occurs in the text at or after `from`.
     fn find(&mut self, needle: &'static str, from: usize) -> Option<usize> {
-        let text = self.text;
-        let search = || text[from..].find(needle).map(|at| from + at);
-        match self.found.iter_mut().find(|(found, _, _)| *found == needle) {
-            Some((_, searched, next)) => {
-                if *searched > from || next.is_some_and(|at| at < from) {
-                    *searched = from;
-                    *next = search();
-                }
-                *next
-            }
+        let index = match self
+            .occurrences
+            .iter()
+            .position(|&(found, _)| found == needle)
+        {
+            Some(index) => index,
             None => {
-                let next = search();
-                self.found.push((needle, from, next));
-                next
+                let at = self.text.match_indices(needle).map(|(at, _)| at).collect();
+                self.occurrences.push((needle, at));
+                self.occurrences.len() - 1
             }
-        }
+        };
+        let at = &self.occurrences[index].1;
+        at.get(at.partition_point(|&at| at < from)).copied()
     }
-}
 
-/// Where the call in `format` that opens at `open` in the text `ahead` reads, its body from
-/// `body`, ends, or `None` while it is still open. A closer inside one of the call's values is
-/// the value's text: a Gemma 4 value quoted in `<|"|>`, a Qwen `<parameter=…>` or Atem
-/// `<atem:parameter>` value, a quoted Liquid argument, and a JSON string of a Qwen JSON,
-/// Hunyuan or DeepSeek call. A JSON-format call ends at the closer after its JSON, once that
-/// reads as a call, so one that does not read stays open and holds what follows. A Mistral Nemo
-/// or Llama call is its marker and then the JSON of a call running to the end of the message:
-/// it ends with that JSON, and a marker followed by anything else, such as prose or the rest of
-/// a string it is quoted in, begins no call. Neither does an Atem call to `self` or `user`, nor
-/// a marker its parser would not read a call after (`begins_call`), such as a stray opener
-/// before a real call. Each search stops at the call's own closer, carried in `ahead`.
-fn call_end(format: ToolCallFormat, ahead: &mut Ahead, open: usize, body: usize) -> Option<usize> {
-    let text = ahead.text;
-    let rest = &text[body..];
-    let json = body + (rest.len() - rest.trim_start().len());
-    let starts_json = |brackets: &[char]| text[json..].starts_with(brackets);
-    let closer = CLOSED_CALL_DELIMITERS
-        .iter()
-        .find_map(|&(delimited, _, end)| (delimited == format).then_some(end));
-    if !begins_call(format, ahead, body, closer)? {
-        return Some(body);
+    /// The first marker at or after the index `from` that is not read as text, as its index
+    /// and reading; or, as `Err`, the first one there not yet read.
+    fn next_not_text(&mut self, from: usize) -> Waits<Option<(usize, Reading)>> {
+        let mut at = from;
+        let found = loop {
+            match self.readings.get(at).copied() {
+                None => break Ok(None),
+                Some(None) => break Err(at),
+                Some(Some(Reading::Text)) => at = self.skip[at],
+                Some(Some(reading)) => break Ok(Some((at, reading))),
+            }
+        };
+        // Every marker passed on the way is text, up to where the search stopped.
+        let mut passed = from;
+        while passed < at {
+            let next = self.skip[passed];
+            self.skip[passed] = at;
+            passed = next;
+        }
+        found
     }
-    match (format, closer) {
-        (ToolCallFormat::Gemma4, Some(end)) => {
-            // `call:NAME{...}` runs to the brace matching its first, which must come before the
-            // first closer, and a closer inside a `<|"|>`-quoted value is that value's text.
-            let first = ahead.find(end, body)?;
-            match text[body..first].find('{') {
-                Some(offset) => {
-                    let (_, after) = gemma4::extract_matched_braces(text, body + offset)?;
-                    ahead.find(end, after).map(|at| at + end.len())
+
+    /// Reads the marker at `index`, and each later marker its reading waits on, the last first.
+    fn resolve(&mut self, index: usize) {
+        let mut waiting = vec![index];
+        while let Some(&top) = waiting.last() {
+            if self.readings[top].is_some() {
+                waiting.pop();
+                continue;
+            }
+            match self.read(top, true) {
+                Ok(reading) => {
+                    self.readings[top] = Some(reading);
+                    waiting.pop();
                 }
-                None => Some(first + end.len()),
+                Err(unread) => waiting.push(unread),
             }
         }
-        (ToolCallFormat::Atem, Some(end)) => {
-            end_outside_tagged_values(ahead, body, end, "<atem:parameter", "</atem:parameter>")
-                .or_else(|| {
-                    matches!(atem::channel_recipient(text, open), Some("self" | "user"))
-                        .then_some(body)
-                })
-        }
-        (ToolCallFormat::Qwen, Some(end)) if starts_json(&['{', '[']) => {
-            end_after_json(text, json, end)
-        }
-        (ToolCallFormat::Qwen, Some(end)) => {
-            end_outside_tagged_values(ahead, body, end, "<parameter=", "</parameter>")
-        }
-        (ToolCallFormat::Hunyuan, Some(end)) if starts_json(&['[']) => {
-            end_after_json(text, json, end)
-        }
-        (ToolCallFormat::DeepSeek, Some(end)) => {
-            // The arguments' JSON comes before the first closer; the call ends at the closer
-            // after it, once the call reads.
-            let first = ahead.find(end, body)?;
-            let arguments = body + text[body..first].find(['{', '['])?;
-            let value_end = json_end(text, arguments)?;
-            let close = ahead.find(end, value_end)? + end.len();
-            deepseek::DeepSeekParser
-                .parse(&text[open..close])
-                .is_ok_and(|calls| calls.is_some())
-                .then_some(close)
-        }
-        (ToolCallFormat::Liquid, Some(end)) => end_outside_quotes(text, body, end),
-        (_, Some(end)) => ahead.find(end, body).map(|at| at + end.len()),
-        (ToolCallFormat::MistralNemo, None) if rest.is_empty() => None,
-        (ToolCallFormat::MistralNemo, None) if rest.starts_with('[') => json_end(text, body),
-        (ToolCallFormat::Llama, None) if rest.trim_start().is_empty() => None,
-        (ToolCallFormat::Llama, None) if starts_json(&['{', '[']) => json_end(text, json),
-        (_, None) => Some(body),
     }
-}
 
-/// Whether the text after a marker, from `body` in the text `ahead` reads, begins a call in
-/// `format` as the format's parser reads one, `None` while too little of it is written to tell:
-/// a Gemma 4 call opens with `call:`, a DeepSeek one with `function<｜tool▁sep｜>`, a Hunyuan or
-/// Liquid one with `[`, a Qwen one with JSON or a `<function=…>` before its closer, and an Atem
-/// one with an `<atem:invoke` before its closer. A marker followed by anything else is text, so
-/// a stray opener does not swallow, or end inside, a call written after it.
-fn begins_call(
-    format: ToolCallFormat,
-    ahead: &mut Ahead,
-    body: usize,
-    closer: Option<&'static str>,
-) -> Option<bool> {
-    let rest = &ahead.text[body..];
-    let opens_with = |prefix: &str| {
-        if rest.starts_with(prefix) {
-            Some(true)
+    /// Whether the stretch of a call's framing from `from` to `to`, or to the text's end, cuts
+    /// the call's reading short: as `Text` when the first marker there that is not text begins
+    /// a call that ends or a DSML block that cannot be read, as `Open` when it begins one that
+    /// has not ended, so the call around it has not either, and `None` when there is none.
+    /// With `inline`, a marker there not yet read is read here, unless its own reading waits on
+    /// a later one, which is returned as `Err`, as any unread marker is without it.
+    fn cut(&mut self, from: usize, to: Option<usize>, inline: bool) -> Waits<Option<Reading>> {
+        let within = |at: usize| to.is_none_or(|to| at < to);
+        let mut index = self.first_marker_at(from);
+        loop {
+            match self.next_not_text(index) {
+                Ok(Some((next, reading))) if within(self.markers[next].0) => {
+                    return Ok(match reading {
+                        Reading::Call(_) | Reading::Unreadable => Some(Reading::Text),
+                        Reading::Open => Some(Reading::Open),
+                        Reading::Text => None,
+                    });
+                }
+                Ok(_) => return Ok(None),
+                Err(unread) if !within(self.markers[unread].0) => return Ok(None),
+                Err(unread) if inline => {
+                    let reading = self.read(unread, false)?;
+                    self.readings[unread] = Some(reading);
+                    index = unread;
+                }
+                Err(unread) => return Err(unread),
+            }
+        }
+    }
+
+    /// Whether a marker at `at`, outside a call's values, cuts the call short, as `cut` reads
+    /// it.
+    fn cut_at(&mut self, at: usize, inline: bool) -> Waits<Option<Reading>> {
+        self.cut(at, Some(at + 1), inline)
+    }
+
+    /// How the marker at `index` reads, from the readings of the later markers in its call's
+    /// framing; `Err` with the first of those not yet read, when one is needed.
+    ///
+    /// A Gemma 4 call opens with `call:`, a DeepSeek one with `function<｜tool▁sep｜>`, a
+    /// Hunyuan or Liquid one with `[`, a Qwen one with JSON or a `<function=…>` before its
+    /// closer, an Atem one with an `<atem:invoke` before its closer, and a Mistral Nemo or
+    /// Llama one with JSON: a marker followed by anything else is text. A closer inside one of
+    /// the call's values is the value's text: a Gemma 4 value in its braces, a Qwen
+    /// `<parameter=…>` or Atem `<atem:parameter>` value, a quoted Liquid argument, and a JSON
+    /// string. A JSON-format call ends at the closer after its JSON, once that reads as a call,
+    /// so one that does not read stays open and holds what follows. A Mistral Nemo or Llama
+    /// call is its marker and then the JSON of a call running to the end of the message. An
+    /// Atem call to `self` or `user` begins no call. A DSML block is read as DSML reads it.
+    fn read(&mut self, index: usize, inline: bool) -> Waits<Reading> {
+        let (open, format, marker) = self.markers[index];
+        let text = self.text;
+        let body = open + marker.len();
+        let rest = &text[body..];
+        let trimmed = rest.trim_start();
+        let json = text.len() - trimmed.len();
+        let closer = CLOSED_CALL_DELIMITERS
+            .iter()
+            .find_map(|&(delimited, _, end)| (delimited == format).then_some(end));
+        let opens_with = |prefix: &str| {
+            if rest.starts_with(prefix) {
+                Some(true)
+            } else {
+                (!prefix.starts_with(rest)).then_some(false)
+            }
+        };
+        Ok(match (format, closer) {
+            (ToolCallFormat::DeepSeekDsml, _) => match dsml::frame(text, open) {
+                dsml::Frame::NotABlock => Reading::Text,
+                dsml::Frame::Block(end) => Reading::Call(end),
+                dsml::Frame::Open => Reading::Open,
+                dsml::Frame::Unreadable => Reading::Unreadable,
+            },
+            (ToolCallFormat::Gemma4, Some(end)) => match opens_with("call:") {
+                Some(true) => self.gemma4(body, end, inline)?,
+                Some(false) => Reading::Text,
+                None => Reading::Open,
+            },
+            (ToolCallFormat::DeepSeek, Some(end)) => match opens_with("function<｜tool▁sep｜>")
+            {
+                Some(true) => self.deepseek(open, body, end, inline)?,
+                Some(false) => Reading::Text,
+                None => Reading::Open,
+            },
+            (ToolCallFormat::MistralNemo, _) if rest.is_empty() => Reading::Open,
+            (ToolCallFormat::MistralNemo, _) if rest.starts_with('[') => {
+                self.json_reading(body, inline)?
+            }
+            (ToolCallFormat::Hunyuan | ToolCallFormat::Liquid | ToolCallFormat::Llama, _)
+                if trimmed.is_empty() =>
+            {
+                Reading::Open
+            }
+            (ToolCallFormat::Llama, _) if trimmed.starts_with(['{', '[']) => {
+                self.json_reading(json, inline)?
+            }
+            (ToolCallFormat::Hunyuan, Some(end)) if trimmed.starts_with('[') => {
+                self.json_call(json, end, inline)?
+            }
+            (ToolCallFormat::Liquid, Some(end)) if trimmed.starts_with('[') => {
+                self.liquid(body, end, inline)?
+            }
+            (ToolCallFormat::Qwen, Some(end)) if trimmed.starts_with(['{', '[']) => {
+                self.json_call(json, end, inline)?
+            }
+            (ToolCallFormat::Qwen, Some(end)) => self.tagged(
+                body,
+                end,
+                "<function=",
+                "<parameter=",
+                "</parameter>",
+                inline,
+            )?,
+            (ToolCallFormat::Atem, Some(end)) => {
+                let tag = "<atem:invoke";
+                let reading = self.tagged(
+                    body,
+                    end,
+                    tag,
+                    "<atem:parameter",
+                    "</atem:parameter>",
+                    inline,
+                )?;
+                let to_itself = reading == Reading::Open
+                    && self.find(tag, body).is_some()
+                    && matches!(atem::channel_recipient(text, open), Some("self" | "user"));
+                if to_itself {
+                    Reading::Text
+                } else {
+                    reading
+                }
+            }
+            _ => Reading::Text,
+        })
+    }
+
+    /// A Gemma 4 call, from after its `call:`: its name, then its arguments' braces, then its
+    /// closer, or its closer right after the name for a call with no arguments.
+    fn gemma4(&mut self, body: usize, end: &'static str, inline: bool) -> Waits<Reading> {
+        let first = self.find(end, body);
+        let brace = self
+            .find("{", body)
+            .filter(|&at| first.is_none_or(|first| at < first));
+        if let Some(reading) = self.cut(body, brace.or(first), inline)? {
+            return Ok(reading);
+        }
+        let Some(brace) = brace else {
+            return Ok(first.map_or(Reading::Open, |first| Reading::Call(first + end.len())));
+        };
+        let after = match self.gemma4_braces(brace, inline)? {
+            Ok(after) => after,
+            Err(reading) => return Ok(reading),
+        };
+        let close = self.find(end, after);
+        if let Some(reading) = self.cut(after, close, inline)? {
+            return Ok(reading);
+        }
+        Ok(close.map_or(Reading::Open, |close| Reading::Call(close + end.len())))
+    }
+
+    /// Where the braces of a Gemma 4 call's arguments, which open at `brace`, close, counting
+    /// only braces outside its values quoted in `<|"|>`; or, as `Err`, how the call reads when
+    /// they do not: open while a value or a brace is, and at a marker outside the quoted
+    /// values, which no argument holds, as `cut_at` reads it, open when it begins no call.
+    fn gemma4_braces(
+        &mut self,
+        brace: usize,
+        inline: bool,
+    ) -> Waits<std::result::Result<usize, Reading>> {
+        const QUOTE: &str = "<|\"|>";
+        let text = self.text;
+        let mut depth = 0usize;
+        let mut quoted = false;
+        let mut marker = self.first_marker_at(brace);
+        let mut at = brace;
+        while let Some(c) = text[at..].chars().next() {
+            if text[at..].starts_with(QUOTE) {
+                quoted = !quoted;
+                at += QUOTE.len();
+                continue;
+            }
+            if !quoted {
+                if c == '<' || c == '[' {
+                    while self
+                        .markers
+                        .get(marker)
+                        .is_some_and(|&(open, _, _)| open < at)
+                    {
+                        marker += 1;
+                    }
+                    if self
+                        .markers
+                        .get(marker)
+                        .is_some_and(|&(open, _, _)| open == at)
+                    {
+                        return Ok(Err(self.cut_at(at, inline)?.unwrap_or(Reading::Open)));
+                    }
+                }
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        let Some(outer) = depth.checked_sub(1) else {
+                            return Ok(Err(Reading::Open));
+                        };
+                        depth = outer;
+                        if depth == 0 {
+                            return Ok(Ok(at + 1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            at += c.len_utf8();
+        }
+        Ok(Err(Reading::Open))
+    }
+
+    /// A DeepSeek call, from after its `function<｜tool▁sep｜>`: its name and fence, its
+    /// arguments' JSON before its first closer, and the closer after that JSON, once the
+    /// DeepSeek parser reads the whole as a call.
+    fn deepseek(
+        &mut self,
+        open: usize,
+        body: usize,
+        end: &'static str,
+        inline: bool,
+    ) -> Waits<Reading> {
+        let first = self.find(end, body);
+        let arguments = [self.find("{", body), self.find("[", body)]
+            .into_iter()
+            .flatten()
+            .min()
+            .filter(|&at| first.is_none_or(|first| at < first));
+        if let Some(reading) = self.cut(body, arguments.or(first), inline)? {
+            return Ok(reading);
+        }
+        let Some(arguments) = arguments else {
+            return Ok(Reading::Open);
+        };
+        let value_end = match self.json_value(arguments, inline)? {
+            Json::Ends(value_end) => value_end,
+            Json::Open => return Ok(Reading::Open),
+            Json::Interrupted => return Ok(Reading::Text),
+        };
+        let close = self.find(end, value_end);
+        if let Some(reading) = self.cut(value_end, close, inline)? {
+            return Ok(reading);
+        }
+        let Some(close) = close.map(|close| close + end.len()) else {
+            return Ok(Reading::Open);
+        };
+        let reads = deepseek::DeepSeekParser
+            .parse(&self.text[open..close])
+            .is_ok_and(|calls| calls.is_some());
+        Ok(if reads {
+            Reading::Call(close)
         } else {
-            (!prefix.starts_with(rest)).then_some(false)
-        }
-    };
-    let tag = match format {
-        ToolCallFormat::Gemma4 => return opens_with("call:"),
-        ToolCallFormat::DeepSeek => return opens_with("function<｜tool▁sep｜>"),
-        ToolCallFormat::Hunyuan | ToolCallFormat::Liquid => {
-            let trimmed = rest.trim_start();
-            return (!trimmed.is_empty()).then(|| trimmed.starts_with('['));
-        }
-        ToolCallFormat::Qwen if rest.trim_start().starts_with(['{', '[']) => return Some(true),
-        ToolCallFormat::Qwen => "<function=",
-        ToolCallFormat::Atem => "<atem:invoke",
-        _ => return Some(true),
-    };
-    // The tag counts only inside the call's own extent: before its closer, and before any
-    // other call begins, so one quoted in a later call's value does not.
-    let tag_at = ahead.find(tag, body);
-    let close = closer.and_then(|end| ahead.find(end, body));
-    let later = ahead.next_call(body);
-    match tag_at {
-        Some(at) => {
-            Some(close.is_none_or(|close| at < close) && later.is_none_or(|later| at < later))
-        }
-        None if close.is_none() && later.is_none() => None,
-        None => Some(false),
+            Reading::Open
+        })
     }
-}
 
-/// Whether the marker of `format` that opens at `open` in `text` begins a call, judged by the
-/// text right after it, from `body`: what `begins_call` reads, with a Qwen or Atem call taken to
-/// begin only where its JSON, `<function=` or `<atem:invoke` follows the marker directly.
-fn starts_call(format: ToolCallFormat, text: &str, open: usize, body: usize) -> bool {
-    let rest = &text[body..];
-    let trimmed = rest.trim_start();
-    match format {
-        ToolCallFormat::DeepSeekDsml => dsml::opens_block(&text[open..]),
-        ToolCallFormat::Gemma4 => rest.starts_with("call:"),
-        ToolCallFormat::DeepSeek => rest.starts_with("function<｜tool▁sep｜>"),
-        ToolCallFormat::Hunyuan | ToolCallFormat::Liquid | ToolCallFormat::MistralNemo => {
-            trimmed.starts_with('[')
+    /// A call whose JSON begins at `json` and is followed by its closer `end`, which only
+    /// whitespace may separate from the JSON once it reads. Other text after the JSON leaves the
+    /// call open, as one that does not read, unless it is a marker that begins a call.
+    fn json_call(&mut self, json: usize, end: &'static str, inline: bool) -> Waits<Reading> {
+        let value_end = match self.json_value(json, inline)? {
+            Json::Ends(value_end) => value_end,
+            Json::Open => return Ok(Reading::Open),
+            Json::Interrupted => return Ok(Reading::Text),
+        };
+        let after = &self.text[value_end..];
+        let close = value_end + (after.len() - after.trim_start().len());
+        if self.text[close..].starts_with(end) {
+            return Ok(Reading::Call(close + end.len()));
         }
-        ToolCallFormat::Llama => trimmed.starts_with(['{', '[']),
-        ToolCallFormat::Qwen => {
-            trimmed.starts_with(['{', '[']) || trimmed.starts_with("<function=")
+        Ok(match self.cut_at(close, inline)? {
+            Some(Reading::Text) => Reading::Text,
+            _ => Reading::Open,
+        })
+    }
+
+    /// A call that is its JSON, which begins at `start`, as a Mistral Nemo or Llama call is.
+    fn json_reading(&mut self, start: usize, inline: bool) -> Waits<Reading> {
+        Ok(match self.json_value(start, inline)? {
+            Json::Ends(end) => Reading::Call(end),
+            Json::Open => Reading::Open,
+            Json::Interrupted => Reading::Text,
+        })
+    }
+
+    /// How the JSON value that begins at `start` reads: where it ends, at the bracket closing
+    /// its first, counting only brackets outside its strings, where `\` escapes the next
+    /// character, once it reads; or where a marker outside its strings, where JSON cannot go
+    /// on, begins a call.
+    fn json_value(&mut self, start: usize, inline: bool) -> Waits<Json> {
+        if let Some(&json) = self.json_values.get(&start) {
+            return Ok(json);
         }
-        ToolCallFormat::Atem => trimmed.starts_with("<atem:invoke"),
-        ToolCallFormat::Harmony => false,
+        let json = self.read_json_value(start, inline)?;
+        self.json_values.insert(start, json);
+        Ok(json)
+    }
+
+    /// How the JSON value that begins at `start` reads, as `json_value` gives it, read anew.
+    fn read_json_value(&mut self, start: usize, inline: bool) -> Waits<Json> {
+        let text = self.text;
+        let mut depth = 0usize;
+        let mut inside = false;
+        let mut escaped = false;
+        let mut marker = self.first_marker_at(start);
+        for (offset, c) in text[start..].char_indices() {
+            let at = start + offset;
+            if inside {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    inside = false;
+                }
+                continue;
+            }
+            if matches!(c, '<' | '[') {
+                while self
+                    .markers
+                    .get(marker)
+                    .is_some_and(|&(open, _, _)| open < at)
+                {
+                    marker += 1;
+                }
+                if self
+                    .markers
+                    .get(marker)
+                    .is_some_and(|&(open, _, _)| open == at)
+                {
+                    return Ok(match self.cut_at(at, inline)? {
+                        Some(Reading::Text) => Json::Interrupted,
+                        _ => Json::Open,
+                    });
+                }
+            }
+            match c {
+                '"' => inside = true,
+                '{' | '[' => depth += 1,
+                '}' | ']' => {
+                    let Some(outer) = depth.checked_sub(1) else {
+                        return Ok(Json::Open);
+                    };
+                    depth = outer;
+                    if depth == 0 {
+                        let end = at + c.len_utf8();
+                        return Ok(if is_json(&text[start..end]) {
+                            Json::Ends(end)
+                        } else {
+                            Json::Open
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(Json::Open)
+    }
+
+    /// A Liquid call, from its `[`: it ends at the first closer `end` outside a string quoted
+    /// in `"` or `'`, where `\` escapes the next character, once its list has closed right
+    /// before it, every bracket outside the strings matched; one that has not, or that holds a
+    /// marker outside its strings, stays open and holds what follows, unless that marker
+    /// begins a call.
+    fn liquid(&mut self, body: usize, end: &'static str, inline: bool) -> Waits<Reading> {
+        let text = self.text;
+        let mut quote = None;
+        let mut escaped = false;
+        let mut depth = 0usize;
+        let mut last = ' ';
+        let mut marker = self.first_marker_at(body);
+        for (offset, c) in text[body..].char_indices() {
+            let at = body + offset;
+            if let Some(open) = quote {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == open {
+                    quote = None;
+                    last = c;
+                }
+                continue;
+            }
+            let closed = depth == 0 && last == ']';
+            if text[at..].starts_with(end) {
+                return Ok(if closed {
+                    Reading::Call(at + end.len())
+                } else {
+                    Reading::Open
+                });
+            }
+            if matches!(c, '<' | '[') {
+                while self
+                    .markers
+                    .get(marker)
+                    .is_some_and(|&(open, _, _)| open < at)
+                {
+                    marker += 1;
+                }
+                if self
+                    .markers
+                    .get(marker)
+                    .is_some_and(|&(open, _, _)| open == at)
+                {
+                    // No Liquid call holds a marker outside its strings.
+                    return Ok(self.cut_at(at, inline)?.unwrap_or(Reading::Open));
+                }
+            }
+            // Only whitespace may come between the closed list and the closer.
+            if closed && !c.is_whitespace() {
+                return Ok(Reading::Open);
+            }
+            match c {
+                '"' | '\'' => quote = Some(c),
+                '[' | '(' | '{' => depth += 1,
+                ']' | ')' | '}' => match depth.checked_sub(1) {
+                    Some(outer) => depth = outer,
+                    None => return Ok(Reading::Open),
+                },
+                _ => {}
+            }
+            if !c.is_whitespace() {
+                last = c;
+            }
+        }
+        Ok(Reading::Open)
+    }
+
+    /// A call whose start is `tag`, before its closer `end`, and whose values run from each
+    /// `value_open` to the `value_close` after it. A closer before the tag leaves no call.
+    fn tagged(
+        &mut self,
+        body: usize,
+        end: &'static str,
+        tag: &'static str,
+        value_open: &'static str,
+        value_close: &'static str,
+        inline: bool,
+    ) -> Waits<Reading> {
+        let tag_at = self.find(tag, body);
+        let close = self.find(end, body);
+        if close.is_some_and(|close| tag_at.is_none_or(|tag_at| close < tag_at)) {
+            return Ok(Reading::Text);
+        }
+        if let Some(reading) = self.cut(body, tag_at, inline)? {
+            return Ok(reading);
+        }
+        let Some(mut from) = tag_at else {
+            return Ok(Reading::Open);
+        };
+        let mut passed = Vec::new();
+        let reading = loop {
+            if let Some(&reading) = self.tails.get(&(from, value_open)) {
+                break reading;
+            }
+            passed.push(from);
+            let close = self.find(end, from);
+            let value = self
+                .find(value_open, from)
+                .filter(|&at| close.is_none_or(|close| at < close));
+            if let Some(reading) = self.cut(from, value.or(close), inline)? {
+                break reading;
+            }
+            match (value, close) {
+                (Some(at), _) => match self.find(value_close, at + value_open.len()) {
+                    Some(value_end) => from = value_end + value_close.len(),
+                    None => break Reading::Open,
+                },
+                (None, Some(close)) => break Reading::Call(close + end.len()),
+                (None, None) => break Reading::Open,
+            }
+        };
+        for from in passed {
+            self.tails.insert((from, value_open), reading);
+        }
+        Ok(reading)
     }
 }
 
 /// Whether `text` is one JSON value.
 fn is_json(text: &str) -> bool {
     serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
-}
-
-/// Where a call whose JSON begins at `json` in `text` ends: past `end`, which only whitespace
-/// may separate from the JSON once it reads. `None` while it has not, or ever will.
-fn end_after_json(text: &str, json: usize, end: &str) -> Option<usize> {
-    let value_end = json_end(text, json)?;
-    let after = &text[value_end..];
-    let close = value_end + (after.len() - after.trim_start().len());
-    text[close..].starts_with(end).then(|| close + end.len())
-}
-
-/// Where the first `end` from `body` in the text `ahead` reads that is not inside a value, from
-/// a `value_open` tag through its `value_close`, ends; `None` before one, or inside a value still
-/// open. Every search is carried in `ahead`.
-fn end_outside_tagged_values(
-    ahead: &mut Ahead,
-    body: usize,
-    end: &'static str,
-    value_open: &'static str,
-    value_close: &'static str,
-) -> Option<usize> {
-    let mut from = body;
-    loop {
-        let close = ahead.find(end, from)?;
-        match ahead.find(value_open, from).filter(|&at| at < close) {
-            Some(at) => {
-                let value = at + value_open.len();
-                from = ahead.find(value_close, value)? + value_close.len();
-            }
-            None => return Some(close + end.len()),
-        }
-    }
-}
-
-/// Where the first `end` from `body` in `text` that is not inside a string quoted in `"` or
-/// `'`, where `\` escapes the next character, ends; `None` before one, or inside a string.
-fn end_outside_quotes(text: &str, body: usize, end: &str) -> Option<usize> {
-    let mut quote = None;
-    let mut escaped = false;
-    for (offset, c) in text[body..].char_indices() {
-        match quote {
-            Some(_) if escaped => escaped = false,
-            Some(_) if c == '\\' => escaped = true,
-            Some(open) if c == open => quote = None,
-            Some(_) => {}
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if text[body + offset..].starts_with(end) => {
-                return Some(body + offset + end.len());
-            }
-            None => {}
-        }
-    }
-    None
 }
 
 /// Why a required call in `format` cannot hold one of `tools` to its strict schema, if it
