@@ -494,6 +494,8 @@ fn template_tool_call_format(template: &str) -> Option<ToolCallFormat> {
         Some(ToolCallFormat::Llama)
     } else if template.contains("[TOOL_CALLS]") {
         Some(ToolCallFormat::MistralNemo)
+    } else if template.contains("｜DSML｜") {
+        Some(ToolCallFormat::DeepSeekDsml)
     } else if template.contains("<tool_calls>") && template.contains("</tool_calls>") {
         Some(ToolCallFormat::Hunyuan)
     } else if template.contains("<｜tool▁call▁begin｜>") {
@@ -1052,6 +1054,10 @@ mod tests {
                 ToolCallFormat::Hunyuan,
             ),
             ("<｜tool▁call▁begin｜>function", ToolCallFormat::DeepSeek),
+            (
+                "{%- set dsml_token = '｜DSML｜' -%}<' + dsml_token + 'tool_calls>",
+                ToolCallFormat::DeepSeekDsml,
+            ),
             ("<tool_call>{{ tool }}</tool_call>", ToolCallFormat::Qwen),
             (
                 "<|start|>assistant<|channel|>commentary<|message|>",

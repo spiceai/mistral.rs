@@ -47,6 +47,8 @@ mimalloc = "0.1"
 anyhow = "1.0.100"
 serde = "1.0.228"
 serde_json = "1.0.149"
+# Validates a DSML call to a strict tool against the tool's parameters schema; no remote `$ref` resolution.
+jsonschema = { version = "0.60.1", default-features = false }
 sha2 = "0.10.9"
 indexmap = { version = "2.13.0", features = ["serde"] }
 either = { version = "1.15.0", features = ["serde"] }

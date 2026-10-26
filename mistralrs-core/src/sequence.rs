@@ -3124,7 +3124,7 @@ mod tests {
         seq.tool_call_state
             .as_mut()
             .and_then(|state| {
-                state.maybe_force_required_grammar(remaining, max_generation_len, false)
+                state.maybe_force_required_grammar(remaining, max_generation_len, false, None)
             })
             .is_some()
     }

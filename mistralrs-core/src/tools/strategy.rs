@@ -26,6 +26,16 @@ pub(crate) trait ToolCallStrategy: Send + Sync {
     fn required_boundary(&self) -> ToolCallBoundary {
         ToolCallBoundary::ContinueCurrentMessage
     }
+    /// Whether `content`, the response so far without its reasoning, is partway through a call
+    /// that no grammar constrains, which forcing a required call would write a second call into.
+    fn call_unfinished(&self, _content: &str) -> bool {
+        false
+    }
+    /// The format `content`, the response so far without its reasoning, is read in alone, if
+    /// one claims it: a call forced into it must be written in that format to be read.
+    fn claimed_format(&self, _content: &str) -> Option<ToolCallFormat> {
+        None
+    }
     fn has_reasoning(&self) -> bool {
         false
     }
@@ -65,6 +75,18 @@ impl TextToolCallStrategy {
 
 impl ToolCallStrategy for TextToolCallStrategy {
     fn observe_token(&mut self, _token: u32, _bytes: &[u8]) {}
+
+    /// A DSML block is read whatever format the template prefers, so one still being written is
+    /// found in the content alone.
+    fn call_unfinished(&self, content: &str) -> bool {
+        parsers::call_unfinished(content)
+    }
+
+    /// A message that has opened a DSML block outside any other format's call is read only as
+    /// DSML, whatever format the template prefers.
+    fn claimed_format(&self, content: &str) -> Option<ToolCallFormat> {
+        parsers::claimed_format(content)
+    }
 
     fn continuation_grammar(
         &mut self,

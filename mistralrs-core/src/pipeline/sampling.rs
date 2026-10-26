@@ -70,12 +70,28 @@ fn activate_required_tool_call_grammar(
     if !matches!(seq.recognizer, SequenceRecognizer::None) {
         return;
     }
+    // Only a required call still owed can be forced; ordinary generation skips the rest, which
+    // copies the response so far on every token.
+    if !seq
+        .tool_call_state
+        .as_ref()
+        .is_some_and(ToolCallState::required_tool_call_unsatisfied)
+    {
+        return;
+    }
     let generated = seq.generated_len();
     let max_generation_len = seq.max_generation_len(max_model_len);
     let (_, remaining, deadline_tokens) =
         ToolCallState::required_tool_call_deadline_status(generated, max_generation_len);
+    // The response so far without its reasoning, as prefix detection reads it.
+    let content = tool_detection_text(seq, None);
     let grm = seq.tool_call_state.as_mut().and_then(|state| {
-        state.maybe_force_required_grammar(remaining, max_generation_len, force_now)
+        state.maybe_force_required_grammar(
+            remaining,
+            max_generation_len,
+            force_now,
+            content.as_deref(),
+        )
     });
     let Some(mut grm) = grm else {
         return;
@@ -84,7 +100,7 @@ fn activate_required_tool_call_grammar(
         tracing::warn!("Cannot force required tool call: llguidance is unavailable");
         return;
     };
-    crate::tools::specialize_required_tool_call_grammar(&mut grm, factory.tok_env().tok_trie());
+    crate::tools::specialize_tool_call_grammar(&mut grm, factory.tok_env().tok_trie());
     match crate::pipeline::llg::constraint_from_llg_grammar(factory, grm) {
         Ok(matcher) => {
             seq.recognizer = SequenceRecognizer::Llguidance(Box::new(matcher));
@@ -244,8 +260,9 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             .as_mut()
             .and_then(|state| state.maybe_activate_continuation_grammar(text.as_deref()));
 
-        if let Some(grm) = grm {
+        if let Some(mut grm) = grm {
             if let Some(ref factory) = metadata.llg_factory {
+                crate::tools::specialize_tool_call_grammar(&mut grm, factory.tok_env().tok_trie());
                 match crate::pipeline::llg::constraint_from_llg_grammar(factory, grm) {
                     Ok(matcher) => {
                         tracing::debug!("Activated tool call grammar");
@@ -1427,6 +1444,19 @@ pub async fn sample_sequence(
     if stop_token_requires_tool {
         activate_required_tool_call_grammar(seq, llg_factory.as_ref(), max_model_len, true);
     }
+    // A stop token the required call blocks, where no grammar could be forced (as inside an
+    // unfinished DSML call), is masked out and resampled: kept, its text would be written into
+    // the output.
+    let blocked: Vec<u32> = if stop_token_requires_tool {
+        eos_tok
+            .unwrap_or_default()
+            .iter()
+            .chain(seq.stop_tokens())
+            .copied()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let bias_if_not_allowed = match &mut seq.recognizer {
         SequenceRecognizer::Llguidance(ref mut llg) => {
@@ -1466,6 +1496,15 @@ pub async fn sample_sequence(
                     Some(acc)
                 }
             }
+        }
+        SequenceRecognizer::None if !blocked.is_empty() => {
+            let mut acc = vec![0.0f32; logits.dims1()?];
+            for token in &blocked {
+                if let Some(slot) = acc.get_mut(*token as usize) {
+                    *slot = -f32::INFINITY;
+                }
+            }
+            Some(acc)
         }
         SequenceRecognizer::None => None,
     };
@@ -1679,6 +1718,45 @@ mod tests {
         .await
         .unwrap()
         .token
+    }
+
+    /// regression test for spiceai/mistral.rs#54: where no grammar can be forced, as inside an
+    /// unfinished DSML call, a blocked stop token was kept and its text written into the
+    /// output. Here no grammar can be forced because the test has no llguidance factory.
+    #[tokio::test]
+    async fn a_stop_token_blocked_inside_an_unfinished_required_call_is_resampled() {
+        let state = ToolCallState::new(
+            ToolChoice::Required,
+            Some(&[weather_tool()]),
+            Some(crate::tools::ToolCallFormat::DeepSeekDsml),
+        )
+        .unwrap();
+        let mut seq = terminal_test_sequence(vec![], None, false);
+        seq.tool_call_state = Some(state);
+        // Greedy sampling picks token 3, the end of sequence; the next best is token 2.
+        let logits = Tensor::from_vec(
+            vec![0.1f32, 0.2, 0.3, 0.4],
+            (1, 1, 4),
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let rng = Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(999)));
+        let token = sample_sequence(
+            logits,
+            &mut seq,
+            false,
+            Some(&[3]),
+            None,
+            1024,
+            rng,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap()
+        .token;
+        assert_eq!(token, 2);
     }
 
     #[tokio::test]

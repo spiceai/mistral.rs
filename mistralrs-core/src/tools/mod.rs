@@ -1,4 +1,6 @@
 pub(crate) mod grammar;
+#[cfg(test)]
+mod parse_oracle;
 pub(crate) mod parsers;
 mod request;
 mod response;
@@ -6,7 +8,7 @@ pub(crate) mod state;
 pub(crate) mod strategy;
 
 use candle_core::Result;
-pub(crate) use parsers::specialize_required_tool_call_grammar;
+pub(crate) use parsers::specialize_tool_call_grammar;
 pub use parsers::ToolCallFormat;
 pub use request::*;
 pub use response::*;
@@ -36,10 +38,16 @@ fn process_model_specific_message(message: &str) -> Result<String> {
     parsers::process_model_specific_message(message)
 }
 
+/// A strict tool's parameters schema compiled to hold the tool's calls to, or why it cannot be.
+type StrictValidator = std::result::Result<jsonschema::Validator, String>;
+
 pub struct ToolCallingMatcher {
     tool_choice: ToolChoice,
     known_tool_names: Option<std::collections::HashSet<String>>,
     tools: Option<Arc<Vec<crate::Tool>>>,
+    /// Each strict tool's parameters schema, by the tool's name, compiled once to hold the
+    /// tool's calls to when they are read, or why it cannot be compiled.
+    strict_validators: Arc<HashMap<String, StrictValidator>>,
 }
 
 // Same as CalledFunction, but has different cases for variations on the names
@@ -102,6 +110,20 @@ fn fix_broken_json(raw: &str) -> anyhow::Result<String> {
         Ok(fixed)
     } else {
         Ok(raw.to_string())
+    }
+}
+
+/// `message` with `fix_broken_json`'s repair, unless `format` writes exact JSON of its own: a
+/// DSML call's arguments are what the parser read, so a string parameter named `arguments`
+/// holding `{}` is a string, which the repair would turn into an object.
+fn repaired_unless_exact(
+    message: String,
+    format: Option<ToolCallFormat>,
+) -> anyhow::Result<String> {
+    if format == Some(ToolCallFormat::DeepSeekDsml) {
+        Ok(message)
+    } else {
+        fix_broken_json(&message)
     }
 }
 
@@ -169,11 +191,20 @@ impl ToolCallingMatcher {
                 .map(|tool| tool.function.name.clone())
                 .collect::<std::collections::HashSet<_>>()
         });
+        let strict_validators = selected_tools
+            .iter()
+            .flatten()
+            .filter_map(|tool| {
+                let schema = tool.function.strict_parameters_schema()?;
+                Some((tool.function.name.clone(), compile_strict_schema(&schema)))
+            })
+            .collect::<HashMap<_, _>>();
         let tools_arc = selected_tools.map(Arc::new);
         Ok(Self {
             tool_choice,
             known_tool_names,
             tools: tools_arc,
+            strict_validators: Arc::new(strict_validators),
         })
     }
 
@@ -200,8 +231,12 @@ impl ToolCallingMatcher {
             return Ok((false, false));
         }
         let raw_prefix = message_prefix;
-        let message_prefix = process_model_specific_message(message_prefix)?;
-        let message_prefix = fix_broken_json(&message_prefix).map_err(candle_core::Error::msg)?;
+        let (message_prefix, format) = match parsers::extract_model_specific_call(message_prefix)? {
+            Some((json, _, format)) => (json, Some(format)),
+            None => (process_model_specific_message(message_prefix)?, None),
+        };
+        let message_prefix =
+            repaired_unless_exact(message_prefix, format).map_err(candle_core::Error::msg)?;
 
         // Check if the prefix could be a JSON serialization of any of the following types.
         let (could_be_tool, is_complete_tool) = [
@@ -218,9 +253,36 @@ impl ToolCallingMatcher {
             }
         })
         .unwrap_or((contains_tool_call_prefix(&message_prefix), false));
-        // Qwen emits parallel calls as consecutive blocks; keep buffering until the model closes the turn
-        if is_complete_tool && qwen_more_calls_possible(raw_prefix) {
+        // Text that more could still make a call, inside a call that has not ended or partway
+        // through a marker that begins one, is held back: streamed out, the rest of it would be
+        // read on its own, and a DSML block inside the call would make a call the message does
+        // not.
+        let could_be_tool =
+            could_be_tool || (!is_complete_tool && parsers::may_still_call(raw_prefix));
+        // Qwen emits parallel calls as consecutive blocks; keep buffering until the model closes
+        // the turn. Only a Qwen call is read this way: another format's value may hold a Qwen
+        // closer as text.
+        if is_complete_tool
+            && format == Some(ToolCallFormat::Qwen)
+            && qwen_more_calls_possible(raw_prefix)
+        {
             return Ok((true, false));
+        }
+        // A DSML block makes the calls that survive being read: a call to a strict tool that its
+        // schema refuses, or to a tool not offered, is not made. A block that makes none is
+        // content, as a malformed one is, and the message stays held back from it until the turn
+        // ends. A required call that makes none fails when read, so it stays complete and fails
+        // at once.
+        if is_complete_tool
+            && format == Some(ToolCallFormat::DeepSeekDsml)
+            && !self.tool_choice.requires_tool_call()
+        {
+            let (_, calls) = self
+                .get_call_with_content(raw_prefix)
+                .map_err(candle_core::Error::msg)?;
+            if calls.is_empty() {
+                return Ok((true, false));
+            }
         }
         Ok((could_be_tool, is_complete_tool))
     }
@@ -236,19 +298,21 @@ impl ToolCallingMatcher {
         if matches!(self.tool_choice, ToolChoice::None) {
             return Ok((Some(message.to_string()), Vec::new()));
         }
-        let (message, content) =
-            if let Some((message, content)) = parsers::extract_model_specific_message(message)? {
-                let content = content.trim_start().to_string();
-                let content = if content.is_empty() {
-                    None
-                } else {
-                    Some(content)
-                };
-                (message, content)
+        let written = message;
+        let (message, content, format) = if let Some((message, content, format)) =
+            parsers::extract_model_specific_call(message)?
+        {
+            let content = content.trim_start().to_string();
+            let content = if content.is_empty() {
+                None
             } else {
-                (process_model_specific_message(message)?, None)
+                Some(content)
             };
-        let message = fix_broken_json(&message)?;
+            (message, content, Some(format))
+        } else {
+            (process_model_specific_message(message)?, None, None)
+        };
+        let message = repaired_unless_exact(message, format)?;
 
         let mut calls = if let Ok(deser) =
             serde_json::from_str::<CalledFunctionParameters>(&message)
@@ -284,11 +348,27 @@ impl ToolCallingMatcher {
             if self.tool_choice.requires_tool_call() {
                 anyhow::bail!("Tool choice was required but no tools were called.")
             }
-            return Ok((Some(message), Vec::new()));
+            // No call: the content is the message as the model wrote it, not as it was repaired
+            // to be read as one.
+            return Ok((Some(written.to_string()), Vec::new()));
         };
 
+        // DSML marks each value's type itself, so its arguments are already what the model
+        // wrote; a string `null` stays a string. A call to a strict tool is held to the tool's
+        // schema here, as the grammar that holds the model to it while it writes may not have
+        // run: the token that closed the block's opening tag carried more than whitespace, or
+        // the schema is one the grammar cannot hold.
+        let read = calls.len();
         if let Some(tools) = self.tools.as_deref() {
-            coerce_arguments_by_schema(tools, &mut calls)?;
+            if format == Some(ToolCallFormat::DeepSeekDsml) {
+                retain_calls_within_strict_schemas(
+                    &self.strict_validators,
+                    &mut calls,
+                    self.tool_choice.requires_tool_call(),
+                )?;
+            } else {
+                coerce_arguments_by_schema(tools, &mut calls)?;
+            }
         }
 
         // Filter out hallucinated tool names.
@@ -310,6 +390,32 @@ impl ToolCallingMatcher {
             }
         }
 
+        // A DSML block that makes no call is content, as a malformed one is: a message none of
+        // whose blocks makes a call is returned as the model wrote it, and one with a block that
+        // does is returned with only the blocks that make a call stripped, rather than with
+        // every block gone.
+        let content = if format == Some(ToolCallFormat::DeepSeekDsml) && calls.len() < read {
+            if calls.is_empty() {
+                return Ok((Some(written.to_string()), calls));
+            }
+            let made = calls
+                .iter()
+                .map(|call| call.index)
+                .collect::<std::collections::HashSet<_>>();
+            let content =
+                parsers::strip_dsml_blocks_making_calls(written, |index| made.contains(&index))
+                    .trim_start()
+                    .to_string();
+            (!content.is_empty()).then_some(content)
+        } else {
+            content
+        };
+
+        // The calls are numbered as returned, consecutively from zero: a client assembling
+        // streamed calls by index makes no empty call where one was refused.
+        for (index, call) in calls.iter_mut().enumerate() {
+            call.index = index;
+        }
         Ok((content, calls))
     }
 }
@@ -326,6 +432,65 @@ fn qwen_more_calls_possible(text: &str) -> bool {
     tail.is_empty()
         || QWEN_TOOL_CALL_OPEN.starts_with(tail)
         || tail.starts_with(QWEN_TOOL_CALL_OPEN)
+}
+
+/// A strict tool's parameters `schema` compiled to hold the tool's calls to, or why it cannot
+/// be. `format` is an annotation, not a constraint.
+fn compile_strict_schema(schema: &Value) -> StrictValidator {
+    jsonschema::options()
+        .should_validate_formats(false)
+        .build(schema)
+        .map_err(|error| error.to_string())
+}
+
+/// Drops from `calls` each call to a strict tool whose arguments do not match the tool's
+/// parameters schema (`validators`, by the tool's name), and fails when a call is `required`
+/// and none is left: a strict tool is promised arguments that match its schema, so a call with
+/// others is not made.
+fn retain_calls_within_strict_schemas(
+    validators: &HashMap<String, StrictValidator>,
+    calls: &mut Vec<ToolCallResponse>,
+    required: bool,
+) -> anyhow::Result<()> {
+    let mut dropped = None;
+    calls.retain(|call| {
+        let Some(validator) = validators.get(&call.function.name) else {
+            return true;
+        };
+        let Some(why) = strict_schema_mismatch(validator, &call.function.arguments) else {
+            return true;
+        };
+        tracing::warn!("Dropping tool call `{}`: it {why}", call.function.name);
+        dropped.get_or_insert_with(|| format!("`{}` {why}", call.function.name));
+        false
+    });
+    if let Some(dropped) = dropped.filter(|_| required && calls.is_empty()) {
+        anyhow::bail!("Tool choice was required but the model's call to strict tool {dropped}");
+    }
+    Ok(())
+}
+
+/// Why `arguments` do not match the strict tool's parameters schema, compiled as `validator`,
+/// if they do not.
+fn strict_schema_mismatch(validator: &StrictValidator, arguments: &str) -> Option<String> {
+    let arguments: Value = match serde_json::from_str(arguments) {
+        Ok(arguments) => arguments,
+        Err(error) => return Some(format!("has arguments that are not JSON: {error}")),
+    };
+    let validator = match validator {
+        Ok(validator) => validator,
+        Err(error) => {
+            return Some(format!(
+                "has a parameters schema its arguments cannot be checked against: {error}. Fix the schema, or remove `strict` from the tool"
+            ))
+        }
+    };
+    validator.validate(&arguments).err().map(|error| {
+        format!(
+            "has arguments that do not match its parameters schema at `{}`: {error}",
+            error.instance_path()
+        )
+    })
 }
 
 /// XML-style tool formats (Qwen3.5) carry every argument as text; the tool schema decides its JSON type (vLLM parity).
@@ -588,5 +753,1462 @@ mod tests {
             "{first}\n<tool_call>\n<function=get_time>\n<parameter=zone>\nUTC\n</parameter>\n</function>\n</tool_call>"
         );
         assert_eq!(matcher.get_call(&both).unwrap().len(), 2);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML string `null` became JSON null
+    #[test]
+    fn a_dsml_string_value_keeps_its_text_through_the_matcher() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "note",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "count": {"type": "integer"},
+                    },
+                },
+            },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        let calls = matcher
+            .get_call(
+                "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"note\">\n<｜DSML｜parameter name=\"text\" string=\"true\">null</｜DSML｜parameter>\n<｜DSML｜parameter name=\"count\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+            )
+            .unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"text": "null", "count": 2}));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: while a DSML call was unfinished, a
+    /// `<tool_call>` example in one of its values read as a complete call in Qwen's format
+    #[test]
+    fn an_unfinished_dsml_call_keeps_other_formats_out_of_its_values() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let prefix = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Call it as <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call> and then";
+        assert_eq!(matcher.prefix_could_be_tool(prefix).unwrap(), (true, false));
+        assert!(matcher.get_call(prefix).unwrap().is_empty());
+        let finished =
+            format!("{prefix}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>");
+        let calls = matcher.get_call(&finished).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML opener inside another format's call
+    /// claimed the message for DSML, and the call it sat in was lost
+    #[test]
+    fn a_dsml_opener_inside_another_formats_call_is_that_calls_text() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": "write_file", "parameters": { "type": "object" } },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        let calls = matcher
+            .get_call(r#"<tool_call>{"name": "write_file", "arguments": {"content": "<｜DSML｜tool_calls>"}}</tool_call>"#)
+            .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"content": "<｜DSML｜tool_calls>"}));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML block opener inside a string of a
+    /// bare-JSON call claimed the message for DSML: an unfinished block there held a required
+    /// call's deadline, and a block written into the string unescaped made its call in place of
+    /// the call it sat in
+    #[test]
+    fn a_dsml_opener_inside_a_bare_json_call_is_the_strings_text() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("write_file"), tool("rm")]))
+                .expect("a matcher");
+        let prefix = r#"{"name":"write_file","arguments":{"content":"<｜DSML｜tool_calls>"#;
+        assert_eq!(
+            matcher.prefix_could_be_tool(prefix).expect("a prefix"),
+            (true, false)
+        );
+        assert!(!parsers::call_unfinished(prefix));
+        // Unescaped, the markup leaves the message no JSON to read: it makes no call, and is
+        // returned as written.
+        let unescaped = "{\"name\":\"write_file\",\"arguments\":{\"content\":\"<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"rm\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\"}}";
+        let (content, calls) = matcher.get_call_with_content(unescaped).expect("a message");
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(content.as_deref(), Some(unescaped));
+        // Escaped, it is the argument's text.
+        let escaped = r#"{"name":"write_file","arguments":{"content":"<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"rm\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"}}"#;
+        let calls = matcher.get_call(escaped).expect("a call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).expect("JSON");
+        assert_eq!(
+            args,
+            json!({"content": "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"rm\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"})
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a call's closer written inside one of its
+    /// values, a Qwen `<parameter=…>` value, an Atem `<atem:parameter>` value or a quoted Liquid
+    /// argument, counted as the call's end, so a DSML block after it in the same value was read
+    /// as a call: text meant for `write_file` called `delete_all`
+    #[test]
+    fn a_closer_inside_a_value_does_not_end_its_call() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("write_file"), tool("delete_all")]),
+        )
+        .expect("a matcher");
+        let block = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"delete_all\"></｜DSML｜invoke></｜DSML｜tool_calls>";
+        // As the base reads them, where DSML is unknown and the block is only text: the
+        // Qwen and Atem messages make no call and are content, and the Liquid one fails to
+        // parse, while being written and once written. The Atem call is held back while it is
+        // open, where the base streamed it, so the block is never read without it.
+        let unread = |message: &str| {
+            let (content, calls) = matcher.get_call_with_content(message).expect("a message");
+            assert!(calls.is_empty(), "{message}: {calls:?}");
+            assert_eq!(content.as_deref(), Some(message));
+        };
+        for (open, rest, could_be) in [
+            (
+                "<tool_call><function=write_file><parameter=content></tool_call>",
+                "</parameter></function></tool_call>",
+                [(true, false), (true, false)],
+            ),
+            (
+                "<atem:function_calls><atem:invoke name=\"write_file\"><atem:parameter name=\"content\"></atem:function_calls>",
+                "</atem:parameter></atem:invoke></atem:function_calls>",
+                [(true, false), (false, false)],
+            ),
+        ] {
+            let prefix = format!("{open}{block}");
+            let message = format!("{prefix}{rest}");
+            for (text, could_be) in [&prefix, &message].into_iter().zip(could_be) {
+                assert_eq!(
+                    matcher.prefix_could_be_tool(text).expect("a prefix"),
+                    could_be,
+                    "{text}"
+                );
+                unread(text);
+            }
+        }
+        let liquid = format!("<|tool_call_start|>[write_file(content='<|tool_call_end|>{block}");
+        for text in [liquid.clone(), format!("{liquid}')]<|tool_call_end|>")] {
+            let failure = "Liquid tool call body must be a bracketed list";
+            assert_eq!(
+                matcher
+                    .prefix_could_be_tool(&text)
+                    .expect_err("a Liquid body that does not parse")
+                    .to_string(),
+                failure
+            );
+            assert_eq!(
+                matcher
+                    .get_call_with_content(&text)
+                    .expect_err("a Liquid body that does not parse")
+                    .to_string(),
+                failure
+            );
+        }
+        // A block after a call that has closed is a block.
+        let closed = format!(
+            "<tool_call>\n<function=write_file>\n<parameter=content>\nhello\n</parameter>\n</function>\n</tool_call>\n{block}"
+        );
+        let names: Vec<String> = matcher
+            .get_call(&closed)
+            .expect("a message")
+            .into_iter()
+            .map(|call| call.function.name)
+            .collect();
+        assert_eq!(names, ["delete_all"]);
+    }
+
+    /// The tool-call parsers read every message of the differential corpus, and each prefix of
+    /// it, as the base read it (`parse_oracle`), and streaming each message in each of its
+    /// chunkings sends the content and makes the calls the base's streaming did, but where an
+    /// intended difference says otherwise: a call the base did not make, outside those, is a
+    /// regression.
+    #[test]
+    fn the_parsers_read_the_corpus_as_the_base_does_but_where_intended() {
+        use super::parse_oracle::{
+            corpus, dsml_calls, intended_difference, intended_streaming_difference, oracle_json,
+            MUTATION_SEED, SEED, STREAM_SEED,
+        };
+        let base: Value =
+            serde_json::from_str(include_str!("testdata/tool_call_parse_oracle.json"))
+                .expect("the oracle");
+        let entries = corpus();
+        let head = oracle_json(&entries);
+        assert_eq!(
+            (
+                base["seed"].as_str(),
+                base["stream_seed"].as_str(),
+                base["entries"].as_array().map(Vec::len)
+            ),
+            (
+                head["seed"].as_str(),
+                head["stream_seed"].as_str(),
+                Some(entries.len())
+            ),
+            "the corpus no longer matches the oracle; record it again"
+        );
+        let mut matching = [0, 0];
+        let mut intended = [
+            std::collections::BTreeMap::<&str, usize>::new(),
+            std::collections::BTreeMap::<&str, usize>::new(),
+        ];
+        let mut regressions = Vec::new();
+        // The invariant, whatever the listed differences allow: a call is made only if the base
+        // reads it from the message or from one of its prefixes, before any DSML block outside
+        // other calls, or the entry states that its DSML block makes it.
+        let mut invented = Vec::new();
+        // And the other way: a streamed run may make fewer calls than the base's streaming of the
+        // same chunks only where the base's own reading of the whole message lacks them too; a
+        // message with a DSML block outside other calls owes the block's calls instead.
+        let mut lost = Vec::new();
+        let mut fewer = std::collections::BTreeMap::<&str, usize>::new();
+        let recorded = base["entries"].as_array().into_iter().flatten();
+        let read = head["entries"].as_array().into_iter().flatten();
+        for ((entry, base), head) in entries.iter().zip(recorded).zip(read) {
+            assert_eq!(
+                (&base["id"], &base["message"], &base["cuts"], &base["chunks"]),
+                (&head["id"], &head["message"], &head["cuts"], &head["chunks"]),
+                "the corpus no longer matches the oracle (seeds {SEED:#x}, {STREAM_SEED:#x}); record it again"
+            );
+            let base_readings: Vec<(usize, &Value)> = entry
+                .cuts
+                .iter()
+                .copied()
+                .zip(base["outcomes"].as_array().into_iter().flatten())
+                .collect();
+            let block_calls: Vec<Value> = entry
+                .dsml
+                .iter()
+                .flat_map(|dsml| dsml.blocks.iter().flat_map(|(_, calls)| calls))
+                .map(|(name, arguments)| json!([name, arguments]))
+                .collect();
+            let read_by_base = |upto: usize, call: &Value| {
+                let upto = entry.dsml.as_ref().map_or(upto, |dsml| upto.min(dsml.at));
+                block_calls.contains(call)
+                    || base_readings
+                        .iter()
+                        .filter(|(cut, _)| *cut <= upto)
+                        .any(|(_, reading)| {
+                            reading[1][1]
+                                .as_array()
+                                .is_some_and(|calls| calls.contains(call))
+                        })
+            };
+            let outcomes = base["outcomes"].as_array().into_iter().flatten();
+            let readings = head["outcomes"].as_array().into_iter().flatten();
+            for (&cut, head) in entry
+                .cuts
+                .iter()
+                .zip(head["outcomes"].as_array().into_iter().flatten())
+            {
+                for call in head[1][1].as_array().into_iter().flatten() {
+                    if !read_by_base(cut, call) {
+                        invented.push(format!(
+                            "{} at {cut} (seeds {SEED:#x}, {MUTATION_SEED:#x}): {:?} makes {call}",
+                            entry.id,
+                            &entry.message[..cut]
+                        ));
+                    }
+                }
+            }
+            let streamed_base = base["streaming"].as_array().into_iter().flatten();
+            let streamed_head = head["streaming"].as_array().into_iter().flatten();
+            for (chunking, (base, head)) in ["by character", "in runs"]
+                .into_iter()
+                .zip(streamed_base.zip(streamed_head))
+            {
+                let made = head[1].as_array().map_or(0, Vec::len);
+                let streamed = base[1].as_array().map_or(0, Vec::len);
+                // A run that fails as the base's own reading of one of the prefixes fails has
+                // lost nothing the base would have made.
+                let fails_as_read = head.get("error").is_some_and(|error| {
+                    base_readings
+                        .iter()
+                        .any(|(_, reading)| reading[1].get("error") == Some(error))
+                });
+                let owed = if entry.dsml.is_some() {
+                    // A message with a DSML block outside other calls is read only as DSML: it
+                    // owes the block's calls, unless the run ended on a call made before it.
+                    usize::from(!block_calls.is_empty())
+                } else {
+                    // The base's streaming may read more than its reading of the whole
+                    // message, from what follows a marker it streamed out as text.
+                    let whole = base_readings
+                        .last()
+                        .and_then(|(_, reading)| reading[1][1].as_array())
+                        .map_or(0, Vec::len);
+                    streamed.min(whole)
+                };
+                if made < streamed {
+                    let kind = if fails_as_read {
+                        "fails as a prefix is read"
+                    } else if made >= owed {
+                        if entry.dsml.is_some() {
+                            "read only as DSML"
+                        } else {
+                            "the whole message is read with as few"
+                        }
+                    } else {
+                        "lost"
+                    };
+                    *fewer.entry(kind).or_default() += 1;
+                    if kind == "lost" {
+                        lost.push(format!(
+                            "{} streamed {chunking} (seed {STREAM_SEED:#x}): {:?} makes {made} calls where the base streams {streamed} and reads them: {}",
+                            entry.id, entry.message, base[1]
+                        ));
+                    }
+                }
+                for call in head[1].as_array().into_iter().flatten() {
+                    let by_streaming = base[1].as_array().is_some_and(|calls| calls.contains(call));
+                    if !by_streaming && !read_by_base(entry.message.len(), call) {
+                        invented.push(format!(
+                            "{} streamed {chunking} (seed {STREAM_SEED:#x}): {:?} makes {call}",
+                            entry.id, entry.message
+                        ));
+                    }
+                }
+            }
+            for ((&cut, base), head) in entry.cuts.iter().zip(outcomes).zip(readings) {
+                if let Some((reason, calls)) = dsml_calls(entry, cut) {
+                    if head[1].is_array() && head[1][1] == calls {
+                        *intended[0].entry(reason).or_default() += 1;
+                    } else {
+                        regressions.push(format!(
+                            "{} at {cut} (seed {SEED:#x}): {:?}\n  base {base}\n  head {head}\n  calls as DSML {calls}",
+                            entry.id,
+                            &entry.message[..cut]
+                        ));
+                    }
+                } else if head == base {
+                    matching[0] += 1;
+                } else if let Some(reason) = intended_difference(entry, cut, base, head) {
+                    *intended[0].entry(reason).or_default() += 1;
+                } else {
+                    regressions.push(format!(
+                        "{} at {cut} (seed {SEED:#x}): {:?}\n  base {base}\n  head {head}",
+                        entry.id,
+                        &entry.message[..cut]
+                    ));
+                }
+            }
+            let read: Vec<&Value> = entry
+                .cuts
+                .iter()
+                .zip(base["outcomes"].as_array().into_iter().flatten())
+                .filter(|(&cut, _)| entry.dsml.as_ref().is_none_or(|dsml| cut <= dsml.at))
+                .map(|(_, reading)| reading)
+                .collect();
+            let streamed = base["streaming"].as_array().into_iter().flatten();
+            let streaming = head["streaming"].as_array().into_iter().flatten();
+            for (chunking, (base, head)) in ["by character", "in runs"]
+                .into_iter()
+                .zip(streamed.zip(streaming))
+            {
+                if head == base {
+                    matching[1] += 1;
+                } else if let Some(reason) = intended_streaming_difference(entry, base, head, &read)
+                {
+                    *intended[1].entry(reason).or_default() += 1;
+                } else {
+                    regressions.push(format!(
+                        "{} streamed {chunking} (seed {STREAM_SEED:#x}): {:?}\n  base {base}\n  head {head}",
+                        entry.id, entry.message
+                    ));
+                }
+            }
+        }
+        let readings: usize = entries.iter().map(|entry| entry.cuts.len()).sum();
+        eprintln!(
+            "corpus: {} entries; batch: {readings} readings, {} as the base, {} intended {:?}; streaming: {} runs, {} as the base, {} intended {:?}; {} regressions; {} calls the base does not read; {} calls lost",
+            entries.len(),
+            matching[0],
+            intended[0].values().sum::<usize>(),
+            intended[0],
+            entries.len() * 2,
+            matching[1],
+            intended[1].values().sum::<usize>(),
+            intended[1],
+            regressions.len(),
+            invented.len(),
+            lost.len()
+        );
+        for failure in lost.iter().chain(&invented).chain(&regressions) {
+            eprintln!("{failure}");
+        }
+        eprintln!("streamed runs making fewer calls than the base's streaming, by why: {fewer:?}");
+        assert!(
+            lost.is_empty(),
+            "{} calls the base streams and reads that streaming loses:\n{}",
+            lost.len(),
+            lost.join("\n")
+        );
+        assert!(
+            invented.is_empty(),
+            "{} calls the base does not read from the message or a prefix of it:\n{}",
+            invented.len(),
+            invented.join("\n")
+        );
+        assert!(
+            regressions.is_empty(),
+            "{} regressions:\n{}",
+            regressions.len(),
+            regressions.join("\n")
+        );
+    }
+
+    /// Reading a message heavy with markers takes time linear in it: each of
+    /// `parse_oracle::marker_heavy_messages` is read, streaming state and calls, at 10,000 and at
+    /// 40,000 markers, and the second must take less than six times the first. Read linearly it
+    /// takes about four times as long; read quadratically, as a search from every marker to the
+    /// end does, about sixteen. The ratio holds on any machine, fast or slow. The best of three
+    /// runs is measured at each size, and every time is printed.
+    #[test]
+    fn marker_heavy_messages_are_read_in_linear_time() {
+        let matcher = super::parse_oracle::matcher();
+        let best = |message: &str| {
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let _ = matcher.prefix_could_be_tool(message);
+                    let _ = matcher.get_call_with_content(message);
+                    start.elapsed()
+                })
+                .min()
+                .expect("three runs")
+        };
+        let small = super::parse_oracle::marker_heavy_messages(10_000);
+        let large = super::parse_oracle::marker_heavy_messages(40_000);
+        let mut slow = Vec::new();
+        for ((name, small), (_, large)) in small.iter().zip(&large) {
+            let (small, large) = (best(small), best(large));
+            let ratio = large.as_secs_f64() / small.as_secs_f64();
+            eprintln!("{name}: 10,000 markers in {small:?}, 40,000 in {large:?}, {ratio:.2} times");
+            if ratio >= 6.0 {
+                slow.push(format!("{name}: {ratio:.2} times"));
+            }
+        }
+        assert!(
+            slow.is_empty(),
+            "four times the markers took six times as long or more: {slow:?}"
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a stray Qwen opener before a Gemma 4 call was
+    /// taken to begin a call because a `<function=` quoted in the Gemma 4 value came before the
+    /// first `</tool_call>`, the one quoted after it, so the call ended there and a DSML block
+    /// later in the value was read as a call. A tag counts only before any later call begins.
+    #[test]
+    fn a_stray_opener_does_not_take_its_start_from_a_later_calls_value() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("write_file"), tool("delete_all")]),
+        )
+        .expect("a matcher");
+        let value = "<function=x></tool_call><｜DSML｜tool_calls><｜DSML｜invoke name=\"delete_all\"></｜DSML｜invoke></｜DSML｜tool_calls>";
+        let message = format!(
+            "<tool_call>example\n<|tool_call>call:write_file{{content:<|\"|>{value}<|\"|>}}<tool_call|>"
+        );
+        let calls: Vec<(String, Value)> = matcher
+            .get_call(&message)
+            .expect("a message")
+            .into_iter()
+            .map(|call| {
+                let arguments = serde_json::from_str(&call.function.arguments).expect("JSON");
+                (call.function.name, arguments)
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [("write_file".to_string(), json!({ "content": value }))]
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a stray Gemma 4 opener before a real call
+    /// was framed to the first closer after it, the one quoted in the real call's value, so a
+    /// DSML block later in that value was read as a call. A marker its format's parser would
+    /// not read a call after is text.
+    #[test]
+    fn a_stray_opener_does_not_end_inside_a_later_calls_value() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("write_file"), tool("delete_all")]),
+        )
+        .expect("a matcher");
+        let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"delete_all\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let value = format!("<tool_call|>{block}");
+        let message = format!(
+            "<|tool_call>example\n<|tool_call>call:write_file{{content:<|\"|>{value}<|\"|>}}<tool_call|>"
+        );
+        let calls: Vec<(String, Value)> = matcher
+            .get_call(&message)
+            .expect("a message")
+            .into_iter()
+            .map(|call| {
+                let arguments = serde_json::from_str(&call.function.arguments).expect("JSON");
+                (call.function.name, arguments)
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [("write_file".to_string(), json!({ "content": value }))]
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a Gemma 4 call left without its arguments,
+    /// before a Qwen call, was framed to the first Gemma 4 closer after it, the one in the Qwen
+    /// call's value, so the DSML block after that closer was read as a call, batch and streamed.
+    /// A call cut short by a later call is text: the Qwen call is read, with the block in its
+    /// value.
+    #[test]
+    fn an_unfinished_call_does_not_end_inside_a_later_calls_value() {
+        use super::parse_oracle::{chunkings, matcher, stream_rng, streaming_outcome};
+        let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"delete_all\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let message = format!(
+            "<|tool_call>call:example\n<tool_call>\n<function=write_file>\n<parameter=content>\n<tool_call|>{block}\n</parameter>\n</function>\n</tool_call>"
+        );
+        let content = format!("<tool_call|>{block}");
+        let calls: Vec<(String, Value)> = matcher()
+            .get_call(&message)
+            .expect("a message")
+            .into_iter()
+            .map(|call| {
+                let arguments = serde_json::from_str(&call.function.arguments).expect("JSON");
+                (call.function.name, arguments)
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [("write_file".to_string(), json!({ "content": content }))]
+        );
+        let streamed_call = json!(["write_file", json!({ "content": content }).to_string()]);
+        for ends in chunkings(&message, &mut stream_rng()) {
+            let outcome = streaming_outcome(&message, &ends);
+            assert_eq!(outcome[1], json!([streamed_call]), "{ends:?}: {outcome}");
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: Gemma 4 and Liquid read an unquoted value as
+    /// its text, but the call scanner took a DSML block in one, outside quotes, to cut the call
+    /// short, so the block was read as a call: `delete_all` where the base reads `write_file`,
+    /// batch and streamed. A marker in an unquoted value is the value's text, and the call
+    /// holds what follows until it ends.
+    #[test]
+    fn a_dsml_block_in_an_unquoted_value_is_the_values_text() {
+        use super::parse_oracle::{chunkings, matcher, stream_rng, streaming_outcome};
+        let block = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"delete_all\"></｜DSML｜invoke></｜DSML｜tool_calls>";
+        let mut rng = stream_rng();
+        for message in [
+            format!("<|tool_call>call:write_file{{content:{block}}}<tool_call|>"),
+            format!("<|tool_call_start|>[write_file(content={block})]<|tool_call_end|>"),
+        ] {
+            let calls: Vec<(String, Value)> = matcher()
+                .get_call(&message)
+                .expect("a message")
+                .into_iter()
+                .map(|call| {
+                    let arguments = serde_json::from_str(&call.function.arguments).expect("JSON");
+                    (call.function.name, arguments)
+                })
+                .collect();
+            assert_eq!(
+                calls,
+                [("write_file".to_string(), json!({ "content": block }))],
+                "{message}"
+            );
+            let streamed_call = json!(["write_file", json!({ "content": block }).to_string()]);
+            for ends in chunkings(&message, &mut rng) {
+                let outcome = streaming_outcome(&message, &ends);
+                assert_eq!(
+                    outcome[1],
+                    json!([streamed_call]),
+                    "{message} {ends:?}: {outcome}"
+                );
+            }
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a Gemma 4 or Liquid call holding a marker in
+    /// an unquoted value was left open for good, so a DSML block after the finished call was
+    /// never reached, and the message made the Gemma 4 or Liquid call where the block claims
+    /// it: `note` or `write_file` with the value's text, in place of the block's `write_file`.
+    /// The call ends at its closer, with the marker its value's text, and the block after it is
+    /// read. Streamed, the finished call ends the turn, as any finished call does, and makes
+    /// no call from the marker.
+    #[test]
+    fn a_call_with_a_marker_in_an_unquoted_value_leaves_a_later_block_its_call() {
+        use super::parse_oracle::{chunkings, matcher, stream_rng, streaming_outcome};
+        let delete_all = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"delete_all\"></｜DSML｜invoke></｜DSML｜tool_calls>";
+        let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">hello</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let mut rng = stream_rng();
+        for (name, value) in [("note", "<｜DSML｜note>"), ("write_file", delete_all)] {
+            for call in [
+                format!("<|tool_call>call:{name}{{content:{value}}}<tool_call|>"),
+                format!("<|tool_call_start|>[{name}(content={value})]<|tool_call_end|>"),
+            ] {
+                let message = format!("{call}\n{block}");
+                let calls: Vec<(String, Value)> = matcher()
+                    .get_call(&message)
+                    .expect("a message")
+                    .into_iter()
+                    .map(|call| {
+                        let arguments =
+                            serde_json::from_str(&call.function.arguments).expect("JSON");
+                        (call.function.name, arguments)
+                    })
+                    .collect();
+                assert_eq!(
+                    calls,
+                    [("write_file".to_string(), json!({ "content": "hello" }))],
+                    "{message}"
+                );
+                let finished = json!([name, json!({ "content": value }).to_string()]);
+                for ends in chunkings(&message, &mut rng) {
+                    let outcome = streaming_outcome(&message, &ends);
+                    assert_eq!(
+                        outcome[1],
+                        json!([finished]),
+                        "{message} {ends:?}: {outcome}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: streamed, a bare-JSON call whose string holds
+    /// a literal newline was sent out as content once it could no longer read, and the rest of
+    /// it was read on its own, so a DSML block later in the string made a call the message does
+    /// not. Text inside a call that has not ended is held back until it does.
+    #[test]
+    fn a_streamed_bare_json_call_keeps_a_dsml_block_in_its_string_as_text() {
+        use super::parse_oracle::streaming_outcome;
+        let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"delete_all\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let prefix = "{\"name\":\"write_file\",\"arguments\":{\"content\":\"line1\n";
+        let message = format!("{prefix}line2 {block}\"}}}}");
+        let by_character: Vec<usize> = message
+            .char_indices()
+            .map(|(at, c)| at + c.len_utf8())
+            .collect();
+        // The malformed prefix, its rest, the block, and the JSON's end, as separate chunks.
+        let in_pieces = [
+            prefix.len(),
+            prefix.len() + "line2 ".len(),
+            prefix.len() + "line2 ".len() + block.len(),
+            message.len(),
+        ];
+        for ends in [&by_character[..], &in_pieces[..]] {
+            assert_eq!(
+                streaming_outcome(&message, ends),
+                json!([true, []]),
+                "{ends:?}"
+            );
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a JSON-format call's closer inside one of its
+    /// strings, a Qwen JSON call's `</tool_call>`, Hunyuan's `</tool_calls>` or DeepSeek's
+    /// `<｜tool▁call▁end｜>`, counted as the call's end, so a DSML block after it in the string
+    /// was read as a call, or a DSML opener there took the message and its call was lost. The
+    /// expected outcomes are the base's, where DSML is unknown and the block is only text.
+    #[test]
+    fn a_closer_inside_a_json_string_does_not_end_its_call() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("write_file"), tool("delete_all")]),
+        )
+        .expect("a matcher");
+        let read = |text: &str| {
+            let (content, calls) = matcher.get_call_with_content(text).expect("a message");
+            let calls: Vec<(String, String)> = calls
+                .into_iter()
+                .map(|call| (call.function.name, call.function.arguments))
+                .collect();
+            (content, calls)
+        };
+        let block = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"delete_all\"></｜DSML｜invoke></｜DSML｜tool_calls>";
+        // The quotes of the DSML block's attribute are not escaped, so the JSON is malformed:
+        // the message makes no call and is content, while being written and once written.
+        for (open, rest) in [
+            (
+                "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"content\":\"</tool_call>",
+                "\"}}</tool_call>",
+            ),
+            (
+                "<tool_call>[{\"name\":\"write_file\",\"arguments\":{\"content\":\"</tool_call>",
+                "\"}}]</tool_call>",
+            ),
+            (
+                "<tool_calls>[{\"name\":\"write_file\",\"arguments\":{\"content\":\"</tool_calls>",
+                "\"}}]</tool_calls>",
+            ),
+        ] {
+            let prefix = format!("{open}{block}");
+            let message = format!("{prefix}{rest}");
+            for text in [&prefix, &message] {
+                assert_eq!(
+                    matcher.prefix_could_be_tool(text).expect("a prefix"),
+                    (true, false),
+                    "{text}"
+                );
+                assert_eq!(read(text), (Some(text.to_string()), Vec::new()), "{text}");
+            }
+        }
+        // Valid JSON holding DeepSeek's closer and a DSML opener: the call is made.
+        let prefix = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>write_file\n```json\n{\"content\":\"<｜tool▁call▁end｜><｜DSML｜tool_calls>";
+        assert_eq!(
+            matcher.prefix_could_be_tool(prefix).expect("a prefix"),
+            (true, false)
+        );
+        assert_eq!(read(prefix), (Some(prefix.to_string()), Vec::new()));
+        let message = format!("{prefix}\"}}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>");
+        assert_eq!(
+            matcher.prefix_could_be_tool(&message).expect("a message"),
+            (false, true)
+        );
+        assert_eq!(
+            read(&message),
+            (
+                Some(
+                    "<｜tool▁calls▁begin｜><｜DSML｜tool_calls>\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+                        .to_string()
+                ),
+                vec![(
+                    "write_file".to_string(),
+                    "{\"content\":\"<｜tool▁call▁end｜><｜DSML｜tool_calls>\"}".to_string()
+                )]
+            )
+        );
+        // A block after a JSON call that has closed is a block.
+        let closed = format!(
+            "<tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"content\":\"</tool_call>\"}}}}</tool_call>\n{block}"
+        );
+        assert_eq!(
+            read(&closed).1,
+            [("delete_all".to_string(), "{}".to_string())]
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: another format's opener quoted in a finished
+    /// bare-JSON call counted as opening a call there, so a later DSML block was taken as
+    /// enclosed and a Qwen call inside its value was made in place of the block's call
+    #[test]
+    fn a_marker_quoted_in_a_finished_bare_json_call_does_not_enclose_a_later_dsml_block() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("Bash"), tool("write_file"), tool("note")]),
+        )
+        .expect("a matcher");
+        let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        for marker in [
+            "<tool_calls>",
+            "<|tool_call>",
+            "<tool_call>",
+            "<|tool_call_start|>",
+            "<atem:function_calls>",
+            "<｜tool▁call▁begin｜>",
+        ] {
+            let quoted = serde_json::to_string(marker).expect("JSON");
+            for call in [
+                format!("{{\"name\":\"note\",\"arguments\":{{\"text\":{quoted}}}}}"),
+                format!("[{{\"name\":\"note\",\"arguments\":{{\"text\":{quoted}}}}}]"),
+            ] {
+                let names: Vec<String> = matcher
+                    .get_call(&format!("{call}\n{block}"))
+                    .expect("a message")
+                    .into_iter()
+                    .map(|call| call.function.name)
+                    .collect();
+                assert_eq!(names, ["write_file"], "{call}");
+            }
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a Mistral Nemo `[TOOL_CALLS]` or Llama
+    /// `<|python_tag|>` marker that begins no call, quoted in a finished bare-JSON call or
+    /// written in prose, counted as enclosing a later DSML block, so a Qwen call inside the
+    /// block's value was made in place of the block's call, or the block's call was lost
+    #[test]
+    fn a_marker_that_begins_no_call_does_not_enclose_a_later_dsml_block() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("Bash"), tool("write_file"), tool("note")]),
+        )
+        .expect("a matcher");
+        let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let names = |message: &str| -> Vec<String> {
+            matcher
+                .get_call(message)
+                .expect("a message")
+                .into_iter()
+                .map(|call| call.function.name)
+                .collect()
+        };
+        for before in [
+            r#"{"name":"note","arguments":{"text":"[TOOL_CALLS]"}}"#,
+            r#"[{"name":"note","arguments":{"text":"[TOOL_CALLS]"}}]"#,
+            r#"{"name":"note","arguments":{"text":"<|python_tag|>"}}"#,
+            "Write [TOOL_CALLS] before a Mistral call.",
+            "Write <|python_tag|> before a Llama call.",
+        ] {
+            assert_eq!(
+                names(&format!("{before}\n{block}")),
+                ["write_file"],
+                "{before}"
+            );
+        }
+        // A block inside a call that the marker does begin is that call's text.
+        let inside = format!(
+            "[TOOL_CALLS][{{\"name\":\"note\",\"arguments\":{{\"text\":{}}}}}]",
+            serde_json::to_string(block).expect("JSON")
+        );
+        assert_eq!(names(&inside), ["note"]);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a closed `<tool_call>` example before a DSML
+    /// block counted as enclosing it, and a Qwen call inside the block's value was made
+    #[test]
+    fn a_closed_example_before_a_dsml_block_does_not_enclose_it() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let message = "An empty example: <tool_call></tool_call>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML opener inside an earlier call in
+    /// another format took DSML out of the message, and a later block was read as Qwen
+    #[test]
+    fn a_dsml_opener_inside_an_earlier_call_leaves_later_blocks_to_dsml() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let message = "<tool_call>{\"name\": \"note\", \"arguments\": {\"text\": \"<｜DSML｜tool_calls>\"}}</tool_call>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML block opener that could not be read
+    /// claimed nothing, and a Qwen call written inside it was made
+    #[test]
+    fn a_broken_dsml_block_opener_keeps_other_formats_out() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": "Bash", "parameters": { "type": "object" } },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        for message in [
+            "<｜DSML｜tool_calls x=\"<tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>\">",
+            "<｜DSML｜tool_calls <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>",
+        ] {
+            assert!(matcher.get_call(message).unwrap().is_empty(), "{message}");
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a block whose tags could not be read was
+    /// streamed out as text, and what the model wrote after it was read on its own, so a block
+    /// or a `<tool_call>` example after it made a call the whole message does not
+    #[test]
+    fn a_block_that_cannot_be_read_holds_the_message_and_calls_nothing() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let broken = "Sure.\n<｜DSML｜tool_calls>!";
+        assert_eq!(matcher.prefix_could_be_tool(broken).unwrap(), (true, false));
+        let later_block = format!(
+            "{broken}\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">x</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        assert_eq!(
+            matcher.prefix_could_be_tool(&later_block).unwrap(),
+            (true, false)
+        );
+        assert!(matcher.get_call(&later_block).unwrap().is_empty());
+        let example =
+            format!("{broken} <tool_call>{{\"name\": \"Bash\", \"arguments\": {{}}}}</tool_call>");
+        assert_eq!(
+            matcher.prefix_could_be_tool(&example).unwrap(),
+            (true, false)
+        );
+        assert!(matcher.get_call(&example).unwrap().is_empty());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a marker written as argument text inside a
+    /// finished call in one format counted as opening a call in another, which took a DSML
+    /// block after it out of DSML's hands, and a `<tool_call>` example in that block was made
+    #[test]
+    fn a_marker_inside_a_finished_call_does_not_enclose_a_later_dsml_block() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let message = "<tool_call>{\"name\": \"note\", \"arguments\": {\"text\": \"[TOOL_CALLS]\"}}</tool_call>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a block that broke a rule while its tags
+    /// stayed in place streamed out as content, and what the model wrote after it was read on
+    /// its own, so a `<tool_call>` example after it made a call the whole message does not
+    #[test]
+    fn a_message_that_opened_a_block_streams_nothing_after_it() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let empty = "Sure.\n<｜DSML｜tool_calls></｜DSML｜tool_calls>";
+        assert_eq!(matcher.prefix_could_be_tool(empty).unwrap(), (true, false));
+        let example =
+            format!("{empty} <tool_call>{{\"name\": \"Bash\", \"arguments\": {{}}}}</tool_call>");
+        assert_eq!(
+            matcher.prefix_could_be_tool(&example).unwrap(),
+            (true, false)
+        );
+        assert!(matcher.get_call(&example).unwrap().is_empty());
+        // A valid block after it still calls, and completes the message.
+        let later_block = format!(
+            "{empty}\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">x</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        assert_eq!(
+            matcher.prefix_could_be_tool(&later_block).unwrap(),
+            (false, true)
+        );
+        let calls = matcher.get_call(&later_block).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a finished call's span was blanked format by
+    /// format, so an opener of one format written inside a call of another, with the closer
+    /// after that call, blanked the enclosing call's closer and left it open
+    #[test]
+    fn a_marker_inside_a_finished_call_does_not_hide_that_calls_closer() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let message = "<tool_call>{\"name\": \"note\", \"arguments\": {\"text\": \"<atem:function_calls>\"}}</tool_call></atem:function_calls>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a Gemma 4 call was framed at the first
+    /// `<tool_call|>`, even one inside a `<|"|>`-quoted value, so a DSML block later in that
+    /// value read as outside any call and claimed the message for DSML
+    #[test]
+    fn a_closer_quoted_in_a_gemma_value_does_not_end_its_call() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let value = "End a call with <tool_call|>, then run:\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let message =
+            format!("<|tool_call>call:write_file{{content:<|\"|>{value}<|\"|>}}<tool_call|>");
+        let calls = matcher.get_call(&message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["write_file"]);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({ "content": value }));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML call to a strict tool was read as
+    /// written, with nothing holding it to the tool's schema when no grammar had held the model
+    /// to it, so `Bash`, which requires `command`, could be called without it
+    #[test]
+    fn a_dsml_call_to_a_strict_tool_is_held_to_its_schema_when_read() {
+        let bash: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        }))
+        .unwrap();
+        let call = |parameters: &str| {
+            format!(
+                "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"Bash\">\n{parameters}</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+            )
+        };
+        let command =
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n";
+        let without_command = call("");
+        let timeout_as_text = call(&format!(
+            "{command}<｜DSML｜parameter name=\"timeout\" string=\"true\">30</｜DSML｜parameter>\n"
+        ));
+        let valid = call(&format!(
+            "{command}<｜DSML｜parameter name=\"timeout\" string=\"false\">30</｜DSML｜parameter>\n"
+        ));
+        let auto =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(std::slice::from_ref(&bash))).unwrap();
+        assert!(auto.get_call(&without_command).unwrap().is_empty());
+        assert!(auto.get_call(&timeout_as_text).unwrap().is_empty());
+        let calls = auto.get_call(&valid).unwrap();
+        assert_eq!(calls.len(), 1);
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"command": "ls", "timeout": 30}));
+        let required =
+            ToolCallingMatcher::new(ToolChoice::Required, Some(std::slice::from_ref(&bash)))
+                .unwrap();
+        let error = required.get_call(&without_command).unwrap_err().to_string();
+        assert!(
+            error.contains("strict tool `Bash`")
+                && error.contains("\"command\" is a required property"),
+            "{error}"
+        );
+        assert_eq!(required.get_call(&valid).unwrap().len(), 1);
+        // A tool that is not strict is read as written.
+        let mut loose = bash;
+        loose.function.strict = None;
+        let auto = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[loose])).unwrap();
+        assert_eq!(auto.get_call(&without_command).unwrap().len(), 1);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML block whose every call was refused when
+    /// read, as a call to a strict tool with arguments its schema does not allow or to a tool
+    /// not offered is, was still reported complete, with the block stripped from the content, so
+    /// a stream ended with `finish_reason: "tool_calls"`, no calls, and the block gone. A block
+    /// that makes no call is content, as a malformed one is: the message stays held back from it
+    /// until the turn ends, then is returned as the model wrote it.
+    #[test]
+    fn a_dsml_block_whose_calls_are_all_refused_is_content_not_a_complete_call() {
+        let bash: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        }))
+        .unwrap();
+        let block = |invocations: &str| {
+            format!("Running it.\n\n<｜DSML｜tool_calls>\n{invocations}</｜DSML｜tool_calls>")
+        };
+        let invoke = |name: &str, parameters: &str| {
+            format!("<｜DSML｜invoke name=\"{name}\">\n{parameters}</｜DSML｜invoke>\n")
+        };
+        let command =
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n";
+        let timeout =
+            "<｜DSML｜parameter name=\"timeout\" string=\"false\">30</｜DSML｜parameter>\n";
+        let auto =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(std::slice::from_ref(&bash))).unwrap();
+        // Refused by the tool's schema, and a tool that is not offered.
+        for refused in [
+            block(&invoke("Bash", timeout)),
+            block(&invoke("Shell", command)),
+        ] {
+            assert_eq!(
+                auto.prefix_could_be_tool(&refused).unwrap(),
+                (true, false),
+                "{refused}"
+            );
+            let (content, calls) = auto.get_call_with_content(&refused).unwrap();
+            assert_eq!(content.as_deref(), Some(refused.as_str()), "{refused}");
+            assert!(calls.is_empty(), "{refused}");
+        }
+        // A block that makes a call beside one it does not still ends the turn with that call.
+        let one_of_two = block(&format!(
+            "{}{}",
+            invoke("Bash", timeout),
+            invoke("Bash", command)
+        ));
+        assert_eq!(
+            auto.prefix_could_be_tool(&one_of_two).unwrap(),
+            (false, true)
+        );
+        let (content, calls) = auto.get_call_with_content(&one_of_two).unwrap();
+        assert_eq!(content.as_deref(), Some("Running it.\n\n"));
+        let args: Vec<Value> = calls
+            .iter()
+            .map(|call| serde_json::from_str(&call.function.arguments).unwrap())
+            .collect();
+        assert_eq!(args, [json!({"command": "ls"})]);
+        // The call that survives is the first, whatever its place among the calls read.
+        assert_eq!(calls.iter().map(|call| call.index).collect::<Vec<_>>(), [0]);
+        // A required call that makes none fails as soon as it is read.
+        let required = ToolCallingMatcher::new(ToolChoice::Required, Some(&[bash])).unwrap();
+        let refused = block(&invoke("Bash", timeout));
+        assert_eq!(
+            required.prefix_could_be_tool(&refused).unwrap(),
+            (false, true)
+        );
+        let error = required.get_call(&refused).unwrap_err().to_string();
+        assert!(
+            error.contains("\"command\" is a required property"),
+            "{error}"
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: the check for a Qwen block of parallel calls
+    /// still being written ran on a DSML call too, so a string value holding
+    /// `</tool_call><tool_call>` kept a complete block from being reported complete: the stream
+    /// stayed buffered, and a required call, never marked satisfied, could have a second block
+    /// forced into the turn at its deadline
+    #[test]
+    fn a_qwen_closer_inside_a_dsml_value_does_not_hold_the_block_open() {
+        let tool = test_tool("write");
+        let value = "</tool_call><tool_call>";
+        let message = format!(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write\">\n<｜DSML｜parameter name=\"body\" string=\"true\">{value}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        for tool_choice in [ToolChoice::Auto, ToolChoice::Required] {
+            let matcher =
+                ToolCallingMatcher::new(tool_choice, Some(std::slice::from_ref(&tool))).unwrap();
+            assert_eq!(
+                matcher.prefix_could_be_tool(&message).unwrap(),
+                (false, true)
+            );
+            let calls = matcher.get_call(&message).unwrap();
+            assert_eq!(calls.len(), 1);
+            let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(args, json!({"body": value}));
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a message that made no call was returned as
+    /// content after the repair for a model's stringified `arguments`, so a DSML block the parser
+    /// made content, followed by the text `{"arguments":"{}"}`, came back with `{"arguments":{}}`
+    #[test]
+    fn content_that_makes_no_call_is_returned_as_written() {
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[test_tool("set")])).unwrap();
+        let block_then_example =
+            "<｜DSML｜tool_calls></｜DSML｜tool_calls>\n{\"arguments\":\"{}\"}";
+        for message in [
+            block_then_example,
+            "The shape is {\"arguments\":\"{}\"} with the braces quoted.",
+        ] {
+            let (content, calls) = matcher.get_call_with_content(message).unwrap();
+            assert_eq!(content.as_deref(), Some(message), "{message}");
+            assert!(calls.is_empty(), "{message}");
+        }
+        // The block is DSML's, so the message is held back until the turn ends.
+        assert_eq!(
+            matcher.prefix_could_be_tool(block_then_example).unwrap(),
+            (true, false)
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML block whose every call was refused
+    /// vanished from the content when another block in the message made a call, as every block
+    /// was stripped once a call survived. Only a block that made a call is stripped; one that
+    /// made none is content, as a malformed one is.
+    #[test]
+    fn a_refused_dsml_block_stays_content_beside_a_block_that_calls() {
+        let bash: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "timeout": {"type": "integer"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        }))
+        .unwrap();
+        let block = |name: &str, parameter: &str| {
+            format!(
+                "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"{name}\">\n<｜DSML｜parameter {parameter}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+            )
+        };
+        let refused = block("Bash", "name=\"timeout\" string=\"false\">30");
+        let not_offered = block("Shell", "name=\"command\" string=\"true\">ls");
+        let calling = block("Bash", "name=\"command\" string=\"true\">ls");
+        let auto = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[bash])).unwrap();
+        for (message, content) in [
+            (
+                format!("First.\n{refused}\nThen.\n{calling}"),
+                format!("First.\n{refused}\nThen.\n"),
+            ),
+            (
+                format!("{calling}\n{not_offered}\nDone."),
+                format!("{not_offered}\nDone."),
+            ),
+        ] {
+            assert_eq!(
+                auto.prefix_could_be_tool(&message).unwrap(),
+                (false, true),
+                "{message}"
+            );
+            let (got, calls) = auto.get_call_with_content(&message).unwrap();
+            assert_eq!(got.as_deref(), Some(content.as_str()), "{message}");
+            let args: Vec<Value> = calls
+                .iter()
+                .map(|call| serde_json::from_str(&call.function.arguments).unwrap())
+                .collect();
+            assert_eq!(args, [json!({"command": "ls"})], "{message}");
+            // The call that survives is the first, whatever its place among the calls read, so a
+            // client assembling streamed calls by index makes no empty call before it.
+            assert_eq!(
+                calls.iter().map(|call| call.index).collect::<Vec<_>>(),
+                [0],
+                "{message}"
+            );
+        }
+    }
+
+    /// A strict tool whose parameters schema cannot be compiled, here a `minimum` that is not a
+    /// number, cannot hold a call: the call is refused with the reason, in `auto` mode dropped
+    /// and in `required` mode an error, as a call to a strict tool is held to the schema when
+    /// read.
+    #[test]
+    fn a_strict_schema_that_cannot_be_compiled_refuses_its_calls_with_the_reason() {
+        let broken: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": {
+                "name": "set",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": { "n": { "type": "integer", "minimum": "zero" } },
+                },
+            },
+        }))
+        .unwrap();
+        let call = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"set\">\n<｜DSML｜parameter name=\"n\" string=\"false\">1</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let auto =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(std::slice::from_ref(&broken))).unwrap();
+        let (content, calls) = auto.get_call_with_content(call).unwrap();
+        assert_eq!(content.as_deref(), Some(call));
+        assert!(calls.is_empty());
+        let required = ToolCallingMatcher::new(ToolChoice::Required, Some(&[broken])).unwrap();
+        let error = required.get_call(call).unwrap_err().to_string();
+        assert!(
+            error.contains("strict tool `set`")
+                && error.contains("cannot be checked against")
+                && error.contains("remove `strict` from the tool"),
+            "{error}"
+        );
+    }
+
+    /// A tool that declares no parameters takes any in a forced call, so no grammar keeps the
+    /// model from giving a parameter twice. Such a block is content, and a required call ends
+    /// the request with an error rather than calling with one of the two values.
+    #[test]
+    fn a_required_call_with_a_parameter_given_twice_is_an_error_not_a_call() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": "set", "parameters": { "type": "object" } },
+        }))
+        .unwrap();
+        let twice = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"set\">\n<｜DSML｜parameter name=\"a\" string=\"true\">1</｜DSML｜parameter>\n<｜DSML｜parameter name=\"a\" string=\"true\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let required = ToolCallingMatcher::new(ToolChoice::Required, Some(&[tool])).unwrap();
+        assert_eq!(
+            required.get_call(twice).unwrap_err().to_string(),
+            "Tool choice was required but no tools were called."
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a DSML block opener still being written, or
+    /// only its marker, claimed nothing, so a finished `<tool_call>` example earlier in the
+    /// message was dispatched as a complete call and the turn ended before the DSML call
+    #[test]
+    fn a_partial_dsml_opener_claims_the_message_before_an_example_is_dispatched() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .unwrap()
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("Bash"), tool("write_file")]))
+                .unwrap();
+        let example = "Like this: <tool_call>{\"name\": \"note\", \"arguments\": {}}</tool_call>\nNow for real:\n";
+        for partial in [
+            "<｜",
+            "<｜DSML｜",
+            "<｜DSML｜tool_cal",
+            "<｜DSML｜tool_calls>\n<｜DSML｜inv",
+        ] {
+            let prefix = format!("{example}{partial}");
+            assert_eq!(
+                matcher.prefix_could_be_tool(&prefix).unwrap(),
+                (true, false),
+                "{partial:?}"
+            );
+            assert!(matcher.get_call(&prefix).unwrap().is_empty(), "{partial:?}");
+        }
+        let whole = format!(
+            "{example}<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">x</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        let calls = matcher.get_call(&whole).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        // A tag that is not a block's, or a marker inside another format's open call, claims nothing.
+        assert!(
+            matcher
+                .prefix_could_be_tool(&format!("{example}<｜DSML｜note>"))
+                .unwrap()
+                .1
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: the repair for a model's stringified
+    /// `arguments` ran on the DSML parser's own JSON, so a string parameter named `arguments`
+    /// holding `{}` reached the tool as an object
+    #[test]
+    fn a_dsml_string_parameter_named_arguments_stays_a_string() {
+        let tool: Tool = serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": "note", "parameters": { "type": "object" } },
+        }))
+        .unwrap();
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        let message = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"note\">\n<｜DSML｜parameter name=\"arguments\" string=\"true\">{}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        assert_eq!(
+            matcher.prefix_could_be_tool(message).unwrap(),
+            (false, true)
+        );
+        let calls = matcher.get_call(message).unwrap();
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"arguments": "{}"}));
     }
 }

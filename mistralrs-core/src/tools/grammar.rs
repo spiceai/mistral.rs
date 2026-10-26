@@ -194,6 +194,10 @@ mod tests {
             ),
             (parsers::ToolCallFormat::DeepSeek, "<｜tool▁call▁begin｜>"),
             (
+                parsers::ToolCallFormat::DeepSeekDsml,
+                r#"start: "<" dsml_mark "tool_calls>\n""#,
+            ),
+            (
                 parsers::ToolCallFormat::Gemma4,
                 "start: <|tool_call> tool_call_body",
             ),
@@ -234,7 +238,7 @@ mod tests {
         for (format, expected) in cases {
             let mut grammar =
                 parsers::build_required_tool_call_grammar(Some(format), &sample_tools());
-            parsers::specialize_required_tool_call_grammar(&mut grammar, &trie);
+            parsers::specialize_tool_call_grammar(&mut grammar, &trie);
             let lark = grammar.grammars[0].lark_grammar.as_ref().unwrap();
             assert!(
                 lark.contains(expected),
