@@ -279,7 +279,9 @@ fn without_closed_calls(text: &str) -> String {
 /// Where the call in `format` that `start` opens at `open` in `text` ends, past its `end`, or
 /// `None` while it is still open. A closer inside one of the call's values is the value's text:
 /// a Gemma 4 value quoted in `<|"|>`, a Qwen `<parameter=…>` or Atem `<atem:parameter>` value,
-/// and a quoted Liquid argument. Any other format's call ends at its first closer.
+/// a quoted Liquid argument, and a JSON string of a Qwen JSON, Hunyuan or DeepSeek call. A
+/// JSON-format call ends only at a closer up to which it reads as a call, so one that does not
+/// read stays open and holds what follows. Any other call ends at its first closer.
 fn call_end(
     format: ToolCallFormat,
     text: &str,
@@ -297,10 +299,55 @@ fn call_end(
             end_outside_tagged_values(text, body, end, "<atem:parameter", "</atem:parameter>")
         }
         ToolCallFormat::Liquid => end_outside_quotes(text, body, end),
+        ToolCallFormat::Qwen if text[body..].trim_start().starts_with('{') => {
+            end_outside_json_strings(text, body, end, |at| is_json(&text[body..at]))
+        }
+        ToolCallFormat::Hunyuan if text[body..].trim_start().starts_with('[') => {
+            end_outside_json_strings(text, body, end, |at| is_json(&text[body..at]))
+        }
+        ToolCallFormat::DeepSeek => end_outside_json_strings(text, body, end, |at| {
+            deepseek::DeepSeekParser
+                .parse(&text[open..at + end.len()])
+                .is_ok_and(|calls| calls.is_some())
+        }),
         _ => text[body..]
             .find(end)
             .map(|length| body + length + end.len()),
     }
+}
+
+/// Whether `text` is one JSON value.
+fn is_json(text: &str) -> bool {
+    serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
+}
+
+/// Where the first `end` from `body` in `text` that is outside JSON strings, where `\` escapes
+/// the next character, and at which `reads` holds ends; `None` before one.
+fn end_outside_json_strings(
+    text: &str,
+    body: usize,
+    end: &str,
+    reads: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let mut inside = false;
+    let mut escaped = false;
+    for (offset, c) in text[body..].char_indices() {
+        let at = body + offset;
+        if inside {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                inside = false;
+            }
+        } else if c == '"' {
+            inside = true;
+        } else if text[at..].starts_with(end) && reads(at) {
+            return Some(at + end.len());
+        }
+    }
+    None
 }
 
 /// Where the first `end` from `body` in `text` that is not inside a value, from a `value_open`
@@ -418,12 +465,6 @@ fn ends_inside_json_string(text: &str) -> bool {
         }
     }
     inside
-}
-
-/// Whether `text` ends after an `open` delimiter with no `close` after it.
-fn open_between(text: &str, open: &str, close: &str) -> bool {
-    text.rfind(open)
-        .is_some_and(|at| !text[at + open.len()..].contains(close))
 }
 
 /// Why a required call in `format` cannot hold one of `tools` to its strict schema, if it

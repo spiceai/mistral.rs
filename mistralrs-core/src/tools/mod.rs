@@ -938,6 +938,92 @@ mod tests {
         assert_eq!(names, ["delete_all"]);
     }
 
+    /// regression test for spiceai/mistral.rs#54: a JSON-format call's closer inside one of its
+    /// strings, a Qwen JSON call's `</tool_call>`, Hunyuan's `</tool_calls>` or DeepSeek's
+    /// `<｜tool▁call▁end｜>`, counted as the call's end, so a DSML block after it in the string
+    /// was read as a call, or a DSML opener there took the message and its call was lost. The
+    /// expected outcomes are the base's, where DSML is unknown and the block is only text.
+    #[test]
+    fn a_closer_inside_a_json_string_does_not_end_its_call() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("write_file"), tool("delete_all")]),
+        )
+        .expect("a matcher");
+        let read = |text: &str| {
+            let (content, calls) = matcher.get_call_with_content(text).expect("a message");
+            let calls: Vec<(String, String)> = calls
+                .into_iter()
+                .map(|call| (call.function.name, call.function.arguments))
+                .collect();
+            (content, calls)
+        };
+        let block = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"delete_all\"></｜DSML｜invoke></｜DSML｜tool_calls>";
+        // The quotes of the DSML block's attribute are not escaped, so the JSON is malformed:
+        // the message makes no call and is content, while being written and once written.
+        for (open, rest) in [
+            (
+                "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"content\":\"</tool_call>",
+                "\"}}</tool_call>",
+            ),
+            (
+                "<tool_calls>[{\"name\":\"write_file\",\"arguments\":{\"content\":\"</tool_calls>",
+                "\"}}]</tool_calls>",
+            ),
+        ] {
+            let prefix = format!("{open}{block}");
+            let message = format!("{prefix}{rest}");
+            for text in [&prefix, &message] {
+                assert_eq!(
+                    matcher.prefix_could_be_tool(text).expect("a prefix"),
+                    (true, false),
+                    "{text}"
+                );
+                assert_eq!(read(text), (Some(text.to_string()), Vec::new()), "{text}");
+            }
+        }
+        // Valid JSON holding DeepSeek's closer and a DSML opener: the call is made.
+        let prefix = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>write_file\n```json\n{\"content\":\"<｜tool▁call▁end｜><｜DSML｜tool_calls>";
+        assert_eq!(
+            matcher.prefix_could_be_tool(prefix).expect("a prefix"),
+            (true, false)
+        );
+        assert_eq!(read(prefix), (Some(prefix.to_string()), Vec::new()));
+        let message = format!("{prefix}\"}}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>");
+        assert_eq!(
+            matcher.prefix_could_be_tool(&message).expect("a message"),
+            (false, true)
+        );
+        assert_eq!(
+            read(&message),
+            (
+                Some(
+                    "<｜tool▁calls▁begin｜><｜DSML｜tool_calls>\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+                        .to_string()
+                ),
+                vec![(
+                    "write_file".to_string(),
+                    "{\"content\":\"<｜tool▁call▁end｜><｜DSML｜tool_calls>\"}".to_string()
+                )]
+            )
+        );
+        // A block after a JSON call that has closed is a block.
+        let closed = format!(
+            "<tool_call>{{\"name\":\"write_file\",\"arguments\":{{\"content\":\"</tool_call>\"}}}}</tool_call>\n{block}"
+        );
+        assert_eq!(
+            read(&closed).1,
+            [("delete_all".to_string(), "{}".to_string())]
+        );
+    }
+
     /// regression test for spiceai/mistral.rs#54: a Mistral Nemo `[TOOL_CALLS]` or Llama
     /// `<|python_tag|>` marker that begins no call, quoted in a finished bare-JSON call or
     /// written in prose, counted as enclosing a later DSML block, so a Qwen call inside the

@@ -18,8 +18,9 @@ impl ToolFormatParser for HunyuanParser {
         text.contains(START) || text.ends_with(PREFIX)
     }
 
+    /// A `</tool_calls>` inside a JSON string is the string's text.
     fn open_at_end(&self, text: &str) -> bool {
-        super::open_between(text, START, END)
+        super::open_call_start(text, super::ToolCallFormat::Hunyuan).is_some()
     }
 
     fn format(&self) -> super::ToolCallFormat {

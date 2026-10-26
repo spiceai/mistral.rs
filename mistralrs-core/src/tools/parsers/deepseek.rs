@@ -26,8 +26,9 @@ impl ToolFormatParser for DeepSeekParser {
         text.contains("<｜tool▁call▁begin｜>")
     }
 
+    /// A `<｜tool▁call▁end｜>` inside a JSON string is the string's text.
     fn open_at_end(&self, text: &str) -> bool {
-        super::open_between(text, "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>")
+        super::open_call_start(text, super::ToolCallFormat::DeepSeek).is_some()
     }
 
     fn format(&self) -> super::ToolCallFormat {
