@@ -690,8 +690,8 @@ fn property_value(property: &Value) -> PropertyValue {
 
 /// The keys a strict tool's parameters schema may have for a required call's grammar to hold
 /// the object it describes: the grammar writes each declared property at most once, its
-/// required ones always, and no other.
-const ENFORCED_ROOT_KEYS: [&str; 13] = [
+/// required ones always, and no other. An annotation constrains nothing, so it is allowed.
+const ENFORCED_ROOT_KEYS: [&str; 17] = [
     "type",
     "properties",
     "required",
@@ -702,9 +702,13 @@ const ENFORCED_ROOT_KEYS: [&str; 13] = [
     "definitions",
     "$schema",
     "$id",
+    "$anchor",
     "$comment",
     "examples",
     "default",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
 ];
 
 /// Why a required call cannot hold one of `tools` to its strict schema: a constraint on the
@@ -1754,6 +1758,56 @@ mod tests {
                 "{reference}"
             );
         }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a strict tool's schema with an annotation at
+    /// its root, `$anchor`, `deprecated`, `readOnly` or `writeOnly`, was refused as constraining
+    /// the object as a whole. An annotation constrains nothing: a required call holds the schema
+    /// as it does without it, and a `$ref` to the root's anchor names the root.
+    #[test]
+    fn a_strict_schemas_root_annotations_do_not_make_it_unenforceable() {
+        let schema = serde_json::json!({
+            "$anchor": "Args",
+            "deprecated": false,
+            "readOnly": false,
+            "writeOnly": false,
+            "type": "object",
+            "properties": {
+                "n": { "type": "integer" },
+                "again": { "$ref": "#Args" },
+            },
+            "required": ["n"],
+            "additionalProperties": false,
+        });
+        let annotated = tool(schema.clone());
+        assert_eq!(unenforceable_tool(&annotated), None);
+        assert_eq!(
+            property_schema(&schema, "n")["$defs"]["tool"]["properties"]["again"]["$ref"],
+            serde_json::json!("#/$defs/tool")
+        );
+        let tools = std::slice::from_ref(&annotated);
+        assert!(forced_call_accepts(
+            tools,
+            &one_call("set", &[("n", "false", "3")])
+        ));
+        assert!(forced_call_accepts(
+            tools,
+            &one_call(
+                "set",
+                &[("again", "false", r#"{"n": 1}"#), ("n", "false", "3")]
+            )
+        ));
+        assert!(!forced_call_accepts(
+            tools,
+            &one_call(
+                "set",
+                &[("again", "false", r#"{"n": "one"}"#), ("n", "false", "3")]
+            )
+        ));
+        assert!(!forced_call_accepts(
+            tools,
+            &one_call("set", &[("n", "false", "\"three\"")])
+        ));
     }
 
     /// regression test for spiceai/mistral.rs#54: the `enum` and `const` shortcuts dropped the

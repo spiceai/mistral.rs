@@ -236,8 +236,13 @@ impl ToolCallingMatcher {
             }
         })
         .unwrap_or((contains_tool_call_prefix(&message_prefix), false));
-        // Qwen emits parallel calls as consecutive blocks; keep buffering until the model closes the turn
-        if is_complete_tool && qwen_more_calls_possible(raw_prefix) {
+        // Qwen emits parallel calls as consecutive blocks; keep buffering until the model closes
+        // the turn. Only a Qwen call is read this way: another format's value may hold a Qwen
+        // closer as text.
+        if is_complete_tool
+            && format == Some(ToolCallFormat::Qwen)
+            && qwen_more_calls_possible(raw_prefix)
+        {
             return Ok((true, false));
         }
         // A DSML block makes the calls that survive being read: a call to a strict tool that its
@@ -320,7 +325,9 @@ impl ToolCallingMatcher {
             if self.tool_choice.requires_tool_call() {
                 anyhow::bail!("Tool choice was required but no tools were called.")
             }
-            return Ok((Some(message), Vec::new()));
+            // No call: the content is the message as the model wrote it, not as it was repaired
+            // to be read as one.
+            return Ok((Some(written.to_string()), Vec::new()));
         };
 
         // DSML marks each value's type itself, so its arguments are already what the model
@@ -1120,6 +1127,55 @@ mod tests {
         assert!(
             error.contains("\"command\" is a required property"),
             "{error}"
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: the check for a Qwen block of parallel calls
+    /// still being written ran on a DSML call too, so a string value holding
+    /// `</tool_call><tool_call>` kept a complete block from being reported complete: the stream
+    /// stayed buffered, and a required call, never marked satisfied, could have a second block
+    /// forced into the turn at its deadline
+    #[test]
+    fn a_qwen_closer_inside_a_dsml_value_does_not_hold_the_block_open() {
+        let tool = test_tool("write");
+        let value = "</tool_call><tool_call>";
+        let message = format!(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write\">\n<｜DSML｜parameter name=\"body\" string=\"true\">{value}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        for tool_choice in [ToolChoice::Auto, ToolChoice::Required] {
+            let matcher =
+                ToolCallingMatcher::new(tool_choice, Some(std::slice::from_ref(&tool))).unwrap();
+            assert_eq!(
+                matcher.prefix_could_be_tool(&message).unwrap(),
+                (false, true)
+            );
+            let calls = matcher.get_call(&message).unwrap();
+            assert_eq!(calls.len(), 1);
+            let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(args, json!({"body": value}));
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a message that made no call was returned as
+    /// content after the repair for a model's stringified `arguments`, so a DSML block the parser
+    /// made content, followed by the text `{"arguments":"{}"}`, came back with `{"arguments":{}}`
+    #[test]
+    fn content_that_makes_no_call_is_returned_as_written() {
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[test_tool("set")])).unwrap();
+        let block_then_example =
+            "<｜DSML｜tool_calls></｜DSML｜tool_calls>\n{\"arguments\":\"{}\"}";
+        for message in [
+            block_then_example,
+            "The shape is {\"arguments\":\"{}\"} with the braces quoted.",
+        ] {
+            let (content, calls) = matcher.get_call_with_content(message).unwrap();
+            assert_eq!(content.as_deref(), Some(message), "{message}");
+            assert!(calls.is_empty(), "{message}");
+        }
+        // The block is DSML's, so the message is held back until the turn ends.
+        assert_eq!(
+            matcher.prefix_could_be_tool(block_then_example).unwrap(),
+            (true, false)
         );
     }
 
