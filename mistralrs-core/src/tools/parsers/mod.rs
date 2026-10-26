@@ -416,7 +416,8 @@ fn json_end(text: &str, start: usize) -> Option<usize> {
 /// does not read stays open and holds what follows. A Mistral Nemo or Llama call is its marker
 /// and then the JSON of a call running to the end of the message: it ends with that JSON, and a
 /// marker followed by anything else, such as prose or the rest of a string it is quoted in,
-/// begins no call. Neither does an Atem call to `self` or `user`.
+/// begins no call. Neither does an Atem call to `self` or `user`, nor a marker its parser would
+/// not read a call after (`begins_call`), such as a stray opener before a real call.
 fn call_end(format: ToolCallFormat, text: &str, open: usize, body: usize) -> Option<usize> {
     let rest = &text[body..];
     let json = body + (rest.len() - rest.trim_start().len());
@@ -424,6 +425,9 @@ fn call_end(format: ToolCallFormat, text: &str, open: usize, body: usize) -> Opt
     let closer = CLOSED_CALL_DELIMITERS
         .iter()
         .find_map(|&(delimited, _, end)| (delimited == format).then_some(end));
+    if !begins_call(format, rest, closer)? {
+        return Some(body);
+    }
     match (format, closer) {
         (ToolCallFormat::Gemma4, _) => gemma4::call_end(text, open),
         (ToolCallFormat::Atem, Some(end)) => {
@@ -458,6 +462,43 @@ fn call_end(format: ToolCallFormat, text: &str, open: usize, body: usize) -> Opt
         (ToolCallFormat::Llama, None) if rest.trim_start().is_empty() => None,
         (ToolCallFormat::Llama, None) if starts_json(&['{', '[']) => json_end(text, json),
         (_, None) => Some(body),
+    }
+}
+
+/// Whether the text after a marker, `rest`, begins a call in `format` as the format's parser
+/// reads one, `None` while too little of it is written to tell: a Gemma 4 call opens with
+/// `call:`, a DeepSeek one with `function<｜tool▁sep｜>`, a Hunyuan or Liquid one with `[`, a
+/// Qwen one with JSON or a `<function=…>` before its closer, and an Atem one with an
+/// `<atem:invoke` before its closer. A marker followed by anything else is text, so a stray
+/// opener does not swallow, or end inside, a call written after it.
+fn begins_call(format: ToolCallFormat, rest: &str, closer: Option<&str>) -> Option<bool> {
+    let opens_with = |prefix: &str| {
+        if rest.starts_with(prefix) {
+            Some(true)
+        } else {
+            (!prefix.starts_with(rest)).then_some(false)
+        }
+    };
+    let holds_before_closer = |tag: &str| {
+        let trimmed = rest.trim_start();
+        if format == ToolCallFormat::Qwen && trimmed.starts_with(['{', '[']) {
+            return Some(true);
+        }
+        match closer.and_then(|end| rest.find(end)) {
+            Some(close) => Some(rest[..close].contains(tag)),
+            None => rest.contains(tag).then_some(true),
+        }
+    };
+    match format {
+        ToolCallFormat::Gemma4 => opens_with("call:"),
+        ToolCallFormat::DeepSeek => opens_with("function<｜tool▁sep｜>"),
+        ToolCallFormat::Hunyuan | ToolCallFormat::Liquid => {
+            let trimmed = rest.trim_start();
+            (!trimmed.is_empty()).then(|| trimmed.starts_with('['))
+        }
+        ToolCallFormat::Qwen => holds_before_closer("<function="),
+        ToolCallFormat::Atem => holds_before_closer("<atem:invoke"),
+        _ => Some(true),
     }
 }
 

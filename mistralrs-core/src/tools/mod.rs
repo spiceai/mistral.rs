@@ -956,7 +956,7 @@ mod tests {
     fn the_parsers_read_the_corpus_as_the_base_does_but_where_intended() {
         use super::parse_oracle::{
             corpus, dsml_calls, intended_difference, intended_streaming_difference, oracle_json,
-            SEED, STREAM_SEED,
+            MUTATION_SEED, SEED, STREAM_SEED,
         };
         let base: Value =
             serde_json::from_str(include_str!("testdata/tool_call_parse_oracle.json"))
@@ -982,6 +982,10 @@ mod tests {
             std::collections::BTreeMap::<&str, usize>::new(),
         ];
         let mut regressions = Vec::new();
+        // The invariant, whatever the listed differences allow: a call is made only if the base
+        // reads it from the message or from one of its prefixes, before any DSML block outside
+        // other calls, or the entry states that its DSML block makes it.
+        let mut invented = Vec::new();
         let recorded = base["entries"].as_array().into_iter().flatten();
         let read = head["entries"].as_array().into_iter().flatten();
         for ((entry, base), head) in entries.iter().zip(recorded).zip(read) {
@@ -990,8 +994,63 @@ mod tests {
                 (&head["id"], &head["message"], &head["cuts"], &head["chunks"]),
                 "the corpus no longer matches the oracle (seeds {SEED:#x}, {STREAM_SEED:#x}); record it again"
             );
+            let base_readings: Vec<(usize, &Value)> = entry
+                .cuts
+                .iter()
+                .copied()
+                .zip(base["outcomes"].as_array().into_iter().flatten())
+                .collect();
+            let block_calls: Vec<Value> = entry
+                .dsml
+                .iter()
+                .flat_map(|dsml| dsml.blocks.iter().flat_map(|(_, calls)| calls))
+                .map(|(name, arguments)| json!([name, arguments]))
+                .collect();
+            let read_by_base = |upto: usize, call: &Value| {
+                let upto = entry.dsml.as_ref().map_or(upto, |dsml| upto.min(dsml.at));
+                block_calls.contains(call)
+                    || base_readings
+                        .iter()
+                        .filter(|(cut, _)| *cut <= upto)
+                        .any(|(_, reading)| {
+                            reading[1][1]
+                                .as_array()
+                                .is_some_and(|calls| calls.contains(call))
+                        })
+            };
             let outcomes = base["outcomes"].as_array().into_iter().flatten();
             let readings = head["outcomes"].as_array().into_iter().flatten();
+            for (&cut, head) in entry
+                .cuts
+                .iter()
+                .zip(head["outcomes"].as_array().into_iter().flatten())
+            {
+                for call in head[1][1].as_array().into_iter().flatten() {
+                    if !read_by_base(cut, call) {
+                        invented.push(format!(
+                            "{} at {cut} (seeds {SEED:#x}, {MUTATION_SEED:#x}): {:?} makes {call}",
+                            entry.id,
+                            &entry.message[..cut]
+                        ));
+                    }
+                }
+            }
+            let streamed_base = base["streaming"].as_array().into_iter().flatten();
+            let streamed_head = head["streaming"].as_array().into_iter().flatten();
+            for (chunking, (base, head)) in ["by character", "in runs"]
+                .into_iter()
+                .zip(streamed_base.zip(streamed_head))
+            {
+                for call in head[1].as_array().into_iter().flatten() {
+                    let by_streaming = base[1].as_array().is_some_and(|calls| calls.contains(call));
+                    if !by_streaming && !read_by_base(entry.message.len(), call) {
+                        invented.push(format!(
+                            "{} streamed {chunking} (seed {STREAM_SEED:#x}): {:?} makes {call}",
+                            entry.id, entry.message
+                        ));
+                    }
+                }
+            }
             for ((&cut, base), head) in entry.cuts.iter().zip(outcomes).zip(readings) {
                 if let Some((reason, calls)) = dsml_calls(entry, cut) {
                     if head[1].is_array() && head[1][1] == calls {
@@ -1043,7 +1102,7 @@ mod tests {
         }
         let readings: usize = entries.iter().map(|entry| entry.cuts.len()).sum();
         eprintln!(
-            "corpus: {} entries; batch: {readings} readings, {} as the base, {} intended {:?}; streaming: {} runs, {} as the base, {} intended {:?}; {} regressions",
+            "corpus: {} entries; batch: {readings} readings, {} as the base, {} intended {:?}; streaming: {} runs, {} as the base, {} intended {:?}; {} regressions; {} calls the base does not read",
             entries.len(),
             matching[0],
             intended[0].values().sum::<usize>(),
@@ -1052,13 +1111,58 @@ mod tests {
             matching[1],
             intended[1].values().sum::<usize>(),
             intended[1],
-            regressions.len()
+            regressions.len(),
+            invented.len()
+        );
+        assert!(
+            invented.is_empty(),
+            "{} calls the base does not read from the message or a prefix of it:\n{}",
+            invented.len(),
+            invented.join("\n")
         );
         assert!(
             regressions.is_empty(),
             "{} regressions:\n{}",
             regressions.len(),
             regressions.join("\n")
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a stray Gemma 4 opener before a real call
+    /// was framed to the first closer after it, the one quoted in the real call's value, so a
+    /// DSML block later in that value was read as a call. A marker its format's parser would
+    /// not read a call after is text.
+    #[test]
+    fn a_stray_opener_does_not_end_inside_a_later_calls_value() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("write_file"), tool("delete_all")]),
+        )
+        .expect("a matcher");
+        let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"delete_all\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let value = format!("<tool_call|>{block}");
+        let message = format!(
+            "<|tool_call>example\n<|tool_call>call:write_file{{content:<|\"|>{value}<|\"|>}}<tool_call|>"
+        );
+        let calls: Vec<(String, Value)> = matcher
+            .get_call(&message)
+            .expect("a message")
+            .into_iter()
+            .map(|call| {
+                let arguments = serde_json::from_str(&call.function.arguments).expect("JSON");
+                (call.function.name, arguments)
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [("write_file".to_string(), json!({ "content": value }))]
         );
     }
 

@@ -207,33 +207,72 @@ fn leading_whitespace(text: &str) -> usize {
 /// its own closing tag: anything else in it, DSML tags included, is part of the value. The
 /// flag says whether the closing tag carried attributes, which the template never writes.
 ///
-/// A `json` value may spell a closing tag inside a JSON string, so it ends at the first closing
-/// tag that leaves it readable as JSON. One that no closing tag leaves readable is text ending
-/// at the first, as the parser reads a value that does not parse; but when it begins a JSON
-/// string, object or array, which could hold the tag's text, the text so far may still be cut
-/// short, and more could finish it.
+/// A `json` value that begins a JSON string, object or array may spell a closing tag inside a
+/// string, so it ends at the closing tag after its JSON, found in one pass over it, once the
+/// JSON reads; until then, more text could finish it. Any other value ends at the first
+/// closing tag, as no JSON it could be holds one; a value that does not parse is read as text.
 fn value_at(text: &str, json: bool) -> Scan<(&str, usize, bool)> {
-    let mut first = None;
+    let lead = leading_whitespace(text);
+    if json && text[lead..].starts_with(['"', '{', '[']) {
+        let Some(end) = json_text_end(text, lead) else {
+            return Scan::More;
+        };
+        let close = end + leading_whitespace(&text[end..]);
+        return match tag_at(&text[close..], true, &["parameter"]) {
+            Scan::Done((attributes, length)) if is_json(&text[..close]) => {
+                Scan::Done((&text[..close], close + length, !bare(attributes)))
+            }
+            _ => Scan::More,
+        };
+    }
     let mut from = 0;
     while let Some(offset) = text[from..].find(CLOSE) {
         let at = from + offset;
         match tag_at(&text[at..], true, &["parameter"]) {
             Scan::Done((attributes, length)) => {
-                let value = (&text[..at], at + length, !bare(attributes));
-                if !json || is_json(value.0) {
-                    return Scan::Done(value);
-                }
-                first.get_or_insert(value);
-                from = at + length;
+                return Scan::Done((&text[..at], at + length, !bare(attributes)));
             }
             Scan::More => return Scan::More,
             Scan::Bad => from = at + CLOSE.len(),
         }
     }
-    match first {
-        Some(value) if !value.0.trim_start().starts_with(['"', '{', '[']) => Scan::Done(value),
-        _ => Scan::More,
+    Scan::More
+}
+
+/// Where the JSON string, object or array that begins at `start` in `text` ends, read in one
+/// pass: at the quote closing its string, or the bracket closing its first, counting only
+/// brackets outside its strings, where `\` escapes the next character. `None` while it has not.
+fn json_text_end(text: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut inside = false;
+    let mut escaped = false;
+    for (offset, c) in text[start..].char_indices() {
+        if inside {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                inside = false;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            continue;
+        }
+        match c {
+            '"' => inside = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
     }
+    None
 }
 
 /// Whether `text` is one JSON value in form, which reading it as `IgnoredAny` checks without

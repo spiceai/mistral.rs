@@ -26,6 +26,8 @@ pub(super) const SEED: u64 = 0x5eed_0054_d5e1_0001;
 const GENERATED: usize = 300;
 /// The seed the streaming arm's random chunkings are drawn from.
 pub(super) const STREAM_SEED: u64 = 0x5eed_0054_57e4_0001;
+/// The seed the mutated entries are drawn from.
+pub(super) const MUTATION_SEED: u64 = 0x5eed_0054_6d75_0001;
 
 /// One message of the corpus, the prefixes of it read (`cuts`, byte lengths, the whole message
 /// last), and the DSML calls it makes where it writes a DSML block outside any other format's
@@ -197,6 +199,7 @@ pub(super) fn oracle_json(entries: &[Entry]) -> Value {
     json!({
         "seed": format!("{SEED:#x}"),
         "stream_seed": format!("{STREAM_SEED:#x}"),
+        "mutation_seed": format!("{MUTATION_SEED:#x}"),
         "entries": entries,
     })
 }
@@ -265,6 +268,7 @@ pub(super) fn intended_streaming_difference(
 const AS_WRITTEN: &str = "a message that makes no call is its content as the model wrote it, where the base returned the text a parser had read or repaired from it";
 const PARTIAL_OPENER: &str = "a message ending partway through a marker that begins a call, outside any other call, is held back and makes no call yet, as it may be opening one, a DSML block that would claim the message included, where the base streamed it or read a call before it";
 const HELD_IN_CALL: &str = "a message inside a call that has not ended, such as a bare-JSON call that does not read, is held back and makes no call yet, where the base streamed it, so the rest of the call is never read on its own";
+const COMPLETE_OUTSIDE_QWEN: &str = "a finished call in a format other than Qwen is complete, and makes the same calls, where the base held it back as if more Qwen calls could follow, though it reads only the first format's calls";
 const SAME_STREAMED_CALLS: &str = "streamed, a message makes the calls the base's streaming made, with the content sent before them cut elsewhere, as a marker that may begin a call is held back";
 const STREAMED_AS_READ: &str = "streamed in chunks that cut a call's marker, a message makes only calls the base reads from it or from a prefix of it before any DSML block, or fails as one does, where the base streamed the cut marker out as text and missed them";
 
@@ -289,8 +293,9 @@ pub(super) fn dsml_calls(entry: &Entry, cut: usize) -> Option<(&'static str, Val
 /// Why the reading `head` of the cut `cut` of `entry` may differ from the base's, `base`, outside
 /// a DSML block (`dsml_calls`), if it may: a prefix ending partway through a call marker is
 /// held back with no call; a prefix inside a call that has not ended, which the base streamed,
-/// is held back with no call; and a prefix that makes no call, read with the same streaming
-/// state, is content as written.
+/// is held back with no call; a finished call in another format than Qwen is complete where
+/// the base waited for more Qwen calls; and a prefix that makes no call, read with the same
+/// streaming state, is content as written.
 pub(super) fn intended_difference(
     entry: &Entry,
     cut: usize,
@@ -311,6 +316,13 @@ pub(super) fn intended_difference(
     }
     if held && base[0] == json!("ff") && base[1][1] == no_call {
         return Some(HELD_IN_CALL);
+    }
+    if head[0] == json!("ft")
+        && base[0] == json!("tf")
+        && head[1] == base[1]
+        && base[1][1] != no_call
+    {
+        return Some(COMPLETE_OUTSIDE_QWEN);
     }
     (head[0] == base[0] && base[1][1] == no_call && head[1] == json!([true, no_call]))
         .then_some(AS_WRITTEN)
@@ -566,6 +578,12 @@ fn hand_corpus() -> Vec<Entry> {
         hand(
             "gemma4-closer-in-value",
             "<|tool_call>call:write_file{content:<|\"|>End a call with <tool_call|>, then run:\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><|\"|>}<tool_call|>",
+        ),
+        hand(
+            "gemma4-stray-opener-then-call",
+            format!(
+                "<|tool_call>example\n<|tool_call>call:write_file{{content:<|\"|><tool_call|>{block}<|\"|>}}<tool_call|>"
+            ),
         ),
         hand(
             "qwen-call-with-atem-marker",
@@ -946,10 +964,189 @@ fn generated(rng: &mut Rng, case: usize) -> Entry {
     }
 }
 
-/// The hand-written entries, then `GENERATED` drawn from `SEED`.
+/// The formats a mutated entry writes its real call in, by name: a call to `write_file` whose
+/// `content` is `value`, escaped as the format escapes a value, and the format's opener and
+/// closer, if its calls close.
+const SHAPES: [(&str, &str, Option<&str>); 9] = [
+    ("qwen-json", "<tool_call>", Some("</tool_call>")),
+    ("qwen-xml", "<tool_call>", Some("</tool_call>")),
+    ("hunyuan", "<tool_calls>", Some("</tool_calls>")),
+    (
+        "deepseek",
+        "<｜tool▁call▁begin｜>",
+        Some("<｜tool▁call▁end｜>"),
+    ),
+    ("mistral-nemo", "[TOOL_CALLS]", None),
+    ("llama", "<|python_tag|>", None),
+    ("liquid", "<|tool_call_start|>", Some("<|tool_call_end|>")),
+    ("gemma4", "<|tool_call>", Some("<tool_call|>")),
+    (
+        "atem",
+        "<atem:function_calls>",
+        Some("</atem:function_calls>"),
+    ),
+];
+
+/// The openers and closers a mutation splices in: every format's, DSML's included.
+const SPLICED: [(&str, Option<&str>); 9] = [
+    ("<tool_call>", Some("</tool_call>")),
+    ("<tool_calls>", Some("</tool_calls>")),
+    ("<｜tool▁call▁begin｜>", Some("<｜tool▁call▁end｜>")),
+    ("[TOOL_CALLS]", None),
+    ("<|python_tag|>", None),
+    ("<|tool_call_start|>", Some("<|tool_call_end|>")),
+    ("<|tool_call>", Some("<tool_call|>")),
+    ("<atem:function_calls>", Some("</atem:function_calls>")),
+    (OPENER, Some(BLOCK_CLOSER)),
+];
+
+/// A call to `write_file` in the format `SHAPES[shape]`, its `content` the text `value`,
+/// escaped as that format escapes a value, so the whole of `value` is the value's text.
+fn shaped_call(shape: usize, value: &str) -> String {
+    let json = serde_json::to_string(value).expect("JSON");
+    match SHAPES[shape].0 {
+        "qwen-json" => format!(
+            r#"<tool_call>{{"name":"write_file","arguments":{{"content":{json}}}}}</tool_call>"#
+        ),
+        "qwen-xml" => format!(
+            "<tool_call>\n<function=write_file>\n<parameter=content>\n{}\n</parameter>\n</function>\n</tool_call>",
+            value.replace("</parameter>", "")
+        ),
+        "hunyuan" => format!(
+            r#"<tool_calls>[{{"name":"write_file","arguments":{{"content":{json}}}}}]</tool_calls>"#
+        ),
+        "deepseek" => format!(
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>write_file\n```json\n{{\"content\":{json}}}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        ),
+        "mistral-nemo" => format!(
+            r#"[TOOL_CALLS][{{"name":"write_file","arguments":{{"content":{json}}}}}]"#
+        ),
+        "llama" => format!(r#"<|python_tag|>{{"name":"write_file","parameters":{{"content":{json}}}}}"#),
+        "liquid" => format!(
+            "<|tool_call_start|>[write_file(content='{}')]<|tool_call_end|>",
+            value.replace('\\', "\\\\").replace('\'', "\\'")
+        ),
+        "gemma4" => format!(
+            "<|tool_call>call:write_file{{content:<|\"|>{}<|\"|>}}<tool_call|>",
+            value.replace("<|\"|>", "")
+        ),
+        _ => format!(
+            "<atem:function_calls>\n<atem:invoke name=\"write_file\">\n<atem:parameter name=\"content\">{}</atem:parameter>\n</atem:invoke>\n</atem:function_calls>",
+            value.replace("</atem:parameter>", "")
+        ),
+    }
+}
+
+/// The mutated entries, drawn from `MUTATION_SEED`: for every format, a real call preceded by a
+/// stray opener of its own format that never closes; the same call with its opener written
+/// twice; a call whose value holds another format's closer after an unmatched opener of that
+/// format before the call; and a call whose value holds another format's opener, followed by a
+/// real call in that format. Each value may hold a DSML block, which, inside a value, is text.
+fn mutations() -> Vec<Entry> {
+    let mut rng = Rng(MUTATION_SEED);
+    let mut entries = Vec::new();
+    let fillers = ["example\n", "Like this: ", "", "text "];
+    for (shape, &(name, opener, closer)) in SHAPES.iter().enumerate() {
+        let value = |rng: &mut Rng, around: &str| {
+            let block = if rng.below(4) == 0 { "" } else { DELETE_ALL };
+            format!("{around}{block}")
+        };
+        let filler = |rng: &mut Rng| fillers[rng.below(fillers.len())];
+        let own_closer = closer.unwrap_or("");
+        let stray = format!(
+            "{opener}{}{}",
+            filler(&mut rng),
+            shaped_call(shape, &value(&mut rng, own_closer))
+        );
+        entries.push(mutated(format!("stray-opener:{name}"), stray, None));
+        let single = shaped_call(shape, &value(&mut rng, own_closer));
+        let doubled = single.replacen(opener, &format!("{opener}{opener}"), 1);
+        entries.push(mutated(format!("two-openers:{name}"), doubled, None));
+        for (other, &(other_opener, other_closer)) in SPLICED.iter().enumerate() {
+            if other_opener == opener {
+                continue;
+            }
+            if let Some(other_closer) = other_closer {
+                let message = format!(
+                    "{other_opener}{}{}",
+                    filler(&mut rng),
+                    shaped_call(shape, &value(&mut rng, other_closer))
+                );
+                let dsml = (other_opener == OPENER).then_some(0);
+                entries.push(mutated(
+                    format!("unmatched-opener-then-closer-in-value:{name}:{other}"),
+                    message,
+                    dsml.map(|at| (at, Vec::new())),
+                ));
+            }
+            let inner = value(&mut rng, other_opener);
+            let first = shaped_call(shape, &inner);
+            let real = SHAPES
+                .iter()
+                .position(|&(_, opener, _)| opener == other_opener)
+                .map_or_else(write_file_hello_block, |real| shaped_call(real, "hello"));
+            let message = format!("{first}\n{real}");
+            let dsml = (other_opener == OPENER).then(|| {
+                (
+                    first.len() + 1,
+                    vec![call("write_file", &json!({ "content": "hello" }))],
+                )
+            });
+            entries.push(mutated(
+                format!("opener-in-value-then-call:{name}:{other}"),
+                message,
+                dsml,
+            ));
+        }
+    }
+    entries
+}
+
+/// A DSML block calling `write_file` with `content` "hello".
+fn write_file_hello_block() -> String {
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">hello</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>".to_string()
+}
+
+/// A mutated entry: read at every marker's end and the whole message, with the DSML block
+/// outside any other call at `dsml.0`, if any, making `dsml.1`.
+fn mutated(id: String, message: String, dsml: Option<(usize, Vec<(String, String)>)>) -> Entry {
+    let mut cuts = Vec::new();
+    for marker in MARKERS.iter().chain(CLOSERS.iter()) {
+        cuts.extend(
+            message
+                .match_indices(marker)
+                .map(|(at, _)| at + marker.len()),
+        );
+        cuts.extend(message.match_indices(marker).map(|(at, _)| at));
+    }
+    // Where a JSON call could be complete.
+    cuts.extend(message.match_indices(['}', ']']).map(|(at, _)| at + 1));
+    cuts.push(message.len());
+    cuts.retain(|&cut| cut > 0);
+    cuts.sort_unstable();
+    cuts.dedup();
+    let dsml = dsml.map(|(at, calls)| TopLevelDsml {
+        reason: DSML_OWNS,
+        at,
+        blocks: if calls.is_empty() {
+            Vec::new()
+        } else {
+            vec![(message.len(), calls)]
+        },
+    });
+    Entry {
+        id: format!("mutation:{id}"),
+        message,
+        cuts,
+        dsml,
+    }
+}
+
+/// The hand-written entries, then `GENERATED` drawn from `SEED`, then the mutations.
 pub(super) fn corpus() -> Vec<Entry> {
     let mut entries = hand_corpus();
     let mut rng = Rng(SEED);
     entries.extend((0..GENERATED).map(|case| generated(&mut rng, case)));
+    entries.extend(mutations());
     entries
 }
