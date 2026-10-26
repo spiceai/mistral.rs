@@ -1102,6 +1102,48 @@ fn mutations() -> Vec<Entry> {
     entries
 }
 
+/// Messages heavy with markers, `n` of them each, by name: Qwen openers rejected for want of a
+/// call, repeated Gemma 4 calls with no arguments, DSML openers in a bare-JSON string, closing
+/// tags in a JSON parameter value, and, for every format, `n` stray openers before a real call.
+/// Reading any of them takes time linear in its length.
+pub(super) fn marker_heavy_messages(n: usize) -> Vec<(String, String)> {
+    let mut messages = vec![
+        (
+            "qwen-rejected-openers".to_string(),
+            format!("{}</tool_call>", "<tool_call>text ".repeat(n)),
+        ),
+        (
+            "gemma4-calls-without-arguments".to_string(),
+            "<|tool_call>call:x<tool_call|>".repeat(n),
+        ),
+        (
+            "dsml-openers-in-bare-json".to_string(),
+            format!(
+                r#"{{"name":"write_file","arguments":{{"content":"{}"#,
+                OPENER.repeat(n)
+            ),
+        ),
+        (
+            "closing-tags-in-a-json-value".to_string(),
+            format!(
+                "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"false\">{}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+                serde_json::to_string(&"</｜DSML｜parameter>".repeat(n)).expect("JSON")
+            ),
+        ),
+    ];
+    for (shape, &(name, opener, _)) in SHAPES.iter().enumerate() {
+        messages.push((
+            format!("stray-openers:{name}"),
+            format!(
+                "{}{}",
+                format!("{opener}text ").repeat(n),
+                shaped_call(shape, "hello")
+            ),
+        ));
+    }
+    messages
+}
+
 /// A DSML block calling `write_file` with `content` "hello".
 fn write_file_hello_block() -> String {
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">hello</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>".to_string()

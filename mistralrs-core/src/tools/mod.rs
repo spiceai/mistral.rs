@@ -1128,6 +1128,38 @@ mod tests {
         );
     }
 
+    /// Reading a message heavy with markers takes time linear in it: each of
+    /// `parse_oracle::marker_heavy_messages`, at 20,000 markers, is read, streaming state and
+    /// calls, within `BOUND`. Read linearly, the slowest takes about 60 ms here, and doubling the
+    /// markers doubles it; read quadratically, as a search from every marker to the end does,
+    /// the Gemma 4 calls took 2.3 s and the rejected Qwen openers 19 s. `BOUND` is about 16
+    /// times the linear reading, so a slower machine does not fail it, and under every quadratic
+    /// one measured. The best of three runs is measured, and every time is printed.
+    #[test]
+    fn marker_heavy_messages_are_read_in_linear_time() {
+        const MARKERS: usize = 20_000;
+        const BOUND: std::time::Duration = std::time::Duration::from_millis(BOUND_MS);
+        const BOUND_MS: u64 = 1_000;
+        let matcher = super::parse_oracle::matcher();
+        let mut slow = Vec::new();
+        for (name, message) in super::parse_oracle::marker_heavy_messages(MARKERS) {
+            let best = (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    let _ = matcher.prefix_could_be_tool(&message);
+                    let _ = matcher.get_call_with_content(&message);
+                    start.elapsed()
+                })
+                .min()
+                .expect("three runs");
+            eprintln!("{name}: {} bytes read in {best:?}", message.len());
+            if best > BOUND {
+                slow.push(format!("{name}: {best:?}"));
+            }
+        }
+        assert!(slow.is_empty(), "read in more than {BOUND:?}: {slow:?}");
+    }
+
     /// regression test for spiceai/mistral.rs#54: a stray Gemma 4 opener before a real call
     /// was framed to the first closer after it, the one quoted in the real call's value, so a
     /// DSML block later in that value was read as a call. A marker its format's parser would

@@ -296,6 +296,8 @@ pub(super) fn call_spans(text: &str) -> Vec<Span> {
             }
         }
     }
+    // Where each closer and tag a call is framed by next occurs, carried from call to call.
+    let mut ahead = Ahead::new(text);
     // Where each marker next occurs at or after `from`, found again only once `from` passes it.
     let mut next: Vec<Option<usize>> = CALL_OPENERS
         .iter()
@@ -327,7 +329,7 @@ pub(super) fn call_spans(text: &str) -> Vec<Span> {
                 dsml::Frame::Unreadable => SpanEnd::Unreadable,
             }
         } else {
-            call_end(format, text, open, body).map_or(SpanEnd::Open, SpanEnd::At)
+            call_end(format, &mut ahead, open, body).map_or(SpanEnd::Open, SpanEnd::At)
         };
         spans.push(Span {
             format: Some(format),
@@ -408,30 +410,80 @@ fn json_end(text: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// Where the call in `format` that opens at `open` in `text`, its body from `body`, ends, or
-/// `None` while it is still open. A closer inside one of the call's values is the value's text:
-/// a Gemma 4 value quoted in `<|"|>`, a Qwen `<parameter=…>` or Atem `<atem:parameter>` value,
-/// a quoted Liquid argument, and a JSON string of a Qwen JSON, Hunyuan or DeepSeek call. A
-/// JSON-format call ends at the closer after its JSON, once that reads as a call, so one that
-/// does not read stays open and holds what follows. A Mistral Nemo or Llama call is its marker
-/// and then the JSON of a call running to the end of the message: it ends with that JSON, and a
-/// marker followed by anything else, such as prose or the rest of a string it is quoted in,
-/// begins no call. Neither does an Atem call to `self` or `user`, nor a marker its parser would
-/// not read a call after (`begins_call`), such as a stray opener before a real call.
-fn call_end(format: ToolCallFormat, text: &str, open: usize, body: usize) -> Option<usize> {
+/// The next occurrence of each closer and tag a call is framed by, at or after a position in a
+/// text: each is looked for again only once a lookup passes the occurrence found, so the
+/// lookups of one pass over the text, which move forward, take time linear in it.
+struct Ahead<'a> {
+    text: &'a str,
+    found: Vec<(&'static str, usize, Option<usize>)>,
+}
+
+impl<'a> Ahead<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            found: Vec::new(),
+        }
+    }
+
+    /// Where `needle` next occurs in the text at or after `from`.
+    fn find(&mut self, needle: &'static str, from: usize) -> Option<usize> {
+        let text = self.text;
+        let search = || text[from..].find(needle).map(|at| from + at);
+        match self.found.iter_mut().find(|(found, _, _)| *found == needle) {
+            Some((_, searched, next)) => {
+                if *searched > from || next.is_some_and(|at| at < from) {
+                    *searched = from;
+                    *next = search();
+                }
+                *next
+            }
+            None => {
+                let next = search();
+                self.found.push((needle, from, next));
+                next
+            }
+        }
+    }
+}
+
+/// Where the call in `format` that opens at `open` in the text `ahead` reads, its body from
+/// `body`, ends, or `None` while it is still open. A closer inside one of the call's values is
+/// the value's text: a Gemma 4 value quoted in `<|"|>`, a Qwen `<parameter=…>` or Atem
+/// `<atem:parameter>` value, a quoted Liquid argument, and a JSON string of a Qwen JSON,
+/// Hunyuan or DeepSeek call. A JSON-format call ends at the closer after its JSON, once that
+/// reads as a call, so one that does not read stays open and holds what follows. A Mistral Nemo
+/// or Llama call is its marker and then the JSON of a call running to the end of the message:
+/// it ends with that JSON, and a marker followed by anything else, such as prose or the rest of
+/// a string it is quoted in, begins no call. Neither does an Atem call to `self` or `user`, nor
+/// a marker its parser would not read a call after (`begins_call`), such as a stray opener
+/// before a real call. Each search stops at the call's own closer, carried in `ahead`.
+fn call_end(format: ToolCallFormat, ahead: &mut Ahead, open: usize, body: usize) -> Option<usize> {
+    let text = ahead.text;
     let rest = &text[body..];
     let json = body + (rest.len() - rest.trim_start().len());
     let starts_json = |brackets: &[char]| text[json..].starts_with(brackets);
     let closer = CLOSED_CALL_DELIMITERS
         .iter()
         .find_map(|&(delimited, _, end)| (delimited == format).then_some(end));
-    if !begins_call(format, rest, closer)? {
+    if !begins_call(format, ahead, body, closer)? {
         return Some(body);
     }
     match (format, closer) {
-        (ToolCallFormat::Gemma4, _) => gemma4::call_end(text, open),
+        (ToolCallFormat::Gemma4, Some(end)) => {
+            // `call:NAME{...}` runs to the brace matching its first, which must come before the
+            // first closer, and a closer inside a `<|"|>`-quoted value is that value's text.
+            let first = ahead.find(end, body)?;
+            match text[body..first].find('{') {
+                Some(offset) => {
+                    let (_, after) = gemma4::extract_matched_braces(text, body + offset)?;
+                    ahead.find(end, after).map(|at| at + end.len())
+                }
+                None => Some(first + end.len()),
+            }
+        }
         (ToolCallFormat::Atem, Some(end)) => {
-            end_outside_tagged_values(text, body, end, "<atem:parameter", "</atem:parameter>")
+            end_outside_tagged_values(ahead, body, end, "<atem:parameter", "</atem:parameter>")
                 .or_else(|| {
                     matches!(atem::channel_recipient(text, open), Some("self" | "user"))
                         .then_some(body)
@@ -441,22 +493,25 @@ fn call_end(format: ToolCallFormat, text: &str, open: usize, body: usize) -> Opt
             end_after_json(text, json, end)
         }
         (ToolCallFormat::Qwen, Some(end)) => {
-            end_outside_tagged_values(text, body, end, "<parameter=", "</parameter>")
+            end_outside_tagged_values(ahead, body, end, "<parameter=", "</parameter>")
         }
         (ToolCallFormat::Hunyuan, Some(end)) if starts_json(&['[']) => {
             end_after_json(text, json, end)
         }
         (ToolCallFormat::DeepSeek, Some(end)) => {
-            let arguments = body + rest.find(['{', '['])?;
+            // The arguments' JSON comes before the first closer; the call ends at the closer
+            // after it, once the call reads.
+            let first = ahead.find(end, body)?;
+            let arguments = body + text[body..first].find(['{', '['])?;
             let value_end = json_end(text, arguments)?;
-            let close = value_end + text[value_end..].find(end)? + end.len();
+            let close = ahead.find(end, value_end)? + end.len();
             deepseek::DeepSeekParser
                 .parse(&text[open..close])
                 .is_ok_and(|calls| calls.is_some())
                 .then_some(close)
         }
         (ToolCallFormat::Liquid, Some(end)) => end_outside_quotes(text, body, end),
-        (_, Some(end)) => rest.find(end).map(|length| body + length + end.len()),
+        (_, Some(end)) => ahead.find(end, body).map(|at| at + end.len()),
         (ToolCallFormat::MistralNemo, None) if rest.is_empty() => None,
         (ToolCallFormat::MistralNemo, None) if rest.starts_with('[') => json_end(text, body),
         (ToolCallFormat::Llama, None) if rest.trim_start().is_empty() => None,
@@ -465,13 +520,19 @@ fn call_end(format: ToolCallFormat, text: &str, open: usize, body: usize) -> Opt
     }
 }
 
-/// Whether the text after a marker, `rest`, begins a call in `format` as the format's parser
-/// reads one, `None` while too little of it is written to tell: a Gemma 4 call opens with
-/// `call:`, a DeepSeek one with `function<｜tool▁sep｜>`, a Hunyuan or Liquid one with `[`, a
-/// Qwen one with JSON or a `<function=…>` before its closer, and an Atem one with an
-/// `<atem:invoke` before its closer. A marker followed by anything else is text, so a stray
-/// opener does not swallow, or end inside, a call written after it.
-fn begins_call(format: ToolCallFormat, rest: &str, closer: Option<&str>) -> Option<bool> {
+/// Whether the text after a marker, from `body` in the text `ahead` reads, begins a call in
+/// `format` as the format's parser reads one, `None` while too little of it is written to tell:
+/// a Gemma 4 call opens with `call:`, a DeepSeek one with `function<｜tool▁sep｜>`, a Hunyuan or
+/// Liquid one with `[`, a Qwen one with JSON or a `<function=…>` before its closer, and an Atem
+/// one with an `<atem:invoke` before its closer. A marker followed by anything else is text, so
+/// a stray opener does not swallow, or end inside, a call written after it.
+fn begins_call(
+    format: ToolCallFormat,
+    ahead: &mut Ahead,
+    body: usize,
+    closer: Option<&'static str>,
+) -> Option<bool> {
+    let rest = &ahead.text[body..];
     let opens_with = |prefix: &str| {
         if rest.starts_with(prefix) {
             Some(true)
@@ -479,26 +540,22 @@ fn begins_call(format: ToolCallFormat, rest: &str, closer: Option<&str>) -> Opti
             (!prefix.starts_with(rest)).then_some(false)
         }
     };
-    let holds_before_closer = |tag: &str| {
-        let trimmed = rest.trim_start();
-        if format == ToolCallFormat::Qwen && trimmed.starts_with(['{', '[']) {
-            return Some(true);
-        }
-        match closer.and_then(|end| rest.find(end)) {
-            Some(close) => Some(rest[..close].contains(tag)),
-            None => rest.contains(tag).then_some(true),
-        }
-    };
-    match format {
-        ToolCallFormat::Gemma4 => opens_with("call:"),
-        ToolCallFormat::DeepSeek => opens_with("function<｜tool▁sep｜>"),
+    let tag = match format {
+        ToolCallFormat::Gemma4 => return opens_with("call:"),
+        ToolCallFormat::DeepSeek => return opens_with("function<｜tool▁sep｜>"),
         ToolCallFormat::Hunyuan | ToolCallFormat::Liquid => {
             let trimmed = rest.trim_start();
-            (!trimmed.is_empty()).then(|| trimmed.starts_with('['))
+            return (!trimmed.is_empty()).then(|| trimmed.starts_with('['));
         }
-        ToolCallFormat::Qwen => holds_before_closer("<function="),
-        ToolCallFormat::Atem => holds_before_closer("<atem:invoke"),
-        _ => Some(true),
+        ToolCallFormat::Qwen if rest.trim_start().starts_with(['{', '[']) => return Some(true),
+        ToolCallFormat::Qwen => "<function=",
+        ToolCallFormat::Atem => "<atem:invoke",
+        _ => return Some(true),
+    };
+    let tag_at = ahead.find(tag, body);
+    match closer.and_then(|end| ahead.find(end, body)) {
+        Some(close) => Some(tag_at.is_some_and(|at| at < close)),
+        None => tag_at.map(|_| true),
     }
 }
 
@@ -516,26 +573,23 @@ fn end_after_json(text: &str, json: usize, end: &str) -> Option<usize> {
     text[close..].starts_with(end).then(|| close + end.len())
 }
 
-/// Where the first `end` from `body` in `text` that is not inside a value, from a `value_open`
-/// tag through its `value_close`, ends; `None` before one, or inside a value still open. The
-/// next `end` is looked for again only once a value runs past it.
+/// Where the first `end` from `body` in the text `ahead` reads that is not inside a value, from
+/// a `value_open` tag through its `value_close`, ends; `None` before one, or inside a value still
+/// open. Every search is carried in `ahead`.
 fn end_outside_tagged_values(
-    text: &str,
+    ahead: &mut Ahead,
     body: usize,
-    end: &str,
-    value_open: &str,
-    value_close: &str,
+    end: &'static str,
+    value_open: &'static str,
+    value_close: &'static str,
 ) -> Option<usize> {
     let mut from = body;
-    let mut close = from + text[from..].find(end)?;
     loop {
-        if close < from {
-            close = from + text[from..].find(end)?;
-        }
-        match text[from..close].find(value_open) {
-            Some(offset) => {
-                let value = from + offset + value_open.len();
-                from = value + text[value..].find(value_close)? + value_close.len();
+        let close = ahead.find(end, from)?;
+        match ahead.find(value_open, from).filter(|&at| at < close) {
+            Some(at) => {
+                let value = at + value_open.len();
+                from = ahead.find(value_close, value)? + value_close.len();
             }
             None => return Some(close + end.len()),
         }
