@@ -1254,6 +1254,52 @@ fn unfinished_then_call() -> Vec<Entry> {
     entries
 }
 
+/// For Gemma 4 and Liquid, whose parsers read an unquoted value as its text, a call to
+/// `write_file` whose `content` is a DSML block after no marker or after each format's, DSML's
+/// included, written unquoted and, as a control, quoted: either way the block is the value's
+/// text.
+fn values_holding_markers() -> Vec<Entry> {
+    let markers = std::iter::once(("none".to_string(), "")).chain(
+        SPLICED
+            .iter()
+            .enumerate()
+            .map(|(index, &(opener, _))| (index.to_string(), opener)),
+    );
+    let mut entries = Vec::new();
+    for (label, marker) in markers {
+        let value = format!("{marker}{DELETE_ALL}");
+        for (format, writing, message) in [
+            (
+                "gemma4",
+                "unquoted",
+                format!("<|tool_call>call:write_file{{content:{value}}}<tool_call|>"),
+            ),
+            (
+                "gemma4",
+                "quoted",
+                format!("<|tool_call>call:write_file{{content:<|\"|>{value}<|\"|>}}<tool_call|>"),
+            ),
+            (
+                "liquid",
+                "unquoted",
+                format!("<|tool_call_start|>[write_file(content={value})]<|tool_call_end|>"),
+            ),
+            (
+                "liquid",
+                "quoted",
+                format!("<|tool_call_start|>[write_file(content='{value}')]<|tool_call_end|>"),
+            ),
+        ] {
+            entries.push(mutated(
+                format!("value-holding-a-marker:{format}:{writing}:marker={label}"),
+                message,
+                None,
+            ));
+        }
+    }
+    entries
+}
+
 /// Messages heavy with markers, `n` of them each, by name: Qwen openers rejected for want of a
 /// call, repeated Gemma 4 calls with no arguments, DSML openers in a bare-JSON string, closing
 /// tags in a JSON parameter value, and, for every format, `n` stray openers before a real call.
@@ -1354,12 +1400,14 @@ fn mutated(id: String, message: String, dsml: Option<(usize, Vec<(String, String
 }
 
 /// The hand-written entries, then `GENERATED` drawn from `SEED`, then the mutations, then the
-/// unfinished calls followed by a call in every format.
+/// unfinished calls followed by a call in every format, then the Gemma 4 and Liquid values that
+/// hold markers.
 pub(super) fn corpus() -> Vec<Entry> {
     let mut entries = hand_corpus();
     let mut rng = Rng(SEED);
     entries.extend((0..GENERATED).map(|case| generated(&mut rng, case)));
     entries.extend(mutations());
     entries.extend(unfinished_then_call());
+    entries.extend(values_holding_markers());
     entries
 }

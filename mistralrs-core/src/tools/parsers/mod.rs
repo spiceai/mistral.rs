@@ -650,7 +650,7 @@ impl<'a> Ahead<'a> {
                 self.json_call(json, end, inline)?
             }
             (ToolCallFormat::Liquid, Some(end)) if trimmed.starts_with('[') => {
-                self.liquid(body, end, inline)?
+                self.liquid(body, end)
             }
             (ToolCallFormat::Qwen, Some(end)) if trimmed.starts_with(['{', '[']) => {
                 self.json_call(json, end, inline)?
@@ -699,7 +699,7 @@ impl<'a> Ahead<'a> {
         let Some(brace) = brace else {
             return Ok(first.map_or(Reading::Open, |first| Reading::Call(first + end.len())));
         };
-        let after = match self.gemma4_braces(brace, inline)? {
+        let after = match self.gemma4_braces(brace) {
             Ok(after) => after,
             Err(reading) => return Ok(reading),
         };
@@ -712,13 +712,11 @@ impl<'a> Ahead<'a> {
 
     /// Where the braces of a Gemma 4 call's arguments, which open at `brace`, close, counting
     /// only braces outside its values quoted in `<|"|>`; or, as `Err`, how the call reads when
-    /// they do not: open while a value or a brace is, and at a marker outside the quoted
-    /// values, which no argument holds, as `cut_at` reads it, open when it begins no call.
-    fn gemma4_braces(
-        &mut self,
-        brace: usize,
-        inline: bool,
-    ) -> Waits<std::result::Result<usize, Reading>> {
+    /// they do not: open while a value or a brace is, and at a marker in them. Gemma 4 reads an
+    /// unquoted value as its text, which may hold a marker, so a marker there is no call of its
+    /// own and cannot cut this one short: the call holds what follows, and makes no call the
+    /// message does not, and the braces are read no further than the marker.
+    fn gemma4_braces(&self, brace: usize) -> std::result::Result<usize, Reading> {
         const QUOTE: &str = "<|\"|>";
         let text = self.text;
         let mut depth = 0usize;
@@ -745,18 +743,18 @@ impl<'a> Ahead<'a> {
                         .get(marker)
                         .is_some_and(|&(open, _, _)| open == at)
                     {
-                        return Ok(Err(self.cut_at(at, inline)?.unwrap_or(Reading::Open)));
+                        return Err(Reading::Open);
                     }
                 }
                 match c {
                     '{' => depth += 1,
                     '}' => {
                         let Some(outer) = depth.checked_sub(1) else {
-                            return Ok(Err(Reading::Open));
+                            return Err(Reading::Open);
                         };
                         depth = outer;
                         if depth == 0 {
-                            return Ok(Ok(at + 1));
+                            return Ok(at + 1);
                         }
                     }
                     _ => {}
@@ -764,7 +762,7 @@ impl<'a> Ahead<'a> {
             }
             at += c.len_utf8();
         }
-        Ok(Err(Reading::Open))
+        Err(Reading::Open)
     }
 
     /// A DeepSeek call, from after its `function<｜tool▁sep｜>`: its name and fence, its
@@ -916,10 +914,11 @@ impl<'a> Ahead<'a> {
 
     /// A Liquid call, from its `[`: it ends at the first closer `end` outside a string quoted
     /// in `"` or `'`, where `\` escapes the next character, once its list has closed right
-    /// before it, every bracket outside the strings matched; one that has not, or that holds a
-    /// marker outside its strings, stays open and holds what follows, unless that marker
-    /// begins a call.
-    fn liquid(&mut self, body: usize, end: &'static str, inline: bool) -> Waits<Reading> {
+    /// before it, every bracket outside the strings matched; one that has not stays open and
+    /// holds what follows. So does one that holds a marker outside its strings: Liquid reads an
+    /// unquoted value as its text, which may hold a marker, so a marker there is no call of its
+    /// own and cannot cut this one short, and the call is read no further than the marker.
+    fn liquid(&self, body: usize, end: &'static str) -> Reading {
         let text = self.text;
         let mut quote = None;
         let mut escaped = false;
@@ -941,11 +940,11 @@ impl<'a> Ahead<'a> {
             }
             let closed = depth == 0 && last == ']';
             if text[at..].starts_with(end) {
-                return Ok(if closed {
+                return if closed {
                     Reading::Call(at + end.len())
                 } else {
                     Reading::Open
-                });
+                };
             }
             if matches!(c, '<' | '[') {
                 while self
@@ -960,20 +959,19 @@ impl<'a> Ahead<'a> {
                     .get(marker)
                     .is_some_and(|&(open, _, _)| open == at)
                 {
-                    // No Liquid call holds a marker outside its strings.
-                    return Ok(self.cut_at(at, inline)?.unwrap_or(Reading::Open));
+                    return Reading::Open;
                 }
             }
             // Only whitespace may come between the closed list and the closer.
             if closed && !c.is_whitespace() {
-                return Ok(Reading::Open);
+                return Reading::Open;
             }
             match c {
                 '"' | '\'' => quote = Some(c),
                 '[' | '(' | '{' => depth += 1,
                 ']' | ')' | '}' => match depth.checked_sub(1) {
                     Some(outer) => depth = outer,
-                    None => return Ok(Reading::Open),
+                    None => return Reading::Open,
                 },
                 _ => {}
             }
@@ -981,7 +979,7 @@ impl<'a> Ahead<'a> {
                 last = c;
             }
         }
-        Ok(Reading::Open)
+        Reading::Open
     }
 
     /// A call whose start is `tag`, before its closer `end`, and whose values run from each
