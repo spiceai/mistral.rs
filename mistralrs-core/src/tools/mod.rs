@@ -817,6 +817,46 @@ mod tests {
         assert_eq!(args, json!({"content": "<｜DSML｜tool_calls>"}));
     }
 
+    /// regression test for spiceai/mistral.rs#54: a DSML block opener inside a string of a
+    /// bare-JSON call claimed the message for DSML: an unfinished block there held a required
+    /// call's deadline, and a block written into the string unescaped made its call in place of
+    /// the call it sat in
+    #[test]
+    fn a_dsml_opener_inside_a_bare_json_call_is_the_strings_text() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher =
+            ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool("write_file"), tool("rm")]))
+                .expect("a matcher");
+        let prefix = r#"{"name":"write_file","arguments":{"content":"<｜DSML｜tool_calls>"#;
+        assert_eq!(
+            matcher.prefix_could_be_tool(prefix).expect("a prefix"),
+            (true, false)
+        );
+        assert!(!parsers::call_unfinished(prefix));
+        // Unescaped, the markup leaves the message no JSON to read: it makes no call, and is
+        // returned as written.
+        let unescaped = "{\"name\":\"write_file\",\"arguments\":{\"content\":\"<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"rm\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\"}}";
+        let (content, calls) = matcher.get_call_with_content(unescaped).expect("a message");
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(content.as_deref(), Some(unescaped));
+        // Escaped, it is the argument's text.
+        let escaped = r#"{"name":"write_file","arguments":{"content":"<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"rm\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"}}"#;
+        let calls = matcher.get_call(escaped).expect("a call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "write_file");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).expect("JSON");
+        assert_eq!(
+            args,
+            json!({"content": "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"rm\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"})
+        );
+    }
+
     /// regression test for spiceai/mistral.rs#54: a closed `<tool_call>` example before a DSML
     /// block counted as enclosing it, and a Qwen call inside the block's value was made
     #[test]

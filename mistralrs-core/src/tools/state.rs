@@ -439,6 +439,43 @@ mod tests {
         );
     }
 
+    /// regression test for spiceai/mistral.rs#54: a DSML block opener inside a string of a
+    /// bare-JSON call, where generation paused at
+    /// `{"name":"write_file","arguments":{"content":"<｜DSML｜tool_calls>`, activated the DSML
+    /// grammar, which wrote unescaped markup into the string
+    #[test]
+    fn a_dsml_opener_inside_a_bare_json_call_activates_no_grammar() {
+        let tools = vec![tool("write_file"), tool("rm")];
+        for preferred in [Some(ToolCallFormat::DeepSeekDsml), None] {
+            for text in [
+                r#"{"name":"write_file","arguments":{"content":"<｜DSML｜tool_calls>"#,
+                r#"  [{"name":"write_file","arguments":{"content":"a \"b\" <｜DSML｜tool_calls>"#,
+            ] {
+                let mut state = ToolCallState::new(ToolChoice::Auto, Some(&tools), preferred)
+                    .expect("a tool call state");
+                assert!(
+                    state
+                        .maybe_activate_continuation_grammar(Some(text))
+                        .is_none(),
+                    "{preferred:?}: {text}"
+                );
+            }
+            // A block opened after the JSON closes is a block.
+            let mut state = ToolCallState::new(ToolChoice::Auto, Some(&tools), preferred)
+                .expect("a tool call state");
+            let grammar = state
+                .maybe_activate_continuation_grammar(Some(
+                    "{\"name\":\"write_file\",\"arguments\":{\"content\":\"x\"}}\n<｜DSML｜tool_calls>",
+                ))
+                .expect("a block after the JSON activates the grammar");
+            assert!(
+                lark(&grammar).starts_with("start: DSML_WS? (invoke_0 | invoke_1)+ "),
+                "{}",
+                lark(&grammar)
+            );
+        }
+    }
+
     #[test]
     fn tool_call_choice_none_does_not_activate_continuation_grammar() {
         let tools = vec![tool("get_weather")];

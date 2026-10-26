@@ -284,13 +284,49 @@ fn without_closed_calls(text: &str) -> String {
     }
 }
 
-/// Whether a call in a format other than `format` is open at the end of `text`. A marker inside
-/// a finished call of some format is that call's text, and opens nothing.
+/// Whether a call in a format other than `format` is open at the end of `text`, a bare-JSON call
+/// included. A marker inside a finished call of some format is that call's text, and opens
+/// nothing.
 pub(super) fn open_in_other_format(text: &str, format: ToolCallFormat) -> bool {
+    if in_bare_json_call_string(text) {
+        return true;
+    }
     let outside = without_closed_calls(text);
     PARSERS
         .iter()
         .any(|parser| parser.format() != format && parser.open_at_end(&outside))
+}
+
+/// Whether `text` begins a bare-JSON call, a call or an array of calls written as JSON with
+/// nothing around it, and ends inside one of its strings, where a marker is the string's text.
+fn in_bare_json_call_string(text: &str) -> bool {
+    let json = text.trim_start();
+    if !json.starts_with(['{', '[']) {
+        return false;
+    }
+    let unfinished = super::could_be_json::<super::CalledFunctionParameters>(json).0
+        || super::could_be_json::<Vec<super::CalledFunctionParameters>>(json).0;
+    unfinished && ends_inside_json_string(json)
+}
+
+/// Whether the JSON `text` ends inside a string.
+fn ends_inside_json_string(text: &str) -> bool {
+    let mut inside = false;
+    let mut escaped = false;
+    for c in text.chars() {
+        if escaped {
+            escaped = false;
+        } else if inside {
+            match c {
+                '\\' => escaped = true,
+                '"' => inside = false,
+                _ => {}
+            }
+        } else {
+            inside = c == '"';
+        }
+    }
+    inside
 }
 
 /// Whether `text` ends after an `open` delimiter with no `close` after it.
