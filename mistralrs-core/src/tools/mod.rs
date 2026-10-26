@@ -386,7 +386,7 @@ impl ToolCallingMatcher {
         // whose blocks makes a call is returned as the model wrote it, and one with a block that
         // does is returned with only the blocks that make a call stripped, rather than with
         // every block gone.
-        if format == Some(ToolCallFormat::DeepSeekDsml) && calls.len() < read {
+        let content = if format == Some(ToolCallFormat::DeepSeekDsml) && calls.len() < read {
             if calls.is_empty() {
                 return Ok((Some(written.to_string()), calls));
             }
@@ -398,9 +398,16 @@ impl ToolCallingMatcher {
                 parsers::strip_dsml_blocks_making_calls(written, |index| made.contains(&index))
                     .trim_start()
                     .to_string();
-            return Ok(((!content.is_empty()).then_some(content), calls));
-        }
+            (!content.is_empty()).then_some(content)
+        } else {
+            content
+        };
 
+        // The calls are numbered as returned, consecutively from zero: a client assembling
+        // streamed calls by index makes no empty call where one was refused.
+        for (index, call) in calls.iter_mut().enumerate() {
+            call.index = index;
+        }
         Ok((content, calls))
     }
 }
@@ -1148,6 +1155,8 @@ mod tests {
             .map(|call| serde_json::from_str(&call.function.arguments).unwrap())
             .collect();
         assert_eq!(args, [json!({"command": "ls"})]);
+        // The call that survives is the first, whatever its place among the calls read.
+        assert_eq!(calls.iter().map(|call| call.index).collect::<Vec<_>>(), [0]);
         // A required call that makes none fails as soon as it is read.
         let required = ToolCallingMatcher::new(ToolChoice::Required, Some(&[bash])).unwrap();
         let refused = block(&invoke("Bash", timeout));
@@ -1264,6 +1273,13 @@ mod tests {
                 .map(|call| serde_json::from_str(&call.function.arguments).unwrap())
                 .collect();
             assert_eq!(args, [json!({"command": "ls"})], "{message}");
+            // The call that survives is the first, whatever its place among the calls read, so a
+            // client assembling streamed calls by index makes no empty call before it.
+            assert_eq!(
+                calls.iter().map(|call| call.index).collect::<Vec<_>>(),
+                [0],
+                "{message}"
+            );
         }
     }
 
