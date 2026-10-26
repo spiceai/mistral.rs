@@ -481,26 +481,40 @@ mod tests {
     }
 
     /// regression test for spiceai/mistral.rs#54: a required call's deadline, reached inside
-    /// an unfinished DSML call, forced a new block of calls into its value
+    /// an unfinished DSML call, forced a new block of calls into its value; and it did so
+    /// again when the template preferred no format, though a DSML block is read whatever the
+    /// template prefers, so the deadline reads the unfinished call from the content alone
     #[test]
     fn required_tool_call_deadline_waits_for_an_unfinished_dsml_call() {
         let tools = vec![tool("get_weather")];
-        let mut state = ToolCallState::new(
-            ToolChoice::Required,
-            Some(&tools),
-            Some(ToolCallFormat::DeepSeekDsml),
-        )
-        .unwrap();
-        let calling = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par";
-        assert!(state
-            .maybe_force_required_grammar(0, 8192, false, Some(calling))
-            .is_none());
-        assert!(state
-            .maybe_force_required_grammar(0, 8192, true, Some(calling))
-            .is_none());
-        assert!(state
-            .maybe_force_required_grammar(0, 8192, false, Some("The weather? Let me check. "))
-            .is_some());
+        for preferred in [Some(ToolCallFormat::DeepSeekDsml), None] {
+            let mut state =
+                ToolCallState::new(ToolChoice::Required, Some(&tools), preferred).unwrap();
+            let calling = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Par";
+            assert!(
+                state
+                    .maybe_force_required_grammar(0, 8192, false, Some(calling))
+                    .is_none(),
+                "{preferred:?}"
+            );
+            assert!(
+                state
+                    .maybe_force_required_grammar(0, 8192, true, Some(calling))
+                    .is_none(),
+                "{preferred:?}"
+            );
+            assert!(
+                state
+                    .maybe_force_required_grammar(
+                        0,
+                        8192,
+                        false,
+                        Some("The weather? Let me check. ")
+                    )
+                    .is_some(),
+                "{preferred:?}"
+            );
+        }
     }
 
     /// regression test for spiceai/mistral.rs#54: a DSML example in the reasoning hid an

@@ -71,9 +71,10 @@ impl TextToolCallStrategy {
 impl ToolCallStrategy for TextToolCallStrategy {
     fn observe_token(&mut self, _token: u32, _bytes: &[u8]) {}
 
+    /// A DSML block is read whatever format the template prefers, so one still being written is
+    /// found in the content alone.
     fn call_unfinished(&self, content: &str) -> bool {
-        self.preferred_format == Some(ToolCallFormat::DeepSeekDsml)
-            && parsers::call_unfinished(content)
+        parsers::call_unfinished(content)
     }
 
     fn continuation_grammar(
