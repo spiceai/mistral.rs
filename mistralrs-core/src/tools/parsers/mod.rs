@@ -299,7 +299,7 @@ fn call_end(
             end_outside_tagged_values(text, body, end, "<atem:parameter", "</atem:parameter>")
         }
         ToolCallFormat::Liquid => end_outside_quotes(text, body, end),
-        ToolCallFormat::Qwen if text[body..].trim_start().starts_with('{') => {
+        ToolCallFormat::Qwen if text[body..].trim_start().starts_with(['{', '[']) => {
             end_outside_json_strings(text, body, end, |at| is_json(&text[body..at]))
         }
         ToolCallFormat::Hunyuan if text[body..].trim_start().starts_with('[') => {
@@ -417,10 +417,43 @@ pub(super) fn open_in_other_format(text: &str, format: ToolCallFormat) -> bool {
     if in_bare_json_call_string(text) {
         return true;
     }
-    let outside = without_closed_calls(text);
+    let outside = without_closed_calls(&without_bare_json_call(text));
     PARSERS
         .iter()
         .any(|parser| parser.format() != format && parser.open_at_end(&outside))
+}
+
+/// `text` with the bare-JSON call it begins with, a call or an array of calls written as JSON
+/// with nothing around it, blanked out once the call is finished, so a marker quoted in one of
+/// its strings does not open a call in another format.
+fn without_bare_json_call(text: &str) -> std::borrow::Cow<'_, str> {
+    let json = text.trim_start();
+    let start = text.len() - json.len();
+    let finished = |length: Option<usize>| length.map(|length| start..start + length);
+    let Some(call) = json
+        .starts_with(['{', '['])
+        .then(|| {
+            finished(finished_json_length::<super::CalledFunctionParameters>(
+                json,
+            ))
+            .or_else(|| {
+                finished(finished_json_length::<Vec<super::CalledFunctionParameters>>(json))
+            })
+        })
+        .flatten()
+    else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let mut out = text.to_string();
+    let blank = " ".repeat(out[call.clone()].chars().count());
+    out.replace_range(call, &blank);
+    std::borrow::Cow::Owned(out)
+}
+
+/// The length of the `T` that `json` begins with, written as JSON, once it is finished.
+fn finished_json_length<T: serde::de::DeserializeOwned>(json: &str) -> Option<usize> {
+    let mut values = serde_json::Deserializer::from_str(json).into_iter::<T>();
+    matches!(values.next(), Some(Ok(_))).then(|| values.byte_offset())
 }
 
 /// Whether `text` begins a bare-JSON call, a call or an array of calls written as JSON with

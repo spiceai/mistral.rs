@@ -974,6 +974,10 @@ mod tests {
                 "\"}}</tool_call>",
             ),
             (
+                "<tool_call>[{\"name\":\"write_file\",\"arguments\":{\"content\":\"</tool_call>",
+                "\"}}]</tool_call>",
+            ),
+            (
                 "<tool_calls>[{\"name\":\"write_file\",\"arguments\":{\"content\":\"</tool_calls>",
                 "\"}}]</tool_calls>",
             ),
@@ -1022,6 +1026,48 @@ mod tests {
             read(&closed).1,
             [("delete_all".to_string(), "{}".to_string())]
         );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: another format's opener quoted in a finished
+    /// bare-JSON call counted as opening a call there, so a later DSML block was taken as
+    /// enclosed and a Qwen call inside its value was made in place of the block's call
+    #[test]
+    fn a_marker_quoted_in_a_finished_bare_json_call_does_not_enclose_a_later_dsml_block() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("Bash"), tool("write_file"), tool("note")]),
+        )
+        .expect("a matcher");
+        let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        for marker in [
+            "<tool_calls>",
+            "<|tool_call>",
+            "<tool_call>",
+            "<|tool_call_start|>",
+            "<atem:function_calls>",
+            "<｜tool▁call▁begin｜>",
+        ] {
+            let quoted = serde_json::to_string(marker).expect("JSON");
+            for call in [
+                format!("{{\"name\":\"note\",\"arguments\":{{\"text\":{quoted}}}}}"),
+                format!("[{{\"name\":\"note\",\"arguments\":{{\"text\":{quoted}}}}}]"),
+            ] {
+                let names: Vec<String> = matcher
+                    .get_call(&format!("{call}\n{block}"))
+                    .expect("a message")
+                    .into_iter()
+                    .map(|call| call.function.name)
+                    .collect();
+                assert_eq!(names, ["write_file"], "{call}");
+            }
+        }
     }
 
     /// regression test for spiceai/mistral.rs#54: a Mistral Nemo `[TOOL_CALLS]` or Llama
