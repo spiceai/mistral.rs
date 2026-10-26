@@ -1,9 +1,12 @@
 //! A differential corpus for the tool-call parsers: messages that splice one format's call
 //! markers into another format's calls, and their prefixes, each read by the matcher here and
-//! compared with what the base read from the same text. The base is `spiceai` at
+//! compared with what the base read from the same text; and each message streamed through
+//! `parse_streaming` one character at a time and in runs drawn from `STREAM_SEED`, compared
+//! with what the base's streaming of the same chunks sent and called. The base is `spiceai` at
 //! fcd94520dd6ed6ee7c1800b7c60351c4772ffccf, before DeepSeek-V4's DSML calls were read; its
 //! readings are recorded in `testdata/tool_call_parse_oracle.json`, which pairs every entry of
-//! `corpus()` with what `outcome()` returned on the base for each of its cuts. To record it
+//! `corpus()` with what `outcome()` returned on the base for each of its cuts, and what
+//! `streaming_outcome()` returned for each of its chunkings. To record it
 //! again, check out the base, add this module there, and write `oracle_json(&corpus())` to that
 //! file.
 //!
@@ -13,6 +16,7 @@
 
 use serde_json::{json, Value};
 
+use super::state::ToolCallState;
 use super::{ToolCallingMatcher, ToolChoice};
 use crate::Tool;
 
@@ -20,6 +24,8 @@ use crate::Tool;
 pub(super) const SEED: u64 = 0x5eed_0054_d5e1_0001;
 /// How many entries are generated.
 const GENERATED: usize = 300;
+/// The seed the streaming arm's random chunkings are drawn from.
+pub(super) const STREAM_SEED: u64 = 0x5eed_0054_57e4_0001;
 
 /// One message of the corpus, the prefixes of it read (`cuts`, byte lengths, the whole message
 /// last), and the DSML calls it makes where it writes a DSML block outside any other format's
@@ -40,8 +46,8 @@ pub(super) struct TopLevelDsml {
 }
 
 /// The tools every entry is read with.
-pub(super) fn matcher() -> ToolCallingMatcher {
-    let tools: Vec<Tool> = [
+fn tools() -> Vec<Tool> {
+    [
         "write_file",
         "delete_all",
         "Bash",
@@ -57,8 +63,12 @@ pub(super) fn matcher() -> ToolCallingMatcher {
         }))
         .expect("a tool")
     })
-    .collect();
-    ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).expect("a matcher")
+    .collect()
+}
+
+/// A matcher for the tools every entry is read with.
+pub(super) fn matcher() -> ToolCallingMatcher {
+    ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools())).expect("a matcher")
 }
 
 /// What the matcher reads from `text`, as `[streaming, read]`: the streaming state as `"tf"`
@@ -89,9 +99,78 @@ pub(super) fn outcome(matcher: &ToolCallingMatcher, text: &str) -> Value {
     json!([streaming, read])
 }
 
-/// The corpus with what the matcher reads from each cut, as the oracle file records it.
+/// The chunkings `message` is streamed in, as the byte offsets the chunks end at: one character
+/// at a time, and runs of one to eight characters drawn from `rng`.
+pub(super) fn chunkings(message: &str, rng: &mut Rng) -> [Vec<usize>; 2] {
+    let ends: Vec<usize> = message
+        .char_indices()
+        .map(|(at, c)| at + c.len_utf8())
+        .collect();
+    let mut runs = Vec::new();
+    let mut at = 0;
+    while at < ends.len() {
+        at = (at + 1 + rng.below(8)).min(ends.len());
+        runs.push(ends[at - 1]);
+    }
+    [ends, runs]
+}
+
+/// What streaming `message` in chunks ending at `ends` reads, as a chat response with no
+/// reasoning parser streams: after each chunk the text not yet sent is checked, and is sent
+/// through `parse_streaming` once it cannot be or is a call, or the message has ended; a call
+/// ends the response. As `[content, calls]`: the content sent, joined, `true` when it is the
+/// whole message, and each call as its name and its arguments' JSON; an error is
+/// `{"error": message}`.
+pub(super) fn streaming_outcome(message: &str, ends: &[usize]) -> Value {
+    let tools = tools();
+    let mut state = match ToolCallState::new(ToolChoice::Auto, Some(&tools), None) {
+        Ok(state) => state,
+        Err(error) => return json!({ "error": error.to_string() }),
+    };
+    let mut sent = 0;
+    let mut content = String::new();
+    let mut calls = Vec::new();
+    for (index, &end) in ends.iter().enumerate() {
+        let last = index + 1 == ends.len();
+        let pending = &message[sent..end];
+        let (possible, done) = match state.prefix_status(pending) {
+            Ok(status) => status,
+            Err(error) => return json!({ "error": error.to_string() }),
+        };
+        if possible && !done && !last {
+            continue;
+        }
+        let parsed =
+            match state.parse_streaming(Some(pending.to_string()), pending, None, false, last) {
+                Ok(parsed) => parsed,
+                Err(error) => return json!({ "error": error.to_string() }),
+            };
+        sent = end;
+        content.push_str(parsed.content.as_deref().unwrap_or_default());
+        let made = !parsed.tool_calls.is_empty();
+        calls.extend(
+            parsed
+                .tool_calls
+                .into_iter()
+                .map(|call| json!([call.function.name, call.function.arguments])),
+        );
+        if parsed.tool_use_is_done || made {
+            break;
+        }
+    }
+    let content = if content == message {
+        Value::Bool(true)
+    } else {
+        Value::String(content)
+    };
+    json!([content, Value::Array(calls)])
+}
+
+/// The corpus with what the matcher reads from each cut, and what streaming each message in
+/// each of its chunkings reads, as the oracle file records them.
 pub(super) fn oracle_json(entries: &[Entry]) -> Value {
     let matcher = matcher();
+    let mut rng = Rng(STREAM_SEED);
     let entries: Vec<Value> = entries
         .iter()
         .map(|entry| {
@@ -100,22 +179,94 @@ pub(super) fn oracle_json(entries: &[Entry]) -> Value {
                 .iter()
                 .map(|&cut| outcome(&matcher, &entry.message[..cut]))
                 .collect();
+            let chunkings = chunkings(&entry.message, &mut rng);
+            let streaming: Vec<Value> = chunkings
+                .iter()
+                .map(|ends| streaming_outcome(&entry.message, ends))
+                .collect();
             json!({
                 "id": entry.id,
                 "message": entry.message,
                 "cuts": entry.cuts,
                 "outcomes": outcomes,
+                "chunks": chunkings.iter().map(Vec::len).collect::<Vec<_>>(),
+                "streaming": streaming,
             })
         })
         .collect();
-    json!({ "seed": format!("{SEED:#x}"), "entries": entries })
+    json!({
+        "seed": format!("{SEED:#x}"),
+        "stream_seed": format!("{STREAM_SEED:#x}"),
+        "entries": entries,
+    })
+}
+
+/// Why streaming `entry` may read `head` where the base's streaming read `base`, if it may.
+/// `read` is what the base read from each prefix of the message, the whole message included,
+/// that ends before the entry's DSML block, if it writes one outside any other format's call. A
+/// message with such a block may make the block's calls; any message may make the calls the
+/// base's streaming made, with the content before them cut elsewhere, or only calls one of
+/// `read` makes, or fail as one of `read` does; and a message that makes no call is its content
+/// as written.
+pub(super) fn intended_streaming_difference(
+    entry: &Entry,
+    base: &Value,
+    head: &Value,
+    read: &[&Value],
+) -> Option<&'static str> {
+    let calls = |reading: &Value| -> Option<Vec<Value>> {
+        reading.get(1).and_then(Value::as_array).cloned()
+    };
+    let within = |made: &[Value], read: Option<Vec<Value>>| {
+        let mut read = read.unwrap_or_default();
+        made.iter().all(|call| {
+            read.iter()
+                .position(|candidate| candidate == call)
+                .map(|at| read.remove(at))
+                .is_some()
+        })
+    };
+    if let Some(dsml) = &entry.dsml {
+        let blocks: Vec<Value> = dsml
+            .blocks
+            .iter()
+            .flat_map(|(_, calls)| {
+                calls
+                    .iter()
+                    .map(|(name, arguments)| json!([name, arguments]))
+            })
+            .collect();
+        if calls(head).as_deref() == Some(blocks.as_slice()) {
+            return Some(dsml.reason);
+        }
+    }
+    let no_call = json!([]);
+    if base.get(1) == Some(&no_call) && *head == json!([true, no_call]) {
+        return Some(AS_WRITTEN);
+    }
+    if base.get(1).is_some() && base.get(1) == head.get(1) {
+        return Some(SAME_STREAMED_CALLS);
+    }
+    let as_read = match head.get("error") {
+        Some(error) => read
+            .iter()
+            .any(|reading| reading[1].get("error") == Some(error)),
+        None => {
+            let made = calls(head)?;
+            read.iter().any(|reading| within(&made, calls(&reading[1])))
+        }
+    };
+    as_read.then_some(STREAMED_AS_READ)
 }
 
 /// The differences from the base this crate intends, one per line with its reason. A DSML
 /// block outside any other format's call (`TopLevelDsml`) is read from its opener on by
 /// `DSML_CALLS` or `DSML_OWNS`; and:
 const AS_WRITTEN: &str = "a message that makes no call is its content as the model wrote it, where the base returned the text a parser had read or repaired from it";
-const PARTIAL_OPENER: &str = "a message ending partway through `<｜DSML｜` outside any other format's call is held back and makes no call yet, as it may be opening a DSML block that would claim it, where the base streamed it or read a call before it";
+const PARTIAL_OPENER: &str = "a message ending partway through a marker that begins a call, outside any other call, is held back and makes no call yet, as it may be opening one, a DSML block that would claim the message included, where the base streamed it or read a call before it";
+const HELD_IN_CALL: &str = "a message inside a call that has not ended, such as a bare-JSON call that does not read, is held back and makes no call yet, where the base streamed it, so the rest of the call is never read on its own";
+const SAME_STREAMED_CALLS: &str = "streamed, a message makes the calls the base's streaming made, with the content sent before them cut elsewhere, as a marker that may begin a call is held back";
+const STREAMED_AS_READ: &str = "streamed in chunks that cut a call's marker, a message makes only calls the base reads from it or from a prefix of it before any DSML block, or fails as one does, where the base streamed the cut marker out as text and missed them";
 
 /// The calls a cut of `entry` makes as DSML, with the reason, when it reaches into a DSML
 /// block outside any other format's call: from the block's opener on, the prefix makes
@@ -136,9 +287,10 @@ pub(super) fn dsml_calls(entry: &Entry, cut: usize) -> Option<(&'static str, Val
 }
 
 /// Why the reading `head` of the cut `cut` of `entry` may differ from the base's, `base`, outside
-/// a DSML block (`dsml_calls`), if it may: a prefix ending partway through a DSML marker is
-/// held back with no call; and a prefix that makes no call, read with the same streaming state,
-/// is content as written.
+/// a DSML block (`dsml_calls`), if it may: a prefix ending partway through a call marker is
+/// held back with no call; a prefix inside a call that has not ended, which the base streamed,
+/// is held back with no call; and a prefix that makes no call, read with the same streaming
+/// state, is content as written.
 pub(super) fn intended_difference(
     entry: &Entry,
     cut: usize,
@@ -147,18 +299,35 @@ pub(super) fn intended_difference(
 ) -> Option<&'static str> {
     let no_call = json!([]);
     let text = &entry.message[..cut];
-    let partial = (1..OPEN_MARKER.len())
-        .filter(|&at| OPEN_MARKER.is_char_boundary(at))
-        .any(|at| text.ends_with(&OPEN_MARKER[..at]));
-    if partial && head[0] == json!("tf") && head[1] == json!([true, no_call]) {
+    let held = head[0] == json!("tf") && head[1] == json!([true, no_call]);
+    let partial = MARKERS.iter().any(|marker| {
+        marker
+            .char_indices()
+            .skip(1)
+            .any(|(at, _)| text.ends_with(&marker[..at]))
+    });
+    if held && partial {
         return Some(PARTIAL_OPENER);
+    }
+    if held && base[0] == json!("ff") && base[1][1] == no_call {
+        return Some(HELD_IN_CALL);
     }
     (head[0] == base[0] && base[1][1] == no_call && head[1] == json!([true, no_call]))
         .then_some(AS_WRITTEN)
 }
 
-/// The marker every DSML tag opens with.
-const OPEN_MARKER: &str = "<｜DSML｜";
+/// The markers that begin a call, in every format.
+const MARKERS: [&str; 9] = [
+    "<｜DSML｜",
+    "<atem:function_calls>",
+    "<|tool_call>",
+    "<|tool_call_start|>",
+    "<|python_tag|>",
+    "<tool_call>",
+    "<tool_calls>",
+    "[TOOL_CALLS]",
+    "<｜tool▁call▁begin｜>",
+];
 
 const DELETE_ALL: &str = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"delete_all\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
 const BASH_EXAMPLE: &str = "Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>";
@@ -539,7 +708,7 @@ fn hand_corpus() -> Vec<Entry> {
 }
 
 /// A xorshift64* stream, so the generated entries are the same on every machine.
-struct Rng(u64);
+pub(super) struct Rng(u64);
 
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -595,6 +764,17 @@ const FRAGMENTS: &[&str] = &[
     "]",
     "text ",
     "```",
+];
+
+/// The markers that end a call, in every format whose calls close.
+const CLOSERS: [&str; 7] = [
+    "</tool_call>",
+    "</tool_calls>",
+    "<tool_call|>",
+    "<|tool_call_end|>",
+    "<｜tool▁call▁end｜>",
+    "</atem:function_calls>",
+    BLOCK_CLOSER,
 ];
 
 /// Where the JSON value of a generated call goes, and the call's text after it.
@@ -731,12 +911,21 @@ fn generated(rng: &mut Rng, case: usize) -> Entry {
         let at = message.len() + 1;
         message.push('\n');
         message.push_str(&block);
-        cuts.push(at + OPENER.len());
+        cuts.extend([at - 1, at, at + OPENER.len()]);
         dsml = Some(TopLevelDsml {
             reason: DSML_OWNS,
             at,
             blocks: vec![(message.len(), calls)],
         });
+    }
+    // Where a call written in the value could be complete, so a call streaming makes there is
+    // checked against what the base reads there.
+    for closer in CLOSERS {
+        cuts.extend(
+            message
+                .match_indices(closer)
+                .map(|(at, _)| at + closer.len()),
+        );
     }
     let boundaries: Vec<usize> = message.char_indices().map(|(at, _)| at).collect();
     for _ in 0..2 {

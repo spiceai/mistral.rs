@@ -33,7 +33,7 @@ use crate::Tool;
 
 /// The token every DSML tag starts with after its `<` or `</`.
 pub(super) const DSML: &str = "｜DSML｜";
-const OPEN: &str = "<｜DSML｜";
+pub(super) const OPEN: &str = "<｜DSML｜";
 const CLOSE: &str = "</｜DSML｜";
 /// The whitespace a tag may hold, as the grammars' value lexemes know it: `[ \t\r\n]`. The
 /// scanner reads no other whitespace in a tag, so a tag a grammar lets through as value text,
@@ -364,43 +364,63 @@ fn block_at(text: &str, name: &str) -> Scan<(Vec<DsmlToolCall>, usize, bool)> {
     }
 }
 
-/// Reads every block of calls in `message`. A block that breaks a rule of the markup while
-/// its tags stay in place is content, and reading resumes after it; its values are read as
-/// values, so a block written inside one never becomes a call. A block whose tags cannot be
-/// read leaves no place to resume, so the message makes no call.
+/// How a DSML tag at an offset of a message frames what follows it.
+pub(super) enum Frame {
+    /// The tag opens no block: it is text.
+    NotABlock,
+    /// It opens a block that ends at this offset, read or not.
+    Block(usize),
+    /// It opens a block, or may, that has not ended.
+    Open,
+    /// It opens a block whose tags cannot be read, which leaves no place to resume.
+    Unreadable,
+}
+
+/// How the DSML tag at `start` in `text` frames what follows it, for `call_spans`.
+pub(super) fn frame(text: &str, start: usize) -> Frame {
+    match tag_at(&text[start..], false, &BLOCK_NAMES) {
+        Scan::Done((_, open)) => {
+            let name = block_name(&text[start..start + open]);
+            match block_at(&text[start + open..], name) {
+                Scan::Done((_, length, _)) => Frame::Block(start + open + length),
+                Scan::More => Frame::Open,
+                Scan::Bad => Frame::Unreadable,
+            }
+        }
+        Scan::More => Frame::Open,
+        Scan::Bad if names_block(&text[start..]) => Frame::Unreadable,
+        Scan::Bad => Frame::NotABlock,
+    }
+}
+
+/// Reads every block of calls in `message` outside any other format's call, as `call_spans`
+/// finds them. A block that breaks a rule of the markup while its tags stay in place is
+/// content, and reading resumes after it; its values are read as values, so a block written
+/// inside one never becomes a call. A block whose tags cannot be read leaves no place to resume,
+/// so the message makes no call.
 fn scan(message: &str) -> Scan<Found> {
     let mut found = Found {
         calls: Vec::new(),
         blocks: Vec::new(),
     };
-    let mut from = 0;
-    // Where the text outside DSML blocks resumes, after the last block read.
-    let mut outside = 0;
-    while let Some(offset) = message[from..].find(OPEN) {
-        let start = from + offset;
-        // An opener inside another format's call is that call's text.
-        if super::inside_a_call(&message[outside..start]) {
-            from = start + OPEN.len();
-            continue;
-        }
-        let (attributes, open) = match tag_at(&message[start..], false, &BLOCK_NAMES) {
-            Scan::Done(tag) => tag,
-            Scan::More => return Scan::More,
-            // A block's opening tag that cannot be read leaves no place to resume.
-            Scan::Bad if names_block(&message[start..]) => return Scan::Bad,
-            // A DSML tag that does not open a block is not a call.
-            Scan::Bad => {
-                from = start + OPEN.len();
-                continue;
-            }
+    let spans = super::call_spans(message);
+    let blocks = spans
+        .iter()
+        .filter(|span| span.format == Some(super::ToolCallFormat::DeepSeekDsml));
+    for span in blocks {
+        let end = match span.end {
+            super::SpanEnd::At(end) => end,
+            super::SpanEnd::Open => return Scan::More,
+            super::SpanEnd::Unreadable => return Scan::Bad,
+        };
+        let start = span.open;
+        let Scan::Done((attributes, open)) = tag_at(&message[start..], false, &BLOCK_NAMES) else {
+            return Scan::Bad;
         };
         let name = block_name(&message[start..start + open]);
-        let (calls, length, malformed) = match block_at(&message[start + open..], name) {
-            Scan::Done(block) => block,
-            Scan::More => return Scan::More,
-            Scan::Bad => return Scan::Bad,
+        let Scan::Done((calls, _, malformed)) = block_at(&message[start + open..end], name) else {
+            return Scan::Bad;
         };
-        let end = start + open + length;
         if !malformed && bare(attributes) {
             found.blocks.push(FoundBlock {
                 span: start..end,
@@ -408,20 +428,32 @@ fn scan(message: &str) -> Scan<Found> {
             });
             found.calls.extend(calls);
         }
-        from = end;
-        outside = end;
     }
-    // The message may end partway through the marker that opens the next block, outside any
-    // other format's call.
-    let tail = &message[from..];
-    let partial = OPEN.char_indices().skip(1).any(|(at, _)| {
-        tail.ends_with(&OPEN[..at]) && !super::inside_a_call(&message[outside..message.len() - at])
-    });
-    if partial {
+    if partial_opener_outside(message, &spans).is_some() {
         Scan::More
     } else {
         Scan::Done(found)
     }
+}
+
+/// Where `message` ends partway through the marker that opens a block, outside any other
+/// format's call: prefixes of the marker end in different characters, so at most one of them
+/// ends the message.
+fn partial_opener_outside(message: &str, spans: &[super::Span]) -> Option<usize> {
+    let after = match spans.last() {
+        Some(super::Span {
+            end: super::SpanEnd::At(end),
+            ..
+        }) => *end,
+        Some(_) => return None,
+        None => 0,
+    };
+    OPEN.char_indices()
+        .skip(1)
+        .map(|(at, _)| at)
+        .find(|&at| message.ends_with(&OPEN[..at]))
+        .map(|at| message.len() - at)
+        .filter(|&start| start >= after)
 }
 
 /// Where `message` opens its first block of calls outside any other format's call, finished
@@ -430,28 +462,12 @@ fn scan(message: &str) -> Scan<Found> {
 /// marker included, is claimed as well, so an example in another format earlier in it is not
 /// dispatched as a call while the block is still being written.
 fn block_start(message: &str) -> Option<usize> {
-    let outside = |start: usize| !super::inside_a_call(&message[..start]);
-    let opener = message
-        .match_indices(OPEN)
-        .map(|(start, _)| start)
-        .find(|&start| {
-            let opens = match tag_at(&message[start..], false, &BLOCK_NAMES) {
-                Scan::Done(_) | Scan::More => true,
-                Scan::Bad => names_block(&message[start..]),
-            };
-            opens && outside(start)
-        });
-    if opener.is_some() {
-        return opener;
-    }
-    // The message may end partway through the marker that opens a block; prefixes of the
-    // marker end in different characters, so at most one of them ends the message.
-    OPEN.char_indices()
-        .skip(1)
-        .map(|(at, _)| at)
-        .find(|&at| message.ends_with(&OPEN[..at]))
-        .map(|at| message.len() - at)
-        .filter(|&start| outside(start))
+    let spans = super::call_spans(message);
+    spans
+        .iter()
+        .find(|span| span.format == Some(super::ToolCallFormat::DeepSeekDsml))
+        .map(|span| span.open)
+        .or_else(|| partial_opener_outside(message, &spans))
 }
 
 /// Whether the DSML tag at the start of `text` names a block, whether or not the tag can be
@@ -749,6 +765,16 @@ fn unenforceable_tool(tool: &Tool) -> Option<String> {
             "Tool '{name}' is strict, and its parameters schema constrains the object as a whole with `{keyword}`, which a required DeepSeek-V4 tool call cannot enforce. Remove `strict` from the tool, or the `{keyword}` from its schema."
         ));
     }
+    // The grammar writes declared properties only, so a schema that admits others, as a map of
+    // parameters does through `additionalProperties`, is one it cannot hold.
+    if object
+        .get("additionalProperties")
+        .is_some_and(|additional| *additional != Value::Bool(false))
+    {
+        return Some(format!(
+            "Tool '{name}' is strict, and its parameters schema admits parameters it does not declare (`additionalProperties`), which a required DeepSeek-V4 tool call cannot write. Declare the parameters in `properties` and set `additionalProperties` to `false`, or remove `strict` from the tool."
+        ));
+    }
     // The grammar writes declared properties only, so a required one must be declared.
     let declared = object.get("properties").and_then(Value::as_object);
     if let Some(unwritable) =
@@ -771,9 +797,17 @@ fn unenforceable_tool(tool: &Tool) -> Option<String> {
             "Tool '{name}' is strict, and its parameters schema refers to `{reference}`, which a DeepSeek-V4 tool call cannot follow: a reference names the schema's root (`#`), a pointer into it (`#/...`), or an `$anchor` it declares. Point the reference into the schema, or remove `strict` from the tool."
         ));
     }
-    let missing = object
-        .get("required")
-        .and_then(Value::as_array)?
+    let required = object.get("required").and_then(Value::as_array)?;
+    // A property whose schema is `false` admits no value, so one that is required cannot be
+    // written at all.
+    if let Some(unsatisfiable) = required.iter().filter_map(Value::as_str).find(|required| {
+        declared.is_some_and(|declared| declared.get(*required) == Some(&Value::Bool(false)))
+    }) {
+        return Some(format!(
+            "Tool '{name}' is strict, and its parameters schema requires `{unsatisfiable}` with the schema `false`, which no value satisfies, so no call to it can be written. Allow a value for `{unsatisfiable}`, or stop requiring it."
+        ));
+    }
+    let missing = required
         .iter()
         .filter_map(Value::as_str)
         .find(|required| declared.is_none_or(|declared| !declared.contains_key(*required)))?;
@@ -1060,6 +1094,10 @@ fn emit_arguments(
     for (property_index, name) in names.into_iter().enumerate() {
         let parameter = format!("parameter_{tool_index}_{property_index}");
         let property = &properties[name];
+        // A property whose schema is `false` admits no value: the call leaves it out.
+        if *property == Value::Bool(false) {
+            continue;
+        }
         let open = tag(false, &format!("parameter name=\"{name}\" string=\""));
         let close = tag(true, "parameter>\n");
         let as_text = lark_literal("true\">");
@@ -2358,6 +2396,104 @@ mod tests {
             );
         }
         assert!(calls(&valid.replace("command", "a.b-c_9")).is_some());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a strict schema that admits parameters it does
+    /// not declare, a map through `additionalProperties`, was held to its declared ones, none,
+    /// so every call the grammar let the model write had no arguments
+    #[test]
+    fn a_strict_schema_admitting_undeclared_parameters_is_written_with_them() {
+        use crate::tools::{ToolCallingMatcher, ToolChoice};
+        let map = tool(serde_json::json!({
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+        }));
+        let tools = std::slice::from_ref(&map);
+        let why = unenforceable(tools).expect("refused for a required call");
+        assert!(why.contains("`additionalProperties`"), "{why}");
+        let opener = format!("<{DSML}tool_calls>");
+        let body = |parameters: &str| {
+            format!(
+                "\n<{DSML}invoke name=\"set\">\n{parameters}</{DSML}invoke>\n</{DSML}tool_calls>"
+            )
+        };
+        let parameter = |name: &str, string: &str, value: &str| {
+            format!(
+                "<{DSML}parameter name=\"{name}\" string=\"{string}\">{value}</{DSML}parameter>\n"
+            )
+        };
+        let (env, _) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let grammar = continuation_grammar(tools, &opener).expect("a grammar");
+        assert_eq!(
+            factory
+                .create_parser(grammar)
+                .err()
+                .map(|error| error.to_string()),
+            None
+        );
+        let k = parameter("k", "true", "v");
+        assert!(continuation_accepts(tools, &opener, &body(&k)));
+        assert!(continuation_accepts(tools, &opener, &body("")));
+        // The calls are held to the schema when read: a value that is not a string is refused.
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(tools)).expect("a matcher");
+        let read = |parameters: &str| {
+            matcher
+                .get_call(&format!("{opener}{}", body(parameters)))
+                .expect("read")
+                .into_iter()
+                .map(|call| call.function.arguments)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(read(&k), [r#"{"k":"v"}"#]);
+        assert_eq!(read(&parameter("k", "false", "3")), Vec::<String>::new());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: an optional property whose schema is `false`,
+    /// one the call must leave out, was compiled into a sub-grammar no value satisfies, which
+    /// does not compile, so no call to any tool offered beside it was constrained
+    #[test]
+    fn a_strict_property_whose_schema_is_false_is_left_out() {
+        let blocked = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "command": { "type": "string" }, "blocked": false },
+            "required": ["command"],
+            "additionalProperties": false,
+        }));
+        let tools = std::slice::from_ref(&blocked);
+        assert_eq!(unenforceable(tools), None);
+        let (env, _) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        assert_eq!(
+            factory
+                .create_parser(build_dsml_grammar(tools, Block::Whole))
+                .err()
+                .map(|error| error.to_string()),
+            None
+        );
+        assert!(forced_call_accepts(
+            tools,
+            &one_call("set", &[("command", "true", "ls")])
+        ));
+        assert!(!forced_call_accepts(
+            tools,
+            &one_call(
+                "set",
+                &[("blocked", "true", "x"), ("command", "true", "ls")]
+            )
+        ));
+        // A required property whose schema is `false` cannot be written at all.
+        let unsatisfiable = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "blocked": false },
+            "required": ["blocked"],
+            "additionalProperties": false,
+        }));
+        let why = unenforceable(&[unsatisfiable]).expect("refused");
+        assert!(
+            why.contains("`blocked`") && why.contains("`false`"),
+            "{why}"
+        );
     }
 
     /// regression test for spiceai/mistral.rs#54: a strict `enum` value holding a tab, a

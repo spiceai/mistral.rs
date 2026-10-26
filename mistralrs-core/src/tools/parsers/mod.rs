@@ -127,17 +127,9 @@ static PARSERS: std::sync::LazyLock<Vec<Box<dyn ToolFormatParser>>> =
 fn parsers_for(message: &str) -> Vec<&'static dyn ToolFormatParser> {
     let all = || PARSERS.iter().map(|parser| parser.as_ref());
     for parser in all() {
-        let Some(start) = parser.claim_start(message) else {
-            continue;
-        };
-        let enclosed = inside_a_call(&message[..start]);
-        return if enclosed {
-            all()
-                .filter(|other| other.format() != parser.format())
-                .collect()
-        } else {
-            vec![parser]
-        };
+        if parser.claim_start(message).is_some() {
+            return vec![parser];
+        }
     }
     all().collect()
 }
@@ -241,9 +233,10 @@ const CLOSED_CALL_DELIMITERS: [(ToolCallFormat, &str, &str); 6] = [
     ),
 ];
 
-/// The markers that begin a call in a format other than DSML, as the parsers are tried: Gemma 4
-/// before Qwen, as `<|tool_call>` holds `<tool_call>`.
-const CALL_OPENERS: [(ToolCallFormat, &str); 8] = [
+/// The markers that begin a call, as the parsers are tried: Gemma 4 before Qwen, as
+/// `<|tool_call>` holds `<tool_call>`.
+const CALL_OPENERS: [(ToolCallFormat, &str); 9] = [
+    (ToolCallFormat::DeepSeekDsml, dsml::OPEN),
     (ToolCallFormat::Atem, "<atem:function_calls>"),
     (ToolCallFormat::Gemma4, "<|tool_call>"),
     (ToolCallFormat::Liquid, "<|tool_call_start|>"),
@@ -254,41 +247,122 @@ const CALL_OPENERS: [(ToolCallFormat, &str); 8] = [
     (ToolCallFormat::DeepSeek, "<｜tool▁call▁begin｜>"),
 ];
 
-/// Whether `text` ends inside a call in a format other than DSML, a bare-JSON call included, so
-/// that a DSML marker there is the call's text. One pass reads the calls of `text` left to
-/// right: a bare-JSON call at its start, then from the earliest marker that begins one, each
-/// call to where its format ends it (`call_end`), with the next looked for after it, so a marker
-/// inside a call, whichever format's, is that call's text. A call its format has not ended,
-/// such as one that does not read once closed, holds everything after it.
-pub(super) fn inside_a_call(text: &str) -> bool {
-    let mut from = match bare_json_call(text) {
-        Some(Some(end)) => end,
-        Some(None) => return true,
-        None => 0,
-    };
+/// A call found in a message: its format, `None` for a bare-JSON call, where it opens, and how
+/// it ends.
+pub(super) struct Span {
+    pub(super) format: Option<ToolCallFormat>,
+    pub(super) open: usize,
+    pub(super) end: SpanEnd,
+}
+
+/// How a call found in a message ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpanEnd {
+    /// It ends at this offset.
+    At(usize),
+    /// It has not ended, and holds everything after it.
+    Open,
+    /// A DSML block whose tags cannot be read: it holds everything after it, and the message
+    /// makes no call.
+    Unreadable,
+}
+
+/// The calls of `text`, left to right, in one pass: a bare-JSON call at its start, then from
+/// the earliest marker that begins one, each call to where its format ends it, with the next
+/// looked for after it, so a marker inside a call, whichever format's, is that call's text. A
+/// call that has not ended, such as one that does not read once closed, holds everything after
+/// it, and is the last. Each marker is looked for from where the last call ended, and each
+/// call's text is read once, so the pass takes time linear in `text`.
+pub(super) fn call_spans(text: &str) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut from = 0;
+    if let Some((open, end)) = bare_json_call(text) {
+        match end {
+            Some(end) => {
+                spans.push(Span {
+                    format: None,
+                    open,
+                    end: SpanEnd::At(end),
+                });
+                from = end;
+            }
+            None => {
+                spans.push(Span {
+                    format: None,
+                    open,
+                    end: SpanEnd::Open,
+                });
+                return spans;
+            }
+        }
+    }
+    // Where each marker next occurs at or after `from`, found again only once `from` passes it.
+    let mut next: Vec<Option<usize>> = CALL_OPENERS
+        .iter()
+        .map(|(_, marker)| text[from..].find(marker).map(|at| from + at))
+        .collect();
     loop {
-        let Some((format, open, marker)) = CALL_OPENERS
+        for ((_, marker), at) in CALL_OPENERS.iter().zip(next.iter_mut()) {
+            if at.is_some_and(|at| at < from) {
+                *at = text[from..].find(marker).map(|offset| from + offset);
+            }
+        }
+        let Some((format, marker, open)) = CALL_OPENERS
             .iter()
-            .filter_map(|&(format, marker)| {
-                text[from..]
-                    .find(marker)
-                    .map(|offset| (format, from + offset, marker))
-            })
-            .min_by_key(|&(_, open, marker)| (open, std::cmp::Reverse(marker.len())))
+            .zip(&next)
+            .filter_map(|(&(format, marker), at)| at.map(|at| (format, marker, at)))
+            .min_by_key(|&(_, marker, at)| (at, std::cmp::Reverse(marker.len())))
         else {
-            return false;
+            return spans;
         };
-        match call_end(format, text, open, open + marker.len()) {
-            Some(end) => from = end,
-            None => return true,
+        let body = open + marker.len();
+        let end = if format == ToolCallFormat::DeepSeekDsml {
+            match dsml::frame(text, open) {
+                dsml::Frame::NotABlock => {
+                    from = body;
+                    continue;
+                }
+                dsml::Frame::Block(end) => SpanEnd::At(end),
+                dsml::Frame::Open => SpanEnd::Open,
+                dsml::Frame::Unreadable => SpanEnd::Unreadable,
+            }
+        } else {
+            call_end(format, text, open, body).map_or(SpanEnd::Open, SpanEnd::At)
+        };
+        spans.push(Span {
+            format: Some(format),
+            open,
+            end,
+        });
+        match end {
+            SpanEnd::At(end) => from = end,
+            SpanEnd::Open | SpanEnd::Unreadable => return spans,
         }
     }
 }
 
-/// Where the bare-JSON call that `text` begins with, a call or an array of calls written as
-/// JSON with nothing around it, ends: `Some(None)` while it has not, and `None` when `text`
-/// begins none.
-fn bare_json_call(text: &str) -> Option<Option<usize>> {
+/// Whether more text could still make `text` a call: it ends inside a call that has not ended,
+/// or partway through a marker that begins one outside any call.
+pub(crate) fn may_still_call(text: &str) -> bool {
+    let after = match call_spans(text).last() {
+        Some(Span {
+            end: SpanEnd::At(end),
+            ..
+        }) => *end,
+        Some(_) => return true,
+        None => 0,
+    };
+    CALL_OPENERS.iter().any(|(_, marker)| {
+        marker
+            .char_indices()
+            .skip(1)
+            .any(|(at, _)| text.ends_with(&marker[..at]) && text.len() - at >= after)
+    })
+}
+
+/// The bare-JSON call that `text` begins with, a call or an array of calls written as JSON with
+/// nothing around it: where it opens, and where it ends, `None` while it has not.
+fn bare_json_call(text: &str) -> Option<(usize, Option<usize>)> {
     fn after(text: &str, c: char) -> Option<&str> {
         text.strip_prefix(c).map(str::trim_start)
     }
@@ -297,7 +371,7 @@ fn bare_json_call(text: &str) -> Option<Option<usize>> {
     let start = text.len() - text.trim_start().len();
     let json = &text[start..];
     (object(json) || after(json, '[').is_some_and(|rest| rest.is_empty() || object(rest)))
-        .then(|| json_end(text, start))
+        .then(|| (start, json_end(text, start)))
 }
 
 /// Where the JSON value that begins at `start` in `text` ends: at the bracket closing its
@@ -338,11 +412,11 @@ fn json_end(text: &str, start: usize) -> Option<usize> {
 /// `None` while it is still open. A closer inside one of the call's values is the value's text:
 /// a Gemma 4 value quoted in `<|"|>`, a Qwen `<parameter=…>` or Atem `<atem:parameter>` value,
 /// a quoted Liquid argument, and a JSON string of a Qwen JSON, Hunyuan or DeepSeek call. A
-/// JSON-format call ends only at a closer up to which it reads as a call, so one that does not
-/// read stays open and holds what follows. A Mistral Nemo or Llama call is its marker and then
-/// the JSON of a call running to the end of the message: it ends with that JSON, and a marker
-/// followed by anything else, such as prose or the rest of a string it is quoted in, begins no
-/// call. Neither does an Atem call to `self` or `user`.
+/// JSON-format call ends at the closer after its JSON, once that reads as a call, so one that
+/// does not read stays open and holds what follows. A Mistral Nemo or Llama call is its marker
+/// and then the JSON of a call running to the end of the message: it ends with that JSON, and a
+/// marker followed by anything else, such as prose or the rest of a string it is quoted in,
+/// begins no call. Neither does an Atem call to `self` or `user`.
 fn call_end(format: ToolCallFormat, text: &str, open: usize, body: usize) -> Option<usize> {
     let rest = &text[body..];
     let json = body + (rest.len() - rest.trim_start().len());
@@ -360,23 +434,25 @@ fn call_end(format: ToolCallFormat, text: &str, open: usize, body: usize) -> Opt
                 })
         }
         (ToolCallFormat::Qwen, Some(end)) if starts_json(&['{', '[']) => {
-            end_outside_json_strings(text, body, end, |at| is_json(&text[body..at]))
+            end_after_json(text, json, end)
         }
         (ToolCallFormat::Qwen, Some(end)) => {
             end_outside_tagged_values(text, body, end, "<parameter=", "</parameter>")
         }
         (ToolCallFormat::Hunyuan, Some(end)) if starts_json(&['[']) => {
-            end_outside_json_strings(text, body, end, |at| is_json(&text[body..at]))
+            end_after_json(text, json, end)
         }
-        (ToolCallFormat::DeepSeek, Some(end)) => end_outside_json_strings(text, body, end, |at| {
+        (ToolCallFormat::DeepSeek, Some(end)) => {
+            let arguments = body + rest.find(['{', '['])?;
+            let value_end = json_end(text, arguments)?;
+            let close = value_end + text[value_end..].find(end)? + end.len();
             deepseek::DeepSeekParser
-                .parse(&text[open..at + end.len()])
+                .parse(&text[open..close])
                 .is_ok_and(|calls| calls.is_some())
-        }),
+                .then_some(close)
+        }
         (ToolCallFormat::Liquid, Some(end)) => end_outside_quotes(text, body, end),
-        (_, Some(end)) => text[body..]
-            .find(end)
-            .map(|length| body + length + end.len()),
+        (_, Some(end)) => rest.find(end).map(|length| body + length + end.len()),
         (ToolCallFormat::MistralNemo, None) if rest.is_empty() => None,
         (ToolCallFormat::MistralNemo, None) if rest.starts_with('[') => json_end(text, body),
         (ToolCallFormat::Llama, None) if rest.trim_start().is_empty() => None,
@@ -390,37 +466,18 @@ fn is_json(text: &str) -> bool {
     serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
 }
 
-/// Where the first `end` from `body` in `text` that is outside JSON strings, where `\` escapes
-/// the next character, and at which `reads` holds ends; `None` before one.
-fn end_outside_json_strings(
-    text: &str,
-    body: usize,
-    end: &str,
-    reads: impl Fn(usize) -> bool,
-) -> Option<usize> {
-    let mut inside = false;
-    let mut escaped = false;
-    for (offset, c) in text[body..].char_indices() {
-        let at = body + offset;
-        if inside {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '"' {
-                inside = false;
-            }
-        } else if c == '"' {
-            inside = true;
-        } else if text[at..].starts_with(end) && reads(at) {
-            return Some(at + end.len());
-        }
-    }
-    None
+/// Where a call whose JSON begins at `json` in `text` ends: past `end`, which only whitespace
+/// may separate from the JSON once it reads. `None` while it has not, or ever will.
+fn end_after_json(text: &str, json: usize, end: &str) -> Option<usize> {
+    let value_end = json_end(text, json)?;
+    let after = &text[value_end..];
+    let close = value_end + (after.len() - after.trim_start().len());
+    text[close..].starts_with(end).then(|| close + end.len())
 }
 
 /// Where the first `end` from `body` in `text` that is not inside a value, from a `value_open`
-/// tag through its `value_close`, ends; `None` before one, or inside a value still open.
+/// tag through its `value_close`, ends; `None` before one, or inside a value still open. The
+/// next `end` is looked for again only once a value runs past it.
 fn end_outside_tagged_values(
     text: &str,
     body: usize,
@@ -429,8 +486,11 @@ fn end_outside_tagged_values(
     value_close: &str,
 ) -> Option<usize> {
     let mut from = body;
+    let mut close = from + text[from..].find(end)?;
     loop {
-        let close = from + text[from..].find(end)?;
+        if close < from {
+            close = from + text[from..].find(end)?;
+        }
         match text[from..close].find(value_open) {
             Some(offset) => {
                 let value = from + offset + value_open.len();
