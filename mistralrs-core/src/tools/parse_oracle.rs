@@ -168,11 +168,16 @@ pub(super) fn streaming_outcome(message: &str, ends: &[usize]) -> Value {
     json!([content, Value::Array(calls)])
 }
 
+/// The stream the streaming arm's chunkings are drawn from, in corpus order.
+pub(super) fn stream_rng() -> Rng {
+    Rng(STREAM_SEED)
+}
+
 /// The corpus with what the matcher reads from each cut, and what streaming each message in
 /// each of its chunkings reads, as the oracle file records them.
 pub(super) fn oracle_json(entries: &[Entry]) -> Value {
     let matcher = matcher();
-    let mut rng = Rng(STREAM_SEED);
+    let mut rng = stream_rng();
     let entries: Vec<Value> = entries
         .iter()
         .map(|entry| {
@@ -1000,6 +1005,20 @@ const SPLICED: [(&str, Option<&str>); 9] = [
     (OPENER, Some(BLOCK_CLOSER)),
 ];
 
+/// What each spliced opener's parser reads as the start of a call after it, in `SPLICED` order:
+/// the text a recognition check looks for.
+const RECOGNITION: [&str; 9] = [
+    "<function=x>",
+    "[",
+    "function<｜tool▁sep｜>",
+    "[",
+    "{",
+    "[",
+    "call:x",
+    "<atem:invoke name=\"x\">",
+    "<｜DSML｜invoke name=\"x\">",
+];
+
 /// A call to `write_file` in the format `SHAPES[shape]`, its `content` the text `value`,
 /// escaped as that format escapes a value, so the whole of `value` is the value's text.
 fn shaped_call(shape: usize, value: &str) -> String {
@@ -1040,8 +1059,10 @@ fn shaped_call(shape: usize, value: &str) -> String {
 /// The mutated entries, drawn from `MUTATION_SEED`: for every format, a real call preceded by a
 /// stray opener of its own format that never closes; the same call with its opener written
 /// twice; a call whose value holds another format's closer after an unmatched opener of that
-/// format before the call; and a call whose value holds another format's opener, followed by a
-/// real call in that format. Each value may hold a DSML block, which, inside a value, is text.
+/// format before the call; a call whose value holds another format's opener, followed by a real
+/// call in that format; and an unmatched opener, then a call whose value holds what that
+/// opener's parser reads as a call's start and its closer, then a DSML block. Each value may
+/// hold a DSML block, which, inside a value, is text.
 fn mutations() -> Vec<Entry> {
     let mut rng = Rng(MUTATION_SEED);
     let mut entries = Vec::new();
@@ -1077,6 +1098,22 @@ fn mutations() -> Vec<Entry> {
                     format!("unmatched-opener-then-closer-in-value:{name}:{other}"),
                     message,
                     dsml.map(|at| (at, Vec::new())),
+                ));
+            }
+            if let Some(other_closer) = other_closer {
+                let message = format!(
+                    "{other_opener}{}{}",
+                    filler(&mut rng),
+                    shaped_call(
+                        shape,
+                        &format!("{}{other_closer}{DELETE_ALL}", RECOGNITION[other])
+                    )
+                );
+                let dsml = (other_opener == OPENER).then_some((0, Vec::new()));
+                entries.push(mutated(
+                    format!("unmatched-opener-then-its-start-and-closer-in-value:{name}:{other}"),
+                    message,
+                    dsml,
                 ));
             }
             let inner = value(&mut rng, other_opener);

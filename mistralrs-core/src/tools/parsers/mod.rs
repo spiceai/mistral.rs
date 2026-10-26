@@ -344,8 +344,13 @@ pub(super) fn call_spans(text: &str) -> Vec<Span> {
 }
 
 /// Whether more text could still make `text` a call: it ends inside a call that has not ended,
-/// or partway through a marker that begins one outside any call.
+/// or partway through a marker that begins one outside any call, or holds a Mistral Nemo or
+/// Llama marker, whose parser reads the rest of the message from it as one call, so none of
+/// what follows may be read on its own.
 pub(crate) fn may_still_call(text: &str) -> bool {
+    if text.contains("[TOOL_CALLS]") || text.contains("<|python_tag|>") {
+        return true;
+    }
     let after = match call_spans(text).last() {
         Some(Span {
             end: SpanEnd::At(end),
@@ -416,6 +421,8 @@ fn json_end(text: &str, start: usize) -> Option<usize> {
 struct Ahead<'a> {
     text: &'a str,
     found: Vec<(&'static str, usize, Option<usize>)>,
+    /// Where the next call begins at or after a position, and the position it was found from.
+    begins: Option<(usize, Option<usize>)>,
 }
 
 impl<'a> Ahead<'a> {
@@ -423,7 +430,36 @@ impl<'a> Ahead<'a> {
         Self {
             text,
             found: Vec::new(),
+            begins: None,
         }
+    }
+
+    /// Where the next marker at or after `from` that begins a call, as the text right after it
+    /// shows (`starts_call`), opens.
+    fn next_call(&mut self, from: usize) -> Option<usize> {
+        if let Some((searched, next)) = self.begins {
+            if searched <= from && next.is_none_or(|at| at >= from) {
+                return next;
+            }
+        }
+        let mut at = from;
+        let next = loop {
+            let Some((format, marker, open)) = CALL_OPENERS
+                .iter()
+                .filter_map(|&(format, marker)| {
+                    self.find(marker, at).map(|open| (format, marker, open))
+                })
+                .min_by_key(|&(_, marker, open)| (open, std::cmp::Reverse(marker.len())))
+            else {
+                break None;
+            };
+            if starts_call(format, self.text, open, open + marker.len()) {
+                break Some(open);
+            }
+            at = open + marker.len();
+        };
+        self.begins = Some((from, next));
+        next
     }
 
     /// Where `needle` next occurs in the text at or after `from`.
@@ -552,10 +588,39 @@ fn begins_call(
         ToolCallFormat::Atem => "<atem:invoke",
         _ => return Some(true),
     };
+    // The tag counts only inside the call's own extent: before its closer, and before any
+    // other call begins, so one quoted in a later call's value does not.
     let tag_at = ahead.find(tag, body);
-    match closer.and_then(|end| ahead.find(end, body)) {
-        Some(close) => Some(tag_at.is_some_and(|at| at < close)),
-        None => tag_at.map(|_| true),
+    let close = closer.and_then(|end| ahead.find(end, body));
+    let later = ahead.next_call(body);
+    match tag_at {
+        Some(at) => {
+            Some(close.is_none_or(|close| at < close) && later.is_none_or(|later| at < later))
+        }
+        None if close.is_none() && later.is_none() => None,
+        None => Some(false),
+    }
+}
+
+/// Whether the marker of `format` that opens at `open` in `text` begins a call, judged by the
+/// text right after it, from `body`: what `begins_call` reads, with a Qwen or Atem call taken to
+/// begin only where its JSON, `<function=` or `<atem:invoke` follows the marker directly.
+fn starts_call(format: ToolCallFormat, text: &str, open: usize, body: usize) -> bool {
+    let rest = &text[body..];
+    let trimmed = rest.trim_start();
+    match format {
+        ToolCallFormat::DeepSeekDsml => dsml::opens_block(&text[open..]),
+        ToolCallFormat::Gemma4 => rest.starts_with("call:"),
+        ToolCallFormat::DeepSeek => rest.starts_with("function<｜tool▁sep｜>"),
+        ToolCallFormat::Hunyuan | ToolCallFormat::Liquid | ToolCallFormat::MistralNemo => {
+            trimmed.starts_with('[')
+        }
+        ToolCallFormat::Llama => trimmed.starts_with(['{', '[']),
+        ToolCallFormat::Qwen => {
+            trimmed.starts_with(['{', '[']) || trimmed.starts_with("<function=")
+        }
+        ToolCallFormat::Atem => trimmed.starts_with("<atem:invoke"),
+        ToolCallFormat::Harmony => false,
     }
 }
 

@@ -986,6 +986,11 @@ mod tests {
         // reads it from the message or from one of its prefixes, before any DSML block outside
         // other calls, or the entry states that its DSML block makes it.
         let mut invented = Vec::new();
+        // And the other way: a streamed run may make fewer calls than the base's streaming of the
+        // same chunks only where the base's own reading of the whole message lacks them too; a
+        // message with a DSML block outside other calls owes the block's calls instead.
+        let mut lost = Vec::new();
+        let mut fewer = std::collections::BTreeMap::<&str, usize>::new();
         let recorded = base["entries"].as_array().into_iter().flatten();
         let read = head["entries"].as_array().into_iter().flatten();
         for ((entry, base), head) in entries.iter().zip(recorded).zip(read) {
@@ -1041,6 +1046,48 @@ mod tests {
                 .into_iter()
                 .zip(streamed_base.zip(streamed_head))
             {
+                let made = head[1].as_array().map_or(0, Vec::len);
+                let streamed = base[1].as_array().map_or(0, Vec::len);
+                // A run that fails as the base's own reading of one of the prefixes fails has
+                // lost nothing the base would have made.
+                let fails_as_read = head.get("error").is_some_and(|error| {
+                    base_readings
+                        .iter()
+                        .any(|(_, reading)| reading[1].get("error") == Some(error))
+                });
+                let owed = if entry.dsml.is_some() {
+                    // A message with a DSML block outside other calls is read only as DSML: it
+                    // owes the block's calls, unless the run ended on a call made before it.
+                    usize::from(!block_calls.is_empty())
+                } else {
+                    // The base's streaming may read more than its reading of the whole
+                    // message, from what follows a marker it streamed out as text.
+                    let whole = base_readings
+                        .last()
+                        .and_then(|(_, reading)| reading[1][1].as_array())
+                        .map_or(0, Vec::len);
+                    streamed.min(whole)
+                };
+                if made < streamed {
+                    let kind = if fails_as_read {
+                        "fails as a prefix is read"
+                    } else if made >= owed {
+                        if entry.dsml.is_some() {
+                            "read only as DSML"
+                        } else {
+                            "the whole message is read with as few"
+                        }
+                    } else {
+                        "lost"
+                    };
+                    *fewer.entry(kind).or_default() += 1;
+                    if kind == "lost" {
+                        lost.push(format!(
+                            "{} streamed {chunking} (seed {STREAM_SEED:#x}): {:?} makes {made} calls where the base streams {streamed} and reads them: {}",
+                            entry.id, entry.message, base[1]
+                        ));
+                    }
+                }
                 for call in head[1].as_array().into_iter().flatten() {
                     let by_streaming = base[1].as_array().is_some_and(|calls| calls.contains(call));
                     if !by_streaming && !read_by_base(entry.message.len(), call) {
@@ -1102,7 +1149,7 @@ mod tests {
         }
         let readings: usize = entries.iter().map(|entry| entry.cuts.len()).sum();
         eprintln!(
-            "corpus: {} entries; batch: {readings} readings, {} as the base, {} intended {:?}; streaming: {} runs, {} as the base, {} intended {:?}; {} regressions; {} calls the base does not read",
+            "corpus: {} entries; batch: {readings} readings, {} as the base, {} intended {:?}; streaming: {} runs, {} as the base, {} intended {:?}; {} regressions; {} calls the base does not read; {} calls lost",
             entries.len(),
             matching[0],
             intended[0].values().sum::<usize>(),
@@ -1112,7 +1159,18 @@ mod tests {
             intended[1].values().sum::<usize>(),
             intended[1],
             regressions.len(),
-            invented.len()
+            invented.len(),
+            lost.len()
+        );
+        for failure in lost.iter().chain(&invented).chain(&regressions) {
+            eprintln!("{failure}");
+        }
+        eprintln!("streamed runs making fewer calls than the base's streaming, by why: {fewer:?}");
+        assert!(
+            lost.is_empty(),
+            "{} calls the base streams and reads that streaming loses:\n{}",
+            lost.len(),
+            lost.join("\n")
         );
         assert!(
             invented.is_empty(),
@@ -1129,35 +1187,77 @@ mod tests {
     }
 
     /// Reading a message heavy with markers takes time linear in it: each of
-    /// `parse_oracle::marker_heavy_messages`, at 20,000 markers, is read, streaming state and
-    /// calls, within `BOUND`. Read linearly, the slowest takes about 60 ms here, and doubling the
-    /// markers doubles it; read quadratically, as a search from every marker to the end does,
-    /// the Gemma 4 calls took 2.3 s and the rejected Qwen openers 19 s. `BOUND` is about 16
-    /// times the linear reading, so a slower machine does not fail it, and under every quadratic
-    /// one measured. The best of three runs is measured, and every time is printed.
+    /// `parse_oracle::marker_heavy_messages` is read, streaming state and calls, at 10,000 and at
+    /// 40,000 markers, and the second must take less than six times the first. Read linearly it
+    /// takes about four times as long; read quadratically, as a search from every marker to the
+    /// end does, about sixteen. The ratio holds on any machine, fast or slow. The best of three
+    /// runs is measured at each size, and every time is printed.
     #[test]
     fn marker_heavy_messages_are_read_in_linear_time() {
-        const MARKERS: usize = 20_000;
-        const BOUND: std::time::Duration = std::time::Duration::from_millis(BOUND_MS);
-        const BOUND_MS: u64 = 1_000;
         let matcher = super::parse_oracle::matcher();
-        let mut slow = Vec::new();
-        for (name, message) in super::parse_oracle::marker_heavy_messages(MARKERS) {
-            let best = (0..3)
+        let best = |message: &str| {
+            (0..3)
                 .map(|_| {
                     let start = std::time::Instant::now();
-                    let _ = matcher.prefix_could_be_tool(&message);
-                    let _ = matcher.get_call_with_content(&message);
+                    let _ = matcher.prefix_could_be_tool(message);
+                    let _ = matcher.get_call_with_content(message);
                     start.elapsed()
                 })
                 .min()
-                .expect("three runs");
-            eprintln!("{name}: {} bytes read in {best:?}", message.len());
-            if best > BOUND {
-                slow.push(format!("{name}: {best:?}"));
+                .expect("three runs")
+        };
+        let small = super::parse_oracle::marker_heavy_messages(10_000);
+        let large = super::parse_oracle::marker_heavy_messages(40_000);
+        let mut slow = Vec::new();
+        for ((name, small), (_, large)) in small.iter().zip(&large) {
+            let (small, large) = (best(small), best(large));
+            let ratio = large.as_secs_f64() / small.as_secs_f64();
+            eprintln!("{name}: 10,000 markers in {small:?}, 40,000 in {large:?}, {ratio:.2} times");
+            if ratio >= 6.0 {
+                slow.push(format!("{name}: {ratio:.2} times"));
             }
         }
-        assert!(slow.is_empty(), "read in more than {BOUND:?}: {slow:?}");
+        assert!(
+            slow.is_empty(),
+            "four times the markers took six times as long or more: {slow:?}"
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a stray Qwen opener before a Gemma 4 call was
+    /// taken to begin a call because a `<function=` quoted in the Gemma 4 value came before the
+    /// first `</tool_call>`, the one quoted after it, so the call ended there and a DSML block
+    /// later in the value was read as a call. A tag counts only before any later call begins.
+    #[test]
+    fn a_stray_opener_does_not_take_its_start_from_a_later_calls_value() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("write_file"), tool("delete_all")]),
+        )
+        .expect("a matcher");
+        let value = "<function=x></tool_call><｜DSML｜tool_calls><｜DSML｜invoke name=\"delete_all\"></｜DSML｜invoke></｜DSML｜tool_calls>";
+        let message = format!(
+            "<tool_call>example\n<|tool_call>call:write_file{{content:<|\"|>{value}<|\"|>}}<tool_call|>"
+        );
+        let calls: Vec<(String, Value)> = matcher
+            .get_call(&message)
+            .expect("a message")
+            .into_iter()
+            .map(|call| {
+                let arguments = serde_json::from_str(&call.function.arguments).expect("JSON");
+                (call.function.name, arguments)
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [("write_file".to_string(), json!({ "content": value }))]
+        );
     }
 
     /// regression test for spiceai/mistral.rs#54: a stray Gemma 4 opener before a real call
