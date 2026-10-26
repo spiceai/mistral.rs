@@ -846,10 +846,13 @@ fn unenforceable_tool(tool: &Tool) -> Option<String> {
         ));
     }
     let required = object.get("required").and_then(Value::as_array)?;
-    // A property whose schema is `false` admits no value, so one that is required cannot be
-    // written at all.
+    // A property whose schema is `false`, or refers to one, admits no value, so one that is
+    // required cannot be written at all.
+    let anchors = anchors(&schema);
     if let Some(unsatisfiable) = required.iter().filter_map(Value::as_str).find(|required| {
-        declared.is_some_and(|declared| declared.get(*required) == Some(&Value::Bool(false)))
+        declared
+            .and_then(|declared| declared.get(*required))
+            .is_some_and(|property| admits_nothing(&schema, property, &anchors))
     }) {
         return Some(format!(
             "Tool '{name}' is strict, and its parameters schema requires `{unsatisfiable}` with the schema `false`, which no value satisfies, so no call to it can be written. Allow a value for `{unsatisfiable}`, or stop requiring it."
@@ -878,18 +881,113 @@ fn writable_name(name: &str) -> bool {
 const TOOL_SCHEMA: &str = "tool";
 
 /// The schema of property `name` of the tool schema `root`, as a schema of its own: a reference
-/// into a copy of the whole tool schema, kept under a definition, with every reference in the
-/// copy rebased onto it. A reference in the tool schema is relative to the tool schema's root,
-/// so one to the root's `$defs`, to another property, or into the property's own definitions
+/// into a copy of the tool schema, kept under a definition, with every reference in the copy
+/// rebased onto it. A reference in the tool schema is relative to the tool schema's root, so
+/// one to the root's `$defs`, to another property, or into the property's own definitions
 /// resolves as it does there; a property copied out alone would lose the first two, and could
-/// bind the first to definitions of its own.
-fn property_schema(root: &Value, name: &str) -> Value {
-    let mut tool = root.clone();
+/// bind the first to definitions of its own. The copy holds only the parts of the tool schema
+/// the property reaches (`reached_copy`), each in its place, so a tool's grammar grows with its
+/// schema rather than with its schema times its parameters; `anchors` are the tool schema's.
+fn property_schema(root: &Value, name: &str, anchors: &HashMap<String, String>) -> Value {
+    let property = format!("/properties/{}", pointer_segment(name));
+    let mut tool = reached_copy(root, &property, anchors).unwrap_or_else(|| root.clone());
     rebase_references(&mut tool, &format!("#/$defs/{TOOL_SCHEMA}"));
     serde_json::json!({
-        "$ref": format!("#/$defs/{TOOL_SCHEMA}/properties/{}", pointer_segment(name)),
+        "$ref": format!("#/$defs/{TOOL_SCHEMA}{property}"),
         "$defs": { TOOL_SCHEMA: tool },
     })
+}
+
+/// A copy of the parts of `root` that the schema at `pointer` reaches: that schema, and each
+/// schema a reference in a part copied names, transitively, each at its own place, so the
+/// references resolve as they do in `root`. `None` where only a copy of the whole keeps them in
+/// place: a part that is the root itself, sits inside an array, or is not found.
+fn reached_copy(root: &Value, pointer: &str, anchors: &HashMap<String, String>) -> Option<Value> {
+    let within = |pointer: &str, ancestor: &str| {
+        pointer == ancestor
+            || pointer
+                .strip_prefix(ancestor)
+                .is_some_and(|rest| rest.starts_with('/'))
+    };
+    let mut reached: Vec<String> = Vec::new();
+    let mut pending = vec![pointer.to_string()];
+    while let Some(pointer) = pending.pop() {
+        if pointer.is_empty() {
+            return None;
+        }
+        if reached.iter().any(|seen| within(&pointer, seen)) {
+            continue;
+        }
+        let part = root.pointer(&pointer)?;
+        for inner in schema_pointers(part) {
+            if let Some(reference) = part
+                .pointer(&inner)
+                .and_then(|schema| schema.get("$ref"))
+                .and_then(Value::as_str)
+            {
+                pending.push(reference_target(reference, anchors)?);
+            }
+        }
+        reached.retain(|seen| !within(seen, &pointer));
+        reached.push(pointer);
+    }
+    /// `source`'s part at `segments`, placed at the same segments in `target`.
+    fn place(target: &mut Value, source: &Value, segments: &[String]) -> Option<()> {
+        let (first, rest) = segments.split_first()?;
+        let source = source.as_object()?.get(first)?;
+        let map = target.as_object_mut()?;
+        if rest.is_empty() {
+            map.insert(first.clone(), source.clone());
+            return Some(());
+        }
+        let next = map
+            .entry(first.clone())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        place(next, source, rest)
+    }
+    let mut copy = Value::Object(serde_json::Map::new());
+    for pointer in &reached {
+        let segments: Vec<String> = pointer
+            .split('/')
+            .skip(1)
+            .map(|segment| segment.replace("~1", "/").replace("~0", "~"))
+            .collect();
+        place(&mut copy, root, &segments)?;
+    }
+    Some(copy)
+}
+
+/// The pointer, in its document, of the schema `reference` names: `#` is the root, `#/...` a
+/// pointer from it, and `#name` the schema declaring `$anchor: "name"`, among `anchors`.
+fn reference_target(reference: &str, anchors: &HashMap<String, String>) -> Option<String> {
+    let fragment = reference.strip_prefix('#')?;
+    if fragment.is_empty() || fragment.starts_with('/') {
+        Some(fragment.to_string())
+    } else {
+        anchors.get(fragment).cloned()
+    }
+}
+
+/// Whether `schema`, in the tool schema `root` whose anchors are `anchors`, admits no value: it
+/// is `false`, or a `$ref` that leads, through more of them, to `false`.
+fn admits_nothing(root: &Value, schema: &Value, anchors: &HashMap<String, String>) -> bool {
+    let mut schema = schema;
+    // A cycle of references leads nowhere; the bound ends one.
+    for _ in 0..64 {
+        if *schema == Value::Bool(false) {
+            return true;
+        }
+        let Some(target) = schema
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|reference| reference_target(reference, anchors))
+            .and_then(|pointer| root.pointer(&pointer))
+        else {
+            return false;
+        };
+        schema = target;
+    }
+    false
 }
 
 /// `key` as a segment of a JSON pointer, which escapes `~` and `/`.
@@ -1139,11 +1237,13 @@ fn emit_arguments(
     let mut names = properties.keys().collect::<Vec<_>>();
     names.sort();
     let mut sequence = Vec::new();
+    let anchors = anchors(&schema);
     for (property_index, name) in names.into_iter().enumerate() {
         let parameter = format!("parameter_{tool_index}_{property_index}");
         let property = &properties[name];
-        // A property whose schema is `false` admits no value: the call leaves it out.
-        if *property == Value::Bool(false) {
+        // A property whose schema is `false`, or refers to one, admits no value: the call
+        // leaves it out.
+        if admits_nothing(&schema, property, &anchors) {
             continue;
         }
         let open = tag(false, &format!("parameter name=\"{name}\" string=\""));
@@ -1155,7 +1255,7 @@ fn emit_arguments(
             let grammar = format!("dsml_schema_{tool_index}_{property_index}");
             schemas.push(GrammarWithLexer {
                 name: Some(grammar.clone()),
-                json_schema: Some(property_schema(&schema, name)),
+                json_schema: Some(property_schema(&schema, name, &anchors)),
                 ..Default::default()
             });
             format!("{as_json} @{grammar} {close}")
@@ -1426,23 +1526,21 @@ mod tests {
         );
         // Each property's schema, then the any-JSON grammar for parameters no schema holds.
         assert_eq!(grammar.grammars.len(), 4);
-        // A property's schema refers into the whole tool schema, so its references resolve as
-        // they do there.
+        // A property's schema refers into a copy of the parts of the tool schema it reaches, in
+        // their places, so its references resolve as they do there.
         let tool_schema = bash(true).function.parameters.expect("parameters");
-        assert_eq!(
-            grammar.grammars[1].json_schema,
-            Some(serde_json::json!({
-                "$ref": "#/$defs/tool/properties/command",
-                "$defs": { "tool": tool_schema },
-            }))
-        );
-        assert_eq!(
-            grammar.grammars[2].json_schema,
-            Some(serde_json::json!({
-                "$ref": "#/$defs/tool/properties/timeout",
-                "$defs": { "tool": tool_schema },
-            }))
-        );
+        for (index, name) in [(1, "command"), (2, "timeout")] {
+            assert_eq!(
+                grammar.grammars[index].json_schema,
+                Some(serde_json::json!({
+                    "$ref": format!("#/$defs/tool/properties/{name}"),
+                    "$defs": {
+                        "tool": { "properties": { name: tool_schema["properties"][name] } },
+                    },
+                })),
+                "{name}"
+            );
+        }
         assert_eq!(grammar.grammars[3].name.as_deref(), Some("dsml_json"));
     }
 
@@ -1504,22 +1602,22 @@ mod tests {
             "required": ["pinned", "listed", "nested"],
             "additionalProperties": false,
         });
-        let schema = property_schema(&root, "pinned");
-        let tool_copy = &schema["$defs"]["tool"];
+        let copy =
+            |name: &str| property_schema(&root, name, &anchors(&root))["$defs"]["tool"].clone();
         assert_eq!(
-            tool_copy["properties"]["pinned"]["const"],
+            copy("pinned")["properties"]["pinned"]["const"],
             serde_json::json!({ "$ref": "#/original" })
         );
         assert_eq!(
-            tool_copy["properties"]["listed"]["enum"],
+            copy("listed")["properties"]["listed"]["enum"],
             serde_json::json!([{ "$ref": "#/original" }])
         );
         assert_eq!(
-            tool_copy["properties"]["listed"]["default"],
+            copy("listed")["properties"]["listed"]["default"],
             serde_json::json!({ "$ref": "#/d" })
         );
         assert_eq!(
-            tool_copy["properties"]["nested"]["items"]["$ref"],
+            copy("nested")["properties"]["nested"]["items"]["$ref"],
             serde_json::json!("#/$defs/tool/$defs/Any")
         );
         // Through the forced grammar: the constant as the schema gives it, and nothing else.
@@ -1820,17 +1918,18 @@ mod tests {
             "required": ["n", "m", "max"],
             "additionalProperties": false,
         });
-        let copy = &property_schema(&schema, "n")["$defs"]["tool"]["properties"];
+        let copy =
+            |name: &str| property_schema(&schema, name, &anchors(&schema))["$defs"]["tool"].clone();
         assert_eq!(
-            copy["n"]["$ref"],
+            copy("n")["properties"]["n"]["$ref"],
             serde_json::json!("#/$defs/tool/$defs/Count")
         );
         assert_eq!(
-            copy["m"]["$ref"],
+            copy("m")["properties"]["m"]["$ref"],
             serde_json::json!("#/$defs/tool/$defs/Count")
         );
         assert_eq!(
-            copy["max"]["$ref"],
+            copy("max")["properties"]["max"]["$ref"],
             serde_json::json!("#/$defs/tool/properties/min")
         );
         let anchored = tool(schema);
@@ -1929,7 +2028,8 @@ mod tests {
         let annotated = tool(schema.clone());
         assert_eq!(unenforceable_tool(&annotated), None);
         assert_eq!(
-            property_schema(&schema, "n")["$defs"]["tool"]["properties"]["again"]["$ref"],
+            property_schema(&schema, "again", &anchors(&schema))["$defs"]["tool"]["properties"]
+                ["again"]["$ref"],
             serde_json::json!("#/$defs/tool")
         );
         let tools = std::slice::from_ref(&annotated);
@@ -2444,6 +2544,93 @@ mod tests {
             );
         }
         assert!(calls(&valid.replace("command", "a.b-c_9")).is_some());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: an optional property whose schema is a `$ref`
+    /// to a `false` schema, one the call must leave out, was compiled into a sub-grammar no value
+    /// satisfies, which does not compile, so no call to any tool offered beside it was
+    /// constrained. A property's schema is resolved through its references before the check.
+    #[test]
+    fn a_strict_property_referring_to_a_false_schema_is_left_out() {
+        let schema = |required: &[&str]| {
+            tool(serde_json::json!({
+                "type": "object",
+                "$defs": { "Never": false, "Alias": { "$ref": "#/$defs/Never" } },
+                "properties": {
+                    "command": { "type": "string" },
+                    "blocked": { "$ref": "#/$defs/Never" },
+                    "aliased": { "$ref": "#/$defs/Alias" },
+                },
+                "required": required,
+                "additionalProperties": false,
+            }))
+        };
+        let optional = schema(&["command"]);
+        let tools = std::slice::from_ref(&optional);
+        assert_eq!(unenforceable(tools), None);
+        let (env, _) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        assert_eq!(
+            factory
+                .create_parser(build_dsml_grammar(tools, Block::Whole))
+                .err()
+                .map(|error| error.to_string()),
+            None
+        );
+        assert!(forced_call_accepts(
+            tools,
+            &one_call("set", &[("command", "true", "ls")])
+        ));
+        for written in ["blocked", "aliased"] {
+            assert!(
+                !forced_call_accepts(
+                    tools,
+                    &one_call("set", &[(written, "true", "x"), ("command", "true", "ls")])
+                ),
+                "{written}"
+            );
+        }
+        // Required, it cannot be written at all.
+        let why = unenforceable(&[schema(&["command", "aliased"])]).expect("refused");
+        assert!(
+            why.contains("`aliased`") && why.contains("`false`"),
+            "{why}"
+        );
+    }
+
+    /// regression test for spiceai/mistral.rs#54: each parameter's sub-grammar held a copy of
+    /// the whole tool schema, so a strict tool's grammar grew with the square of its parameters:
+    /// 1000 parameters with 1 KB descriptions copied 1 GB. Each now holds only what the
+    /// parameter's schema reaches. Four times the parameters must take less than six times the
+    /// space (linear is four, square sixteen), and 1000 of them under 64 MB.
+    #[test]
+    fn a_strict_tools_grammar_grows_linearly_with_its_parameters() {
+        let copied = |parameters: usize| {
+            let properties: serde_json::Map<String, Value> = (0..parameters)
+                .map(|index| {
+                    let schema =
+                        serde_json::json!({ "type": "string", "description": "d".repeat(1024) });
+                    (format!("p{index}"), schema)
+                })
+                .collect();
+            let strict = tool(serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "additionalProperties": false,
+            }));
+            build_dsml_grammar(std::slice::from_ref(&strict), Block::Whole)
+                .grammars
+                .iter()
+                .filter_map(|grammar| grammar.json_schema.as_ref())
+                .map(|schema| serde_json::to_string(schema).expect("JSON").len())
+                .sum::<usize>()
+        };
+        let (small, large) = (copied(250), copied(1000));
+        let hundredths = large * 100 / small;
+        let ratio = format!("{}.{:02} times", hundredths / 100, hundredths % 100);
+        eprintln!("250 parameters: {small} bytes of sub-grammar schemas; 1000: {large}; {ratio}");
+        assert!(large < small * 6, "{ratio}");
+        assert!(large < 64 << 20, "{large} bytes");
     }
 
     /// regression test for spiceai/mistral.rs#54: a strict schema that admits parameters it does
