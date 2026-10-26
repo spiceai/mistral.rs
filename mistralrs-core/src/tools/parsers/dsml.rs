@@ -614,7 +614,9 @@ enum Block<'a> {
 }
 
 /// The grammar for the rest of the block that `text`, the message so far, ends by opening:
-/// its opening tag is complete, and only whitespace follows it. The grammar writes the
+/// its opening tag is complete, and only whitespace follows it. That block is the last the
+/// message opens, after any it has closed, an empty or malformed one included, as a block
+/// after one that makes no call still makes its own. The grammar writes the
 /// invocations and the closing tag under the name the block opened with, so a call the model
 /// writes on its own is held to the offered tools and to a strict tool's schema, as in the other
 /// formats; a strict tool whose schema the grammar cannot hold (`unenforceable`) is written as
@@ -622,7 +624,14 @@ enum Block<'a> {
 /// block's body has begun, where a grammar could not know what the model has written, and when
 /// the opening tag cannot be read.
 pub(super) fn continuation_grammar(tools: &[Tool], text: &str) -> Option<TopLevelGrammar> {
-    let start = block_start(text)?;
+    let start = match super::call_spans(text).last() {
+        Some(super::Span {
+            format: Some(super::ToolCallFormat::DeepSeekDsml),
+            open,
+            end: super::SpanEnd::Open,
+        }) => *open,
+        _ => return None,
+    };
     let Scan::Done((attributes, length)) = tag_at(&text[start..], false, &BLOCK_NAMES) else {
         return None;
     };
@@ -858,6 +867,49 @@ fn unenforceable_tool(tool: &Tool) -> Option<String> {
     Some(format!(
         "Tool '{name}' is strict, and its parameters schema requires `{missing}` without declaring it in `properties`, so a required DeepSeek-V4 tool call cannot write it. Declare `{missing}` in `properties`, or remove `strict` from the tool."
     ))
+}
+
+/// The names a tool's parameters `schema` gives its parameters, in order: those its
+/// `properties` declare and its `required` lists, and those of every `allOf`, `anyOf` and
+/// `oneOf` branch, followed through the local references the schema makes, as a call may
+/// write any of them and may need some of them.
+fn parameter_names(schema: &Value) -> Vec<String> {
+    let anchors = anchors(schema);
+    let mut names = std::collections::BTreeSet::new();
+    let mut pending = vec![schema];
+    let mut followed = std::collections::HashSet::new();
+    while let Some(part) = pending.pop() {
+        let Some(object) = part.as_object() else {
+            continue;
+        };
+        if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+            names.extend(properties.keys().cloned());
+        }
+        if let Some(required) = object.get("required").and_then(Value::as_array) {
+            names.extend(
+                required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string),
+            );
+        }
+        for keyword in ["allOf", "anyOf", "oneOf"] {
+            if let Some(branches) = object.get(keyword).and_then(Value::as_array) {
+                pending.extend(branches);
+            }
+        }
+        // A reference is followed once, so a schema that refers to itself is read through.
+        if let Some(target) = object
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|reference| reference_target(reference, &anchors))
+        {
+            if followed.insert(target.clone()) {
+                pending.extend(schema.pointer(&target));
+            }
+        }
+    }
+    names.into_iter().collect()
 }
 
 /// Whether a parameter name can be written in a tag's `name="..."` attribute and read back:
@@ -1160,36 +1212,47 @@ fn emit_arguments(
         // A tool that is not strict takes any value. Its declared parameters are written at
         // most once each, as the parser reads a parameter given twice as malformed; one that
         // declares none takes any parameters.
-        let declared = tool
-            .function
-            .parameters
-            .as_ref()
-            .and_then(|parameters| parameters.get("properties"))
-            .and_then(Value::as_object);
-        let Some(declared) = declared.filter(|declared| !declared.is_empty()) else {
+        let Some(parameters) = tool.function.parameters.as_ref().filter(|parameters| {
+            parameters
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|declared| !declared.is_empty())
+        }) else {
             rules.push(format!("{arguments}: dsml_parameter*"));
             return arguments;
         };
         // A name the markup cannot write is left out: the model could not write it either.
-        let mut names = declared
-            .keys()
+        let schema = Value::Object(
+            parameters
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
+        let names = parameter_names(&schema)
+            .into_iter()
             .filter(|name| writable_name(name))
             .collect::<Vec<_>>();
-        names.sort();
         let mut sequence = Vec::new();
+        // Each parameter's tag is written as the same opening, then its name, so the name of a
+        // parameter written as another (`other_parameter_…`) is read as a name, whatever
+        // declared name it begins as: a tag spelled whole around a declared name would leave
+        // the parser's lexer reading `command` as the start of `cwd`, and failing.
         for (property_index, name) in names.iter().enumerate() {
             let parameter = format!("parameter_{tool_index}_{property_index}");
             rules.push(format!(
-                "{parameter}: {open} (\"true\" {after} {VALUE_THEN_CLOSE} | \"false\" {after} @{ANY_JSON} {close})",
-                open = tag(false, &format!("parameter name=\"{name}\" string=\"")),
+                "{parameter}: {open} {name} {string} (\"true\" {after} {VALUE_THEN_CLOSE} | \"false\" {after} @{ANY_JSON} {close})",
+                open = tag(false, "parameter name=\""),
+                name = lark_literal(name),
+                string = lark_literal("\" string=\""),
                 after = lark_literal("\">"),
                 close = tag(true, "parameter>\n"),
             ));
             sequence.push(format!("{parameter}?"));
         }
-        // A strict tool's schema may require a parameter it does not declare, through `allOf`
-        // or the like, so the grammar standing in for one it cannot hold also takes any other
-        // parameter the markup can write; the call is held to the whole schema when read.
+        // A strict tool's schema may require a parameter it gives nowhere `parameter_names`
+        // reads, through `dependentRequired` or `if` and `then`, so the grammar standing in
+        // for one it cannot hold also takes any other parameter the markup can write; the call
+        // is held to the whole schema when read.
         if strict {
             let other = format!("other_parameter_{tool_index}");
             let other_name = format!("OTHER_NAME_{tool_index}");
@@ -3145,5 +3208,109 @@ mod tests {
             Some(serde_json::json!([{"name": "set", "arguments": {"a": "1", "b": "2"}}]))
         );
         assert_eq!(calls(&twice), None);
+    }
+
+    /// regression test for spiceai/mistral.rs#54: the grammar wrote a tool's parameters from
+    /// its schema's root `properties` only, so a parameter an `allOf` branch declares and
+    /// requires could not be written, by a tool that is not strict or by a strict one, and a
+    /// forced or continued call could only leave it out.
+    #[test]
+    fn a_parameter_an_allof_branch_requires_can_be_written() {
+        let tool = |strict: Option<bool>| -> Tool {
+            let mut function = serde_json::json!({
+                "name": "Bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "cwd": { "type": "string" } },
+                    "allOf": [{
+                        "required": ["command"],
+                        "properties": { "command": { "type": "string" } },
+                    }],
+                },
+            });
+            if let Some(strict) = strict {
+                function["strict"] = serde_json::json!(strict);
+            }
+            serde_json::from_value(serde_json::json!({ "type": "function", "function": function }))
+                .expect("tool")
+        };
+        let opener = format!("<{DSML}tool_calls>");
+        for strict in [None, Some(false), Some(true)] {
+            let tools = [tool(strict)];
+            for call in [
+                one_call("Bash", &[("command", "true", "ls")]),
+                one_call(
+                    "Bash",
+                    &[("command", "true", "ls"), ("cwd", "true", "/tmp")],
+                ),
+            ] {
+                assert!(forced_call_accepts(&tools, &call), "{strict:?} {call}");
+                assert!(
+                    continuation_accepts(&tools, &opener, &call[opener.len()..]),
+                    "{strict:?} {call}"
+                );
+            }
+            // A name the schema gives nowhere is still not written.
+            let other = one_call("Bash", &[("shell", "true", "sh")]);
+            if strict != Some(true) {
+                assert!(!forced_call_accepts(&tools, &other), "{strict:?}");
+            }
+        }
+        // A strict tool's schema may require a name it gives nowhere the grammar reads, and the
+        // grammar standing in for the schema takes it, whatever declared name it begins as.
+        let dependent: Tool = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": { "cwd": { "type": "string" } },
+                    "dependentRequired": { "cwd": ["command"] },
+                },
+            },
+        }))
+        .expect("tool");
+        for name in ["command", "cwdx", "shell"] {
+            let call = one_call("Bash", &[(name, "true", "ls")]);
+            assert!(
+                forced_call_accepts(std::slice::from_ref(&dependent), &call),
+                "{name}"
+            );
+        }
+    }
+
+    /// regression test for spiceai/mistral.rs#54: the continuation grammar took over only at
+    /// the message's first block, so after a block that makes no call, empty or malformed with
+    /// its tags in place, a later block, whose calls are made, was written with no grammar,
+    /// and a strict tool's call in it was not held to its schema.
+    #[test]
+    fn the_continuation_grammar_takes_over_a_block_after_one_that_makes_no_call() {
+        let tools = [bash(true)];
+        let body = format!(
+            "\n<{DSML}invoke name=\"Bash\">\n<{DSML}parameter name=\"command\" string=\"true\">ls</{DSML}parameter>\n</{DSML}invoke>\n</{DSML}tool_calls>"
+        );
+        let without_command =
+            format!("\n<{DSML}invoke name=\"Bash\">\n</{DSML}invoke>\n</{DSML}tool_calls>");
+        for before in [
+            format!("<{DSML}tool_calls>\n</{DSML}tool_calls>\n"),
+            format!("<{DSML}tool_calls>\n<{DSML}invoke>\n</{DSML}invoke>\n</{DSML}tool_calls>\n"),
+        ] {
+            let opener = format!("{before}<{DSML}tool_calls>");
+            assert!(
+                continuation_grammar(&tools, &opener).is_some(),
+                "{opener:?}"
+            );
+            assert!(continuation_accepts(&tools, &opener, &body), "{opener:?}");
+            assert!(
+                !continuation_accepts(&tools, &opener, &without_command),
+                "{opener:?}"
+            );
+            assert_eq!(
+                calls(&format!("{opener}{body}")),
+                Some(serde_json::json!([{ "name": "Bash", "arguments": { "command": "ls" } }])),
+                "{opener:?}"
+            );
+        }
     }
 }

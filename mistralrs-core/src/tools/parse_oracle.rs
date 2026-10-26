@@ -1021,6 +1021,14 @@ const RECOGNITION: [&str; 9] = [
     "<｜DSML｜invoke name=\"x\">",
 ];
 
+/// The index in `SHAPES` of the format named `name`.
+fn shape_named(name: &str) -> usize {
+    SHAPES
+        .iter()
+        .position(|&(shape, _, _)| shape == name)
+        .expect("a format in SHAPES")
+}
+
 /// A call to `write_file` in the format `SHAPES[shape]`, its `content` the text `value`,
 /// escaped as that format escapes a value, so the whole of `value` is the value's text.
 fn shaped_call(shape: usize, value: &str) -> String {
@@ -1300,6 +1308,54 @@ fn values_holding_markers() -> Vec<Entry> {
     entries
 }
 
+/// For Gemma 4 and Liquid, a finished call to `write_file` whose `content` is each format's
+/// marker, DSML's included, a DSML tag that opens no block, or a DSML block, written unquoted
+/// and quoted, then a DSML block after the call: the call ends at its closer, so the block after
+/// it claims the message and makes its call.
+fn calls_then_blocks() -> Vec<Entry> {
+    let values = SPLICED
+        .iter()
+        .enumerate()
+        .map(|(index, &(opener, _))| (format!("marker={index}"), opener.to_string()))
+        .chain([
+            ("dsml-tag".to_string(), "<｜DSML｜note>".to_string()),
+            ("dsml-block".to_string(), DELETE_ALL.to_string()),
+        ]);
+    let mut entries = Vec::new();
+    for (label, value) in values {
+        for (format, writing, written) in [
+            (
+                "gemma4",
+                "unquoted",
+                format!("<|tool_call>call:write_file{{content:{value}}}<tool_call|>"),
+            ),
+            (
+                "gemma4",
+                "quoted",
+                format!("<|tool_call>call:write_file{{content:<|\"|>{value}<|\"|>}}<tool_call|>"),
+            ),
+            (
+                "liquid",
+                "unquoted",
+                format!("<|tool_call_start|>[write_file(content={value})]<|tool_call_end|>"),
+            ),
+            (
+                "liquid",
+                "quoted",
+                format!("<|tool_call_start|>[write_file(content='{value}')]<|tool_call_end|>"),
+            ),
+        ] {
+            let at = written.len() + 1;
+            entries.push(mutated(
+                format!("call-then-block:{format}:{writing}:{label}"),
+                format!("{written}\n{}", write_file_hello_block()),
+                Some((at, vec![call("write_file", &json!({ "content": "hello" }))])),
+            ));
+        }
+    }
+    entries
+}
+
 /// Messages heavy with markers, `n` of them each, by name: Qwen openers rejected for want of a
 /// call, repeated Gemma 4 calls with no arguments, DSML openers in a bare-JSON string, closing
 /// tags in a JSON parameter value, and, for every format, `n` stray openers before a real call.
@@ -1339,6 +1395,24 @@ pub(super) fn marker_heavy_messages(n: usize) -> Vec<(String, String)> {
             ),
         ));
     }
+    // An unquoted value holding a marker, its call never closed, is read on to the next call,
+    // whose own braces or brackets it passes over once they have been matched.
+    messages.push((
+        "unquoted-values:gemma4".to_string(),
+        format!(
+            "{}{}",
+            "<|tool_call>call:write_file{content:<tool_call>\n".repeat(n),
+            shaped_call(shape_named("gemma4"), "hello")
+        ),
+    ));
+    messages.push((
+        "unquoted-values:liquid".to_string(),
+        format!(
+            "{}{}",
+            "<|tool_call_start|>[write_file(content=<tool_call>\n".repeat(n),
+            shaped_call(shape_named("liquid"), "hello")
+        ),
+    ));
     // Each unfinished call is read up to the next, which decides whether the one before it
     // begins a call at all.
     for shape in 0..=SHAPES.len() {
@@ -1401,7 +1475,7 @@ fn mutated(id: String, message: String, dsml: Option<(usize, Vec<(String, String
 
 /// The hand-written entries, then `GENERATED` drawn from `SEED`, then the mutations, then the
 /// unfinished calls followed by a call in every format, then the Gemma 4 and Liquid values that
-/// hold markers.
+/// hold markers, then the Gemma 4 and Liquid calls holding markers before a DSML block.
 pub(super) fn corpus() -> Vec<Entry> {
     let mut entries = hand_corpus();
     let mut rng = Rng(SEED);
@@ -1409,5 +1483,6 @@ pub(super) fn corpus() -> Vec<Entry> {
     entries.extend(mutations());
     entries.extend(unfinished_then_call());
     entries.extend(values_holding_markers());
+    entries.extend(calls_then_blocks());
     entries
 }

@@ -455,6 +455,12 @@ struct Ahead<'a> {
     tails: std::collections::HashMap<(usize, &'static str), Reading>,
     /// How the JSON value that begins at an offset reads, once read.
     json_values: std::collections::HashMap<usize, Json>,
+    /// Where the Gemma 4 brace at an offset, outside a quoted value, is matched, once read, and
+    /// `None` where it never is.
+    braces: std::collections::HashMap<usize, Option<usize>>,
+    /// Where the Liquid bracket at an offset, outside a string, is matched before any closer,
+    /// once read, and `None` where it never is.
+    brackets: std::collections::HashMap<usize, Option<usize>>,
 }
 
 impl<'a> Ahead<'a> {
@@ -484,6 +490,8 @@ impl<'a> Ahead<'a> {
             occurrences: Vec::new(),
             tails: std::collections::HashMap::new(),
             json_values: std::collections::HashMap::new(),
+            braces: std::collections::HashMap::new(),
+            brackets: std::collections::HashMap::new(),
         }
     }
 
@@ -699,9 +707,8 @@ impl<'a> Ahead<'a> {
         let Some(brace) = brace else {
             return Ok(first.map_or(Reading::Open, |first| Reading::Call(first + end.len())));
         };
-        let after = match self.gemma4_braces(brace) {
-            Ok(after) => after,
-            Err(reading) => return Ok(reading),
+        let Some(after) = self.gemma4_braces(brace) else {
+            return Ok(Reading::Open);
         };
         let close = self.find(end, after);
         if let Some(reading) = self.cut(after, close, inline)? {
@@ -711,18 +718,22 @@ impl<'a> Ahead<'a> {
     }
 
     /// Where the braces of a Gemma 4 call's arguments, which open at `brace`, close, counting
-    /// only braces outside its values quoted in `<|"|>`; or, as `Err`, how the call reads when
-    /// they do not: open while a value or a brace is, and at a marker in them. Gemma 4 reads an
-    /// unquoted value as its text, which may hold a marker, so a marker there is no call of its
-    /// own and cannot cut this one short: the call holds what follows, and makes no call the
-    /// message does not, and the braces are read no further than the marker.
-    fn gemma4_braces(&self, brace: usize) -> std::result::Result<usize, Reading> {
+    /// only braces outside its values quoted in `<|"|>`; `None` while they have not. Gemma 4
+    /// reads an unquoted value as its text, so a marker in the braces is an argument's text, as
+    /// a marker in a quoted value is. Each brace met on the way is matched once: a brace another
+    /// call's braces reach, outside a quoted value, is matched as it is on its own, so its
+    /// region is passed over in one step, and the braces of one text are read in time linear in
+    /// it.
+    fn gemma4_braces(&mut self, brace: usize) -> Option<usize> {
         const QUOTE: &str = "<|\"|>";
+        if let Some(&matched) = self.braces.get(&brace) {
+            return matched;
+        }
         let text = self.text;
-        let mut depth = 0usize;
+        // The braces opened and not yet matched, the innermost last.
+        let mut open = vec![brace];
         let mut quoted = false;
-        let mut marker = self.first_marker_at(brace);
-        let mut at = brace;
+        let mut at = brace + 1;
         while let Some(c) = text[at..].chars().next() {
             if text[at..].starts_with(QUOTE) {
                 quoted = !quoted;
@@ -730,31 +741,22 @@ impl<'a> Ahead<'a> {
                 continue;
             }
             if !quoted {
-                if c == '<' || c == '[' {
-                    while self
-                        .markers
-                        .get(marker)
-                        .is_some_and(|&(open, _, _)| open < at)
-                    {
-                        marker += 1;
-                    }
-                    if self
-                        .markers
-                        .get(marker)
-                        .is_some_and(|&(open, _, _)| open == at)
-                    {
-                        return Err(Reading::Open);
-                    }
-                }
                 match c {
-                    '{' => depth += 1,
+                    '{' => match self.braces.get(&at) {
+                        Some(&Some(matched)) => {
+                            at = matched;
+                            continue;
+                        }
+                        // A brace inside these that never closes leaves them open too.
+                        Some(&None) => break,
+                        None => open.push(at),
+                    },
                     '}' => {
-                        let Some(outer) = depth.checked_sub(1) else {
-                            return Err(Reading::Open);
-                        };
-                        depth = outer;
-                        if depth == 0 {
-                            return Ok(at + 1);
+                        if let Some(inner) = open.pop() {
+                            self.braces.insert(inner, Some(at + 1));
+                        }
+                        if open.is_empty() {
+                            return Some(at + 1);
                         }
                     }
                     _ => {}
@@ -762,7 +764,10 @@ impl<'a> Ahead<'a> {
             }
             at += c.len_utf8();
         }
-        Err(Reading::Open)
+        for unmatched in open {
+            self.braces.insert(unmatched, None);
+        }
+        None
     }
 
     /// A DeepSeek call, from after its `function<｜tool▁sep｜>`: its name and fence, its
@@ -915,71 +920,84 @@ impl<'a> Ahead<'a> {
     /// A Liquid call, from its `[`: it ends at the first closer `end` outside a string quoted
     /// in `"` or `'`, where `\` escapes the next character, once its list has closed right
     /// before it, every bracket outside the strings matched; one that has not stays open and
-    /// holds what follows. So does one that holds a marker outside its strings: Liquid reads an
-    /// unquoted value as its text, which may hold a marker, so a marker there is no call of its
-    /// own and cannot cut this one short, and the call is read no further than the marker.
-    fn liquid(&self, body: usize, end: &'static str) -> Reading {
+    /// holds what follows. Liquid reads an unquoted value as its text, so a marker in the list
+    /// is an argument's text, as a marker in a string is. Each bracket met on the way is matched
+    /// once, as `gemma4_braces` matches a brace.
+    fn liquid(&mut self, body: usize, end: &'static str) -> Reading {
         let text = self.text;
+        let list = body + (text[body..].len() - text[body..].trim_start().len());
+        // The brackets opened and not yet matched, the innermost last.
+        let mut open = Vec::new();
         let mut quote = None;
         let mut escaped = false;
-        let mut depth = 0usize;
         let mut last = ' ';
-        let mut marker = self.first_marker_at(body);
-        for (offset, c) in text[body..].char_indices() {
-            let at = body + offset;
-            if let Some(open) = quote {
+        let mut at = list;
+        match self.brackets.get(&list) {
+            Some(&Some(matched)) => {
+                at = matched;
+                last = text[..matched].chars().next_back().unwrap_or(' ');
+            }
+            Some(&None) => return Reading::Open,
+            None => {}
+        }
+        let reading = loop {
+            let Some(c) = text[at..].chars().next() else {
+                break Reading::Open;
+            };
+            if let Some(opened) = quote {
                 if escaped {
                     escaped = false;
                 } else if c == '\\' {
                     escaped = true;
-                } else if c == open {
+                } else if c == opened {
                     quote = None;
                     last = c;
                 }
+                at += c.len_utf8();
                 continue;
             }
-            let closed = depth == 0 && last == ']';
+            let closed = open.is_empty() && last == ']';
             if text[at..].starts_with(end) {
-                return if closed {
+                break if closed {
                     Reading::Call(at + end.len())
                 } else {
                     Reading::Open
                 };
             }
-            if matches!(c, '<' | '[') {
-                while self
-                    .markers
-                    .get(marker)
-                    .is_some_and(|&(open, _, _)| open < at)
-                {
-                    marker += 1;
-                }
-                if self
-                    .markers
-                    .get(marker)
-                    .is_some_and(|&(open, _, _)| open == at)
-                {
-                    return Reading::Open;
-                }
-            }
             // Only whitespace may come between the closed list and the closer.
             if closed && !c.is_whitespace() {
-                return Reading::Open;
+                break Reading::Open;
             }
             match c {
                 '"' | '\'' => quote = Some(c),
-                '[' | '(' | '{' => depth += 1,
-                ']' | ')' | '}' => match depth.checked_sub(1) {
-                    Some(outer) => depth = outer,
-                    None => return Reading::Open,
+                '[' | '(' | '{' if !open.is_empty() => match self.brackets.get(&at) {
+                    Some(&Some(matched)) => {
+                        at = matched;
+                        last = text[..matched].chars().next_back().unwrap_or(c);
+                        continue;
+                    }
+                    // A bracket inside these that never closes leaves them open too.
+                    Some(&None) => break Reading::Open,
+                    None => open.push(at),
+                },
+                '[' | '(' | '{' => open.push(at),
+                ']' | ')' | '}' => match open.pop() {
+                    Some(opened) => {
+                        self.brackets.insert(opened, Some(at + c.len_utf8()));
+                    }
+                    None => break Reading::Open,
                 },
                 _ => {}
             }
             if !c.is_whitespace() {
                 last = c;
             }
+            at += c.len_utf8();
+        };
+        for unmatched in open {
+            self.brackets.insert(unmatched, None);
         }
-        Reading::Open
+        reading
     }
 
     /// A call whose start is `tag`, before its closer `end`, and whose values run from each

@@ -1371,6 +1371,53 @@ mod tests {
         }
     }
 
+    /// regression test for spiceai/mistral.rs#54: a Gemma 4 or Liquid call holding a marker in
+    /// an unquoted value was left open for good, so a DSML block after the finished call was
+    /// never reached, and the message made the Gemma 4 or Liquid call where the block claims
+    /// it: `note` or `write_file` with the value's text, in place of the block's `write_file`.
+    /// The call ends at its closer, with the marker its value's text, and the block after it is
+    /// read. Streamed, the finished call ends the turn, as any finished call does, and makes
+    /// no call from the marker.
+    #[test]
+    fn a_call_with_a_marker_in_an_unquoted_value_leaves_a_later_block_its_call() {
+        use super::parse_oracle::{chunkings, matcher, stream_rng, streaming_outcome};
+        let delete_all = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"delete_all\"></｜DSML｜invoke></｜DSML｜tool_calls>";
+        let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">hello</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let mut rng = stream_rng();
+        for (name, value) in [("note", "<｜DSML｜note>"), ("write_file", delete_all)] {
+            for call in [
+                format!("<|tool_call>call:{name}{{content:{value}}}<tool_call|>"),
+                format!("<|tool_call_start|>[{name}(content={value})]<|tool_call_end|>"),
+            ] {
+                let message = format!("{call}\n{block}");
+                let calls: Vec<(String, Value)> = matcher()
+                    .get_call(&message)
+                    .expect("a message")
+                    .into_iter()
+                    .map(|call| {
+                        let arguments =
+                            serde_json::from_str(&call.function.arguments).expect("JSON");
+                        (call.function.name, arguments)
+                    })
+                    .collect();
+                assert_eq!(
+                    calls,
+                    [("write_file".to_string(), json!({ "content": "hello" }))],
+                    "{message}"
+                );
+                let finished = json!([name, json!({ "content": value }).to_string()]);
+                for ends in chunkings(&message, &mut rng) {
+                    let outcome = streaming_outcome(&message, &ends);
+                    assert_eq!(
+                        outcome[1],
+                        json!([finished]),
+                        "{message} {ends:?}: {outcome}"
+                    );
+                }
+            }
+        }
+    }
+
     /// regression test for spiceai/mistral.rs#54: streamed, a bare-JSON call whose string holds
     /// a literal newline was sent out as content once it could no longer read, and the rest of
     /// it was read on its own, so a DSML block later in the string made a call the message does
