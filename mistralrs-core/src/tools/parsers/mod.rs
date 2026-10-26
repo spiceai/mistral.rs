@@ -267,21 +267,100 @@ fn without_closed_calls(text: &str) -> String {
         else {
             return out;
         };
-        // A Gemma 4 call quotes its string values, and a closer inside one is the value's text.
-        let close = if format == ToolCallFormat::Gemma4 {
-            gemma4::call_end(&out, open)
-        } else {
-            out[open + start.len()..]
-                .find(end)
-                .map(|length| open + start.len() + length + end.len())
-        };
-        let Some(close) = close else {
+        let Some(close) = call_end(format, &out, open, start, end) else {
             return out;
         };
         let blank = " ".repeat(out[open..close].chars().count());
         out.replace_range(open..close, &blank);
         from = open + blank.len();
     }
+}
+
+/// Where the call in `format` that `start` opens at `open` in `text` ends, past its `end`, or
+/// `None` while it is still open. A closer inside one of the call's values is the value's text:
+/// a Gemma 4 value quoted in `<|"|>`, a Qwen `<parameter=…>` or Atem `<atem:parameter>` value,
+/// and a quoted Liquid argument. Any other format's call ends at its first closer.
+fn call_end(
+    format: ToolCallFormat,
+    text: &str,
+    open: usize,
+    start: &str,
+    end: &str,
+) -> Option<usize> {
+    let body = open + start.len();
+    match format {
+        ToolCallFormat::Gemma4 => gemma4::call_end(text, open),
+        ToolCallFormat::Qwen if text[body..].trim_start().starts_with("<function=") => {
+            end_outside_tagged_values(text, body, end, "<parameter=", "</parameter>")
+        }
+        ToolCallFormat::Atem => {
+            end_outside_tagged_values(text, body, end, "<atem:parameter", "</atem:parameter>")
+        }
+        ToolCallFormat::Liquid => end_outside_quotes(text, body, end),
+        _ => text[body..]
+            .find(end)
+            .map(|length| body + length + end.len()),
+    }
+}
+
+/// Where the first `end` from `body` in `text` that is not inside a value, from a `value_open`
+/// tag through its `value_close`, ends; `None` before one, or inside a value still open.
+fn end_outside_tagged_values(
+    text: &str,
+    body: usize,
+    end: &str,
+    value_open: &str,
+    value_close: &str,
+) -> Option<usize> {
+    let mut from = body;
+    loop {
+        let close = from + text[from..].find(end)?;
+        match text[from..close].find(value_open) {
+            Some(offset) => {
+                let value = from + offset + value_open.len();
+                from = value + text[value..].find(value_close)? + value_close.len();
+            }
+            None => return Some(close + end.len()),
+        }
+    }
+}
+
+/// Where the first `end` from `body` in `text` that is not inside a string quoted in `"` or
+/// `'`, where `\` escapes the next character, ends; `None` before one, or inside a string.
+fn end_outside_quotes(text: &str, body: usize, end: &str) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, c) in text[body..].char_indices() {
+        match quote {
+            Some(_) if escaped => escaped = false,
+            Some(_) if c == '\\' => escaped = true,
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if text[body + offset..].starts_with(end) => {
+                return Some(body + offset + end.len());
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+/// Whether a call in `format`, one of the formats whose calls close, is open at the end of
+/// `text`, and where it opens: a call is open from its opener until `call_end` finds its end.
+pub(super) fn open_call_start(text: &str, format: ToolCallFormat) -> Option<usize> {
+    let (_, start, end) = CLOSED_CALL_DELIMITERS
+        .iter()
+        .find(|(delimited, _, _)| *delimited == format)?;
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(start) {
+        let open = from + offset;
+        let Some(close) = call_end(format, text, open, start, end) else {
+            return Some(open);
+        };
+        from = close;
+    }
+    None
 }
 
 /// Whether a call in a format other than `format` is open at the end of `text`, a bare-JSON call

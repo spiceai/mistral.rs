@@ -981,6 +981,7 @@ fn emit_arguments(
     let arguments = format!("arguments_{tool_index}");
     // A strict tool whose schema the grammar cannot hold is written as one that is not strict;
     // its calls are held to the schema when read.
+    let strict = tool.function.strict == Some(true);
     let schema = tool
         .function
         .strict_parameters_schema()
@@ -1006,7 +1007,7 @@ fn emit_arguments(
             .collect::<Vec<_>>();
         names.sort();
         let mut sequence = Vec::new();
-        for (property_index, name) in names.into_iter().enumerate() {
+        for (property_index, name) in names.iter().enumerate() {
             let parameter = format!("parameter_{tool_index}_{property_index}");
             rules.push(format!(
                 "{parameter}: {open} (\"true\" {after} {VALUE_THEN_CLOSE} | \"false\" {after} @{ANY_JSON} {close})",
@@ -1015,6 +1016,29 @@ fn emit_arguments(
                 close = tag(true, "parameter>\n"),
             ));
             sequence.push(format!("{parameter}?"));
+        }
+        // A strict tool's schema may require a parameter it does not declare, through `allOf`
+        // or the like, so the grammar standing in for one it cannot hold also takes any other
+        // parameter the markup can write; the call is held to the whole schema when read.
+        if strict {
+            let other = format!("other_parameter_{tool_index}");
+            let other_name = format!("OTHER_NAME_{tool_index}");
+            rules.push(format!(
+                "{other}: {open} {other_name} {string} (\"true\" {after} {VALUE_THEN_CLOSE} | \"false\" {after} @{ANY_JSON} {close})",
+                open = tag(false, "parameter name=\""),
+                string = lark_literal("\" string=\""),
+                after = lark_literal("\">"),
+                close = tag(true, "parameter>\n"),
+            ));
+            let declared = names
+                .iter()
+                .map(|name| regex::escape(name))
+                .collect::<Vec<_>>()
+                .join("|");
+            rules.push(format!(
+                "{other_name}: /[a-zA-Z_][a-zA-Z0-9_.-]*/ & ~/(?:{declared})/"
+            ));
+            sequence.push(format!("{other}*"));
         }
         rules.push(format!("{arguments}: {}", sequence.join(" ")));
         return arguments;
@@ -2339,6 +2363,60 @@ mod tests {
         assert!(calls(&valid.replace("command", "a.b-c_9")).is_some());
     }
 
+    /// regression test for spiceai/mistral.rs#54: a strict tool whose schema the grammar cannot
+    /// hold was written with its declared parameters only, so one its schema requires elsewhere,
+    /// here through `allOf`, could not be written, and every call the grammar let the model
+    /// write was refused when read
+    #[test]
+    fn an_unenforceable_strict_tool_takes_a_parameter_its_schema_requires_elsewhere() {
+        use crate::tools::{ToolCallingMatcher, ToolChoice};
+        let strict = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "mode": { "type": "string" } },
+            "allOf": [{ "required": ["path"] }],
+        }));
+        let tools = std::slice::from_ref(&strict);
+        assert!(unenforceable(tools).is_some_and(|why| why.contains("`allOf`")));
+        let opener = format!("<{DSML}tool_calls>");
+        let body = |parameters: &[&str]| {
+            let parameters: String = parameters
+                .iter()
+                .map(|name| {
+                    format!(
+                        "<{DSML}parameter name=\"{name}\" string=\"true\">x</{DSML}parameter>\n"
+                    )
+                })
+                .collect();
+            format!(
+                "\n<{DSML}invoke name=\"set\">\n{parameters}</{DSML}invoke>\n</{DSML}tool_calls>"
+            )
+        };
+        assert!(continuation_accepts(
+            tools,
+            &opener,
+            &body(&["mode", "path"])
+        ));
+        assert!(continuation_accepts(tools, &opener, &body(&["path"])));
+        assert!(continuation_accepts(tools, &opener, &body(&["mode"])));
+        // A declared parameter is still written at most once, as the parser reads a parameter
+        // given twice as malformed.
+        assert!(!continuation_accepts(
+            tools,
+            &opener,
+            &body(&["mode", "mode"])
+        ));
+        // The calls are held to the whole schema when read.
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(tools)).expect("a matcher");
+        let read = |parameters: &[&str]| {
+            matcher
+                .get_call(&format!("{opener}{}", body(parameters)))
+                .expect("read")
+                .len()
+        };
+        assert_eq!(read(&["mode", "path"]), 1);
+        assert_eq!(read(&["mode"]), 0);
+    }
+
     /// regression test for spiceai/mistral.rs#54: a strict property whose name the markup cannot
     /// write (`a"b`, `a>b`) was written into `name="..."` as it was, so a required call could
     /// complete its grammar and not read back as a call; a tool that is not strict wrote it too
@@ -2354,7 +2432,8 @@ mod tests {
             let why = unenforceable(std::slice::from_ref(&strict)).expect("refused");
             assert!(why.contains(&format!("`{bad}`")), "{why}");
             // The grammar that takes over a call the model began writes the tool as one that
-            // is not strict: its declared parameters the markup can write, and no other.
+            // is not strict: its declared parameters the markup can write, and other names it
+            // can write, but never one it cannot.
             let opener = format!("<{DSML}tool_calls>");
             let body = |parameters: &str| {
                 format!(

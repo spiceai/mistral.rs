@@ -44,6 +44,13 @@ impl ToolFormatParser for AtemParser {
         !matches!(channel_recipient(text, start), Some("self" | "user"))
     }
 
+    /// A closer inside an `<atem:parameter>` value is the value's text; a call to `self` or
+    /// `user` is not a tool call.
+    fn open_at_end(&self, text: &str) -> bool {
+        super::open_call_start(text, super::ToolCallFormat::Atem)
+            .is_some_and(|start| !matches!(channel_recipient(text, start), Some("self" | "user")))
+    }
+
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::Atem
     }
