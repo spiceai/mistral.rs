@@ -761,6 +761,13 @@ fn unenforceable_tool(tool: &Tool) -> Option<String> {
             "Tool '{name}' is strict, and its parameter `{unwritable}` has a name a DeepSeek-V4 tool call cannot write: a name is letters, digits, `_`, `.` and `-`, and does not start with a digit. Rename the parameter, or remove `strict` from the tool."
         ));
     }
+    // A `$id` inside the schema starts a schema resource of its own, against which the
+    // references in it resolve; the grammar follows references against the root only.
+    if let Some(pointer) = nested_identifier(&schema) {
+        return Some(format!(
+            "Tool '{name}' is strict, and its parameters schema declares `$id` at `{pointer}`, which starts a schema resource of its own, whose references a DeepSeek-V4 tool call's grammar cannot follow. Remove that `$id`, or `strict` from the tool."
+        ));
+    }
     // The grammar follows a reference into the schema only.
     if let Some(reference) = unfollowable_reference(&schema) {
         return Some(format!(
@@ -860,6 +867,17 @@ fn unfollowable_reference(schema: &Value) -> Option<String> {
             None => false,
         };
         (!followable).then(|| reference.to_string())
+    })
+}
+
+/// The pointer of the first schema inside `schema`, the root excepted, that declares an `$id`,
+/// if any: such a schema is a resource of its own, against which the references in it resolve.
+fn nested_identifier(schema: &Value) -> Option<String> {
+    schema_pointers(schema).into_iter().find(|pointer| {
+        !pointer.is_empty()
+            && schema
+                .pointer(pointer)
+                .is_some_and(|schema| schema.get("$id").is_some())
     })
 }
 
@@ -1830,6 +1848,48 @@ mod tests {
             tools,
             &one_call("set", &[("n", "false", "\"three\"")])
         ));
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a `$id` inside a strict tool's schema starts a
+    /// schema resource of its own, against which the references in it resolve, but the grammar
+    /// followed them against the schema's root: with `$defs.Count` an integer in the resource and
+    /// a string at the root, the grammar held a call to the string and refused a valid integer.
+    /// The grammar follows references against the root only, so such a schema is one it cannot
+    /// hold: a required call refuses it, naming the `$id`, and a call the model writes on its own
+    /// is read unconstrained and held to the schema, resource and all, when read.
+    #[test]
+    fn a_strict_schema_with_a_nested_id_is_unenforceable() {
+        use crate::tools::{ToolCallingMatcher, ToolChoice};
+        let nested = tool(serde_json::json!({
+            "type": "object",
+            "$defs": {
+                "Count": { "type": "string" },
+                "Inner": {
+                    "$id": "https://example.com/inner.json",
+                    "type": "object",
+                    "$defs": { "Count": { "type": "integer" } },
+                    "properties": { "n": { "$ref": "#/$defs/Count" } },
+                    "required": ["n"],
+                    "additionalProperties": false,
+                },
+            },
+            "properties": { "inner": { "$ref": "#/$defs/Inner" } },
+            "required": ["inner"],
+            "additionalProperties": false,
+        }));
+        let why = unenforceable_tool(&nested).expect("a nested `$id` is unenforceable");
+        assert!(why.contains("declares `$id` at `/$defs/Inner`"), "{why}");
+        // Written as a tool that is not strict, so the grammar no longer refuses the valid call.
+        let tools = std::slice::from_ref(&nested);
+        let call = |n: &str| one_call("set", &[("inner", "false", &format!(r#"{{"n": {n}}}"#))]);
+        assert!(forced_call_accepts(tools, &call("3")));
+        // Held to the schema, resource and all, when read.
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(tools)).expect("a matcher");
+        assert_eq!(matcher.get_call(&call("3")).expect("read").len(), 1);
+        assert!(matcher
+            .get_call(&call("\"three\""))
+            .expect("read")
+            .is_empty());
     }
 
     /// regression test for spiceai/mistral.rs#54: the `enum` and `const` shortcuts dropped the
