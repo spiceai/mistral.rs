@@ -754,6 +754,60 @@ mod tests {
         }
     }
 
+    /// regression test for spiceai/mistral.rs#54: a strict schema using a keyword the grammar's
+    /// JSON parser does not implement, in a parameter's schema or through a `$ref`, passed as one
+    /// a required call holds, and the grammar for the required call failed to compile
+    #[test]
+    fn a_required_dsml_call_refuses_a_schema_keyword_the_grammar_cannot_compile() {
+        for (keyword, schema) in [
+            (
+                "uniqueItems",
+                serde_json::json!({ "type": "array", "uniqueItems": true }),
+            ),
+            (
+                "not",
+                serde_json::json!({ "type": "string", "not": { "const": "x" } }),
+            ),
+            (
+                "dependentRequired",
+                serde_json::json!({ "type": "object", "dependentRequired": { "a": ["b"] } }),
+            ),
+        ] {
+            for parameters in [
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "tags": schema },
+                    "required": ["tags"],
+                    "additionalProperties": false,
+                }),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "tags": { "$ref": "#/$defs/Tags" } },
+                    "required": ["tags"],
+                    "additionalProperties": false,
+                    "$defs": { "Tags": schema },
+                }),
+            ] {
+                let strict: Tool = serde_json::from_value(serde_json::json!({
+                    "type": "function",
+                    "function": { "name": "Set", "strict": true, "parameters": parameters },
+                }))
+                .unwrap();
+                let error = ToolCallState::new(
+                    ToolChoice::Required,
+                    Some(&[strict]),
+                    Some(ToolCallFormat::DeepSeekDsml),
+                )
+                .err()
+                .expect("a required call is refused");
+                assert_eq!(
+                    error.to_string(),
+                    format!("Tool 'Set' is strict, and the schema of its parameter `tags` uses `{keyword}`, which a required DeepSeek-V4 tool call cannot enforce. Remove `strict` from the tool, or the `{keyword}` from that schema.")
+                );
+            }
+        }
+    }
+
     #[test]
     fn required_harmony_tool_call_deadline_forces_native_grammar() {
         let tools = vec![tool("get_weather")];

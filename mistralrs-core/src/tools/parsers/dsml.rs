@@ -847,6 +847,14 @@ fn unenforceable_tool(tool: &Tool) -> Option<String> {
             "Tool '{name}' is strict, and its parameters schema refers to `{reference}`, which a DeepSeek-V4 tool call cannot follow: a reference names the schema's root (`#`), a pointer into it (`#/...`), or an `$anchor` it declares. Point the reference into the schema, or remove `strict` from the tool."
         ));
     }
+    // The grammar holds each parameter's value to its schema, which llguidance compiles, and a
+    // schema holding a keyword llguidance does not implement fails to compile, and with it the
+    // whole grammar.
+    if let Some((property, keyword)) = unimplemented_keyword(&schema, declared) {
+        return Some(format!(
+            "Tool '{name}' is strict, and the schema of its parameter `{property}` uses `{keyword}`, which a required DeepSeek-V4 tool call cannot enforce. Remove `strict` from the tool, or the `{keyword}` from that schema."
+        ));
+    }
     let required = object.get("required").and_then(Value::as_array)?;
     // A property whose schema is `false`, or refers to one, admits no value, so one that is
     // required cannot be written at all.
@@ -910,6 +918,62 @@ fn parameter_names(schema: &Value) -> Vec<String> {
         }
     }
     names.into_iter().collect()
+}
+
+/// The schema keywords llguidance 1.4.0, which compiles the grammar, does not implement: a schema
+/// holding one fails to compile with `Unimplemented keys`. Found by compiling, one keyword at a
+/// time, a schema using each keyword of JSON Schema 2020-12 and the earlier drafts'
+/// `dependencies` and `additionalItems`, which
+/// `llguidance_refuses_exactly_the_unimplemented_keywords` does again: these failed, and every
+/// other keyword compiled.
+const UNIMPLEMENTED_KEYWORDS: [&str; 16] = [
+    "uniqueItems",
+    "contains",
+    "maxContains",
+    "minContains",
+    "dependentRequired",
+    "dependencies",
+    "dependentSchemas",
+    "not",
+    "if",
+    "then",
+    "else",
+    "propertyNames",
+    "unevaluatedItems",
+    "unevaluatedProperties",
+    "$dynamicRef",
+    "$dynamicAnchor",
+];
+
+/// The first parameter of the tool schema `root`, by name, whose value the grammar holds to a
+/// schema using a keyword llguidance does not implement (`UNIMPLEMENTED_KEYWORDS`), with that
+/// keyword: anywhere in the schema the grammar gives the value (`property_schema`), the parts
+/// of `root` it reaches through `$ref`, `items`, `properties`, `allOf`, `anyOf`, `oneOf` and
+/// every other keyword that holds a schema, included. A parameter that admits no value is left
+/// out of the grammar, so its schema is not compiled.
+fn unimplemented_keyword(
+    root: &Value,
+    declared: Option<&serde_json::Map<String, Value>>,
+) -> Option<(String, &'static str)> {
+    let declared = declared?;
+    let anchors = anchors(root);
+    let mut names = declared.keys().collect::<Vec<_>>();
+    names.sort();
+    names.into_iter().find_map(|name| {
+        if admits_nothing(root, &declared[name], &anchors) {
+            return None;
+        }
+        let schema = property_schema(root, name, &anchors);
+        schema_pointers(&schema)
+            .iter()
+            .filter_map(|pointer| schema.pointer(pointer).and_then(Value::as_object))
+            .find_map(|object| {
+                UNIMPLEMENTED_KEYWORDS
+                    .into_iter()
+                    .find(|keyword| object.contains_key(*keyword))
+            })
+            .map(|keyword| (name.clone(), keyword))
+    })
 }
 
 /// Whether a parameter name can be written in a tag's `name="..."` attribute and read back:
@@ -3383,6 +3447,346 @@ mod tests {
                 one_call("Fetch", &[("format", "true", "xml"), ("url", "true", "x")]),
             ] {
                 assert!(!forced_call_accepts(&tools, &call), "{format}: {call}");
+            }
+        }
+    }
+
+    /// The keywords `UNIMPLEMENTED_KEYWORDS` names are those llguidance refuses: a schema using
+    /// one keyword of JSON Schema 2020-12, or the earlier drafts' `dependencies` or
+    /// `additionalItems`, compiles exactly where the keyword is not in the list. A change of
+    /// llguidance that implements one more, or one fewer, fails here.
+    #[test]
+    fn llguidance_refuses_exactly_the_unimplemented_keywords() {
+        let (env, _) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        let cases = [
+            ("type", serde_json::json!({ "type": "string" })),
+            ("enum", serde_json::json!({ "enum": ["a", "b"] })),
+            ("const", serde_json::json!({ "const": "a" })),
+            (
+                "multipleOf",
+                serde_json::json!({ "type": "integer", "multipleOf": 3 }),
+            ),
+            (
+                "maximum",
+                serde_json::json!({ "type": "integer", "maximum": 3 }),
+            ),
+            (
+                "exclusiveMaximum",
+                serde_json::json!({ "type": "integer", "exclusiveMaximum": 3 }),
+            ),
+            (
+                "minimum",
+                serde_json::json!({ "type": "integer", "minimum": 3 }),
+            ),
+            (
+                "exclusiveMinimum",
+                serde_json::json!({ "type": "integer", "exclusiveMinimum": 3 }),
+            ),
+            (
+                "maxLength",
+                serde_json::json!({ "type": "string", "maxLength": 3 }),
+            ),
+            (
+                "minLength",
+                serde_json::json!({ "type": "string", "minLength": 3 }),
+            ),
+            (
+                "pattern",
+                serde_json::json!({ "type": "string", "pattern": "^a+$" }),
+            ),
+            (
+                "maxItems",
+                serde_json::json!({ "type": "array", "maxItems": 3 }),
+            ),
+            (
+                "minItems",
+                serde_json::json!({ "type": "array", "minItems": 1 }),
+            ),
+            (
+                "uniqueItems",
+                serde_json::json!({ "type": "array", "uniqueItems": true }),
+            ),
+            (
+                "contains",
+                serde_json::json!({ "type": "array", "contains": { "type": "string" } }),
+            ),
+            (
+                "maxContains",
+                serde_json::json!({ "type": "array", "contains": { "type": "string" }, "maxContains": 2 }),
+            ),
+            (
+                "minContains",
+                serde_json::json!({ "type": "array", "contains": { "type": "string" }, "minContains": 1 }),
+            ),
+            (
+                "maxProperties",
+                serde_json::json!({ "type": "object", "maxProperties": 2 }),
+            ),
+            (
+                "minProperties",
+                serde_json::json!({ "type": "object", "minProperties": 1 }),
+            ),
+            (
+                "required",
+                serde_json::json!({ "type": "object", "properties": { "a": { "type": "string" } }, "required": ["a"] }),
+            ),
+            (
+                "dependentRequired",
+                serde_json::json!({ "type": "object", "dependentRequired": { "a": ["b"] } }),
+            ),
+            (
+                "dependencies",
+                serde_json::json!({ "type": "object", "dependencies": { "a": ["b"] } }),
+            ),
+            (
+                "dependentSchemas",
+                serde_json::json!({ "type": "object", "dependentSchemas": { "a": { "required": ["b"] } } }),
+            ),
+            (
+                "allOf",
+                serde_json::json!({ "allOf": [{ "type": "string" }, { "minLength": 1 }] }),
+            ),
+            (
+                "anyOf",
+                serde_json::json!({ "anyOf": [{ "type": "string" }, { "type": "integer" }] }),
+            ),
+            (
+                "oneOf",
+                serde_json::json!({ "oneOf": [{ "type": "string" }, { "type": "integer" }] }),
+            ),
+            (
+                "not",
+                serde_json::json!({ "type": "string", "not": { "const": "x" } }),
+            ),
+            (
+                "if",
+                serde_json::json!({ "type": "string", "if": { "const": "a" } }),
+            ),
+            (
+                "then",
+                serde_json::json!({ "type": "string", "then": { "minLength": 1 } }),
+            ),
+            (
+                "else",
+                serde_json::json!({ "type": "string", "else": { "maxLength": 5 } }),
+            ),
+            (
+                "prefixItems",
+                serde_json::json!({ "type": "array", "prefixItems": [{ "type": "string" }] }),
+            ),
+            (
+                "items",
+                serde_json::json!({ "type": "array", "items": { "type": "string" } }),
+            ),
+            (
+                "additionalItems",
+                serde_json::json!({ "type": "array", "items": [{ "type": "string" }], "additionalItems": false }),
+            ),
+            (
+                "properties",
+                serde_json::json!({ "type": "object", "properties": { "a": { "type": "string" } } }),
+            ),
+            (
+                "patternProperties",
+                serde_json::json!({ "type": "object", "patternProperties": { "^a": { "type": "string" } } }),
+            ),
+            (
+                "additionalProperties",
+                serde_json::json!({ "type": "object", "additionalProperties": { "type": "string" } }),
+            ),
+            (
+                "propertyNames",
+                serde_json::json!({ "type": "object", "propertyNames": { "pattern": "^a" } }),
+            ),
+            (
+                "unevaluatedItems",
+                serde_json::json!({ "type": "array", "unevaluatedItems": false }),
+            ),
+            (
+                "unevaluatedProperties",
+                serde_json::json!({ "type": "object", "unevaluatedProperties": false }),
+            ),
+            (
+                "$ref",
+                serde_json::json!({ "$ref": "#/$defs/a", "$defs": { "a": { "type": "string" } } }),
+            ),
+            (
+                "definitions",
+                serde_json::json!({ "$ref": "#/definitions/a", "definitions": { "a": { "type": "string" } } }),
+            ),
+            (
+                "$dynamicRef",
+                serde_json::json!({ "$dynamicRef": "#/$defs/a", "$defs": { "a": { "type": "string" } } }),
+            ),
+            (
+                "$dynamicAnchor",
+                serde_json::json!({ "$dynamicAnchor": "a", "type": "string" }),
+            ),
+            (
+                "$id",
+                serde_json::json!({ "$id": "https://example.com/s", "type": "string" }),
+            ),
+            (
+                "$schema",
+                serde_json::json!({ "$schema": "https://json-schema.org/draft/2020-12/schema", "type": "string" }),
+            ),
+            (
+                "$vocabulary",
+                serde_json::json!({ "$vocabulary": {}, "type": "string" }),
+            ),
+            (
+                "$comment",
+                serde_json::json!({ "$comment": "c", "type": "string" }),
+            ),
+            (
+                "title",
+                serde_json::json!({ "title": "t", "type": "string" }),
+            ),
+            (
+                "description",
+                serde_json::json!({ "description": "d", "type": "string" }),
+            ),
+            (
+                "default",
+                serde_json::json!({ "default": "d", "type": "string" }),
+            ),
+            (
+                "deprecated",
+                serde_json::json!({ "deprecated": true, "type": "string" }),
+            ),
+            (
+                "readOnly",
+                serde_json::json!({ "readOnly": true, "type": "string" }),
+            ),
+            (
+                "writeOnly",
+                serde_json::json!({ "writeOnly": true, "type": "string" }),
+            ),
+            (
+                "examples",
+                serde_json::json!({ "examples": ["a"], "type": "string" }),
+            ),
+            (
+                "contentEncoding",
+                serde_json::json!({ "contentEncoding": "base64", "type": "string" }),
+            ),
+            (
+                "contentMediaType",
+                serde_json::json!({ "contentMediaType": "application/json", "type": "string" }),
+            ),
+            (
+                "contentSchema",
+                serde_json::json!({ "contentMediaType": "application/json", "contentSchema": { "type": "object" }, "type": "string" }),
+            ),
+        ];
+        for (keyword, schema) in cases {
+            let grammar = TopLevelGrammar {
+                grammars: vec![GrammarWithLexer {
+                    json_schema: Some(schema),
+                    ..Default::default()
+                }],
+                max_tokens: None,
+            };
+            let refused = factory
+                .create_parser(grammar)
+                .err()
+                .map(|error| error.to_string());
+            if UNIMPLEMENTED_KEYWORDS.contains(&keyword) {
+                assert!(
+                    refused
+                        .as_deref()
+                        .is_some_and(|error| error.contains("Unimplemented keys")
+                            && error.contains(&format!("\"{keyword}\""))),
+                    "{keyword}: {refused:?}"
+                );
+            } else {
+                assert_eq!(refused, None, "{keyword}");
+            }
+        }
+    }
+
+    /// The tools `strict_tools_using` gives: for `uniqueItems`, `not` and `dependentRequired`, a
+    /// strict tool whose parameter `tags` uses the keyword, in its own schema and through a
+    /// `$ref`, with a value its schema takes and one it refuses.
+    fn strict_tools_using() -> Vec<(&'static str, Tool, Value, Value)> {
+        let cases = [
+            (
+                "uniqueItems",
+                serde_json::json!({ "type": "array", "items": { "type": "string" }, "uniqueItems": true }),
+                serde_json::json!(["a", "b"]),
+                serde_json::json!(["a", "a"]),
+            ),
+            (
+                "not",
+                serde_json::json!({ "type": "string", "not": { "const": "x" } }),
+                serde_json::json!("y"),
+                serde_json::json!("x"),
+            ),
+            (
+                "dependentRequired",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "a": { "type": "string" }, "b": { "type": "string" } },
+                    "dependentRequired": { "a": ["b"] },
+                }),
+                serde_json::json!({ "a": "1", "b": "2" }),
+                serde_json::json!({ "a": "1" }),
+            ),
+        ];
+        let mut tools = Vec::new();
+        for (keyword, schema, good, bad) in cases {
+            for parameters in [
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "tags": schema },
+                    "required": ["tags"],
+                    "additionalProperties": false,
+                }),
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "tags": { "$ref": "#/$defs/Tags" } },
+                    "required": ["tags"],
+                    "additionalProperties": false,
+                    "$defs": { "Tags": schema },
+                }),
+            ] {
+                tools.push((keyword, tool(parameters), good.clone(), bad.clone()));
+            }
+        }
+        tools
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a strict tool whose parameter's schema used a
+    /// keyword llguidance does not implement, `uniqueItems`, `not` or `dependentRequired`, in
+    /// its own schema or through a `$ref`, passed as one the grammar holds, and the grammar
+    /// failed to compile, so a call the model began was held to nothing. Such a tool is written
+    /// as one that is not strict, its value unconstrained, and its call is held to its schema
+    /// when read; a required call to it is refused (`ToolCallState::new`).
+    #[test]
+    fn a_strict_schema_llguidance_cannot_compile_is_held_when_read() {
+        use crate::tools::{ToolCallingMatcher, ToolChoice};
+        let opener = format!("<{DSML}tool_calls>");
+        for (keyword, strict, good, bad) in strict_tools_using() {
+            let tools = std::slice::from_ref(&strict);
+            assert!(
+                unenforceable(tools).is_some_and(|why| why.contains(&format!("`{keyword}`"))),
+                "{keyword}"
+            );
+            let call = |value: &Value| one_call("set", &[("tags", "false", &value.to_string())]);
+            let matcher =
+                ToolCallingMatcher::new(ToolChoice::Auto, Some(tools)).expect("a matcher");
+            for (value, reads) in [(&good, 1), (&bad, 0)] {
+                let written = call(value);
+                assert!(
+                    continuation_accepts(tools, &opener, &written[opener.len()..]),
+                    "{keyword}: {written}"
+                );
+                assert_eq!(
+                    matcher.get_call(&written).expect("read").len(),
+                    reads,
+                    "{keyword}: {written}"
+                );
             }
         }
     }
