@@ -31,6 +31,11 @@ pub(crate) trait ToolCallStrategy: Send + Sync {
     fn call_unfinished(&self, _content: &str) -> bool {
         false
     }
+    /// The format `content`, the response so far without its reasoning, is read in alone, if
+    /// one claims it: a call forced into it must be written in that format to be read.
+    fn claimed_format(&self, _content: &str) -> Option<ToolCallFormat> {
+        None
+    }
     fn has_reasoning(&self) -> bool {
         false
     }
@@ -75,6 +80,12 @@ impl ToolCallStrategy for TextToolCallStrategy {
     /// found in the content alone.
     fn call_unfinished(&self, content: &str) -> bool {
         parsers::call_unfinished(content)
+    }
+
+    /// A message that has opened a DSML block outside any other format's call is read only as
+    /// DSML, whatever format the template prefers.
+    fn claimed_format(&self, content: &str) -> Option<ToolCallFormat> {
+        parsers::claimed_format(content)
     }
 
     fn continuation_grammar(

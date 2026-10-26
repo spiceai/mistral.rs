@@ -1,0 +1,766 @@
+//! A differential corpus for the tool-call parsers: messages that splice one format's call
+//! markers into another format's calls, and their prefixes, each read by the matcher here and
+//! compared with what the base read from the same text. The base is `spiceai` at
+//! fcd94520dd6ed6ee7c1800b7c60351c4772ffccf, before DeepSeek-V4's DSML calls were read; its
+//! readings are recorded in `testdata/tool_call_parse_oracle.json`, which pairs every entry of
+//! `corpus()` with what `outcome()` returned on the base for each of its cuts. To record it
+//! again, check out the base, add this module there, and write `oracle_json(&corpus())` to that
+//! file.
+//!
+//! A reading here may differ from the base's only where it reaches into a DSML block outside
+//! any other format's call, whose calls `dsml_calls` states, or as `intended_difference` lists:
+//! everything else, a call the base did not make above all, is a regression.
+
+use serde_json::{json, Value};
+
+use super::{ToolCallingMatcher, ToolChoice};
+use crate::Tool;
+
+/// The seed the generated entries are drawn from.
+pub(super) const SEED: u64 = 0x5eed_0054_d5e1_0001;
+/// How many entries are generated.
+const GENERATED: usize = 300;
+
+/// One message of the corpus, the prefixes of it read (`cuts`, byte lengths, the whole message
+/// last), and the DSML calls it makes where it writes a DSML block outside any other format's
+/// call.
+pub(super) struct Entry {
+    pub(super) id: String,
+    pub(super) message: String,
+    pub(super) cuts: Vec<usize>,
+    pub(super) dsml: Option<TopLevelDsml>,
+}
+
+/// A DSML block outside any other format's call: from `at`, the prefixes read as DSML, and each
+/// block that has closed by a prefix's end makes its calls.
+pub(super) struct TopLevelDsml {
+    pub(super) reason: &'static str,
+    pub(super) at: usize,
+    pub(super) blocks: Vec<(usize, Vec<(String, String)>)>,
+}
+
+/// The tools every entry is read with.
+pub(super) fn matcher() -> ToolCallingMatcher {
+    let tools: Vec<Tool> = [
+        "write_file",
+        "delete_all",
+        "Bash",
+        "note",
+        "get_weather",
+        "get_time",
+    ]
+    .into_iter()
+    .map(|name| {
+        serde_json::from_value(json!({
+            "type": "function",
+            "function": { "name": name, "parameters": { "type": "object" } },
+        }))
+        .expect("a tool")
+    })
+    .collect();
+    ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).expect("a matcher")
+}
+
+/// What the matcher reads from `text`, as `[streaming, read]`: the streaming state as `"tf"`
+/// for `(true, false)` and so on, and what is read as `[content, calls]`, each call as its name
+/// and its arguments' JSON, with content written exactly as `text` as `true`. An error is
+/// `{"error": message}` in place of either.
+pub(super) fn outcome(matcher: &ToolCallingMatcher, text: &str) -> Value {
+    let flag = |value: bool| if value { 't' } else { 'f' };
+    let streaming = match matcher.prefix_could_be_tool(text) {
+        Ok((could_be, complete)) => json!(format!("{}{}", flag(could_be), flag(complete))),
+        Err(error) => json!({ "error": error.to_string() }),
+    };
+    let read = match matcher.get_call_with_content(text) {
+        Ok((content, calls)) => {
+            let content = match content {
+                Some(content) if content == text => Value::Bool(true),
+                Some(content) => Value::String(content),
+                None => Value::Null,
+            };
+            let calls: Vec<Value> = calls
+                .into_iter()
+                .map(|call| json!([call.function.name, call.function.arguments]))
+                .collect();
+            json!([content, calls])
+        }
+        Err(error) => json!({ "error": error.to_string() }),
+    };
+    json!([streaming, read])
+}
+
+/// The corpus with what the matcher reads from each cut, as the oracle file records it.
+pub(super) fn oracle_json(entries: &[Entry]) -> Value {
+    let matcher = matcher();
+    let entries: Vec<Value> = entries
+        .iter()
+        .map(|entry| {
+            let outcomes: Vec<Value> = entry
+                .cuts
+                .iter()
+                .map(|&cut| outcome(&matcher, &entry.message[..cut]))
+                .collect();
+            json!({
+                "id": entry.id,
+                "message": entry.message,
+                "cuts": entry.cuts,
+                "outcomes": outcomes,
+            })
+        })
+        .collect();
+    json!({ "seed": format!("{SEED:#x}"), "entries": entries })
+}
+
+/// The differences from the base this crate intends, one per line with its reason. A DSML
+/// block outside any other format's call (`TopLevelDsml`) is read from its opener on by
+/// `DSML_CALLS` or `DSML_OWNS`; and:
+const AS_WRITTEN: &str = "a message that makes no call is its content as the model wrote it, where the base returned the text a parser had read or repaired from it";
+const PARTIAL_OPENER: &str = "a message ending partway through `<｜DSML｜` outside any other format's call is held back and makes no call yet, as it may be opening a DSML block that would claim it, where the base streamed it or read a call before it";
+
+/// The calls a cut of `entry` makes as DSML, with the reason, when it reaches into a DSML
+/// block outside any other format's call: from the block's opener on, the prefix makes
+/// exactly the calls of the blocks closed by its end, whatever the base read.
+pub(super) fn dsml_calls(entry: &Entry, cut: usize) -> Option<(&'static str, Value)> {
+    let dsml = entry.dsml.as_ref().filter(|dsml| cut > dsml.at)?;
+    let calls: Vec<Value> = dsml
+        .blocks
+        .iter()
+        .filter(|(closes, _)| *closes <= cut)
+        .flat_map(|(_, calls)| {
+            calls
+                .iter()
+                .map(|(name, arguments)| json!([name, arguments]))
+        })
+        .collect();
+    Some((dsml.reason, Value::Array(calls)))
+}
+
+/// Why the reading `head` of the cut `cut` of `entry` may differ from the base's, `base`, outside
+/// a DSML block (`dsml_calls`), if it may: a prefix ending partway through a DSML marker is
+/// held back with no call; and a prefix that makes no call, read with the same streaming state,
+/// is content as written.
+pub(super) fn intended_difference(
+    entry: &Entry,
+    cut: usize,
+    base: &Value,
+    head: &Value,
+) -> Option<&'static str> {
+    let no_call = json!([]);
+    let text = &entry.message[..cut];
+    let partial = (1..OPEN_MARKER.len())
+        .filter(|&at| OPEN_MARKER.is_char_boundary(at))
+        .any(|at| text.ends_with(&OPEN_MARKER[..at]));
+    if partial && head[0] == json!("tf") && head[1] == json!([true, no_call]) {
+        return Some(PARTIAL_OPENER);
+    }
+    (head[0] == base[0] && base[1][1] == no_call && head[1] == json!([true, no_call]))
+        .then_some(AS_WRITTEN)
+}
+
+/// The marker every DSML tag opens with.
+const OPEN_MARKER: &str = "<｜DSML｜";
+
+const DELETE_ALL: &str = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"delete_all\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+const BASH_EXAMPLE: &str = "Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>";
+const OPENER: &str = "<｜DSML｜tool_calls>";
+const BLOCK_CLOSER: &str = "</｜DSML｜tool_calls>";
+
+/// A DSML block calling `write_file` whose `content` holds a Qwen call to `Bash`.
+fn write_file_block() -> String {
+    format!(
+        "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">{BASH_EXAMPLE}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    )
+}
+
+fn call(name: &str, arguments: &Value) -> (String, String) {
+    (
+        name.to_string(),
+        serde_json::to_string(arguments).expect("JSON"),
+    )
+}
+
+fn write_file_call() -> (String, String) {
+    call("write_file", &json!({ "content": BASH_EXAMPLE }))
+}
+
+fn delete_all_call() -> (String, String) {
+    call("delete_all", &json!({}))
+}
+
+const DSML_CALLS: &str = "a DSML block outside any other format's call is a call: DSML is the format this PR reads, and the base reads it as text";
+const DSML_OWNS: &str = "a message with a DSML block outside any other format's call is read only as DSML, so a call written in a DSML value, or after a block that cannot be read, is text";
+
+/// The prefixes of `message` read for a hand-written entry: the end of every tag, quote, line,
+/// marker and bracket, the start of every tag, and the whole message.
+fn hand_cuts(message: &str) -> Vec<usize> {
+    let mut cuts: Vec<usize> = message
+        .char_indices()
+        .flat_map(|(at, c)| {
+            let after = at + c.len_utf8();
+            let mut cuts = Vec::new();
+            if matches!(c, '>' | '"' | '\n' | '｜' | '{' | '}' | '[' | ']' | '\'') {
+                cuts.push(after);
+            }
+            if c == '<' && at > 0 {
+                cuts.push(at);
+            }
+            cuts
+        })
+        .collect();
+    cuts.push(message.len());
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts
+}
+
+fn hand(id: &str, message: impl Into<String>) -> Entry {
+    let message = message.into();
+    Entry {
+        id: format!("hand:{id}"),
+        cuts: hand_cuts(&message),
+        message,
+        dsml: None,
+    }
+}
+
+/// A hand-written entry whose last DSML block opener begins a block outside any other
+/// format's call, closing at the end of the message with `calls`.
+fn hand_dsml(
+    id: &str,
+    message: impl Into<String>,
+    reason: &'static str,
+    calls: Vec<(String, String)>,
+) -> Entry {
+    let mut entry = hand(id, message);
+    let at = entry.message.rfind(OPENER).expect("a block");
+    let blocks = if calls.is_empty() {
+        Vec::new()
+    } else {
+        let closes = entry.message.rfind(BLOCK_CLOSER).expect("a closer") + BLOCK_CLOSER.len();
+        vec![(closes, calls)]
+    };
+    entry.dsml = Some(TopLevelDsml { reason, at, blocks });
+    entry
+}
+
+fn hand_corpus() -> Vec<Entry> {
+    let block = DELETE_ALL;
+    let write = write_file_block();
+    let mut entries = vec![
+        // Each format alone.
+        hand(
+            "qwen-json",
+            r#"<tool_call>{"name":"write_file","arguments":{"content":"hello"}}</tool_call>"#,
+        ),
+        hand(
+            "qwen-json-array",
+            r#"<tool_call>[{"name":"write_file","arguments":{"content":"hello"}}]</tool_call>"#,
+        ),
+        hand(
+            "qwen-xml",
+            "<tool_call>\n<function=write_file>\n<parameter=content>\nhello\n</parameter>\n</function>\n</tool_call>",
+        ),
+        hand(
+            "qwen-xml-leading-text",
+            "<tool_call>Example:\n<function=write_file>\n<parameter=content>\nhello\n</parameter>\n</function>\n</tool_call>",
+        ),
+        hand(
+            "qwen-xml-parallel",
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_time>\n<parameter=zone>\nUTC\n</parameter>\n</function>\n</tool_call>",
+        ),
+        hand(
+            "hunyuan",
+            r#"<tool_calls>[{"name":"write_file","arguments":{"content":"hello"}}]</tool_calls>"#,
+        ),
+        hand(
+            "deepseek",
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>write_file\n```json\n{\"content\":\"hello\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        ),
+        hand(
+            "mistral-nemo",
+            r#"[TOOL_CALLS][{"name":"write_file","arguments":{"content":"hello"}}]"#,
+        ),
+        hand(
+            "llama",
+            r#"<|python_tag|>{"name":"write_file","parameters":{"content":"hello"}}"#,
+        ),
+        hand(
+            "liquid",
+            r#"<|tool_call_start|>[write_file(content="hello")]<|tool_call_end|>"#,
+        ),
+        hand(
+            "gemma4",
+            "<|tool_call>call:write_file{content:<|\"|>hello<|\"|>}<tool_call|>",
+        ),
+        hand(
+            "atem",
+            "<atem:function_calls>\n<atem:invoke name=\"write_file\">\n<atem:parameter name=\"content\">hello</atem:parameter>\n</atem:invoke>\n</atem:function_calls>",
+        ),
+        hand(
+            "bare-json",
+            r#"{"name":"write_file","arguments":{"content":"hello"}}"#,
+        ),
+        hand(
+            "bare-json-array",
+            r#"[{"name":"write_file","arguments":{"content":"hello"}}]"#,
+        ),
+        hand("prose", "Sure, here is the answer."),
+        hand(
+            "prose-braces",
+            r#"The shape is {"arguments":"{}"} with the braces quoted."#,
+        ),
+        hand(
+            "stringified-arguments",
+            r#"{"name":"note","arguments":"{\"text\":\"x\"}"}"#,
+        ),
+        // A DSML block, or its opener, inside another format's call: the call's text.
+        hand(
+            "bare-json-opener-in-string",
+            r#"{"name":"write_file","arguments":{"content":"<｜DSML｜tool_calls>"}}"#,
+        ),
+        hand(
+            "bare-json-escaped-block-in-string",
+            format!(
+                r#"{{"name":"write_file","arguments":{{"content":{}}}}}"#,
+                serde_json::to_string(block).expect("JSON")
+            ),
+        ),
+        hand(
+            "bare-json-unescaped-block-in-string",
+            format!(r#"{{"name":"write_file","arguments":{{"content":"{block}"}}}}"#),
+        ),
+        hand(
+            "bare-json-literal-newline-then-block",
+            format!(
+                "{{\"name\":\"write_file\",\"arguments\":{{\"content\":\"line1\nline2 {block}\"}}}}"
+            ),
+        ),
+        hand(
+            "qwen-json-opener-in-string",
+            r#"<tool_call>{"name": "write_file", "arguments": {"content": "<｜DSML｜tool_calls>"}}</tool_call>"#,
+        ),
+        hand(
+            "qwen-json-closer-in-string",
+            r#"<tool_call>{"name":"write_file","arguments":{"content":"</tool_call>"}}</tool_call>"#,
+        ),
+        hand(
+            "qwen-json-unescaped-block-after-closer",
+            format!(
+                r#"<tool_call>{{"name":"write_file","arguments":{{"content":"</tool_call>{block}"}}}}</tool_call>"#
+            ),
+        ),
+        hand(
+            "qwen-array-unescaped-block-after-closer",
+            format!(
+                r#"<tool_call>[{{"name":"write_file","arguments":{{"content":"</tool_call>{block}"}}}}]</tool_call>"#
+            ),
+        ),
+        hand(
+            "qwen-xml-closer-in-value",
+            format!(
+                "<tool_call><function=write_file><parameter=content></tool_call>{block}</parameter></function></tool_call>"
+            ),
+        ),
+        hand(
+            "qwen-xml-leading-text-closer-in-value",
+            format!(
+                "<tool_call>Example:\n<function=write_file><parameter=content></tool_call>{block}</parameter></function></tool_call>"
+            ),
+        ),
+        hand(
+            "hunyuan-unescaped-block-after-closer",
+            format!(
+                r#"<tool_calls>[{{"name":"write_file","arguments":{{"content":"</tool_calls>{block}"}}}}]</tool_calls>"#
+            ),
+        ),
+        hand(
+            "deepseek-closer-and-opener-in-string",
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>write_file\n```json\n{\"content\":\"<｜tool▁call▁end｜><｜DSML｜tool_calls>\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        ),
+        hand(
+            "mistral-nemo-escaped-block-in-string",
+            format!(
+                r#"[TOOL_CALLS][{{"name":"note","arguments":{{"text":{}}}}}]"#,
+                serde_json::to_string(block).expect("JSON")
+            ),
+        ),
+        hand(
+            "atem-closer-in-value",
+            format!(
+                "<atem:function_calls><atem:invoke name=\"write_file\"><atem:parameter name=\"content\"></atem:function_calls>{block}</atem:parameter></atem:invoke></atem:function_calls>"
+            ),
+        ),
+        hand(
+            "liquid-closer-in-single-quotes",
+            format!("<|tool_call_start|>[write_file(content='<|tool_call_end|>{block}')]<|tool_call_end|>"),
+        ),
+        hand(
+            "gemma4-closer-in-value",
+            "<|tool_call>call:write_file{content:<|\"|>End a call with <tool_call|>, then run:\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"Bash\">\n<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><|\"|>}<tool_call|>",
+        ),
+        hand(
+            "qwen-call-with-atem-marker",
+            r#"<tool_call>{"name": "note", "arguments": {"text": "<atem:function_calls>"}}</tool_call></atem:function_calls>"#,
+        ),
+        // A DSML block outside any other format's call.
+        hand_dsml(
+            "dsml-block",
+            block,
+            DSML_CALLS,
+            vec![delete_all_call()],
+        ),
+        hand_dsml(
+            "dsml-block-with-qwen-example",
+            write.clone(),
+            DSML_OWNS,
+            vec![write_file_call()],
+        ),
+        hand_dsml(
+            "closed-example-then-block",
+            format!("An empty example: <tool_call></tool_call>\n{write}"),
+            DSML_OWNS,
+            vec![write_file_call()],
+        ),
+        hand_dsml(
+            "qwen-call-with-opener-then-block",
+            format!(
+                "<tool_call>{{\"name\": \"note\", \"arguments\": {{\"text\": \"<｜DSML｜tool_calls>\"}}}}</tool_call>\n{write}"
+            ),
+            DSML_OWNS,
+            vec![write_file_call()],
+        ),
+        hand_dsml(
+            "qwen-call-with-marker-then-block",
+            format!(
+                "<tool_call>{{\"name\": \"note\", \"arguments\": {{\"text\": \"[TOOL_CALLS]\"}}}}</tool_call>\n{write}"
+            ),
+            DSML_OWNS,
+            vec![write_file_call()],
+        ),
+        hand_dsml(
+            "qwen-call-with-atem-marker-then-block",
+            format!(
+                "<tool_call>{{\"name\": \"note\", \"arguments\": {{\"text\": \"<atem:function_calls>\"}}}}</tool_call></atem:function_calls>\n{write}"
+            ),
+            DSML_OWNS,
+            vec![write_file_call()],
+        ),
+        hand_dsml(
+            "qwen-json-closer-in-string-then-block",
+            format!(
+                r#"<tool_call>{{"name":"write_file","arguments":{{"content":"</tool_call>"}}}}</tool_call>
+{block}"#
+            ),
+            DSML_CALLS,
+            vec![delete_all_call()],
+        ),
+        hand_dsml(
+            "qwen-xml-then-block",
+            format!(
+                "<tool_call>\n<function=write_file>\n<parameter=content>\nhello\n</parameter>\n</function>\n</tool_call>\n{block}"
+            ),
+            DSML_CALLS,
+            vec![delete_all_call()],
+        ),
+        hand_dsml(
+            "mistral-nemo-quoting-hunyuan-then-block",
+            format!(r#"[TOOL_CALLS][{{"name":"note","arguments":{{"text":"<tool_calls>"}}}}]
+{write}"#),
+            DSML_OWNS,
+            vec![write_file_call()],
+        ),
+        hand_dsml(
+            "prose-mistral-marker-then-block",
+            format!("Write [TOOL_CALLS] before a Mistral call.\n{write}"),
+            DSML_OWNS,
+            vec![write_file_call()],
+        ),
+        hand_dsml(
+            "prose-llama-marker-then-block",
+            format!("Write <|python_tag|> before a Llama call.\n{write}"),
+            DSML_OWNS,
+            vec![write_file_call()],
+        ),
+        hand_dsml(
+            "example-then-block",
+            format!(
+                "Like this: <tool_call>{{\"name\": \"note\", \"arguments\": {{}}}}</tool_call>\nNow for real:\n{write}"
+            ),
+            DSML_OWNS,
+            vec![write_file_call()],
+        ),
+        hand_dsml(
+            "empty-block-then-qwen-call",
+            "Sure.\n<｜DSML｜tool_calls></｜DSML｜tool_calls> <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>",
+            DSML_OWNS,
+            Vec::new(),
+        ),
+        hand_dsml(
+            "unreadable-block-then-qwen-call",
+            "Sure.\n<｜DSML｜tool_calls>! <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call>",
+            DSML_OWNS,
+            Vec::new(),
+        ),
+    ];
+    // Another format's opener quoted in a finished bare-JSON call, then a DSML block.
+    for (index, marker) in [
+        "<tool_calls>",
+        "<|tool_call>",
+        "<tool_call>",
+        "<|tool_call_start|>",
+        "<atem:function_calls>",
+        "<｜tool▁call▁begin｜>",
+        "[TOOL_CALLS]",
+        "<|python_tag|>",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let quoted = serde_json::to_string(marker).expect("JSON");
+        for (shape, call) in [
+            (
+                "object",
+                format!(r#"{{"name":"note","arguments":{{"text":{quoted}}}}}"#),
+            ),
+            (
+                "array",
+                format!(r#"[{{"name":"note","arguments":{{"text":{quoted}}}}}]"#),
+            ),
+        ] {
+            entries.push(hand_dsml(
+                &format!("bare-json-{shape}-quoting-marker-{index}-then-block"),
+                format!("{call}\n{write}"),
+                DSML_OWNS,
+                vec![write_file_call()],
+            ));
+        }
+    }
+    entries
+}
+
+/// A xorshift64* stream, so the generated entries are the same on every machine.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        usize::try_from(self.next() % u64::try_from(n).expect("n")).expect("an index")
+    }
+}
+
+/// Text spliced into another format's values: every format's markers, a DSML block, quotes,
+/// backslashes, and control characters.
+const FRAGMENTS: &[&str] = &[
+    OPENER,
+    BLOCK_CLOSER,
+    DELETE_ALL,
+    "<tool_call>",
+    "</tool_call>",
+    "<tool_calls>",
+    "</tool_calls>",
+    "[TOOL_CALLS]",
+    "<|python_tag|>",
+    "<|tool_call>",
+    "<tool_call|>",
+    "<|\"|>",
+    "<|tool_call_start|>",
+    "<|tool_call_end|>",
+    "<｜tool▁call▁begin｜>",
+    "<｜tool▁call▁end｜>",
+    "<atem:function_calls>",
+    "</atem:function_calls>",
+    "<parameter=x>",
+    "</parameter>",
+    "<atem:parameter name=\"x\">",
+    "</atem:parameter>",
+    "<function=Bash>",
+    "<tool_call>{\"name\":\"Bash\",\"arguments\":{}}</tool_call>",
+    "\"",
+    "'",
+    "\\",
+    "\n",
+    "\t",
+    "\r",
+    "{",
+    "}",
+    "[",
+    "]",
+    "text ",
+    "```",
+];
+
+/// Where the JSON value of a generated call goes, and the call's text after it.
+const JSON_CALLS: &[(&str, &str, &str)] = &[
+    (
+        "qwen-json",
+        r#"<tool_call>{"name":"write_file","arguments":{"content":"#,
+        "}}</tool_call>",
+    ),
+    (
+        "qwen-array",
+        r#"<tool_call>[{"name":"write_file","arguments":{"content":"#,
+        "}}]</tool_call>",
+    ),
+    (
+        "hunyuan",
+        r#"<tool_calls>[{"name":"write_file","arguments":{"content":"#,
+        "}}]</tool_calls>",
+    ),
+    (
+        "deepseek",
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>write_file\n```json\n{\"content\":",
+        "}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    ),
+    (
+        "mistral-nemo",
+        r#"[TOOL_CALLS][{"name":"write_file","arguments":{"content":"#,
+        "}}]",
+    ),
+    (
+        "llama",
+        r#"<|python_tag|>{"name":"write_file","parameters":{"content":"#,
+        "}}",
+    ),
+    (
+        "bare-json",
+        r#"{"name":"write_file","arguments":{"content":"#,
+        "}}",
+    ),
+    (
+        "bare-json-array",
+        r#"[{"name":"write_file","arguments":{"content":"#,
+        "}}]",
+    ),
+];
+
+/// One generated entry: a call in one format whose value splices in other formats' markers.
+/// A value written as its format writes one, escaped, keeps its markers as its text; one
+/// written unescaped into a JSON string is never JSON, so the call is never finished. A
+/// finished call may be followed by a DSML block, outside any call.
+fn generated(rng: &mut Rng, case: usize) -> Entry {
+    let mut payload = String::new();
+    for _ in 0..=rng.below(5) {
+        payload.push_str(FRAGMENTS[rng.below(FRAGMENTS.len())]);
+    }
+    let kind = rng.below(JSON_CALLS.len() + 5);
+    let escaped = kind >= JSON_CALLS.len() || rng.below(2) == 0;
+    let (name, head, tail) = if let Some(&(name, open, close)) = JSON_CALLS.get(kind) {
+        let value = if escaped {
+            serde_json::to_string(&payload).expect("JSON")
+        } else {
+            // Unescaped text that keeps the JSON from ever reading: a control character, or a
+            // DSML block whose attribute's quotes end the string early.
+            let escaped_payload = serde_json::to_string(&payload).expect("JSON");
+            let inner = &escaped_payload[1..escaped_payload.len() - 1];
+            let breaker = ["\n", "\t", "\r", DELETE_ALL][rng.below(4)];
+            let split = inner
+                .char_indices()
+                .map(|(at, _)| at)
+                .filter(|&at| !inner[..at].ends_with('\\'))
+                .nth(rng.below(inner.chars().count() + 1))
+                .unwrap_or(inner.len());
+            format!("\"{}{breaker}{}\"", &inner[..split], &inner[split..])
+        };
+        (name, format!("{open}{value}"), close.to_string())
+    } else {
+        match kind - JSON_CALLS.len() {
+            0 => {
+                let value = payload.replace("</parameter>", "");
+                let lead = if rng.below(2) == 0 { "Example:\n" } else { "\n" };
+                (
+                    "qwen-xml",
+                    format!("<tool_call>{lead}<function=write_file>\n<parameter=content>\n{value}"),
+                    "\n</parameter>\n</function>\n</tool_call>".to_string(),
+                )
+            }
+            1 => (
+                "atem",
+                format!(
+                    "<atem:function_calls>\n<atem:invoke name=\"write_file\">\n<atem:parameter name=\"content\">{}",
+                    payload.replace("</atem:parameter>", "")
+                ),
+                "</atem:parameter>\n</atem:invoke>\n</atem:function_calls>".to_string(),
+            ),
+            2 => (
+                "liquid-double",
+                format!(
+                    "<|tool_call_start|>[write_file(content=\"{}",
+                    payload.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+                "\")]<|tool_call_end|>".to_string(),
+            ),
+            3 => (
+                "liquid-single",
+                format!(
+                    "<|tool_call_start|>[write_file(content='{}",
+                    payload.replace('\\', "\\\\").replace('\'', "\\'")
+                ),
+                "')]<|tool_call_end|>".to_string(),
+            ),
+            _ => (
+                "gemma4",
+                format!(
+                    "<|tool_call>call:write_file{{content:<|\"|>{}",
+                    payload.replace("<|\"|>", "")
+                ),
+                "<|\"|>}<tool_call|>".to_string(),
+            ),
+        }
+    };
+    let finished = escaped;
+    let mut message = format!("{head}{tail}");
+    let mut cuts = vec![head.len()];
+    if let Some(at) = message.find(OPENER) {
+        cuts.push(at + OPENER.len());
+    }
+    let mut dsml = None;
+    if finished && rng.below(5) < 2 {
+        let (block, calls) = if rng.below(2) == 0 {
+            (DELETE_ALL.to_string(), vec![delete_all_call()])
+        } else {
+            (write_file_block(), vec![write_file_call()])
+        };
+        let at = message.len() + 1;
+        message.push('\n');
+        message.push_str(&block);
+        cuts.push(at + OPENER.len());
+        dsml = Some(TopLevelDsml {
+            reason: DSML_OWNS,
+            at,
+            blocks: vec![(message.len(), calls)],
+        });
+    }
+    let boundaries: Vec<usize> = message.char_indices().map(|(at, _)| at).collect();
+    for _ in 0..2 {
+        cuts.push(boundaries[rng.below(boundaries.len())]);
+    }
+    cuts.push(message.len());
+    cuts.retain(|&cut| cut > 0);
+    cuts.sort_unstable();
+    cuts.dedup();
+    Entry {
+        id: format!(
+            "generated:{name}:case={case}:{}",
+            if escaped { "escaped" } else { "unescaped" }
+        ),
+        message,
+        cuts,
+        dsml,
+    }
+}
+
+/// The hand-written entries, then `GENERATED` drawn from `SEED`.
+pub(super) fn corpus() -> Vec<Entry> {
+    let mut entries = hand_corpus();
+    let mut rng = Rng(SEED);
+    entries.extend((0..GENERATED).map(|case| generated(&mut rng, case)));
+    entries
+}

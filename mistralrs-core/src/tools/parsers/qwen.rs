@@ -24,11 +24,6 @@ impl ToolFormatParser for QwenParser {
         text.contains("<tool_call>")
     }
 
-    /// A `</tool_call>` inside a `<parameter=…>` value is the value's text.
-    fn open_at_end(&self, text: &str) -> bool {
-        super::open_call_start(text, super::ToolCallFormat::Qwen).is_some()
-    }
-
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::Qwen
     }

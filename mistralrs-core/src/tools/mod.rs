@@ -1,4 +1,6 @@
 pub(crate) mod grammar;
+#[cfg(test)]
+mod parse_oracle;
 pub(crate) mod parsers;
 mod request;
 mod response;
@@ -936,6 +938,77 @@ mod tests {
             .map(|call| call.function.name)
             .collect();
         assert_eq!(names, ["delete_all"]);
+    }
+
+    /// The tool-call parsers read every message of the differential corpus, and each prefix of
+    /// it, as the base read it (`parse_oracle`), but where an intended difference says
+    /// otherwise: a call the base did not make, outside those, is a regression.
+    #[test]
+    fn the_parsers_read_the_corpus_as_the_base_does_but_where_intended() {
+        use super::parse_oracle::{corpus, dsml_calls, intended_difference, oracle_json, SEED};
+        let base: Value =
+            serde_json::from_str(include_str!("testdata/tool_call_parse_oracle.json"))
+                .expect("the oracle");
+        let entries = corpus();
+        let head = oracle_json(&entries);
+        assert_eq!(
+            (
+                base["seed"].as_str(),
+                base["entries"].as_array().map(Vec::len)
+            ),
+            (head["seed"].as_str(), Some(entries.len())),
+            "the corpus no longer matches the oracle; record it again"
+        );
+        let mut matching = 0;
+        let mut intended = std::collections::BTreeMap::<&str, usize>::new();
+        let mut regressions = Vec::new();
+        let recorded = base["entries"].as_array().into_iter().flatten();
+        let read = head["entries"].as_array().into_iter().flatten();
+        for ((entry, base), head) in entries.iter().zip(recorded).zip(read) {
+            assert_eq!(
+                (&base["id"], &base["message"], &base["cuts"]),
+                (&head["id"], &head["message"], &head["cuts"]),
+                "the corpus no longer matches the oracle (seed {SEED:#x}); record it again"
+            );
+            let outcomes = base["outcomes"].as_array().into_iter().flatten();
+            let readings = head["outcomes"].as_array().into_iter().flatten();
+            for ((&cut, base), head) in entry.cuts.iter().zip(outcomes).zip(readings) {
+                if let Some((reason, calls)) = dsml_calls(entry, cut) {
+                    if head[1].is_array() && head[1][1] == calls {
+                        *intended.entry(reason).or_default() += 1;
+                    } else {
+                        regressions.push(format!(
+                            "{} at {cut} (seed {SEED:#x}): {:?}\n  base {base}\n  head {head}\n  calls as DSML {calls}",
+                            entry.id,
+                            &entry.message[..cut]
+                        ));
+                    }
+                } else if head == base {
+                    matching += 1;
+                } else if let Some(reason) = intended_difference(entry, cut, base, head) {
+                    *intended.entry(reason).or_default() += 1;
+                } else {
+                    regressions.push(format!(
+                        "{} at {cut} (seed {SEED:#x}): {:?}\n  base {base}\n  head {head}",
+                        entry.id,
+                        &entry.message[..cut]
+                    ));
+                }
+            }
+        }
+        let readings: usize = entries.iter().map(|entry| entry.cuts.len()).sum();
+        eprintln!(
+            "corpus: {} entries, {readings} readings: {matching} as the base, {} intended {intended:?}, {} regressions",
+            entries.len(),
+            intended.values().sum::<usize>(),
+            regressions.len()
+        );
+        assert!(
+            regressions.is_empty(),
+            "{} regressions:\n{}",
+            regressions.len(),
+            regressions.join("\n")
+        );
     }
 
     /// regression test for spiceai/mistral.rs#54: a JSON-format call's closer inside one of its

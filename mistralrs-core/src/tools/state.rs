@@ -196,6 +196,12 @@ impl ToolCallState {
             return None;
         }
         let tools = self.matcher.tools()?;
+        if let Some(format) = content.and_then(|content| self.strategy.claimed_format(content)) {
+            return Some(crate::tools::parsers::build_required_tool_call_grammar(
+                Some(format),
+                tools,
+            ));
+        }
         let boundary = self.strategy.required_boundary();
         Some(self.strategy.required_grammar(tools, boundary))
     }
@@ -521,6 +527,58 @@ mod tests {
     /// an unfinished DSML call, forced a new block of calls into its value; and it did so
     /// again when the template preferred no format, though a DSML block is read whatever the
     /// template prefers, so the deadline reads the unfinished call from the content alone
+    /// regression test for spiceai/mistral.rs#54: a required call forced after a finished DSML
+    /// block, here an empty one, was written in the template's format, though the block claims
+    /// the message for DSML, so the forced call was not read and the request failed
+    #[test]
+    fn a_required_call_forced_after_a_finished_dsml_block_is_written_in_dsml() {
+        let tools = vec![tool("get_weather")];
+        let content = "Sure.\n<｜DSML｜tool_calls></｜DSML｜tool_calls>";
+        for preferred in [
+            None,
+            Some(ToolCallFormat::Qwen),
+            Some(ToolCallFormat::DeepSeekDsml),
+        ] {
+            let mut state =
+                ToolCallState::new(ToolChoice::Required, Some(&tools), preferred).unwrap();
+            let grammar = state
+                .maybe_force_required_grammar(0, 8192, true, Some(content))
+                .expect("a forced call");
+            assert!(
+                lark(&grammar)
+                    .starts_with("start: \"<\" dsml_mark \"tool_calls>\\n\" (invoke_0)+ "),
+                "{preferred:?}: {}",
+                lark(&grammar)
+            );
+        }
+        // Without a block, the template's format is forced.
+        let mut state = ToolCallState::new(
+            ToolChoice::Required,
+            Some(&tools),
+            Some(ToolCallFormat::Qwen),
+        )
+        .unwrap();
+        let grammar = state
+            .maybe_force_required_grammar(0, 8192, true, Some("Sure.\n"))
+            .expect("a forced call");
+        assert!(
+            lark(&grammar).starts_with("start: \"<tool_call>\""),
+            "{}",
+            lark(&grammar)
+        );
+        // The call forced after the block is read.
+        let matcher =
+            crate::tools::ToolCallingMatcher::new(ToolChoice::Required, Some(&tools)).unwrap();
+        let forced = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let names: Vec<String> = matcher
+            .get_call(&format!("{content}{forced}"))
+            .unwrap()
+            .into_iter()
+            .map(|call| call.function.name)
+            .collect();
+        assert_eq!(names, ["get_weather"]);
+    }
+
     #[test]
     fn required_tool_call_deadline_waits_for_an_unfinished_dsml_call() {
         let tools = vec![tool("get_weather")];

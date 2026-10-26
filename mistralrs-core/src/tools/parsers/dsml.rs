@@ -379,10 +379,7 @@ fn scan(message: &str) -> Scan<Found> {
     while let Some(offset) = message[from..].find(OPEN) {
         let start = from + offset;
         // An opener inside another format's call is that call's text.
-        if super::open_in_other_format(
-            &message[outside..start],
-            super::ToolCallFormat::DeepSeekDsml,
-        ) {
+        if super::inside_a_call(&message[outside..start]) {
             from = start + OPEN.len();
             continue;
         }
@@ -414,12 +411,12 @@ fn scan(message: &str) -> Scan<Found> {
         from = end;
         outside = end;
     }
-    // The message may end partway through the marker that opens the next block.
+    // The message may end partway through the marker that opens the next block, outside any
+    // other format's call.
     let tail = &message[from..];
-    let partial = OPEN
-        .char_indices()
-        .skip(1)
-        .any(|(at, _)| tail.ends_with(&OPEN[..at]));
+    let partial = OPEN.char_indices().skip(1).any(|(at, _)| {
+        tail.ends_with(&OPEN[..at]) && !super::inside_a_call(&message[outside..message.len() - at])
+    });
     if partial {
         Scan::More
     } else {
@@ -433,9 +430,7 @@ fn scan(message: &str) -> Scan<Found> {
 /// marker included, is claimed as well, so an example in another format earlier in it is not
 /// dispatched as a call while the block is still being written.
 fn block_start(message: &str) -> Option<usize> {
-    let outside = |start: usize| {
-        !super::open_in_other_format(&message[..start], super::ToolCallFormat::DeepSeekDsml)
-    };
+    let outside = |start: usize| !super::inside_a_call(&message[..start]);
     let opener = message
         .match_indices(OPEN)
         .map(|(start, _)| start)
@@ -473,6 +468,12 @@ fn names_block(text: &str) -> bool {
     })
 }
 
+/// Whether `message` opens a block of calls outside any other format's call, which claims the
+/// message for DSML.
+pub(super) fn claims(message: &str) -> bool {
+    block_start(message).is_some()
+}
+
 /// Whether `message` opens a block of calls it does not finish, the block's opening tag
 /// included: text cut short partway through one could still be a call.
 pub(super) fn unfinished_block(message: &str) -> bool {
@@ -507,14 +508,10 @@ pub(super) fn strip_blocks_making_calls(message: &str, made: impl Fn(usize) -> b
     out
 }
 
+/// `value` as a grammar's string literal, escaped as a JSON string is, control characters
+/// included, which a literal cannot hold as they are.
 fn lark_literal(value: &str) -> String {
-    format!(
-        "\"{}\"",
-        value
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n")
-    )
+    serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"))
 }
 
 /// A string parameter's value and its closing tag, as a grammar rule.
@@ -2361,6 +2358,40 @@ mod tests {
             );
         }
         assert!(calls(&valid.replace("command", "a.b-c_9")).is_some());
+    }
+
+    /// regression test for spiceai/mistral.rs#54: a strict `enum` value holding a tab, a
+    /// carriage return or another control character was written into the grammar unescaped,
+    /// which does not compile, so no call to any tool offered beside it was constrained
+    #[test]
+    fn a_strict_enum_value_with_a_control_character_compiles_and_is_written() {
+        let values = [",", "\t", "\r", "\u{1}"];
+        let strict = tool(serde_json::json!({
+            "type": "object",
+            "properties": { "delimiter": { "type": "string", "enum": values } },
+            "required": ["delimiter"],
+            "additionalProperties": false,
+        }));
+        let tools = std::slice::from_ref(&strict);
+        let (env, _) = dsml_env();
+        let factory = llguidance::ParserFactory::new_simple(&env).expect("factory");
+        assert_eq!(
+            factory
+                .create_parser(build_dsml_grammar(tools, Block::Whole))
+                .err()
+                .map(|error| error.to_string()),
+            None
+        );
+        for value in values {
+            assert!(
+                forced_call_accepts(tools, &one_call("set", &[("delimiter", "true", value)])),
+                "{value:?}"
+            );
+        }
+        assert!(!forced_call_accepts(
+            tools,
+            &one_call("set", &[("delimiter", "true", ";")])
+        ));
     }
 
     /// regression test for spiceai/mistral.rs#54: a strict tool whose schema the grammar cannot

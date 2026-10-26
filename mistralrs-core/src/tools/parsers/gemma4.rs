@@ -45,17 +45,6 @@ impl ToolFormatParser for Gemma4Parser {
         text.contains("<|tool_call>")
     }
 
-    fn open_at_end(&self, text: &str) -> bool {
-        let mut from = 0;
-        while let Some(offset) = text[from..].find(CALL_OPEN) {
-            let Some(end) = call_end(text, from + offset) else {
-                return true;
-            };
-            from = end;
-        }
-        false
-    }
-
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::Gemma4
     }

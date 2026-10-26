@@ -14,15 +14,6 @@ impl ToolFormatParser for LlamaParser {
         text.contains("<|python_tag|>")
     }
 
-    /// A call is the marker and then the JSON of a call, or of an array of calls, running to
-    /// the end of the message.
-    fn open_at_end(&self, text: &str) -> bool {
-        super::json_call_open_after(text, "<|python_tag|>", |rest| {
-            let rest = rest.trim_start();
-            rest.is_empty() || rest.starts_with(['{', '['])
-        })
-    }
-
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::Llama
     }

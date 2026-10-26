@@ -25,11 +25,6 @@ impl ToolFormatParser for LiquidParser {
         text.contains(START)
     }
 
-    /// A closer inside a quoted argument is the argument's text.
-    fn open_at_end(&self, text: &str) -> bool {
-        super::open_call_start(text, super::ToolCallFormat::Liquid).is_some()
-    }
-
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::Liquid
     }
