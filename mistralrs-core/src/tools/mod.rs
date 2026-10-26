@@ -857,6 +857,54 @@ mod tests {
         );
     }
 
+    /// regression test for spiceai/mistral.rs#54: a Mistral Nemo `[TOOL_CALLS]` or Llama
+    /// `<|python_tag|>` marker that begins no call, quoted in a finished bare-JSON call or
+    /// written in prose, counted as enclosing a later DSML block, so a Qwen call inside the
+    /// block's value was made in place of the block's call, or the block's call was lost
+    #[test]
+    fn a_marker_that_begins_no_call_does_not_enclose_a_later_dsml_block() {
+        let tool = |name: &str| -> Tool {
+            serde_json::from_value(json!({
+                "type": "function",
+                "function": { "name": name, "parameters": { "type": "object" } },
+            }))
+            .expect("a tool")
+        };
+        let matcher = ToolCallingMatcher::new(
+            ToolChoice::Auto,
+            Some(&[tool("Bash"), tool("write_file"), tool("note")]),
+        )
+        .expect("a matcher");
+        let block = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"content\" string=\"true\">Run <tool_call>{\"name\": \"Bash\", \"arguments\": {}}</tool_call></｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        let names = |message: &str| -> Vec<String> {
+            matcher
+                .get_call(message)
+                .expect("a message")
+                .into_iter()
+                .map(|call| call.function.name)
+                .collect()
+        };
+        for before in [
+            r#"{"name":"note","arguments":{"text":"[TOOL_CALLS]"}}"#,
+            r#"[{"name":"note","arguments":{"text":"[TOOL_CALLS]"}}]"#,
+            r#"{"name":"note","arguments":{"text":"<|python_tag|>"}}"#,
+            "Write [TOOL_CALLS] before a Mistral call.",
+            "Write <|python_tag|> before a Llama call.",
+        ] {
+            assert_eq!(
+                names(&format!("{before}\n{block}")),
+                ["write_file"],
+                "{before}"
+            );
+        }
+        // A block inside a call that the marker does begin is that call's text.
+        let inside = format!(
+            "[TOOL_CALLS][{{\"name\":\"note\",\"arguments\":{{\"text\":{}}}}}]",
+            serde_json::to_string(block).expect("JSON")
+        );
+        assert_eq!(names(&inside), ["note"]);
+    }
+
     /// regression test for spiceai/mistral.rs#54: a closed `<tool_call>` example before a DSML
     /// block counted as enclosing it, and a Qwen call inside the block's value was made
     #[test]

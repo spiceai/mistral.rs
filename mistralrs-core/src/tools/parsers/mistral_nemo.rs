@@ -14,6 +14,14 @@ impl ToolFormatParser for MistralNemoParser {
         text.contains("[TOOL_CALLS]")
     }
 
+    /// A call is the marker and then, directly, a JSON array of calls running to the end of the
+    /// message.
+    fn open_at_end(&self, text: &str) -> bool {
+        super::json_call_open_after(text, "[TOOL_CALLS]", |rest| {
+            rest.is_empty() || rest.starts_with('[')
+        })
+    }
+
     fn format(&self) -> super::ToolCallFormat {
         super::ToolCallFormat::MistralNemo
     }

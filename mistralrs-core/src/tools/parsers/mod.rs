@@ -301,12 +301,24 @@ pub(super) fn open_in_other_format(text: &str, format: ToolCallFormat) -> bool {
 /// nothing around it, and ends inside one of its strings, where a marker is the string's text.
 fn in_bare_json_call_string(text: &str) -> bool {
     let json = text.trim_start();
-    if !json.starts_with(['{', '[']) {
-        return false;
-    }
-    let unfinished = super::could_be_json::<super::CalledFunctionParameters>(json).0
-        || super::could_be_json::<Vec<super::CalledFunctionParameters>>(json).0;
-    unfinished && ends_inside_json_string(json)
+    json.starts_with(['{', '[']) && unfinished_json_call(json) && ends_inside_json_string(json)
+}
+
+/// Whether `json` is the start of a call or of an array of calls written as JSON, cut off.
+fn unfinished_json_call(json: &str) -> bool {
+    super::could_be_json::<super::CalledFunctionParameters>(json).0
+        || super::could_be_json::<Vec<super::CalledFunctionParameters>>(json).0
+}
+
+/// Whether `text` ends inside a call of a format whose calls are `marker` and then JSON running
+/// to the end of the message: after some `marker`, the text `begins` a call, and the call's JSON
+/// has yet to begin or has begun and not finished. A marker followed by anything else, such as
+/// prose or the rest of a JSON string it is quoted in, begins no call.
+fn json_call_open_after(text: &str, marker: &str, begins: impl Fn(&str) -> bool) -> bool {
+    text.match_indices(marker).any(|(at, _)| {
+        let rest = &text[at + marker.len()..];
+        begins(rest) && (rest.trim().is_empty() || unfinished_json_call(rest))
+    })
 }
 
 /// Whether the JSON `text` ends inside a string.
