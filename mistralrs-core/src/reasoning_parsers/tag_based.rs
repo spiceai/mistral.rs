@@ -33,6 +33,11 @@ pub const CHANNEL_CLOSE_TAG: &str = "<channel|>";
 pub const GEMMA_THOUGHT_OPEN_TAG: &str = "<unused94>";
 pub const GEMMA_THOUGHT_CLOSE_TAG: &str = "<unused95>";
 
+/// Mistral's reasoning models (Magistral, Mistral Large 4) mark reasoning with these control
+/// tokens: `[THINK]...[/THINK]`.
+pub const MISTRAL_THINK_OPEN_TAG: &str = "[THINK]";
+pub const MISTRAL_THINK_CLOSE_TAG: &str = "[/THINK]";
+
 /// Context for tracking tag-delimited reasoning parsing state within a sequence.
 ///
 /// This provides incremental parsing of token streams containing reasoning tags,
@@ -109,6 +114,18 @@ impl TagReasoningContext {
     /// so the model's output starts inside the think block without an opening tag.
     pub fn new_in_think_block() -> Self {
         let mut ctx = Self::new_think_tags();
+        ctx.in_think_block = true;
+        ctx
+    }
+
+    /// Mistral's `[THINK]...[/THINK]` reasoning.
+    pub fn new_mistral_think() -> Self {
+        Self::with_tags(MISTRAL_THINK_OPEN_TAG, MISTRAL_THINK_CLOSE_TAG)
+    }
+
+    /// Mistral's reasoning, for a prompt that already opened the `[THINK]` block.
+    pub fn new_in_mistral_think_block() -> Self {
+        let mut ctx = Self::new_mistral_think();
         ctx.in_think_block = true;
         ctx
     }
@@ -439,6 +456,11 @@ pub fn is_think_tag_template(template: &str) -> bool {
     template.contains(THINK_OPEN_TAG) && template.contains(THINK_CLOSE_TAG)
 }
 
+/// Check if a chat template marks reasoning with Mistral's `[THINK]` and `[/THINK]` tokens.
+pub fn is_mistral_think_template(template: &str) -> bool {
+    template.contains(MISTRAL_THINK_OPEN_TAG) && template.contains(MISTRAL_THINK_CLOSE_TAG)
+}
+
 /// Check if a chat template uses Gemma 4 channel tags.
 ///
 /// Returns true if the template contains both `<|channel>` and `<channel|>` markers.
@@ -481,6 +503,47 @@ mod tests {
     }
 
     use super::*;
+
+    // === Mistral [THINK] Tests ===
+
+    #[test]
+    fn mistral_think_block_splits_reasoning_from_content() {
+        let mut ctx = TagReasoningContext::new_mistral_think();
+        // the tags arrive split across decoded pieces, as tokens stream out
+        for chunk in [
+            "[TH",
+            "INK]The user wants",
+            " a story.[/",
+            "THINK]Once upon",
+            " a time.",
+        ] {
+            ctx.process_text(chunk);
+        }
+        ctx.finalize();
+        assert_eq!(
+            ctx.reasoning_content(),
+            Some("The user wants a story.".to_string())
+        );
+        assert_eq!(ctx.content(), Some("Once upon a time.".to_string()));
+    }
+
+    #[test]
+    fn mistral_think_block_opened_by_the_prompt() {
+        let mut ctx = TagReasoningContext::new_in_mistral_think_block();
+        ctx.process_text("plan[/THINK]answer");
+        ctx.finalize();
+        assert_eq!(ctx.reasoning_content(), Some("plan".to_string()));
+        assert_eq!(ctx.content(), Some("answer".to_string()));
+    }
+
+    #[test]
+    fn mistral_think_template_is_told_apart() {
+        let mistral = "{{- '[THINK]' ~ block['thinking'] -}}{{- '[/THINK]' -}}";
+        assert!(is_mistral_think_template(mistral));
+        assert!(!is_think_tag_template(mistral));
+        assert!(!is_mistral_think_template("<think>{{ x }}</think>"));
+        assert!(crate::reasoning_parsers::is_reasoning_template(mistral));
+    }
 
     // === Think Tag Tests ===
 

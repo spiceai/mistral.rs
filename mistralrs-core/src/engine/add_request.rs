@@ -825,6 +825,21 @@ impl Engine {
                             crate::reasoning_parsers::ReasoningMode::TagBased,
                             Box::new(ctx),
                         );
+                    } else if chat_template.uses_mistral_think_tags() {
+                        // Magistral, Mistral Large 4: [THINK]...[/THINK]
+                        let starts_in_block = seq
+                            .get_initial_prompt()
+                            .trim_end()
+                            .ends_with(crate::reasoning_parsers::tag_based::MISTRAL_THINK_OPEN_TAG);
+                        let ctx = if starts_in_block {
+                            crate::reasoning_parsers::TagReasoningContext::new_in_mistral_think_block()
+                        } else {
+                            crate::reasoning_parsers::TagReasoningContext::new_mistral_think()
+                        };
+                        seq.enable_reasoning(
+                            crate::reasoning_parsers::ReasoningMode::TagBased,
+                            Box::new(ctx),
+                        );
                     } else if chat_template.uses_gemma_turns() {
                         // Gemma-family thinking convention (MedGemma 1.5 etc):
                         // <unused94>thought\n...<unused95>. Pass-through for models

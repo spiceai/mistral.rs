@@ -37,7 +37,10 @@ pub enum ReasoningMode {
     TagBased,
 }
 
-/// Check if a template uses any reasoning format (think tags or channel tags).
+/// Check if a template uses any reasoning format (think tags, Mistral's `[THINK]` tags or
+/// channel tags).
 pub fn is_reasoning_template(template: &str) -> bool {
-    tag_based::is_think_tag_template(template) || tag_based::is_channel_tag_template(template)
+    tag_based::is_think_tag_template(template)
+        || tag_based::is_mistral_think_template(template)
+        || tag_based::is_channel_tag_template(template)
 }
