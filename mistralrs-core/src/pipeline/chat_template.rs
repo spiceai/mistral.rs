@@ -137,6 +137,18 @@ impl ChatTemplate {
             .any(|t| crate::reasoning_parsers::tag_based::is_think_tag_template(t))
     }
 
+    /// Check if this chat template uses Mistral's `[THINK]...[/THINK]` reasoning tokens
+    /// (Magistral, Mistral Large 4).
+    pub fn uses_mistral_think_tags(&self) -> bool {
+        if self.is_harmony_format() {
+            return false;
+        }
+
+        self.get_template_contents()
+            .iter()
+            .any(|t| crate::reasoning_parsers::tag_based::is_mistral_think_template(t))
+    }
+
     /// Check if the template uses Gemma 4 channel-based reasoning tags.
     pub fn uses_channel_tags(&self) -> bool {
         self.get_template_contents()
