@@ -31,7 +31,10 @@ fn default_max_position_embeddings() -> usize {
     4096
 }
 
-serde_default_fn!(bool, word_emb_default, false);
+// Gemma ties `lm_head` to the token embeddings, and Hugging Face's `GemmaConfig`
+// defaults `tie_word_embeddings` to `true`. The published checkpoints (for example
+// `google/gemma-2b-it`) omit the key from `config.json` and ship no `lm_head.weight`.
+serde_default_fn!(bool, word_emb_default, true);
 serde_default_fn!(bool, attention_bias_default, false);
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone, Default)]
@@ -680,5 +683,44 @@ impl AnyMoeBaseModelMixin for Model {
     }
     fn amoe_supported(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    // The architecture fields of `google/gemma-2b-it`'s `config.json`, which has no
+    // `tie_word_embeddings` key.
+    const GEMMA_2B_IT_CONFIG: &str = r#"{
+        "architectures": ["GemmaForCausalLM"],
+        "attention_bias": false,
+        "head_dim": 256,
+        "hidden_act": "gelu",
+        "hidden_activation": null,
+        "hidden_size": 2048,
+        "intermediate_size": 16384,
+        "max_position_embeddings": 8192,
+        "model_type": "gemma",
+        "num_attention_heads": 8,
+        "num_hidden_layers": 18,
+        "num_key_value_heads": 1,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 10000.0,
+        "vocab_size": 256000
+    }"#;
+
+    #[test]
+    fn a_config_without_tie_word_embeddings_ties_lm_head_to_the_embeddings() {
+        let cfg: Config = serde_json::from_str(GEMMA_2B_IT_CONFIG).unwrap();
+        assert!(cfg.tie_word_embeddings);
+    }
+
+    #[test]
+    fn an_explicit_untied_config_keeps_its_own_lm_head() {
+        let mut value: serde_json::Value = serde_json::from_str(GEMMA_2B_IT_CONFIG).unwrap();
+        value["tie_word_embeddings"] = serde_json::Value::Bool(false);
+        let cfg: Config = serde_json::from_value(value).unwrap();
+        assert!(!cfg.tie_word_embeddings);
     }
 }
