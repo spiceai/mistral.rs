@@ -3,6 +3,7 @@
 //! Formats:
 //! `<tool_call>{"name":"...", "arguments":{...}}</tool_call>`
 //! `<tool_call><function=NAME><parameter=KEY>VALUE</parameter></function></tool_call>`
+//! `<tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value></tool_call>` (GLM-4.5 and later)
 
 use candle_core::Result;
 use llguidance::api::TopLevelGrammar;
@@ -16,6 +17,8 @@ use crate::Tool;
 static QWEN_REGEX: OnceLock<Regex> = OnceLock::new();
 static QWEN_FUNCTION_REGEX: OnceLock<Regex> = OnceLock::new();
 static QWEN_PARAMETER_REGEX: OnceLock<Regex> = OnceLock::new();
+static GLM_CALL_REGEX: OnceLock<Regex> = OnceLock::new();
+static GLM_ARGUMENT_REGEX: OnceLock<Regex> = OnceLock::new();
 
 pub struct QwenParser;
 
@@ -132,6 +135,11 @@ fn parse_qwen_tool_calls(message: &str) -> Result<Option<String>> {
             continue;
         }
 
+        if let Some(call) = parse_glm_tool_call(inner) {
+            xml_calls.push(call);
+            continue;
+        }
+
         match serde_json::from_str::<Value>(inner) {
             Ok(value) => json_calls.push(value),
             Err(_) => return Ok(None),
@@ -179,6 +187,42 @@ fn parse_qwen_xml_tool_call(inner: &str) -> Result<Vec<QwenToolCall>> {
         });
     }
     Ok(calls)
+}
+
+/// One call in GLM's format (GLM-4.5, 4.6, 5.x): the function's name, then each argument as an
+/// `<arg_key>` and `<arg_value>` pair, with newlines between the parts as the template writes
+/// them. A call with no arguments is the name alone. Anything else between the tags, a JSON
+/// object above all, is not this format.
+///
+/// Values are raw text, as in the XML format above: GLM's template writes a string verbatim and
+/// any other value as JSON, and the tool schema's types are applied to them later.
+fn parse_glm_tool_call(inner: &str) -> Option<QwenToolCall> {
+    let call_re = GLM_CALL_REGEX.get_or_init(|| {
+        Regex::new(r"(?s)^(?P<name>[A-Za-z_][A-Za-z0-9_.:\-]*)\s*(?P<arguments><arg_key>.*)?$")
+            .unwrap()
+    });
+    let argument_re = GLM_ARGUMENT_REGEX.get_or_init(|| {
+        Regex::new(
+            r"(?s)\A\s*<arg_key>(?P<key>.*?)</arg_key>\s*<arg_value>(?P<value>.*?)</arg_value>\s*",
+        )
+        .unwrap()
+    });
+    let caps = call_re.captures(inner)?;
+    let name = caps.name("name")?.as_str().to_string();
+    let mut rest = caps.name("arguments").map_or("", |m| m.as_str());
+    let mut arguments = Map::new();
+    // Every argument pair in turn, to the end: text the pairs do not account for means the body
+    // is not a GLM call.
+    while !rest.is_empty() {
+        let pair = argument_re.captures(rest)?;
+        let key = pair.name("key")?.as_str().trim().to_string();
+        arguments.insert(key, Value::String(pair.name("value")?.as_str().to_string()));
+        rest = &rest[pair.get(0)?.end()..];
+    }
+    Some(QwenToolCall {
+        name,
+        arguments: Value::Object(arguments),
+    })
 }
 
 // Values are kept verbatim minus the template's single framing newlines; types come from the tool schema later
@@ -329,6 +373,61 @@ mod tests {
         let value: Value = serde_json::from_str(&parsed).unwrap();
         assert_eq!(value["name"], "get_weather");
         assert_eq!(value["arguments"]["city"], "Paris");
+    }
+
+    /// GLM-5.3's call as Claude Code received it as text through Spice before this format was read.
+    #[test]
+    fn parses_a_glm_tool_call() {
+        let parsed = parse_qwen_tool_calls(
+            "<tool_call>WebSearch<arg_key>query</arg_key><arg_value>Anthropic Claude latest news</arg_value></tool_call>",
+        )
+        .unwrap()
+        .unwrap();
+        let value: Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(
+            value,
+            json!([{"name": "WebSearch", "arguments": {"query": "Anthropic Claude latest news"}}])
+        );
+    }
+
+    /// The layout GLM's chat template writes: newlines between the parts, a non-string value as
+    /// JSON, and a value that holds tags of its own.
+    #[test]
+    fn parses_glm_tool_calls_as_the_template_writes_them() {
+        let parsed = parse_qwen_tool_calls(
+            "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n</tool_call>\n<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value>if a < b:\n    print(\"<b>\")</arg_value>\n</tool_call>",
+        )
+        .unwrap()
+        .unwrap();
+        let value: Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(
+            value,
+            json!([
+                {"name": "get_weather", "arguments": {"city": "Paris", "days": "3"}},
+                {"name": "write_file", "arguments": {"content": "if a < b:\n    print(\"<b>\")"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn a_glm_call_without_arguments_is_its_name() {
+        let parsed = parse_qwen_tool_calls("<tool_call>get_time\n</tool_call>")
+            .unwrap()
+            .unwrap();
+        let value: Value = serde_json::from_str(&parsed).unwrap();
+        assert_eq!(value, json!([{"name": "get_time", "arguments": {}}]));
+    }
+
+    /// Text between the tags that is neither JSON nor a whole GLM call is not a call.
+    #[test]
+    fn a_body_that_is_not_a_glm_call_is_not_read_as_one() {
+        for message in [
+            "<tool_call>not a call: hello</tool_call>",
+            "<tool_call>get_weather<arg_key>city</arg_key></tool_call>",
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value> trailing</tool_call>",
+        ] {
+            assert_eq!(parse_qwen_tool_calls(message).unwrap(), None, "{message}");
+        }
     }
 
     #[test]

@@ -731,6 +731,35 @@ mod tests {
         assert_eq!(args["coords"], json!([1, 2]));
     }
 
+    /// GLM's raw values take the tool schema's types, as the XML format's do.
+    #[test]
+    fn glm_arguments_follow_the_tool_schema() {
+        let mut tool = test_tool("get_weather");
+        tool.function.parameters = Some(
+            serde_json::from_value(json!({
+                "type": "object",
+                "properties": {
+                    "city": { "type": "string" },
+                    "days": { "type": "integer" },
+                    "coords": { "type": "array" }
+                }
+            }))
+            .unwrap(),
+        );
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        let message = "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>12345</arg_value>\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n<arg_key>coords</arg_key>\n<arg_value>[1, 2]</arg_value>\n</tool_call>";
+        // Held while the call is open, read once it closes.
+        assert_eq!(
+            matcher.prefix_could_be_tool(&message[..40]).unwrap(),
+            (true, false)
+        );
+        let calls = matcher.get_call(message).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"city": "12345", "days": 3, "coords": [1, 2]}));
+    }
+
     #[test]
     fn qwen_parallel_calls_keep_buffering_until_the_turn_ends() {
         let tools = vec![test_tool("get_weather"), test_tool("get_time")];
