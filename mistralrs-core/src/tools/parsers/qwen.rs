@@ -85,7 +85,7 @@ xml_call: "\n"? xml_function ("\n"? xml_function)* "\n"? {xml_end}
 {}
 {}
 {}
-glm_call: glm_function {xml_end}
+glm_call: "\n"? glm_function {xml_end}
 {}
 {}
 {}"#,
@@ -214,7 +214,8 @@ pub(super) fn glm_call(body: &str, closer: &str) -> GlmCall {
 }
 
 /// The body of each `<tool_call>` in `message`, and where its call ends: a GLM call to its own
-/// closer, its values read as text, and any other to the first closer.
+/// closer, its values read as text, and any other to the first closer. A GLM call that has not
+/// ended is the last, and has no body yet.
 fn qwen_call_bodies(message: &str) -> Vec<(&str, usize)> {
     let mut bodies = Vec::new();
     let mut from = 0;
@@ -223,7 +224,9 @@ fn qwen_call_bodies(message: &str) -> Vec<(&str, usize)> {
         let body = &message[start..];
         let end = match glm_call(body, WRAPPER_CLOSE) {
             GlmCall::Ends(end) => end,
-            GlmCall::Not | GlmCall::Open => match body.find(WRAPPER_CLOSE) {
+            // a GLM call that has not ended holds everything after it, a closer in its value too
+            GlmCall::Open => break,
+            GlmCall::Not => match body.find(WRAPPER_CLOSE) {
                 Some(close) => close + WRAPPER_CLOSE.len(),
                 None => break,
             },
@@ -253,8 +256,10 @@ pub(super) fn strip_qwen_calls(message: &str) -> String {
 }
 
 fn parse_qwen_tool_calls(message: &str) -> Result<Option<String>> {
-    let mut xml_calls = Vec::new();
-    let mut json_calls = Vec::new();
+    // Every block's calls in order, whichever format each is written in; `tagged` says whether
+    // any is a GLM or XML call, which are written out as a list.
+    let mut calls: Vec<Value> = Vec::new();
+    let mut tagged = false;
 
     for (inner, _) in qwen_call_bodies(message) {
         let inner = inner.trim();
@@ -265,37 +270,44 @@ fn parse_qwen_tool_calls(message: &str) -> Result<Option<String>> {
         // A GLM call is read first: it must account for the whole body, so a `<function=` it
         // holds is a value's text, while the XML format finds its calls anywhere in the body.
         if let Some(call) = parse_glm_tool_call(inner) {
-            xml_calls.push(call);
+            calls.push(serde_json::to_value(call).map_err(candle_core::Error::msg)?);
+            tagged = true;
             continue;
         }
 
         let parsed_xml = parse_qwen_xml_tool_call(inner)?;
         if !parsed_xml.is_empty() {
-            xml_calls.extend(parsed_xml);
+            for call in parsed_xml {
+                calls.push(serde_json::to_value(call).map_err(candle_core::Error::msg)?);
+            }
+            tagged = true;
             continue;
         }
 
         match serde_json::from_str::<Value>(inner) {
-            Ok(value) => json_calls.push(value),
+            Ok(value) => calls.push(value),
             Err(_) => return Ok(None),
         }
     }
 
-    if !xml_calls.is_empty() {
-        return Ok(Some(
-            serde_json::to_string(&xml_calls).map_err(candle_core::Error::msg)?,
-        ));
-    }
-
-    match json_calls.len() {
-        0 => Ok(None),
-        1 => Ok(Some(
-            serde_json::to_string(&json_calls[0]).map_err(candle_core::Error::msg)?,
-        )),
-        _ => Ok(Some(
-            serde_json::to_string(&json_calls).map_err(candle_core::Error::msg)?,
-        )),
-    }
+    let read = match calls.len() {
+        0 => return Ok(None),
+        // a single JSON block is returned as it was written, a call or a list of calls
+        1 if !tagged => calls.swap_remove(0),
+        _ if tagged => Value::Array(
+            calls
+                .into_iter()
+                .flat_map(|call| match call {
+                    Value::Array(calls) => calls,
+                    call => vec![call],
+                })
+                .collect(),
+        ),
+        _ => Value::Array(calls),
+    };
+    Ok(Some(
+        serde_json::to_string(&read).map_err(candle_core::Error::msg)?,
+    ))
 }
 
 fn parse_qwen_xml_tool_call(inner: &str) -> Result<Vec<QwenToolCall>> {
@@ -833,6 +845,16 @@ print(1 < 2)
         accepts(&mut matcher, &trie, body);
         assert!(matcher.compute_mask().unwrap().is_allowed(end_token));
         matcher.consume_token(end_token).unwrap();
+
+        // a newline may lead the name, as the parser reads it
+        let grammar = QwenParser.tool_call_grammar(&[weather_tool()], "<tool_call>");
+        let mut matcher = llguidance::Matcher::new(Ok(factory.create_parser(grammar).unwrap()));
+        accepts(
+            &mut matcher,
+            &trie,
+            "\nget_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>",
+        );
+        assert!(matcher.compute_mask().unwrap().is_allowed(end_token));
     }
 
     /// A required call may be written in GLM's format, and only to an offered tool and its keys.

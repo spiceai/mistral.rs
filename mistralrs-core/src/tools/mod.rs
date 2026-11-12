@@ -822,6 +822,34 @@ mod tests {
         assert_eq!(text.as_deref(), Some("Writing it.\n"));
     }
 
+    /// A GLM call whose value is still streaming is not finished by a `<tool_call>` written in that
+    /// value: the call is held, and no call written in the value is read as complete.
+    #[test]
+    fn a_streaming_glm_value_holding_a_whole_call_is_not_a_finished_call() {
+        let tools = vec![test_tool("write_file"), test_tool("get_time")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let prefix = "<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value><tool_call><function=get_time></function></tool_call> and more";
+        assert_eq!(matcher.prefix_could_be_tool(prefix).unwrap(), (true, false));
+        assert!(
+            matcher.get_call(prefix).unwrap().is_empty(),
+            "an unfinished call makes no call"
+        );
+    }
+
+    /// A turn's calls are all read, in order, whichever of Qwen's formats each block is written in.
+    #[test]
+    fn a_turn_mixing_glm_and_json_blocks_makes_every_call() {
+        let tools = vec![test_tool("get_time"), test_tool("get_weather")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let message = "<tool_call>get_time\n</tool_call>\n<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["get_time", "get_weather"]);
+    }
+
     #[test]
     fn qwen_parallel_calls_keep_buffering_until_the_turn_ends() {
         let tools = vec![test_tool("get_weather"), test_tool("get_time")];
