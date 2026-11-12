@@ -1102,6 +1102,11 @@ pub fn process_model_specific_message(message: &str) -> Result<String> {
 
 /// The calls a model-specific format reads out of `message`, as JSON, with the text around
 /// them and the format they were read in.
+/// Where the last Qwen call of `text` that has ended ends, reading GLM values as text.
+pub(crate) fn last_qwen_call_end(text: &str) -> Option<usize> {
+    qwen::last_call_end(text)
+}
+
 pub(crate) fn extract_model_specific_call(
     message: &str,
 ) -> Result<Option<(String, String, ToolCallFormat)>> {

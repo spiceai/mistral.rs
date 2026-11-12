@@ -237,6 +237,12 @@ fn qwen_call_bodies(message: &str) -> Vec<(&str, usize)> {
     bodies
 }
 
+/// Where the last call of `text` that has ended ends, as `qwen_call_bodies` ends each: a closer
+/// in a GLM value, the value of a call still streaming above all, is not the end of one.
+pub(super) fn last_call_end(text: &str) -> Option<usize> {
+    qwen_call_bodies(text).last().map(|&(_, end)| end)
+}
+
 /// `message` without its calls, each cut out to where `qwen_call_bodies` ends it; a call left
 /// open takes the rest of the message with it.
 pub(super) fn strip_qwen_calls(message: &str) -> String {

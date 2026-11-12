@@ -421,14 +421,15 @@ impl ToolCallingMatcher {
 }
 
 const QWEN_TOOL_CALL_OPEN: &str = "<tool_call>";
-const QWEN_TOOL_CALL_CLOSE: &str = "</tool_call>";
 
 // True while the text after the last complete <tool_call> block is empty or an unfinished opener of the next block
 fn qwen_more_calls_possible(text: &str) -> bool {
-    let Some(last_close) = text.rfind(QWEN_TOOL_CALL_CLOSE) else {
+    // The last call that has ended, as the parser ends each: a closer written in a GLM value is
+    // the value's text, so a call still streaming after a finished one keeps the turn open.
+    let Some(last_end) = parsers::last_qwen_call_end(text) else {
         return false;
     };
-    let tail = text[last_close + QWEN_TOOL_CALL_CLOSE.len()..].trim_start();
+    let tail = text[last_end..].trim_start();
     tail.is_empty()
         || QWEN_TOOL_CALL_OPEN.starts_with(tail)
         || tail.starts_with(QWEN_TOOL_CALL_OPEN)
@@ -834,6 +835,27 @@ mod tests {
             matcher.get_call(prefix).unwrap().is_empty(),
             "an unfinished call makes no call"
         );
+    }
+
+    /// A finished call followed by a GLM call whose value is still streaming is not a finished
+    /// turn, though that value holds a closer: the turn is held until the second call ends.
+    #[test]
+    fn a_closer_in_a_streaming_glm_value_does_not_finish_the_turn() {
+        let tools = vec![test_tool("write_file"), test_tool("get_time")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let first = "<tool_call>get_time\n</tool_call>";
+        let open = format!(
+            "{first}\n<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value></tool_call> and more"
+        );
+        assert_eq!(matcher.prefix_could_be_tool(&open).unwrap(), (true, false));
+        let whole = format!("{open}</arg_value>\n</tool_call>");
+        let names: Vec<String> = matcher
+            .get_call(&whole)
+            .unwrap()
+            .into_iter()
+            .map(|call| call.function.name)
+            .collect();
+        assert_eq!(names, ["get_time", "write_file"]);
     }
 
     /// A turn's calls are all read, in order, whichever of Qwen's formats each block is written in.
