@@ -421,14 +421,15 @@ impl ToolCallingMatcher {
 }
 
 const QWEN_TOOL_CALL_OPEN: &str = "<tool_call>";
-const QWEN_TOOL_CALL_CLOSE: &str = "</tool_call>";
 
 // True while the text after the last complete <tool_call> block is empty or an unfinished opener of the next block
 fn qwen_more_calls_possible(text: &str) -> bool {
-    let Some(last_close) = text.rfind(QWEN_TOOL_CALL_CLOSE) else {
+    // The last call that has ended, as the parser ends each: a closer written in a GLM value is
+    // the value's text, so a call still streaming after a finished one keeps the turn open.
+    let Some(last_end) = parsers::last_qwen_call_end(text) else {
         return false;
     };
-    let tail = text[last_close + QWEN_TOOL_CALL_CLOSE.len()..].trim_start();
+    let tail = text[last_end..].trim_start();
     tail.is_empty()
         || QWEN_TOOL_CALL_OPEN.starts_with(tail)
         || tail.starts_with(QWEN_TOOL_CALL_OPEN)
@@ -729,6 +730,146 @@ mod tests {
         assert_eq!(args["units"], "\"C\"");
         assert_eq!(args["detailed"], true);
         assert_eq!(args["coords"], json!([1, 2]));
+    }
+
+    /// GLM's raw values take the tool schema's types, as the XML format's do.
+    #[test]
+    fn glm_arguments_follow_the_tool_schema() {
+        let mut tool = test_tool("get_weather");
+        tool.function.parameters = Some(
+            serde_json::from_value(json!({
+                "type": "object",
+                "properties": {
+                    "city": { "type": "string" },
+                    "days": { "type": "integer" },
+                    "coords": { "type": "array" }
+                }
+            }))
+            .unwrap(),
+        );
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&[tool])).unwrap();
+        let message = "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>12345</arg_value>\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n<arg_key>coords</arg_key>\n<arg_value>[1, 2]</arg_value>\n</tool_call>";
+        // Held while the call is open, read once it closes.
+        assert_eq!(
+            matcher.prefix_could_be_tool(&message[..40]).unwrap(),
+            (true, false)
+        );
+        let calls = matcher.get_call(message).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"city": "12345", "days": 3, "coords": [1, 2]}));
+    }
+
+    /// A GLM value is text: a Qwen XML call written in it does not replace the GLM call.
+    #[test]
+    fn a_qwen_xml_call_in_a_glm_value_is_the_values_text() {
+        let tools = vec![test_tool("write_file"), test_tool("get_time")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let message = "<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value><function=get_time></function></arg_value>\n</tool_call>";
+        let calls = matcher.get_call(message).unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, "write_file");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"content": "<function=get_time></function>"}));
+    }
+
+    /// A DSML block written in a GLM value is the value's text: it neither claims the message for
+    /// DSML nor makes a call of its own, whole or while the value streams in. That holds when a
+    /// newline leads the call's body, and when the value holds a `</arg_value>` the next pair
+    /// does not follow.
+    #[test]
+    fn a_dsml_block_in_a_glm_value_is_the_values_text() {
+        let tools = vec![test_tool("write_file"), test_tool("get_time")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let dsml = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_time\">\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>";
+        for (lead, content) in [
+            ("", dsml.to_string()),
+            ("\n", dsml.to_string()),
+            ("", format!("literal </arg_value> followed by {dsml}")),
+        ] {
+            let message = format!(
+                "<tool_call>{lead}write_file\n<arg_key>content</arg_key>\n<arg_value>{content}</arg_value>\n</tool_call>"
+            );
+            let calls = matcher.get_call(&message).unwrap();
+            assert_eq!(calls.len(), 1, "{message:?}: {calls:?}");
+            assert_eq!(calls[0].function.name, "write_file", "{message:?}");
+            let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(args, json!({"content": content}), "{message:?}");
+            let streamed = &message[..message.rfind("</arg_value>").unwrap()];
+            assert_eq!(
+                matcher.prefix_could_be_tool(streamed).unwrap(),
+                (true, false),
+                "a call whose value is still streaming is held: {streamed:?}"
+            );
+        }
+    }
+
+    /// A whole `<tool_call>` written in a GLM value, its closer included, is the value's text: the
+    /// call is read to its own closer, and the content around it keeps none of it.
+    #[test]
+    fn a_tool_call_wrapper_in_a_glm_value_is_the_values_text() {
+        let tools = vec![test_tool("write_file"), test_tool("get_time")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let content = "<tool_call><function=get_time></function></tool_call>";
+        let message = format!(
+            "Writing it.\n<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value>{content}</arg_value>\n</tool_call>"
+        );
+        let (text, calls) = matcher.get_call_with_content(&message).unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, "write_file");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"content": content}));
+        assert_eq!(text.as_deref(), Some("Writing it.\n"));
+    }
+
+    /// A GLM call whose value is still streaming is not finished by a `<tool_call>` written in that
+    /// value: the call is held, and no call written in the value is read as complete.
+    #[test]
+    fn a_streaming_glm_value_holding_a_whole_call_is_not_a_finished_call() {
+        let tools = vec![test_tool("write_file"), test_tool("get_time")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let prefix = "<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value><tool_call><function=get_time></function></tool_call> and more";
+        assert_eq!(matcher.prefix_could_be_tool(prefix).unwrap(), (true, false));
+        assert!(
+            matcher.get_call(prefix).unwrap().is_empty(),
+            "an unfinished call makes no call"
+        );
+    }
+
+    /// A finished call followed by a GLM call whose value is still streaming is not a finished
+    /// turn, though that value holds a closer: the turn is held until the second call ends.
+    #[test]
+    fn a_closer_in_a_streaming_glm_value_does_not_finish_the_turn() {
+        let tools = vec![test_tool("write_file"), test_tool("get_time")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let first = "<tool_call>get_time\n</tool_call>";
+        let open = format!(
+            "{first}\n<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value></tool_call> and more"
+        );
+        assert_eq!(matcher.prefix_could_be_tool(&open).unwrap(), (true, false));
+        let whole = format!("{open}</arg_value>\n</tool_call>");
+        let names: Vec<String> = matcher
+            .get_call(&whole)
+            .unwrap()
+            .into_iter()
+            .map(|call| call.function.name)
+            .collect();
+        assert_eq!(names, ["get_time", "write_file"]);
+    }
+
+    /// A turn's calls are all read, in order, whichever of Qwen's formats each block is written in.
+    #[test]
+    fn a_turn_mixing_glm_and_json_blocks_makes_every_call() {
+        let tools = vec![test_tool("get_time"), test_tool("get_weather")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let message = "<tool_call>get_time\n</tool_call>\n<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>";
+        let calls = matcher.get_call(message).unwrap();
+        let names: Vec<&str> = calls
+            .iter()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(names, ["get_time", "get_weather"]);
     }
 
     #[test]

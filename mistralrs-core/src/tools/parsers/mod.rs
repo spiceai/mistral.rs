@@ -598,12 +598,12 @@ impl<'a> Ahead<'a> {
     /// framing; `Err` with the first of those not yet read, when one is needed.
     ///
     /// A Gemma 4 call opens with `call:`, a DeepSeek one with `function<｜tool▁sep｜>`, a
-    /// Hunyuan or Liquid one with `[`, a Qwen one with JSON or a `<function=…>` before its
-    /// closer, an Atem one with an `<atem:invoke` before its closer, and a Mistral Nemo or
-    /// Llama one with JSON: a marker followed by anything else is text. A closer inside one of
-    /// the call's values is the value's text: a Gemma 4 value in its braces, a Qwen
-    /// `<parameter=…>` or Atem `<atem:parameter>` value, a quoted Liquid argument, and a JSON
-    /// string. A JSON-format call ends at the closer after its JSON, once that reads as a call,
+    /// Hunyuan or Liquid one with `[`, a Qwen one with JSON, GLM's function name, or a
+    /// `<function=…>` before its closer, an Atem one with an `<atem:invoke` before its closer,
+    /// and a Mistral Nemo or Llama one with JSON: a marker followed by anything else is text. A
+    /// closer inside one of the call's values is the value's text: a Gemma 4 value in its
+    /// braces, a Qwen `<parameter=…>`, GLM `<arg_value>` or Atem `<atem:parameter>` value, a
+    /// quoted Liquid argument, and a JSON string. A JSON-format call ends at the closer after its JSON, once that reads as a call,
     /// so one that does not read stays open and holds what follows. A Mistral Nemo or Llama
     /// call is its marker and then the JSON of a call running to the end of the message. An
     /// Atem call to `self` or `user` begins no call. A DSML block is read as DSML reads it.
@@ -662,6 +662,16 @@ impl<'a> Ahead<'a> {
             }
             (ToolCallFormat::Qwen, Some(end)) if trimmed.starts_with(['{', '[']) => {
                 self.json_call(json, end, inline)?
+            }
+            // GLM writes the function's name, then its arguments as `<arg_key>` and
+            // `<arg_value>` pairs; a value is text, whatever tags it holds.
+            (ToolCallFormat::Qwen, Some(end))
+                if qwen::glm_call(rest, end) != qwen::GlmCall::Not =>
+            {
+                match qwen::glm_call(rest, end) {
+                    qwen::GlmCall::Ends(at) => Reading::Call(body + at),
+                    _ => Reading::Open,
+                }
             }
             (ToolCallFormat::Qwen, Some(end)) => self.tagged(
                 body,
@@ -1092,6 +1102,11 @@ pub fn process_model_specific_message(message: &str) -> Result<String> {
 
 /// The calls a model-specific format reads out of `message`, as JSON, with the text around
 /// them and the format they were read in.
+/// Where the last Qwen call of `text` that has ended ends, reading GLM values as text.
+pub(crate) fn last_qwen_call_end(text: &str) -> Option<usize> {
+    qwen::last_call_end(text)
+}
+
 pub(crate) fn extract_model_specific_call(
     message: &str,
 ) -> Result<Option<(String, String, ToolCallFormat)>> {
@@ -1115,6 +1130,10 @@ pub(crate) fn strip_dsml_blocks_making_calls(
 }
 
 fn strip_tool_call_segments(message: &str, format: ToolCallFormat) -> String {
+    // a GLM call's values may hold its closer, so Qwen's calls end where its parser ends them
+    if format == ToolCallFormat::Qwen {
+        return qwen::strip_qwen_calls(message);
+    }
     if let Some((_, start, end)) = CLOSED_CALL_DELIMITERS
         .iter()
         .find(|(delimited, _, _)| *delimited == format)
