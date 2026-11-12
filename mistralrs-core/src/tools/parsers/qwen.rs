@@ -18,7 +18,6 @@ static QWEN_REGEX: OnceLock<Regex> = OnceLock::new();
 static QWEN_FUNCTION_REGEX: OnceLock<Regex> = OnceLock::new();
 static QWEN_PARAMETER_REGEX: OnceLock<Regex> = OnceLock::new();
 static GLM_CALL_REGEX: OnceLock<Regex> = OnceLock::new();
-static GLM_ARGUMENT_REGEX: OnceLock<Regex> = OnceLock::new();
 
 pub struct QwenParser;
 
@@ -64,9 +63,9 @@ impl ToolFormatParser for QwenParser {
 fn qwen_tool_call_lark(tools: &[Tool], include_wrapper: bool) -> String {
     // Parallel calls arrive as consecutive <tool_call> blocks, so the grammar stays open for more
     let start = if include_wrapper {
-        r#"start: "<tool_call>" (json_call | xml_call) ("\n"? "<tool_call>" (json_call | xml_call))*"#
+        r#"start: "<tool_call>" (json_call | xml_call | glm_call) ("\n"? "<tool_call>" (json_call | xml_call | glm_call))*"#
     } else {
-        r#"start: (json_call | xml_call) ("\n"? <tool_call> (json_call | xml_call))*"#
+        r#"start: (json_call | xml_call | glm_call) ("\n"? <tool_call> (json_call | xml_call | glm_call))*"#
     };
     let json_call = if include_wrapper {
         r#"json_call: @json_body "</tool_call>""#
@@ -87,19 +86,28 @@ xml_call: "\n"? xml_function ("\n"? xml_function)* "\n"? {xml_end}
 xml_param_value: (xml_param_text | xml_param_lt)*
 xml_param_text: /[^<]+/
 xml_param_lt: {}
+{}
+glm_call: glm_function {xml_end}
+{}
+glm_value: (glm_value_text | glm_value_lt)*
+glm_value_text: /[^<]+/
+glm_value_lt: {}
 {}"#,
         qwen_xml_function_rules(tools),
-        xml_param_lt_rule(),
+        value_lt_rule("/parameter>"),
         qwen_xml_generic_rules(tools),
+        glm_function_rules(tools),
+        value_lt_rule("/arg_value>"),
+        glm_generic_rules(tools),
     )
 }
 
-// Any `<` that does not open the closing `</parameter>` tag may appear inside a value (HTML, XML, code).
-fn xml_param_lt_rule() -> String {
-    const CLOSE: &str = "/parameter>";
+// Any `<` that does not open the value's closing tag (`</parameter>`, `</arg_value>`) may appear
+// inside a value (HTML, XML, code).
+fn value_lt_rule(close: &str) -> String {
     let mut alternatives = vec![r#""<" /[^\/]/"#.to_string()];
-    for (idx, ch) in CLOSE.chars().enumerate().skip(1) {
-        let prefix = &CLOSE[..idx];
+    for (idx, ch) in close.chars().enumerate().skip(1) {
+        let prefix = &close[..idx];
         let escaped = if ch == '/' {
             "\\/".to_string()
         } else {
@@ -129,14 +137,16 @@ fn parse_qwen_tool_calls(message: &str) -> Result<Option<String>> {
             continue;
         }
 
-        let parsed_xml = parse_qwen_xml_tool_call(inner)?;
-        if !parsed_xml.is_empty() {
-            xml_calls.extend(parsed_xml);
+        // A GLM call is read first: it must account for the whole body, so a `<function=` it
+        // holds is a value's text, while the XML format finds its calls anywhere in the body.
+        if let Some(call) = parse_glm_tool_call(inner) {
+            xml_calls.push(call);
             continue;
         }
 
-        if let Some(call) = parse_glm_tool_call(inner) {
-            xml_calls.push(call);
+        let parsed_xml = parse_qwen_xml_tool_call(inner)?;
+        if !parsed_xml.is_empty() {
+            xml_calls.extend(parsed_xml);
             continue;
         }
 
@@ -201,28 +211,49 @@ fn parse_glm_tool_call(inner: &str) -> Option<QwenToolCall> {
         Regex::new(r"(?s)^(?P<name>[A-Za-z_][A-Za-z0-9_.:\-]*)\s*(?P<arguments><arg_key>.*)?$")
             .unwrap()
     });
-    let argument_re = GLM_ARGUMENT_REGEX.get_or_init(|| {
-        Regex::new(
-            r"(?s)\A\s*<arg_key>(?P<key>.*?)</arg_key>\s*<arg_value>(?P<value>.*?)</arg_value>\s*",
-        )
-        .unwrap()
-    });
     let caps = call_re.captures(inner)?;
     let name = caps.name("name")?.as_str().to_string();
-    let mut rest = caps.name("arguments").map_or("", |m| m.as_str());
-    let mut arguments = Map::new();
-    // Every argument pair in turn, to the end: text the pairs do not account for means the body
-    // is not a GLM call.
-    while !rest.is_empty() {
-        let pair = argument_re.captures(rest)?;
-        let key = pair.name("key")?.as_str().trim().to_string();
-        arguments.insert(key, Value::String(pair.name("value")?.as_str().to_string()));
-        rest = &rest[pair.get(0)?.end()..];
-    }
+    let arguments = parse_glm_arguments(caps.name("arguments").map_or("", |m| m.as_str()))?;
     Some(QwenToolCall {
         name,
         arguments: Value::Object(arguments),
     })
+}
+
+/// Every `<arg_key>` and `<arg_value>` pair of a GLM call in turn, to the end; `None` when text
+/// the pairs do not account for means the body is not a GLM call. A key ends at its first
+/// `</arg_key>`, so a key without a value of its own is malformed rather than read up to a
+/// later key's tag. A value is raw text, which may hold `</arg_value>` itself: it ends at the
+/// first `</arg_value>` that the next pair, or the end of the call, follows.
+fn parse_glm_arguments(mut rest: &str) -> Option<Map<String, Value>> {
+    const KEY: &str = "<arg_key>";
+    const KEY_END: &str = "</arg_key>";
+    const VALUE: &str = "<arg_value>";
+    const VALUE_END: &str = "</arg_value>";
+    let mut arguments = Map::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Some(arguments);
+        }
+        rest = rest.strip_prefix(KEY)?;
+        let key_end = rest.find(KEY_END)?;
+        let key = rest[..key_end].trim().to_string();
+        rest = rest[key_end + KEY_END.len()..]
+            .trim_start()
+            .strip_prefix(VALUE)?;
+        let mut from = 0;
+        let value_end = loop {
+            let at = from + rest[from..].find(VALUE_END)?;
+            let next = rest[at + VALUE_END.len()..].trim_start();
+            if next.is_empty() || next.starts_with(KEY) {
+                break at;
+            }
+            from = at + VALUE_END.len();
+        };
+        arguments.insert(key, Value::String(rest[..value_end].to_string()));
+        rest = &rest[value_end + VALUE_END.len()..];
+    }
 }
 
 // Values are kept verbatim minus the template's single framing newlines; types come from the tool schema later
@@ -313,6 +344,66 @@ fn qwen_xml_generic_rules(tools: &[Tool]) -> &'static str {
         r#"qwen_xml_generic_function: "<function=" /[a-zA-Z_][a-zA-Z0-9_]*/ ">" "\n"? qwen_xml_generic_params "</function>"
 qwen_xml_generic_params: (qwen_xml_generic_param "\n"?)*
 qwen_xml_generic_param: "<parameter=" /[a-zA-Z_][a-zA-Z0-9_]*/ ">" "\n"? xml_param_value "</parameter>""#
+    } else {
+        ""
+    }
+}
+
+/// GLM's call to each offered tool: its name, then each of its arguments as a key and value
+/// pair, in any order, as the GLM template writes them; a tool without a schema takes any keys.
+fn glm_function_rules(tools: &[Tool]) -> String {
+    let mut rules = Vec::new();
+    let mut branches = Vec::new();
+    for (tool_idx, tool) in tools.iter().enumerate() {
+        let branch = format!("glm_tool_{tool_idx}");
+        let name = lark_string(&tool.function.name);
+        let args = glm_args_rule(tool_idx, tool, &mut rules);
+        rules.push(format!("{branch}: {name} \"\\n\"? {args}"));
+        branches.push(branch);
+    }
+    if branches.is_empty() {
+        rules.push("glm_function: glm_generic_function".to_string());
+    } else {
+        rules.push(format!("glm_function: {}", branches.join(" | ")));
+    }
+    rules.join("\n")
+}
+
+fn glm_args_rule(tool_idx: usize, tool: &Tool, rules: &mut Vec<String>) -> String {
+    let args_rule = format!("glm_args_{tool_idx}");
+    let properties = tool.function.parameters.as_ref().and_then(|parameters| {
+        match parameters.get("properties") {
+            Some(Value::Object(properties)) => Some(properties),
+            _ => None,
+        }
+    });
+    let Some(properties) = properties else {
+        rules.push(format!("{args_rule}: glm_generic_args"));
+        return args_rule;
+    };
+    let mut property_names = properties.keys().cloned().collect::<Vec<_>>();
+    property_names.sort();
+    let mut pairs = Vec::new();
+    for (prop_idx, name) in property_names.iter().enumerate() {
+        let pair = format!("glm_arg_{tool_idx}_{prop_idx}");
+        let key = lark_string(&format!("<arg_key>{name}</arg_key>"));
+        rules.push(format!(
+            "{pair}: {key} \"\\n\"? \"<arg_value>\" glm_value \"</arg_value>\" \"\\n\"?"
+        ));
+        pairs.push(pair);
+    }
+    if pairs.is_empty() {
+        rules.push(format!("{args_rule}:"));
+    } else {
+        rules.push(format!("{args_rule}: ({})*", pairs.join(" | ")));
+    }
+    args_rule
+}
+
+fn glm_generic_rules(tools: &[Tool]) -> &'static str {
+    if tools.is_empty() || tools.iter().any(|tool| tool.function.parameters.is_none()) {
+        r#"glm_generic_function: /[a-zA-Z_][a-zA-Z0-9_]*/ "\n"? glm_generic_args
+glm_generic_args: ("<arg_key>" /[a-zA-Z_][a-zA-Z0-9_]*/ "</arg_key>" "\n"? "<arg_value>" glm_value "</arg_value>" "\n"?)*"#
     } else {
         ""
     }
@@ -425,6 +516,8 @@ mod tests {
             "<tool_call>not a call: hello</tool_call>",
             "<tool_call>get_weather<arg_key>city</arg_key></tool_call>",
             "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value> trailing</tool_call>",
+            // a key with no value of its own: the next key's closing tag does not end it
+            "<tool_call>get_weather<arg_key>city</arg_key><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
         ] {
             assert_eq!(parse_qwen_tool_calls(message).unwrap(), None, "{message}");
         }
@@ -560,7 +653,7 @@ print(1 < 2)
         specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
 
         let lark = grammar.grammars[0].lark_grammar.as_ref().unwrap();
-        assert!(lark.contains("start: <tool_call> (json_call | xml_call)"));
+        assert!(lark.contains("start: <tool_call> (json_call | xml_call | glm_call)"));
         assert!(lark.contains("json_call: @json_body </tool_call>"));
 
         let parser = factory.create_parser(grammar).unwrap();
@@ -569,6 +662,81 @@ print(1 < 2)
 
         assert!(mask.is_allowed(start_token));
         matcher.consume_token(start_token).unwrap();
+    }
+
+    fn weather_tool() -> crate::Tool {
+        let parameters: HashMap<String, Value> = serde_json::from_value(json!({
+            "type": "object",
+            "properties": { "city": { "type": "string" }, "days": { "type": "integer" } },
+            "required": ["city"]
+        }))
+        .unwrap();
+        crate::Tool {
+            tp: ToolType::Function,
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: Some(parameters),
+                strict: None,
+            },
+        }
+    }
+
+    /// Feeds `body` to `matcher` byte by byte, each of which the grammar must allow.
+    fn accepts(matcher: &mut llguidance::Matcher, trie: &toktrie::TokTrie, body: &str) {
+        for token in trie.greedy_tokenize(body.as_bytes()) {
+            assert!(
+                matcher.compute_mask().unwrap().is_allowed(token),
+                "rejected byte {token} of {body:?}"
+            );
+            matcher.consume_token(token).unwrap();
+        }
+    }
+
+    /// The grammar that constrains a call once `<tool_call>` opens it lets a GLM model write its
+    /// call: the name, then each argument as a key and value pair, in any order, a value holding
+    /// `<` of its own, then the closer.
+    #[test]
+    fn continuation_grammar_allows_a_glm_call() {
+        let grammar = QwenParser.tool_call_grammar(&[weather_tool()], "<tool_call>");
+        let trie = wrapper_token_trie();
+        let end_token = trie.get_special_token("</tool_call>").unwrap();
+        let env: toktrie::TokEnv = Arc::new(GreedyTokenizerEnv { trie: trie.clone() });
+        let factory = llguidance::ParserFactory::new_simple(&env).unwrap();
+        let mut matcher = llguidance::Matcher::new(Ok(factory.create_parser(grammar).unwrap()));
+        let body = "get_weather\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n<arg_key>city</arg_key>\n<arg_value>Paris </b> <arg_v</arg_value>\n";
+        accepts(&mut matcher, &trie, body);
+        assert!(matcher.compute_mask().unwrap().is_allowed(end_token));
+        matcher.consume_token(end_token).unwrap();
+    }
+
+    /// A required call may be written in GLM's format, and only to an offered tool and its keys.
+    #[test]
+    fn required_grammar_allows_a_glm_call_to_an_offered_tool() {
+        let mut grammar = QwenParser.required_tool_call_grammar(&[weather_tool()]);
+        let trie = wrapper_token_trie();
+        let start_token = trie.get_special_token("<tool_call>").unwrap();
+        let end_token = trie.get_special_token("</tool_call>").unwrap();
+        let env: toktrie::TokEnv = Arc::new(GreedyTokenizerEnv { trie: trie.clone() });
+        let factory = llguidance::ParserFactory::new_simple(&env).unwrap();
+        specialize_tool_call_grammar(&mut grammar, factory.tok_env().tok_trie());
+        let parser = factory.create_parser(grammar.clone()).unwrap();
+        let mut matcher = llguidance::Matcher::new(Ok(parser));
+        matcher.consume_token(start_token).unwrap();
+        accepts(
+            &mut matcher,
+            &trie,
+            "get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>",
+        );
+        assert!(matcher.compute_mask().unwrap().is_allowed(end_token));
+
+        // an unoffered key is masked where it would begin
+        let parser = factory.create_parser(grammar).unwrap();
+        let mut matcher = llguidance::Matcher::new(Ok(parser));
+        matcher.consume_token(start_token).unwrap();
+        accepts(&mut matcher, &trie, "get_weather<arg_key>");
+        let z = trie.greedy_tokenize(b"z")[0];
+        assert!(!matcher.compute_mask().unwrap().is_allowed(z));
     }
 
     #[test]

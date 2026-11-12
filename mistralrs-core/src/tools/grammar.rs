@@ -168,7 +168,7 @@ mod tests {
         let grm = parsers::build_required_tool_call_grammar(None, &sample_tools());
         assert_eq!(grm.grammars.len(), 2);
         let lark = grm.grammars[0].lark_grammar.as_ref().unwrap();
-        assert!(lark.contains(r#"start: "<tool_call>" (json_call | xml_call)"#));
+        assert!(lark.contains(r#"start: "<tool_call>" (json_call | xml_call | glm_call)"#));
         assert!(lark.contains(r#"json_call: @json_body "</tool_call>""#));
         assert!(grm.grammars[1].json_schema.is_some());
     }

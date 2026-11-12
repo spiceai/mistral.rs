@@ -760,6 +760,42 @@ mod tests {
         assert_eq!(args, json!({"city": "12345", "days": 3, "coords": [1, 2]}));
     }
 
+    /// A GLM value is text: a Qwen XML call written in it does not replace the GLM call.
+    #[test]
+    fn a_qwen_xml_call_in_a_glm_value_is_the_values_text() {
+        let tools = vec![test_tool("write_file"), test_tool("get_time")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let message = "<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value><function=get_time></function></arg_value>\n</tool_call>";
+        let calls = matcher.get_call(message).unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, "write_file");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"content": "<function=get_time></function>"}));
+    }
+
+    /// A DSML block written in a GLM value is the value's text: it neither claims the message for
+    /// DSML nor makes a call of its own, whole or while the value streams in.
+    #[test]
+    fn a_dsml_block_in_a_glm_value_is_the_values_text() {
+        let tools = vec![test_tool("write_file"), test_tool("get_time")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let dsml = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_time\">\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>";
+        let message = format!(
+            "<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value>{dsml}</arg_value>\n</tool_call>"
+        );
+        let calls = matcher.get_call(&message).unwrap();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].function.name, "write_file");
+        let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args, json!({"content": dsml}));
+        let streamed = &message[..message.find("</arg_value>").unwrap()];
+        assert_eq!(
+            matcher.prefix_could_be_tool(streamed).unwrap(),
+            (true, false),
+            "a call whose value is still streaming is held"
+        );
+    }
+
     #[test]
     fn qwen_parallel_calls_keep_buffering_until_the_turn_ends() {
         let tools = vec![test_tool("get_weather"), test_tool("get_time")];

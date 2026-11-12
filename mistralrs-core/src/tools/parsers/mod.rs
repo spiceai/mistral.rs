@@ -598,12 +598,12 @@ impl<'a> Ahead<'a> {
     /// framing; `Err` with the first of those not yet read, when one is needed.
     ///
     /// A Gemma 4 call opens with `call:`, a DeepSeek one with `function<｜tool▁sep｜>`, a
-    /// Hunyuan or Liquid one with `[`, a Qwen one with JSON or a `<function=…>` before its
-    /// closer, an Atem one with an `<atem:invoke` before its closer, and a Mistral Nemo or
-    /// Llama one with JSON: a marker followed by anything else is text. A closer inside one of
-    /// the call's values is the value's text: a Gemma 4 value in its braces, a Qwen
-    /// `<parameter=…>` or Atem `<atem:parameter>` value, a quoted Liquid argument, and a JSON
-    /// string. A JSON-format call ends at the closer after its JSON, once that reads as a call,
+    /// Hunyuan or Liquid one with `[`, a Qwen one with JSON, GLM's function name, or a
+    /// `<function=…>` before its closer, an Atem one with an `<atem:invoke` before its closer,
+    /// and a Mistral Nemo or Llama one with JSON: a marker followed by anything else is text. A
+    /// closer inside one of the call's values is the value's text: a Gemma 4 value in its
+    /// braces, a Qwen `<parameter=…>`, GLM `<arg_value>` or Atem `<atem:parameter>` value, a
+    /// quoted Liquid argument, and a JSON string. A JSON-format call ends at the closer after its JSON, once that reads as a call,
     /// so one that does not read stays open and holds what follows. A Mistral Nemo or Llama
     /// call is its marker and then the JSON of a call running to the end of the message. An
     /// Atem call to `self` or `user` begins no call. A DSML block is read as DSML reads it.
@@ -662,6 +662,9 @@ impl<'a> Ahead<'a> {
             }
             (ToolCallFormat::Qwen, Some(end)) if trimmed.starts_with(['{', '[']) => {
                 self.json_call(json, end, inline)?
+            }
+            (ToolCallFormat::Qwen, Some(end)) if glm_body(rest, end) => {
+                self.values(body, end, "<arg_value>", "</arg_value>", inline)?
             }
             (ToolCallFormat::Qwen, Some(end)) => self.tagged(
                 body,
@@ -1019,9 +1022,23 @@ impl<'a> Ahead<'a> {
         if let Some(reading) = self.cut(body, tag_at, inline)? {
             return Ok(reading);
         }
-        let Some(mut from) = tag_at else {
+        let Some(from) = tag_at else {
             return Ok(Reading::Open);
         };
+        self.values(from, end, value_open, value_close, inline)
+    }
+
+    /// A call's framing from `from` to its closer `end`, passing over each value from
+    /// `value_open` to `value_close`, whose text is the value's, a marker or a closer in it
+    /// included.
+    fn values(
+        &mut self,
+        mut from: usize,
+        end: &'static str,
+        value_open: &'static str,
+        value_close: &'static str,
+        inline: bool,
+    ) -> Waits<Reading> {
         let mut passed = Vec::new();
         let reading = loop {
             if let Some(&reading) = self.tails.get(&(from, value_open)) {
@@ -1049,6 +1066,23 @@ impl<'a> Ahead<'a> {
         }
         Ok(reading)
     }
+}
+
+/// Whether the text after a `<tool_call>` marker, `rest`, begins a GLM call, or may yet once more
+/// streams in: the function's name right after the marker, then, past any whitespace, its first
+/// `<arg_key>` or the call's closer `end`. Other text after a name, as a sentence's, is not GLM.
+fn glm_body(rest: &str, end: &str) -> bool {
+    if !rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        return false;
+    }
+    let name = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')))
+        .unwrap_or(rest.len());
+    let after = rest[name..].trim_start();
+    after.is_empty()
+        || ["<arg_key>", end]
+            .iter()
+            .any(|tag| after.starts_with(tag) || tag.starts_with(after))
 }
 
 /// Whether `text` is one JSON value.
