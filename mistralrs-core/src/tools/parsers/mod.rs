@@ -663,8 +663,15 @@ impl<'a> Ahead<'a> {
             (ToolCallFormat::Qwen, Some(end)) if trimmed.starts_with(['{', '[']) => {
                 self.json_call(json, end, inline)?
             }
-            (ToolCallFormat::Qwen, Some(end)) if glm_body(rest, end) => {
-                self.values(body, end, "<arg_value>", "</arg_value>", inline)?
+            // GLM writes the function's name, then its arguments as `<arg_key>` and
+            // `<arg_value>` pairs; a value is text, whatever tags it holds.
+            (ToolCallFormat::Qwen, Some(end))
+                if qwen::glm_call(rest, end) != qwen::GlmCall::Not =>
+            {
+                match qwen::glm_call(rest, end) {
+                    qwen::GlmCall::Ends(at) => Reading::Call(body + at),
+                    _ => Reading::Open,
+                }
             }
             (ToolCallFormat::Qwen, Some(end)) => self.tagged(
                 body,
@@ -1022,23 +1029,9 @@ impl<'a> Ahead<'a> {
         if let Some(reading) = self.cut(body, tag_at, inline)? {
             return Ok(reading);
         }
-        let Some(from) = tag_at else {
+        let Some(mut from) = tag_at else {
             return Ok(Reading::Open);
         };
-        self.values(from, end, value_open, value_close, inline)
-    }
-
-    /// A call's framing from `from` to its closer `end`, passing over each value from
-    /// `value_open` to `value_close`, whose text is the value's, a marker or a closer in it
-    /// included.
-    fn values(
-        &mut self,
-        mut from: usize,
-        end: &'static str,
-        value_open: &'static str,
-        value_close: &'static str,
-        inline: bool,
-    ) -> Waits<Reading> {
         let mut passed = Vec::new();
         let reading = loop {
             if let Some(&reading) = self.tails.get(&(from, value_open)) {
@@ -1066,23 +1059,6 @@ impl<'a> Ahead<'a> {
         }
         Ok(reading)
     }
-}
-
-/// Whether the text after a `<tool_call>` marker, `rest`, begins a GLM call, or may yet once more
-/// streams in: the function's name right after the marker, then, past any whitespace, its first
-/// `<arg_key>` or the call's closer `end`. Other text after a name, as a sentence's, is not GLM.
-fn glm_body(rest: &str, end: &str) -> bool {
-    if !rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
-        return false;
-    }
-    let name = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')))
-        .unwrap_or(rest.len());
-    let after = rest[name..].trim_start();
-    after.is_empty()
-        || ["<arg_key>", end]
-            .iter()
-            .any(|tag| after.starts_with(tag) || tag.starts_with(after))
 }
 
 /// Whether `text` is one JSON value.
@@ -1149,6 +1125,10 @@ pub(crate) fn strip_dsml_blocks_making_calls(
 }
 
 fn strip_tool_call_segments(message: &str, format: ToolCallFormat) -> String {
+    // a GLM call's values may hold its closer, so Qwen's calls end where its parser ends them
+    if format == ToolCallFormat::Qwen {
+        return qwen::strip_qwen_calls(message);
+    }
     if let Some((_, start, end)) = CLOSED_CALL_DELIMITERS
         .iter()
         .find(|(delimited, _, _)| *delimited == format)

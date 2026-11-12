@@ -83,39 +83,49 @@ fn qwen_tool_call_lark(tools: &[Tool], include_wrapper: bool) -> String {
 {json_call}
 xml_call: "\n"? xml_function ("\n"? xml_function)* "\n"? {xml_end}
 {}
-xml_param_value: (xml_param_text | xml_param_lt)*
-xml_param_text: /[^<]+/
-xml_param_lt: {}
+{}
 {}
 glm_call: glm_function {xml_end}
 {}
-glm_value: (glm_value_text | glm_value_lt)*
-glm_value_text: /[^<]+/
-glm_value_lt: {}
+{}
 {}"#,
         qwen_xml_function_rules(tools),
-        value_lt_rule("/parameter>"),
+        value_rules("xml_param_value", "</parameter>"),
         qwen_xml_generic_rules(tools),
         glm_function_rules(tools),
-        value_lt_rule("/arg_value>"),
+        value_rules("glm_value", "</arg_value>"),
         glm_generic_rules(tools),
     )
 }
 
-// Any `<` that does not open the value's closing tag (`</parameter>`, `</arg_value>`) may appear
-// inside a value (HTML, XML, code).
-fn value_lt_rule(close: &str) -> String {
-    let mut alternatives = vec![r#""<" /[^\/]/"#.to_string()];
-    for (idx, ch) in close.chars().enumerate().skip(1) {
-        let prefix = &close[..idx];
-        let escaped = if ch == '/' {
-            "\\/".to_string()
-        } else {
-            ch.to_string()
-        };
-        alternatives.push(format!(r#""<{prefix}" /[^{escaped}]/"#));
-    }
-    alternatives.join(" | ")
+// The rules for `name`, a value that runs to its closing tag `close` (`</parameter>`,
+// `</arg_value>`) and may hold any other text, a `<` of its own included (HTML, XML, code). It
+// may hold a start of `close` that does not go on to the whole tag, and may end in one right
+// before the tag. A start of `close` is never taken as more of the value when `<`, which may
+// begin `close` itself, follows it, so the tag that closes the value is never read as its text.
+// `close` holds no `<` but its first character.
+fn value_rules(name: &str, close: &str) -> String {
+    let class_char = |c: char| match c {
+        '/' | '\\' | ']' | '^' | '-' => format!("\\{c}"),
+        c => c.to_string(),
+    };
+    let prefixes = (1..close.len())
+        .map(|k| lark_string(&close[..k]))
+        .collect::<Vec<_>>();
+    let starts = (1..close.len())
+        .map(|k| {
+            let next = class_char(close[k..].chars().next().unwrap_or('<'));
+            format!("{} /[^{next}<]/", lark_string(&close[..k]))
+        })
+        .collect::<Vec<_>>();
+    format!(
+        "{name}: {name}_part* {name}_prefix*\n\
+         {name}_part: /[^<]+/ | {name}_prefix* {name}_start\n\
+         {name}_start: {}\n\
+         {name}_prefix: {}",
+        starts.join(" | "),
+        prefixes.join(" | "),
+    )
 }
 
 #[derive(serde::Serialize)]
@@ -124,15 +134,130 @@ struct QwenToolCall {
     arguments: Value,
 }
 
-fn parse_qwen_tool_calls(message: &str) -> Result<Option<String>> {
-    let re = QWEN_REGEX
-        .get_or_init(|| Regex::new(r"(?s)<tool_call>(?P<inner>.*?)</tool_call>").unwrap());
+const WRAPPER_OPEN: &str = "<tool_call>";
+const WRAPPER_CLOSE: &str = "</tool_call>";
+const GLM_KEY: &str = "<arg_key>";
+const GLM_KEY_END: &str = "</arg_key>";
+const GLM_VALUE: &str = "<arg_value>";
+const GLM_VALUE_END: &str = "</arg_value>";
 
+/// How the text after a `<tool_call>` marker reads as a GLM call.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum GlmCall {
+    /// It is not a GLM call.
+    Not,
+    /// It is one, which ends this far into the text, past its closer.
+    Ends(usize),
+    /// It is one, or may be once more streams in, and has not ended.
+    Open,
+}
+
+/// How `body`, the text after a `<tool_call>` marker, reads as a GLM call closed by `closer`:
+/// the function's name after any whitespace, then each `<arg_key>` and `<arg_value>` pair, then
+/// the closer. A key ends at its first `</arg_key>`. A value is raw text, so a closer, a marker
+/// or a `</arg_value>` in it is its text: it ends at the first `</arg_value>` that the next
+/// `<arg_key>` or the call's closer follows. This one reading frames the call for the parser,
+/// for the text stripped from the content, and for the scanner that tells calls from text.
+pub(super) fn glm_call(body: &str, closer: &str) -> GlmCall {
+    // the text from `at` is the start of `tag`, and more may complete it
+    let partial = |at: usize, tag: &str| tag.starts_with(&body[at..]);
+    let skip_space = |at: usize| body.len() - body[at..].trim_start().len();
+    let mut at = skip_space(0);
+    if !body[at..].starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        return GlmCall::Not;
+    }
+    at += body[at..]
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')))
+        .unwrap_or(body.len() - at);
+    let mut first = true;
+    loop {
+        at = skip_space(at);
+        if body[at..].starts_with(closer) {
+            return GlmCall::Ends(at + closer.len());
+        }
+        if partial(at, closer) || partial(at, GLM_KEY) {
+            return GlmCall::Open;
+        }
+        if !body[at..].starts_with(GLM_KEY) {
+            // after the name, other text is a sentence's, not a call; after a pair it cannot
+            // occur, as a value runs on to a `</arg_value>` the next pair or the closer follows
+            return if first { GlmCall::Not } else { GlmCall::Open };
+        }
+        first = false;
+        at += GLM_KEY.len();
+        let Some(key_end) = body[at..].find(GLM_KEY_END) else {
+            return GlmCall::Open;
+        };
+        at = skip_space(at + key_end + GLM_KEY_END.len());
+        if partial(at, GLM_VALUE) {
+            return GlmCall::Open;
+        }
+        if !body[at..].starts_with(GLM_VALUE) {
+            return GlmCall::Not;
+        }
+        at += GLM_VALUE.len();
+        at = loop {
+            let Some(found) = body[at..].find(GLM_VALUE_END) else {
+                return GlmCall::Open;
+            };
+            let after = at + found + GLM_VALUE_END.len();
+            let next = skip_space(after);
+            if body[next..].starts_with(GLM_KEY) || body[next..].starts_with(closer) {
+                break after;
+            }
+            if partial(next, GLM_KEY) || partial(next, closer) {
+                return GlmCall::Open;
+            }
+            at = after;
+        };
+    }
+}
+
+/// The body of each `<tool_call>` in `message`, and where its call ends: a GLM call to its own
+/// closer, its values read as text, and any other to the first closer.
+fn qwen_call_bodies(message: &str) -> Vec<(&str, usize)> {
+    let mut bodies = Vec::new();
+    let mut from = 0;
+    while let Some(open) = message[from..].find(WRAPPER_OPEN) {
+        let start = from + open + WRAPPER_OPEN.len();
+        let body = &message[start..];
+        let end = match glm_call(body, WRAPPER_CLOSE) {
+            GlmCall::Ends(end) => end,
+            GlmCall::Not | GlmCall::Open => match body.find(WRAPPER_CLOSE) {
+                Some(close) => close + WRAPPER_CLOSE.len(),
+                None => break,
+            },
+        };
+        bodies.push((&body[..end - WRAPPER_CLOSE.len()], start + end));
+        from = start + end;
+    }
+    bodies
+}
+
+/// `message` without its calls, each cut out to where `qwen_call_bodies` ends it; a call left
+/// open takes the rest of the message with it.
+pub(super) fn strip_qwen_calls(message: &str) -> String {
+    let mut out = String::new();
+    let mut from = 0;
+    for (_, end) in qwen_call_bodies(message) {
+        if let Some(open) = message[from..].find(WRAPPER_OPEN) {
+            out.push_str(&message[from..from + open]);
+        }
+        from = end;
+    }
+    match message[from..].find(WRAPPER_OPEN) {
+        Some(open) => out.push_str(&message[from..from + open]),
+        None => out.push_str(&message[from..]),
+    }
+    out
+}
+
+fn parse_qwen_tool_calls(message: &str) -> Result<Option<String>> {
     let mut xml_calls = Vec::new();
     let mut json_calls = Vec::new();
 
-    for caps in re.captures_iter(message) {
-        let inner = caps.name("inner").unwrap().as_str().trim();
+    for (inner, _) in qwen_call_bodies(message) {
+        let inner = inner.trim();
         if inner.is_empty() {
             continue;
         }
@@ -737,6 +862,57 @@ print(1 < 2)
         accepts(&mut matcher, &trie, "get_weather<arg_key>");
         let z = trie.greedy_tokenize(b"z")[0];
         assert!(!matcher.compute_mask().unwrap().is_allowed(z));
+    }
+
+    /// A value may end in `<`, or in the start of its own closing tag, right before that tag:
+    /// the tag still closes it, and is never read as more of the value, so nothing but the
+    /// call's framing may follow it.
+    #[test]
+    fn a_value_may_end_in_the_start_of_its_closing_tag() {
+        let trie = wrapper_token_trie();
+        let end_token = trie.get_special_token("</tool_call>").unwrap();
+        let env: toktrie::TokEnv = Arc::new(GreedyTokenizerEnv { trie: trie.clone() });
+        let factory = llguidance::ParserFactory::new_simple(&env).unwrap();
+        let y = trie.greedy_tokenize(b"y")[0];
+        for (body, close) in [
+            (
+                "get_weather<arg_key>city</arg_key><arg_value>x<",
+                "</arg_value>",
+            ),
+            (
+                "get_weather<arg_key>city</arg_key><arg_value>x</arg_v",
+                "</arg_value>",
+            ),
+            (
+                "get_weather<arg_key>city</arg_key><arg_value>x</a",
+                "</arg_value>",
+            ),
+            (
+                "get_weather<arg_key>city</arg_key><arg_value><<",
+                "</arg_value>",
+            ),
+            (
+                "<function=get_weather><parameter=city>x<",
+                "</parameter></function>",
+            ),
+            (
+                "<function=get_weather><parameter=city>x</param",
+                "</parameter></function>",
+            ),
+        ] {
+            let grammar = QwenParser.tool_call_grammar(&[weather_tool()], "<tool_call>");
+            let mut matcher = llguidance::Matcher::new(Ok(factory.create_parser(grammar).unwrap()));
+            accepts(&mut matcher, &trie, body);
+            accepts(&mut matcher, &trie, close);
+            assert!(
+                matcher.compute_mask().unwrap().is_allowed(end_token),
+                "{body}{close} closes the call"
+            );
+            assert!(
+                !matcher.compute_mask().unwrap().is_allowed(y),
+                "{body}{close}: the closing tag is not read as more of the value"
+            );
+        }
     }
 
     #[test]

@@ -774,26 +774,52 @@ mod tests {
     }
 
     /// A DSML block written in a GLM value is the value's text: it neither claims the message for
-    /// DSML nor makes a call of its own, whole or while the value streams in.
+    /// DSML nor makes a call of its own, whole or while the value streams in. That holds when a
+    /// newline leads the call's body, and when the value holds a `</arg_value>` the next pair
+    /// does not follow.
     #[test]
     fn a_dsml_block_in_a_glm_value_is_the_values_text() {
         let tools = vec![test_tool("write_file"), test_tool("get_time")];
         let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
         let dsml = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_time\">\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>";
+        for (lead, content) in [
+            ("", dsml.to_string()),
+            ("\n", dsml.to_string()),
+            ("", format!("literal </arg_value> followed by {dsml}")),
+        ] {
+            let message = format!(
+                "<tool_call>{lead}write_file\n<arg_key>content</arg_key>\n<arg_value>{content}</arg_value>\n</tool_call>"
+            );
+            let calls = matcher.get_call(&message).unwrap();
+            assert_eq!(calls.len(), 1, "{message:?}: {calls:?}");
+            assert_eq!(calls[0].function.name, "write_file", "{message:?}");
+            let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(args, json!({"content": content}), "{message:?}");
+            let streamed = &message[..message.rfind("</arg_value>").unwrap()];
+            assert_eq!(
+                matcher.prefix_could_be_tool(streamed).unwrap(),
+                (true, false),
+                "a call whose value is still streaming is held: {streamed:?}"
+            );
+        }
+    }
+
+    /// A whole `<tool_call>` written in a GLM value, its closer included, is the value's text: the
+    /// call is read to its own closer, and the content around it keeps none of it.
+    #[test]
+    fn a_tool_call_wrapper_in_a_glm_value_is_the_values_text() {
+        let tools = vec![test_tool("write_file"), test_tool("get_time")];
+        let matcher = ToolCallingMatcher::new(ToolChoice::Auto, Some(&tools)).unwrap();
+        let content = "<tool_call><function=get_time></function></tool_call>";
         let message = format!(
-            "<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value>{dsml}</arg_value>\n</tool_call>"
+            "Writing it.\n<tool_call>write_file\n<arg_key>content</arg_key>\n<arg_value>{content}</arg_value>\n</tool_call>"
         );
-        let calls = matcher.get_call(&message).unwrap();
+        let (text, calls) = matcher.get_call_with_content(&message).unwrap();
         assert_eq!(calls.len(), 1, "{calls:?}");
         assert_eq!(calls[0].function.name, "write_file");
         let args: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
-        assert_eq!(args, json!({"content": dsml}));
-        let streamed = &message[..message.find("</arg_value>").unwrap()];
-        assert_eq!(
-            matcher.prefix_could_be_tool(streamed).unwrap(),
-            (true, false),
-            "a call whose value is still streaming is held"
-        );
+        assert_eq!(args, json!({"content": content}));
+        assert_eq!(text.as_deref(), Some("Writing it.\n"));
     }
 
     #[test]
